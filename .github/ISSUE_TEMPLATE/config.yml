@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Questions and design discussions
+    url: https://github.com/matakartal/aikit-runtime/discussions
+    about: Ask for usage help, share integrations, or discuss design ideas with the community.
   - name: Security vulnerability
     url: https://github.com/matakartal/aikit-runtime/security/advisories/new
     about: Private report only — never post vulnerability details in public issues.
