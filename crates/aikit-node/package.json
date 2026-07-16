@@ -1,0 +1,39 @@
+{
+  "name": "aikit",
+  "version": "0.0.0",
+  "description": "Node (napi) binding for the aikit agent-native, governed, provider-agnostic runtime.",
+  "license": "MIT OR Apache-2.0",
+  "author": "aikit contributors",
+  "keywords": [
+    "ai",
+    "agents",
+    "llm",
+    "governance",
+    "sdk",
+    "napi"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "README.md",
+    "*.node"
+  ],
+  "napi": {
+    "name": "aikit_node"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "zod": {
+      "optional": true
+    }
+  }
+}

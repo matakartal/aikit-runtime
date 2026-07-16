@@ -1,0 +1,27 @@
+[package]
+name = "aikit-node"
+description = "Node (napi-rs) binding for the aikit agent-native runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "aikit_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+aikit-core.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+napi = { version = "2", default-features = false, features = ["napi9", "tokio_rt", "serde-json"] }
+napi-derive = "2"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+napi-build = "2"

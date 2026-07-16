@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "aikit"
+version = "0.0.0"
+description = "The agent-native, governed, provider-agnostic runtime (Python binding)."
+readme = "../../README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "aikit contributors" }]
+keywords = ["ai", "agents", "llm", "governance", "sdk"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+]
+
+[tool.maturin]
+# Native extension module `aikit` (matches [lib] name and the #[pymodule] fn).
+module-name = "aikit"
+# Enable the non-default cargo feature that flips pyo3 into extension-module mode.
+features = ["extension-module"]

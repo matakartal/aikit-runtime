@@ -1,0 +1,26 @@
+[package]
+name = "aikit"
+description = "Agent-native, governed, provider-agnostic AI runtime for Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["ai", "agents", "llm", "governance", "sdk"]
+categories = ["api-bindings", "asynchronous"]
+
+[features]
+default = []
+opentelemetry = ["aikit-core/opentelemetry"]
+
+[dependencies]
+aikit-core.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"

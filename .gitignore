@@ -1,0 +1,32 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.pyd
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / napi — the compiled addon is a build artifact; index.js is hand-written source (we
+# build without @napi-rs/cli, so it is NOT generated — see scripts/build-node.sh).
+node_modules/
+*.node
+*.tgz
+npm-debug.log*
+
+# Env / secrets — never commit API keys
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,33 @@
+[package]
+name = "aikit-py"
+description = "Python (PyO3) binding for the aikit agent-native runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "aikit"
+crate-type = ["cdylib"]
+
+[features]
+# `extension-module` MUST NOT be a default feature: with it on, pyo3 does not link libpython,
+# so a plain `cargo build` fails to link. maturin enables it via pyproject `[tool.maturin]
+# features`. Bare `cargo` commands operate on the workspace `default-members` (pure-Rust crates)
+# and skip this cdylib.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+aikit-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tokio = { version = "1", features = ["sync"] }
+pyo3 = { version = "0.25", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
+pythonize = "0.25"
+
+[dev-dependencies]
+tempfile = "3"
