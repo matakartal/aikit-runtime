@@ -38,6 +38,9 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
         prepared.command.stdout(std::process::Stdio::null());
         prepared.command.stderr(std::process::Stdio::piped());
         prepared.command.kill_on_drop(true);
+        prepared
+            .command
+            .envs(prepared.environment_overrides.clone());
         match tokio::time::timeout(std::time::Duration::from_secs(15), prepared.command.output()).await {
             Ok(Ok(output)) if output.status.success() => BackendCapability::available(
                 ActiveContainmentBackend::WindowsJob,
