@@ -184,7 +184,7 @@ public static class AikitJob {
       Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "SetInformationJobObject");
     }
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
-    PROCESS_INFORMATION pi; string line = Environment.ExpandEnvironmentVariables("%ComSpec%") + " /d /s /c \"" + command.Replace("\"", "\\\"") + "\"";
+    PROCESS_INFORMATION pi; string shell = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"); string line = shell + " /d /s /c \"" + command.Replace("\"", "\\\"") + "\"";
     Check(CreateProcessW(null, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, cwd, ref si, out pi), "CreateProcessW");
     try { Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject"); ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, 0xffffffff); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code); }
     finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); }
