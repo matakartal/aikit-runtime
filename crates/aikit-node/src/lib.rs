@@ -43,15 +43,17 @@ use aikit_core::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction};
-use napi::JsFunction;
+use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunction};
 use napi_derive::napi;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 
 /// A [`ToolExecutor`] that runs JS `async` tools — the "tool callback in" seam. Each entry is a
 /// napi `ThreadsafeFunction` (safe to call from the tokio worker thread the agent loop polls on).
-type HostCallback = ThreadsafeFunction<Value, ErrorStrategy::Fatal>;
+type HostArgs = FnArgs<(Value,)>;
+type HostFunction<'scope> = Function<'scope, HostArgs, Promise<Option<Value>>>;
+type HostCallback =
+    Arc<ThreadsafeFunction<Value, Promise<Option<Value>>, HostArgs, Status, false, true>>;
 
 #[derive(Default)]
 struct NodeToolExecutor {
@@ -118,29 +120,31 @@ impl ToolExecutor for NodeAgentToolExecutor {
     }
 }
 
-fn host_callback(env: &Env, function: JsFunction) -> Result<HostCallback> {
-    let mut callback = function
-        .create_threadsafe_function(0, |ctx: ThreadSafeCallContext<Value>| {
-            Ok(vec![ctx.env.to_js_value(&ctx.value)?])
-        })?;
-    callback.unref(env)?;
-    Ok(callback)
+fn host_callback(function: HostFunction<'_>) -> Result<HostCallback> {
+    function
+        .build_threadsafe_function()
+        .weak::<true>()
+        .build_callback(|ctx: ThreadsafeCallContext<Value>| Ok(FnArgs::from((ctx.value,))))
+        .map(Arc::new)
 }
 
 async fn call_node(callback: HostCallback, payload: Value) -> std::result::Result<Value, String> {
-    let promise: Promise<Value> = callback
-        .call_async::<Promise<Value>>(payload)
+    let promise = callback
+        .call_async(payload)
         .await
         .map_err(|error| error.to_string())?;
-    promise.await.map_err(|error| error.to_string())
+    promise
+        .await
+        .map(|value| value.unwrap_or(Value::Null))
+        .map_err(|error| error.to_string())
 }
 
 async fn call_node_void(callback: HostCallback, payload: Value) -> std::result::Result<(), String> {
-    let promise: Promise<()> = callback
-        .call_async::<Promise<()>>(payload)
+    let promise = callback
+        .call_async(payload)
         .await
         .map_err(|error| error.to_string())?;
-    promise.await.map_err(|error| error.to_string())
+    promise.await.map(|_| ()).map_err(|error| error.to_string())
 }
 
 struct NodeToolApprover {
@@ -346,7 +350,7 @@ async fn run_node_failure_hook(callback: HostCallback, ctx: FailureContext) -> F
 fn node_agent_error(env: &Env, error: AgentError) -> Error {
     let fallback = Error::from_reason(error.to_string());
     let info = error.info();
-    let Ok(mut js_error) = env.create_error(fallback.clone()) else {
+    let Ok(mut js_error) = env.create_error(Error::from_reason(error.to_string())) else {
         return fallback;
     };
     if let Ok(info_value) = env.to_js_value(&info) {
@@ -360,7 +364,10 @@ fn node_agent_error(env: &Env, error: AgentError) -> Error {
             let _ = js_error.set_named_property("code", code_value);
         }
     }
-    Error::from(js_error.into_unknown())
+    match js_error.into_unknown(env) {
+        Ok(value) => Error::from(value),
+        Err(_) => fallback,
+    }
 }
 
 // napi's async methods run on a Send future and therefore cannot retain `Env` long enough to add
@@ -484,16 +491,12 @@ impl ToolExecutor for NodeToolExecutor {
             .get(name)
             .cloned()
             .ok_or_else(|| AikitError::ToolExecution(format!("unknown tool '{name}'")))?;
-        // `call_async` dispatches the call to the JS event loop and resolves with the tool's
-        // return value. A JS `async` tool returns a Promise<string>, so we type D accordingly and
-        // then await the promise itself for the resolved string.
-        let promise: Promise<String> = tsfn
-            .call_async::<Promise<String>>(input)
+        let value = call_node(tsfn, input)
             .await
-            .map_err(|e| AikitError::ToolExecution(e.to_string()))?;
-        promise
-            .await
-            .map_err(|e| AikitError::ToolExecution(e.to_string()))
+            .map_err(AikitError::ToolExecution)?;
+        value.as_str().map(str::to_owned).ok_or_else(|| {
+            AikitError::ToolExecution("Node tool callback must resolve to a string".into())
+        })
     }
 }
 
@@ -963,18 +966,17 @@ impl Agent {
     #[napi]
     pub fn add_tool(
         &mut self,
-        env: Env,
         name: String,
         description: String,
         input_schema: Value,
-        callback: JsFunction,
+        callback: HostFunction<'_>,
     ) -> Result<()> {
         if self.inner.tool_specs().iter().any(|tool| tool.name == name) {
             return Err(Error::from_reason(format!(
                 "tool '{name}' is already registered"
             )));
         }
-        let callback = host_callback(&env, callback)?;
+        let callback = host_callback(callback)?;
         self.executor
             .tools
             .write()
@@ -1051,16 +1053,16 @@ impl Agent {
 
     /// Register an async human/host approval callback for `ask` permission decisions.
     #[napi]
-    pub fn can_use_tool(&mut self, env: Env, callback: JsFunction) -> Result<()> {
+    pub fn can_use_tool(&mut self, callback: HostFunction<'_>) -> Result<()> {
         self.approver = Some(Arc::new(NodeToolApprover {
-            callback: host_callback(&env, callback)?,
+            callback: host_callback(callback)?,
         }));
         Ok(())
     }
 
     #[napi]
-    pub fn on_user_prompt(&mut self, env: Env, callback: JsFunction) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+    pub fn on_user_prompt(&mut self, callback: HostFunction<'_>) -> Result<()> {
+        let callback = host_callback(callback)?;
         self.hooks
             .on_user_prompt_submit_async(move |ctx: PromptContext| {
                 let callback = callback.clone();
@@ -1083,11 +1085,10 @@ impl Agent {
     #[napi]
     pub fn on_pre_tool_use(
         &mut self,
-        env: Env,
-        callback: JsFunction,
+        callback: HostFunction<'_>,
         tool: Option<String>,
     ) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+        let callback = host_callback(callback)?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
             .on_pre_tool_use_async(matcher, move |ctx: PreToolUseContext| {
@@ -1114,11 +1115,10 @@ impl Agent {
     #[napi]
     pub fn on_post_tool_use(
         &mut self,
-        env: Env,
-        callback: JsFunction,
+        callback: HostFunction<'_>,
         tool: Option<String>,
     ) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+        let callback = host_callback(callback)?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
             .on_post_tool_use_async(matcher, move |ctx: PostToolUseContext| {
@@ -1146,8 +1146,8 @@ impl Agent {
     }
 
     #[napi]
-    pub fn on_failure(&mut self, env: Env, callback: JsFunction) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+    pub fn on_failure(&mut self, callback: HostFunction<'_>) -> Result<()> {
+        let callback = host_callback(callback)?;
         self.hooks.on_failure_async(move |ctx: FailureContext| {
             let callback = callback.clone();
             async move { run_node_failure_hook(callback, ctx).await }
@@ -1160,11 +1160,10 @@ impl Agent {
     #[napi]
     pub fn on_post_tool_failure(
         &mut self,
-        env: Env,
-        callback: JsFunction,
+        callback: HostFunction<'_>,
         tool: Option<String>,
     ) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+        let callback = host_callback(callback)?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
             .on_post_tool_failure_async(matcher, move |ctx: FailureContext| {
@@ -1175,8 +1174,8 @@ impl Agent {
     }
 
     #[napi]
-    pub fn on_stop(&mut self, env: Env, callback: JsFunction) -> Result<()> {
-        let callback = host_callback(&env, callback)?;
+    pub fn on_stop(&mut self, callback: HostFunction<'_>) -> Result<()> {
+        let callback = host_callback(callback)?;
         self.hooks.on_stop_async(move |ctx: StopContext| {
             let callback = callback.clone();
             async move {
@@ -1867,7 +1866,7 @@ fn build_permissions(
 pub fn query(
     env: Env,
     input: Value,
-    tools: Option<HashMap<String, JsFunction>>,
+    tools: Option<HashMap<String, HostFunction<'_>>>,
     options: Option<QueryOptions>,
 ) -> Result<QueryStream> {
     let options = options.unwrap_or(QueryOptions {
@@ -1891,7 +1890,7 @@ pub fn query(
     let mut tsfns: HashMap<String, HostCallback> = HashMap::new();
     if let Some(tools) = tools {
         for (name, func) in tools {
-            let tsfn = host_callback(&env, func)?;
+            let tsfn = host_callback(func)?;
             tool_specs.push(ToolSpec {
                 name: name.clone(),
                 description: "tool".into(),

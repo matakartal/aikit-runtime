@@ -25,6 +25,9 @@ tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"
+# napi 3's normal runtime links Node symbols that are supplied only when the `.node` addon is
+# loaded. Unit-test binaries use the official no-op backend; release/native builds do not.
+napi = { version = "3", default-features = false, features = ["noop"] }
 
 [build-dependencies]
 napi-build = "2"

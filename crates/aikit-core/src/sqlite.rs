@@ -173,13 +173,14 @@ impl SessionStore for SqliteSessionStore {
         session.created_at_unix_ms = now;
         session.updated_at_unix_ms = now;
         let json = serde_json::to_string(&session)?;
+        let revision = revision_to_sql(session.revision)?;
         let connection = self
             .connection
             .lock()
             .map_err(|_| SessionStoreError::LockPoisoned)?;
         match connection.execute(
             "INSERT INTO aikit_sessions(id,revision,session_json) VALUES(?1,?2,?3)",
-            params![session.id, session.revision, json],
+            params![session.id, revision, json],
         ) {
             Ok(_) => Ok(session),
             Err(error) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
@@ -242,18 +243,23 @@ impl SessionStore for SqliteSessionStore {
                 actual_revision: current.revision,
             });
         }
-        replacement.revision = current.revision.saturating_add(1);
+        replacement.revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io_error("session revision overflow"))?;
         replacement.created_at_unix_ms = current.created_at_unix_ms;
         replacement.updated_at_unix_ms = now_ms().max(current.updated_at_unix_ms);
         let json = serde_json::to_string(&replacement)?;
+        let replacement_revision = revision_to_sql(replacement.revision)?;
+        let expected_revision_sql = revision_to_sql(expected_revision)?;
         let changed = connection
             .execute(
                 "UPDATE aikit_sessions SET revision=?1,session_json=?2 WHERE id=?3 AND revision=?4",
                 params![
-                    replacement.revision,
+                    replacement_revision,
                     json,
                     replacement.id,
-                    expected_revision
+                    expected_revision_sql
                 ],
             )
             .map_err(|e| io_error(e.to_string()))?;
@@ -270,14 +276,23 @@ impl SessionStore for SqliteSessionStore {
 }
 
 fn current_revision(connection: &Connection, id: &str) -> SessionStoreResult<Option<u64>> {
-    connection
+    let revision: Option<i64> = connection
         .query_row(
             "SELECT revision FROM aikit_sessions WHERE id=?1",
             params![id],
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| io_error(e.to_string()))
+        .map_err(|e| io_error(e.to_string()))?;
+    revision
+        .map(|value| {
+            u64::try_from(value).map_err(|_| io_error("database contains a negative revision"))
+        })
+        .transpose()
+}
+
+fn revision_to_sql(revision: u64) -> SessionStoreResult<i64> {
+    i64::try_from(revision).map_err(|_| io_error("session revision exceeds SQLite INTEGER range"))
 }
 
 fn validate_id(id: &str) -> SessionStoreResult<()> {
@@ -343,5 +358,24 @@ mod tests {
             second.compare_and_swap(created.revision, created),
             Err(SessionStoreError::Conflict { .. })
         ));
+    }
+
+    #[test]
+    fn sqlite_revision_conversion_rejects_values_outside_integer_range() {
+        assert_eq!(revision_to_sql(i64::MAX as u64).unwrap(), i64::MAX);
+        assert!(revision_to_sql(i64::MAX as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn sqlite_rejects_negative_persisted_revisions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO aikit_sessions(id,revision,session_json) VALUES(?1,?2,?3)",
+                params!["bad", -1_i64, "{}"],
+            )
+            .unwrap();
+        assert!(current_revision(&connection, "bad").is_err());
     }
 }
