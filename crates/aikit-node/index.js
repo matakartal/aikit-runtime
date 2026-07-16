@@ -144,7 +144,9 @@ function asyncIterable(stream, transform, signal) {
 function nativeOptions(options) {
   if (options == null || !("signal" in options)) return [options, undefined];
   const { signal, ...rest } = options;
-  return [rest, signal];
+  // Carry a pre-aborted signal into the Rust CancellationToken before the core driver is spawned.
+  // Calling stream.cancel() only after nativeRun() returns races an ultra-fast mock/provider run.
+  return [{ ...rest, cancelBeforeStart: signal?.aborted === true }, signal];
 }
 
 /** Pair one canonical tool definition with its host callback for convenient registration. */

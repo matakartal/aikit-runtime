@@ -1285,6 +1285,8 @@ pub struct RunOptions {
     pub budget: Option<Value>,
     pub retry: Option<Value>,
     pub routing: Option<Value>,
+    /// Wrapper-private bridge for an AbortSignal that was already aborted before `run()`.
+    pub cancel_before_start: Option<bool>,
 }
 
 fn parse_routing_options(value: Option<Value>) -> Result<Option<CoreRoutingOptions>> {
@@ -1460,6 +1462,9 @@ fn build_agent_options(
     mapped.budget = parse_budget_policy(options.budget)?;
     mapped.retry = parse_retry_policy(options.retry)?;
     mapped.routing = parse_routing_options(options.routing)?;
+    if options.cancel_before_start.unwrap_or(false) {
+        mapped.cancellation.cancel();
+    }
     Ok(mapped)
 }
 
@@ -1506,6 +1511,8 @@ pub struct QueryOptions {
     pub routing: Option<Value>,
     pub permissions: Option<Vec<RuleSpec>>,
     pub default_mode: Option<String>,
+    /// Wrapper-private bridge for an AbortSignal that was already aborted before `query()`.
+    pub cancel_before_start: Option<bool>,
 }
 
 fn permission_mode(mode: &str) -> Result<PermissionMode> {
@@ -1580,6 +1587,7 @@ pub fn query(
         routing: None,
         permissions: None,
         default_mode: None,
+        cancel_before_start: None,
     });
 
     // Build the tool specs (advertised to the model) and, for each JS function, a thread-safe
@@ -1609,6 +1617,7 @@ pub fn query(
         routing,
         permissions,
         default_mode,
+        cancel_before_start,
     } = options;
     let mode = permission_mode(default_mode.as_deref().unwrap_or("allow"))?;
     let governance = Governance::new(build_permissions(permissions, mode)?, HookDispatcher::new());
@@ -1630,6 +1639,7 @@ pub fn query(
             budget,
             retry,
             routing,
+            cancel_before_start,
         }),
         governance,
     )?;
@@ -1891,6 +1901,7 @@ mod tests {
                     "perAttemptTimeoutMs": 30
                 })),
                 routing: None,
+                cancel_before_start: Some(true),
             }),
             Governance::default(),
         )
@@ -1905,6 +1916,7 @@ mod tests {
         assert_eq!(options.budget.pricing.unwrap().output_per_million_usd, 4.0);
         assert_eq!(options.retry.max_attempts_per_model, 3);
         assert_eq!(options.retry.per_attempt_timeout_ms, 30);
+        assert!(options.cancellation.is_cancelled());
     }
 
     #[cfg(unix)]
