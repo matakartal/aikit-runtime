@@ -38,7 +38,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
         prepared.command.stdout(std::process::Stdio::null());
         prepared.command.stderr(std::process::Stdio::piped());
         prepared.command.kill_on_drop(true);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), prepared.command.output()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), prepared.command.output()).await {
             Ok(Ok(output)) if output.status.success() => BackendCapability::available(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
