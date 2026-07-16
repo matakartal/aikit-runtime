@@ -798,7 +798,7 @@ fn provider_for_model(model: &str) -> Option<&'static str> {
         Some("groq")
     } else if m.starts_with("mistral:") {
         Some("mistral")
-    } else if m.starts_with("xai:") {
+    } else if m.starts_with("xai:") || m.starts_with("grok-") {
         Some("xai")
     } else {
         None
@@ -1154,6 +1154,7 @@ mod tests {
             ("groq:llama-3.3-70b-versatile", "groq"),
             ("mistral:mistral-large-latest", "mistral"),
             ("xai:grok-3", "xai"),
+            ("grok-4.5", "xai"),
         ] {
             assert_eq!(agent.provider_for(model).unwrap().name(), provider);
         }

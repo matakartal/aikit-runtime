@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file. The format 
 - Strict policy parsing that rejects unknown fields and malformed rules, with multiline-safe glob
   matching to prevent newline-based policy bypasses.
 - Isolated OpenAI-compatible endpoints for OpenRouter, Groq, Mistral, and xAI.
+- Grok model discovery through `grok-*` and `xai:grok-*`, backed by `XAI_API_KEY` and a keyless
+  xAI wire-contract regression test.
 - GitHub CodeQL, Dependabot, community-health files, Discussions, and repository metadata.
 
 ### Changed

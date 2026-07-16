@@ -35,10 +35,12 @@ it, so stores and host logs must protect it like prompts and model output.
 | OpenRouter | Model-dependent; dropped on replay | Yes | No | `prompted_and_parsed` |
 | Groq | No replay claim | No | No | `prompted_and_parsed` |
 | Mistral | No replay claim | Yes | No | `prompted_and_parsed` |
-| xAI | Reasoning supported; dropped on replay | Yes | No | `prompted_and_parsed` |
+| xAI / Grok | Reasoning supported; dropped on replay | Yes | No | `prompted_and_parsed` |
 
 These are capability declarations and tested adapter behavior, not a promise that every model in
 a provider's catalog supports every feature. The caller still chooses a compatible model.
+Grok models accept both the natural `grok-*` form and the explicit `xai:grok-*` namespace;
+credentials load from `XAI_API_KEY` and requests use `https://api.x.ai/v1/chat/completions`.
 The exact rules follow the current [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)
 and [Gemini thought-signature](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)
 contracts and remain subject to the live-smoke boundary.

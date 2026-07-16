@@ -282,6 +282,19 @@ shape.
 OpenRouter, Groq, Mistral, and xAI are supported through isolated OpenAI-compatible endpoints.
 They do not inherit native-provider fidelity claims automatically; capability checks still apply.
 
+### Grok through xAI
+
+Set `XAI_API_KEY`, then select Grok with either its natural model id or the explicit xAI namespace:
+
+```python
+agent = aikit.Agent.from_env({"XAI_API_KEY": "..."})
+answer = await agent.generate_text("Hello from Grok", model="grok-4.5")
+# Equivalent explicit form: model="xai:grok-4.5"
+```
+
+The adapter uses xAI's OpenAI-compatible Chat Completions endpoint. Model availability can change;
+choose a model currently enabled for your xAI account.
+
 Generated objects report their actual fidelity:
 
 - `native_constrained`

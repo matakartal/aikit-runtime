@@ -813,4 +813,38 @@ mod tests {
         assert_eq!(body["model"], "llama-3.3");
         assert_eq!(provider.name(), "groq");
     }
+
+    #[tokio::test]
+    async fn xai_grok_adapter_sends_the_unprefixed_model_and_bearer_key() {
+        use futures::StreamExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer xai-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::compatible("xai", "xai-test-key", server.uri());
+        let req = ProviderRequest {
+            model: "xai:grok-4.5".into(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 10,
+            options: serde_json::Map::new(),
+            provider_options: crate::types::ProviderOptions::new(),
+        };
+
+        let _: Vec<_> = provider.stream(req).await.unwrap().collect().await;
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "grok-4.5");
+        assert_eq!(provider.name(), "xai");
+    }
 }
