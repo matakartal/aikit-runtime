@@ -4,8 +4,8 @@
 frameworks, coding-agent harnesses, and governance/sandbox tooling. This is what to **take** from
 the field, phase by phase — disciplined by what actually defends aikit's moat.*
 
-> **Status note (docs refresh):** Phase 1 is largely landed and Phase 2 core primitives (declarative
-> policy, plan mode, heuristic SmartApprove, reliability rules, off-prompt output) ship in
+> **Status note (docs refresh):** Phase 1's core is landed and every Phase 2 row (declarative
+> policy, plan mode, heuristic SmartApprove, reliability rules, off-prompt output) ships in
 > `aikit-runtime-core`. Treat unchecked residual items and Phases 3–4 as forward planning. For
 > current public capabilities, prefer [`FEATURES.md`](FEATURES.md) and the root README.
 
@@ -35,7 +35,8 @@ Three findings must reshape the plan and the pitch:
    where we can win). Close these first or the conjunction has a hole.
 
 ### The positioning that survives scrutiny
-> **"Claude-Code-grade governance, provider-neutral across 4 co-equal providers, from one
+> **"Claude-Code-grade governance, provider-neutral across 4 native providers plus isolated
+> compatible endpoints, from one
 > conformance-tested Rust core with Python / TypeScript / Rust bindings."**
 > Not "another agent framework with hooks and multi-provider."
 
@@ -84,7 +85,7 @@ capability broker as the base.*
 | 3.2 | **Durable / resumable runs** — checkpoint run state; resume/rewind after crash or interrupt. We have sessions + run recording; add durable checkpoints. | LangGraph `interrupt()`+checkpointer (best-in-class), Julep/Temporal, Inngest, Dapr, Cloudflare DO | Long-running production agents must survive crashes and pause/resume. LangGraph's is the bar. | L |
 | 3.3 | **Model-summarizer compaction + memory-flush** — upgrade our extractive compaction to a cheap-model summary at ~85% context, flushing key facts to memory first. | grok-build compaction (`two_pass`, memory-flush) | Our v1 compaction drops-with-a-note; summarizing preserves information. Memory already exists. | M |
 | 3.4 | **Worktree-isolated parallel subagents** — git-worktree isolation for fan-out so parallel agents don't collide. We have orchestration/subagents; add worktree isolation. | grok-build worktree subagents | Safe parallel edits; matches how we already run multi-agent work. | M |
-| 3.5 | **Generic OpenAI-compatible adapter** — one honest generic adapter for the long tail (Ollama, OpenRouter, Groq, xAI, Mistral, Together, llama.cpp) graded lower fidelity. Keep 4 native + 1 generic. | Rig (20+), LiteLLM (100+), Cline, opencode (75+) | Provider *breadth* without diluting native fidelity. Local models (Ollama) = local-first story. | M |
+| 3.5 | **Broaden the compatible adapter** — OpenRouter, Groq, xAI, and Mistral already ship as isolated lower-fidelity endpoints; add configurable Ollama, Together, and llama.cpp support without weakening the four native adapters. | Rig (20+), LiteLLM (100+), Cline, opencode (75+) | Provider *breadth* without diluting native fidelity. Local models (Ollama/llama.cpp) strengthen the local-first story. | S–M |
 
 ---
 

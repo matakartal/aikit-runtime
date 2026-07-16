@@ -18,7 +18,7 @@ Security vulnerabilities must **not** be filed as public issues — follow [`SEC
 
 | Requirement | Version |
 |---|---|
-| Rust | 1.88+ (MSVR declared in workspace) |
+| Rust | 1.88+ (MSRV declared in workspace) |
 | Python | 3.9+ |
 | Node.js | 18.17+ |
 | C/C++ toolchain | Required for native bindings |
@@ -28,6 +28,7 @@ Security vulnerabilities must **not** be filed as public issues — follow [`SEC
 cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all --check
+rustup run 1.88.0 cargo check --workspace --all-targets --all-features --locked
 ```
 
 To build and verify the language bindings:

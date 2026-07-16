@@ -30,7 +30,9 @@ tree, unresolved public contacts, or incomplete authority/live/native-artifact e
 - The containment capability report is reviewed on each supported release platform. An unavailable
   required backend must deny execution rather than silently run uncontained.
 - The threat model, security policy, changelog/release notes, and known limitations match the code.
-- A real source remote and private security-reporting contact replace all TBD hosting metadata.
+- Source remote and private security reporting remain reachable and correctly linked.
+- CodeQL and dependency advisories are reviewed; no unresolved high or critical finding remains
+  without an explicit maintainer decision and documented mitigation.
 - The versioned evidence record points to the exact committed SHA and contains no credentials,
   private prompts, or raw provider responses.
 
@@ -45,9 +47,10 @@ distribution identity is therefore:
 - npm wrapper: `aikit-runtime`
 - npm native packages: `aikit-runtime-{darwin-arm64,darwin-x64,linux-arm64-gnu,linux-x64-gnu,win32-x64-msvc}`
 
-The names were checked as available before implementation, but availability is not ownership.
-The release record must still prove that the maintainer authenticated to each registry and
-reserved/published the intended names. Never publish this repository under bare `aikit`.
+The names were selected to avoid known bare-name collisions, but availability can change and is
+not ownership. Recheck immediately before publication. The release record must prove that the
+maintainer authenticated to each registry and reserved/published the intended names. Never publish
+this repository under bare `aikit`.
 
 ## Native distribution layout
 

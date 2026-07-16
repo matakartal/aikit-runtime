@@ -6,6 +6,11 @@
 is published to registries, security fixes land on the default branch only. Published support
 windows will be listed here before the first registry release.
 
+Package publication is blocked until release checks include a review of dependency and CodeQL
+alerts, with no unresolved high or critical finding unless a documented maintainer decision and
+mitigation exist. Source users should review the repository's current security state before
+deploying a pre-release commit.
+
 | Version | Supported |
 |---|---|
 | `main` (pre-release) | Yes |

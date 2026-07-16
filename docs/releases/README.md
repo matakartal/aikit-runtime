@@ -19,7 +19,7 @@ private model content, and raw provider responses out of these records.
 
 | Version | Status | Notes |
 |---|---|---|
-| [v0.1.0](v0.1.0.md) | `draft` | Source/native candidate recorded; live-provider matrix and registry authority still pending. |
+| [v0.1.0](v0.1.0.md) | `draft` | Historical source/native snapshot; refresh, dependency clearance, live matrix, and registry authority still pending. |
 
 Until a record reaches `ready` and a signed version tag is pushed, no registry publication is
 claimed. See [`RELEASE.md`](../RELEASE.md) for the full checklist.

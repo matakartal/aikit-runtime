@@ -35,7 +35,7 @@ wire request or that an artifact has been published under an authorized registry
 | TypeScript SDK | Typed napi package, async iterables/callbacks, canonical media input, typed errors, tool/DX helpers, Zod objects, audit, orchestration, and local stores | `crates/aikit-node`, strict tsc and runtime tests | Complete locally |
 | Conformance | Seven canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, and multimodal/routed input | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
-| OSS readiness | README, feature reference, threat model, security policy, contributing/code of conduct, issue/PR templates, and CI | Root docs and `.github` | Repository materials complete; source remote and private security reporting verified |
+| OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs and `.github` | Repository materials complete; source remote and private security reporting verified |
 | Distribution | Cargo package set, Python ABI3 wheels, npm wrapper/platform packages, licenses, readmes, and types | CI/release workflows plus `stage-node-platform.sh` and packaged-loader tests | Layout complete; registry ownership and live matrix remain external gates |
 
 ## Deliberate post-v1 boundaries
@@ -52,12 +52,14 @@ The implementation candidate cannot honestly become a published v1 until a maint
 1. runs and records the explicit four-provider live matrix with real keys and current model ids;
 2. verifies ownership/publication authority for the coordinated `aikit-runtime` names on crates.io,
    PyPI, and npm;
-3. completes signed-tag publication and post-upload install checks on every claimed platform.
+3. clears dependency-security release gates, including unresolved high/critical advisories;
+4. completes signed-tag publication and post-upload install checks on every claimed platform.
 
 Source remote, private security reporting, CI, native multi-platform artifacts, and provenance
-attestation are already recorded for the draft `v0.1.0` candidate in
-[`releases/v0.1.0.md`](releases/v0.1.0.md). Remaining gaps are live-provider acceptance and
-registry authority.
+attestation were recorded for an earlier draft `v0.1.0` source snapshot in
+[`releases/v0.1.0.md`](releases/v0.1.0.md). Because `main` has advanced, that assembly is historical
+evidence and must be regenerated for the final tag commit. Remaining gaps include dependency
+clearance, live-provider acceptance, registry authority, and final-commit assembly.
 
 These are authority, credential, and release-environment gates. The keyless suite must not convert
 their absence into a synthetic pass.

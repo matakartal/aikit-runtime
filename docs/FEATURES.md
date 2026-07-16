@@ -96,7 +96,9 @@ compile it into an enforcing `PermissionEngine`:
 ```
 
 Each rule is `Tool` (any input) or `Tool(glob)`. Globs match the whole decoded string leaf of the
-tool input (`*` = any run, `?` = one char). Deny remains authoritative regardless of rule order.
+tool input (`*` = any run including newlines, `?` = one character). Unknown JSON fields,
+malformed rule names, and invalid patterns are rejected rather than ignored. Deny remains
+authoritative regardless of rule order.
 `PolicySpec::from_json` / `from_file` and `build()` are the Rust entry points; Python and Node
 continue to accept structured permission rule lists that compile into the same engine.
 
@@ -149,6 +151,8 @@ next call and returns `Allow` or model-facing `Forbid(reason)`. Rules load from 
 an `OffPromptStore` and replaced with a compact reference plus preview. The agent retrieves full
 content only via the `retrieve_output` tool when needed. Small outputs pass through unchanged.
 This protects context budget and reduces replaying bulky or sensitive tool dumps every turn.
+The wrapper's canonical `retrieve_output_tool()` specification must be advertised with the wrapped
+executor; otherwise references cannot be resolved by the model.
 
 ### Capability requests
 

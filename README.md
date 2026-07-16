@@ -16,7 +16,7 @@ streaming, tools, policy, routing, budgets, audit, memory, or sessions in every 
 [![Node 18.17+](https://img.shields.io/badge/Node-18.17%2B-339933?logo=nodedotjs&logoColor=white)](crates/aikit-node/package.json)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**One core. Three SDKs. Four native providers. One policy boundary.**
+**One core. Three SDKs. Four native providers. Four compatible endpoints. One policy boundary.**
 
 [Quick start](#quick-start) · [Architecture](#architecture) · [Governance](#governed-tool-execution) · [SDKs](#one-runtime-three-sdks) · [Documentation](#documentation)
 
@@ -67,10 +67,11 @@ flowchart TB
     CORE --> O[OpenAI<br/>Responses]
     CORE --> G[Google<br/>Gemini]
     CORE --> D[DeepSeek<br/>Chat Completions]
+    CORE --> C[Compatible endpoints<br/>OpenRouter · Groq · Mistral · xAI]
 
     CORE --> HOST[Host callbacks]
     CORE --> BUILTIN[Jailed built-in tools]
-    BUILTIN --> BOUNDARY[Seatbelt or hardened Docker<br/>for required Bash containment]
+    BUILTIN --> BOUNDARY[Seatbelt · Linux namespaces + seccomp<br/>Windows Job · hardened Docker]
 ```
 
 The bindings translate host values and async callbacks at the edge. They do not duplicate policy,
@@ -278,6 +279,9 @@ shape.
 | Google | Gemini `generateContent` | Thought signature retained on the exact function-call part | `responseJsonSchema` | Yes |
 | DeepSeek | Chat Completions | Full `reasoning_content` retained for tool continuation | JSON mode + validation and repair | No |
 
+OpenRouter, Groq, Mistral, and xAI are supported through isolated OpenAI-compatible endpoints.
+They do not inherit native-provider fidelity claims automatically; capability checks still apply.
+
 Generated objects report their actual fidelity:
 
 - `native_constrained`
@@ -340,7 +344,7 @@ agent.use_session_file("./state/sessions.json")
 | Surface | Boundary |
 |---|---|
 | Read / Write / Edit / Glob / Grep | Descriptor-relative jail, registered roots only, no symlink following. |
-| Built-in Bash | Required containment: probed macOS Seatbelt or hardened, digest-pinned Docker. |
+| Built-in Bash | Required containment: probed macOS Seatbelt, Linux namespaces+seccomp, Windows Job Objects, or hardened digest-pinned Docker. |
 | Host callbacks | Your application process and your responsibility to isolate further when needed. |
 
 If required containment is unavailable, built-in Bash is denied before process launch.
@@ -358,8 +362,10 @@ to unrelated projects.
 | npm wrapper | `aikit-runtime` | `require("aikit-runtime")` |
 | npm native binaries | `aikit-runtime-{platform}` | selected automatically by the wrapper |
 
-The current `v0.1.0` release candidate is built and verified from source. Registry publication is
-the final distribution step; until then, use the checkout commands in [Quick start](#quick-start).
+The current `v0.1.0` tree is an **unpublished implementation candidate**. Keyless source and
+package checks run in CI, but registry publication, a refreshed release assembly for the final
+commit, dependency-security clearance, and the optional billable live-provider matrix remain
+release gates. Until then, use the checkout commands in [Quick start](#quick-start).
 
 ### Supported binary targets
 
@@ -381,15 +387,18 @@ cargo test --workspace --all-features --locked
 ./scripts/release-check.sh --candidate
 ```
 
-The GitHub matrix also verifies:
+Normal GitHub CI verifies:
 
 - Rust stable, Rust 1.88 MSRV, rustdoc, and doctests
 - Rust / Python / Node canonical parity
-- Python ABI3 wheels on five target combinations
 - Node native packages on five target combinations
-- packaged install and native-addon loading
-- artifact SHA-256 manifests and GitHub provenance attestations
+- package dry-runs and native-addon loading
 - keyless provider wire contracts and fail-closed containment behavior
+
+The separate release-assembly workflow builds the five Python ABI3 wheels, assembles all native
+packages, records SHA-256 manifests, and produces GitHub provenance attestations. The committed
+[`v0.1.0` evidence](docs/releases/v0.1.0.md) is a historical draft snapshot; it must be regenerated
+for the final release commit before a tag is created.
 
 ## Repository map
 
@@ -420,6 +429,7 @@ The GitHub matrix also verifies:
 | [Release guide](docs/RELEASE.md) | Package identities, publication order, and release gates. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Completion matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed v1 implementation coverage. |
+| [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and still blocked for package release. |
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |
 
@@ -428,6 +438,9 @@ The GitHub matrix also verifies:
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), follow the
 [Code of Conduct](CODE_OF_CONDUCT.md), and report vulnerabilities through the private process in
 [SECURITY.md](SECURITY.md).
+
+Questions and usage help belong in [GitHub Discussions](https://github.com/matakartal/aikit-runtime/discussions)
+or the channels listed in [SUPPORT.md](SUPPORT.md).
 
 ## License
 

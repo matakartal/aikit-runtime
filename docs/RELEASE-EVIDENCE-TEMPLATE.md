@@ -37,6 +37,8 @@ provider responses here.
 | Node.js native matrix |  |  |
 | Rust/Python/Node conformance |  |  |
 | Containment capability review |  |  |
+| CodeQL review |  |  |
+| Dependency advisory review |  |  |
 
 ## Live-provider matrix
 
@@ -69,4 +71,5 @@ Use dedicated low-limit credentials. Record model ids and outcomes only.
 - Publishing identities verified by:
 - Signing authority verified by:
 - Threat model and known limitations reviewed by:
+- Unresolved high/critical security findings (must be `none` or include an approved mitigation):
 - Final release approval:

@@ -12,6 +12,7 @@ goes deeper: capabilities, security, release evidence, and historical design not
 | [Live-provider harness](LIVE-SMOKE.md) | Maintainers | Explicit, billable real-provider acceptance contract. |
 | [Release guide](RELEASE.md) | Maintainers | Package identities, publication order, and release gates. |
 | [v1 completion matrix](V1-COMPLETION-MATRIX.md) | Contributors | Implementation proof vs external release blockers. |
+| [Project status](PROJECT-STATUS.md) | Everyone | Current shareability and package-release gates. |
 
 ## Governance deep dive
 
@@ -43,7 +44,7 @@ Cross-language governance examples live under `examples/python/` and `examples/n
 | [Release guide](RELEASE.md) | Checklist, registry identity, publication order. |
 | [Evidence template](RELEASE-EVIDENCE-TEMPLATE.md) | Blank per-version proof record (no secrets). |
 | [Release evidence records](releases/README.md) | Index of committed version evidence. |
-| [v0.1.0 evidence](releases/v0.1.0.md) | Current release-candidate record (draft; live matrix pending). |
+| [v0.1.0 evidence](releases/v0.1.0.md) | Historical draft assembly snapshot; refresh required for the final tag commit. |
 
 ## Historical and planning notes
 
@@ -54,7 +55,7 @@ for what the tree does today.
 |---|---|
 | [Phase 0 spike](PHASE-0-SPIKE.md) | Archived FFI architecture proof. |
 | [Phase 1 progress](PHASE-1-PROGRESS.md) | Archived provider/reasoning milestone. |
-| [Competitive roadmap](COMPETITIVE-ROADMAP.md) | Competitor-informed take list; some Phase 2 items are already implemented. |
+| [Competitive roadmap](COMPETITIVE-ROADMAP.md) | Competitor-informed forward plan; Phase 1 core and Phase 2 are implemented. |
 
 ## Project policies (repository root)
 
@@ -64,6 +65,7 @@ for what the tree does today.
 | [`SECURITY.md`](../SECURITY.md) | Private vulnerability reporting. |
 | [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | Collaboration norms. |
 | [`CHANGELOG.md`](../CHANGELOG.md) | Keep a Changelog history. |
+| [`SUPPORT.md`](../SUPPORT.md) | Usage help and support channels. |
 
 ## Binding packages
 
