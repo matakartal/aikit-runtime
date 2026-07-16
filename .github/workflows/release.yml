@@ -21,9 +21,9 @@ jobs:
     name: Source packages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Candidate invariants
@@ -34,7 +34,7 @@ jobs:
           cargo package -p aikit-runtime-core --locked
           cp target/package/aikit-runtime-core-*.crate dist/source/
           cargo package -p aikit-runtime --allow-dirty --list --locked > dist/source/aikit-runtime-files.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source-packages
           path: dist/source
@@ -63,8 +63,8 @@ jobs:
             native: target/release/aikit_node.dll
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - uses: dtolnay/rust-toolchain@stable
@@ -79,7 +79,7 @@ jobs:
           ./scripts/stage-node-platform.sh "${{ matrix.target }}" "${{ matrix.native }}"
           mkdir -p dist/npm-pack
           npm pack --pack-destination dist/npm-pack "./dist/npm/${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: node-${{ matrix.target }}
           path: dist/npm-pack/*.tgz
@@ -89,8 +89,8 @@ jobs:
     name: Node platform-selecting wrapper
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Assert wrapper contains no host binary
@@ -103,7 +103,7 @@ jobs:
             echo 'root wrapper embeds a host-specific native addon' >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: node-wrapper
           path: dist/npm-pack/*.tgz
@@ -127,8 +127,8 @@ jobs:
             target: windows-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.9"
       - uses: dtolnay/rust-toolchain@stable
@@ -141,7 +141,7 @@ jobs:
         run: |
           python -m pip install --force-reinstall dist/python/*.whl
           python -c "import aikit; assert aikit.__version__ == '0.1.0'"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: python-${{ matrix.target }}
           path: dist/python/*.whl
@@ -156,8 +156,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist/release
       - name: Verify complete target matrix and hash artifacts
@@ -168,14 +168,14 @@ jobs:
           find dist/release -type f ! -name SHA256SUMS -print0 \
             | sort -z \
             | xargs -0 sha256sum > dist/release/SHA256SUMS
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/release/**/*.whl
             dist/release/**/*.tgz
             dist/release/**/*.crate
             dist/release/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-bundle
           path: dist/release
@@ -188,7 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require a complete committed evidence record
         run: ./scripts/release-check.sh --release
       - name: Explain registry authority requirements
