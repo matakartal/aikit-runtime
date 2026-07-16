@@ -42,7 +42,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
             Ok(Ok(output)) if output.status.success() => BackendCapability::available(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
-                "suspended child assignment to kill-on-close Windows Job succeeded; filesystem and network are not isolated",
+                "suspended child assignment to kill-on-close Windows Job succeeded; process limit enforced, job-memory limit is host-dependent, filesystem/network are not isolated",
             ),
             Ok(Ok(output)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
@@ -171,11 +171,18 @@ public static class AikitJob {
   [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
-  static void Check(bool ok, string op) { if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error(), op); }
+  static void Check(bool ok, string op) { if (!ok) { int code = Marshal.GetLastWin32Error(); throw new Win32Exception(code, op + " (Win32 " + code + ")"); } }
   public static int Run(string command, string cwd, uint processes, ulong memory) {
     IntPtr job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception();
     var limits = new EXTENDED_LIMITS(); limits.BasicLimitInformation.LimitFlags = 0x2000u | 0x8u | 0x200u; limits.BasicLimitInformation.ActiveProcessLimit = processes; limits.JobMemoryLimit = (UIntPtr)memory;
-    Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "SetInformationJobObject");
+    bool configured = SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits));
+    if (!configured) {
+      // Some managed/CI hosts reject a nested job-memory limit even though kill-on-close and
+      // active-process limits are available. Preserve the process-tree boundary and fail only if
+      // that minimum native contract cannot be installed.
+      limits.BasicLimitInformation.LimitFlags = 0x2000u | 0x8u; limits.JobMemoryLimit = UIntPtr.Zero;
+      Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "SetInformationJobObject");
+    }
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
     PROCESS_INFORMATION pi; string line = Environment.ExpandEnvironmentVariables("%ComSpec%") + " /d /s /c \"" + command.Replace("\"", "\\\"") + "\"";
     Check(CreateProcessW(null, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, cwd, ref si, out pi), "CreateProcessW");

@@ -173,7 +173,8 @@ output limits, rlimits, process-group termination, and one OS boundary:
 - macOS: an actively probed Seatbelt profile;
 - Linux: actively probed namespaces, read-only host root, writable workspace, private temp, and a
   seccomp deny filter through bubblewrap;
-- Windows: suspended child assignment to a kill-on-close Job Object with process/memory limits;
+- Windows: suspended child assignment to a kill-on-close Job Object with a process limit and a
+  memory limit where the host permits nested job-memory accounting;
   filesystem and network isolation are explicitly not claimed;
 - macOS/Linux/Windows hosts with Docker: a local digest-pinned image, no network, read-only root,
   dropped capabilities, non-root user, bounded resources, and Docker's default seccomp profile;

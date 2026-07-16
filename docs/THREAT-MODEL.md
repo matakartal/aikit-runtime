@@ -67,7 +67,7 @@ security boundary. The Python and Node built-in APIs do not expose this opt-out.
 | Network | Denied | New network namespace | Not isolated | None |
 | Descendants | Policy inherited | Namespace/filter inherited | Kill-on-close job inherited | Container inherited |
 | Syscalls | No custom filter | Deny filter for privilege/escape syscalls | No syscall filter | Runtime seccomp profile |
-| Resources | Timeout/output/rlimits | Timeout/output/rlimits | Process count, memory, timeout/output | CPU/memory/pids/ulimits/tmpfs |
+| Resources | Timeout/output/rlimits | Timeout/output/rlimits | Process count, optional job memory, timeout/output | CPU/memory/pids/ulimits/tmpfs |
 
 Outer command construction is argv-safe: workspace paths, environment keys, image references, and
 Docker options are separate arguments. The final model-produced command is intentionally passed as
@@ -119,7 +119,8 @@ its argv.
 ### Windows Job Object
 
 - PowerShell hosts a small P/Invoke launcher. The command process is created suspended, assigned to
-  a kill-on-close Job Object with active-process and memory limits, then resumed.
+  a kill-on-close Job Object with an active-process limit, then resumed. A job-memory limit is used
+  when the host allows it; nested managed CI jobs may reject that optional flag.
 - Job Objects do not isolate filesystem reads/writes, network access, registry access, or syscalls.
   The capability report marks those guarantees false. Use Docker or an external Windows sandbox
   when those boundaries are required.
