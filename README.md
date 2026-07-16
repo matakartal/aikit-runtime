@@ -18,7 +18,7 @@ streaming, tools, policy, routing, budgets, audit, memory, or sessions in every 
 
 **One core. Three SDKs. Four native providers. Four compatible endpoints. One policy boundary.**
 
-[Quick start](#quick-start) · [Architecture](#architecture) · [Governance](#governed-tool-execution) · [SDKs](#one-runtime-three-sdks) · [Documentation](#documentation)
+[Quick start](#quick-start) · [CLI](#command-line-interface) · [Architecture](#architecture) · [Governance](#governed-tool-execution) · [SDKs](#one-runtime-three-sdks) · [Documentation](#documentation)
 
 </div>
 
@@ -93,6 +93,28 @@ Expected output:
 ```text
 Araç sonucunu aldım; görevi tamamladım.
 ```
+
+## Command-line interface
+
+The source-first CLI makes the runtime usable without writing an application. Its default model
+is the deterministic, offline `mock-1` provider:
+
+```bash
+cargo run -p aikit-cli -- run "Explain aikit in one sentence"
+cargo run -p aikit-cli -- chat
+cargo run -p aikit-cli -- providers
+cargo run -p aikit-cli -- doctor
+```
+
+Choose a configured provider explicitly only when you intend to make a network call:
+
+```bash
+XAI_API_KEY='...' cargo run -p aikit-cli -- run --model grok-4.5 "Say hello"
+```
+
+The CLI supports text, JSON, and JSONL output, stable exit codes, stdin prompts, canonical
+multi-turn history, secret-safe provider discovery, containment diagnostics, and shell completion
+generation. See the [CLI guide](crates/aikit-cli/README.md) for the full contract.
 
 ### Rust
 
@@ -419,7 +441,8 @@ anything to a package registry.
 │   ├── aikit/          # ergonomic Rust facade (package: aikit-runtime)
 │   ├── aikit-core/     # canonical runtime, providers, governance
 │   ├── aikit-py/       # PyO3 binding + type stubs (import aikit)
-│   └── aikit-node/     # napi binding + TypeScript declarations
+│   ├── aikit-node/     # napi binding + TypeScript declarations
+│   └── aikit-cli/      # source-first terminal interface
 ├── examples/
 │   ├── python/         # governance, options, and conformance
 │   └── node/           # governance, options, and conformance
@@ -440,9 +463,10 @@ anything to a package registry.
 | [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Completion matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed v1 implementation coverage. |
-| [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and still blocked for package release. |
+| [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and intentionally source-only. |
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |
+| [CLI guide](crates/aikit-cli/README.md) | Commands, automation contracts, diagnostics, and completions. |
 
 ## Contributing
 

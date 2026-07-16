@@ -83,6 +83,7 @@ node examples/node/agent_governance.cjs
 | `crates/aikit` | Ergonomic Rust facade (`aikit-runtime` package) |
 | `crates/aikit-py` | PyO3 binding (`import aikit`) |
 | `crates/aikit-node` | napi binding and local Node wrapper |
+| `crates/aikit-cli` | Source-first terminal interface over the Rust facade |
 | `examples/` | Cross-language demos and conformance drivers |
 | `docs/` | Feature reference, threat model, release evidence |
 | `scripts/` | Build, parity, live-smoke, and source-distribution checks |

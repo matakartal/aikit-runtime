@@ -3,6 +3,16 @@
 This document describes the source-first implementation in this repository. Public registry
 packages are not distributed, and changing live provider APIs are not claimed as validated.
 
+## Source-first CLI
+
+The `aikit-cli` workspace crate exposes the same Rust facade through an `aikit` binary. It includes
+one-shot runs, canonical multi-turn chat, secret-safe provider discovery, capability inspection,
+workspace/containment diagnostics, and shell completion generation. `mock-1` is the offline default.
+
+Text is the human output; JSON is the single-document automation format; JSONL is the streaming
+chat format. Input errors and runtime errors use distinct stable exit codes. The CLI never prints
+credential values and does not silently choose a billable provider.
+
 ## One canonical runtime
 
 `aikit-runtime-core` owns messages, usage, provider options/metadata, provider translation, reasoning

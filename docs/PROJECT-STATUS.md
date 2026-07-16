@@ -14,6 +14,8 @@ This page records what can be demonstrated from source today.
   exercised without API keys through the deterministic mock provider.
 - Main-branch CI and CodeQL are green for the current source tree.
 - The repository is suitable to share publicly as an open-source implementation preview.
+- The source-first CLI provides keyless runs, interactive chat, provider/capability discovery,
+  containment diagnostics, automation output, and shell completions.
 
 ## Distribution boundaries
 

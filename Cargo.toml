@@ -5,12 +5,13 @@ members = [
     "crates/aikit-core",
     "crates/aikit-py",
     "crates/aikit-node",
+    "crates/aikit-cli",
 ]
 # Bare `cargo build`/`cargo test` operate on these (pure-Rust) crates only. The `aikit-py` and
 # `aikit-node` cdylibs are built out-of-band (maturin for Python; `scripts/build-node.sh` for
 # Node), so they are kept out of the default set — `aikit-py` needs the `extension-module`
 # feature to link, and keeping the bindings out keeps a bare `cargo build` fast and pure-Rust.
-default-members = ["crates/aikit", "crates/aikit-core"]
+default-members = ["crates/aikit", "crates/aikit-core", "crates/aikit-cli"]
 
 [workspace.package]
 version = "0.1.0"

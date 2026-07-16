@@ -24,6 +24,8 @@ All notable changes to this project will be documented in this file. The format 
 - Isolated OpenAI-compatible endpoints for OpenRouter, Groq, Mistral, and xAI.
 - Grok model discovery through `grok-*` and `xai:grok-*`, backed by `XAI_API_KEY` and a keyless
   xAI wire-contract regression test.
+- Source-first `aikit` CLI with one-shot runs, canonical multi-turn chat, provider/capability
+  discovery, containment doctor, text/JSON/JSONL output, stable exit codes, and shell completions.
 - GitHub CodeQL, Dependabot, community-health files, Discussions, and repository metadata.
 
 ### Changed

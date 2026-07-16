@@ -75,3 +75,9 @@ for what the tree does today.
 | Python | [`crates/aikit-py/README.md`](../crates/aikit-py/README.md) |
 | Rust facade | crate rustdoc via `cargo doc -p aikit-runtime --open` |
 | Rust core | crate rustdoc via `cargo doc -p aikit-runtime-core --open` |
+
+## Command line
+
+| Surface | Local docs |
+|---|---|
+| `aikit` CLI | [`crates/aikit-cli/README.md`](../crates/aikit-cli/README.md) |
