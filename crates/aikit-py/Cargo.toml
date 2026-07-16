@@ -13,6 +13,10 @@ publish = false
 [lib]
 name = "aikit"
 crate-type = ["cdylib"]
+# The Python extension must use the `aikit` module name, which intentionally matches the public
+# Rust facade's import name. It has no standalone Rust API docs; disabling its rustdoc target avoids
+# a workspace output collision while leaving maturin/PyO3 packaging unchanged.
+doc = false
 
 [features]
 # `extension-module` MUST NOT be a default feature: with it on, pyo3 does not link libpython,

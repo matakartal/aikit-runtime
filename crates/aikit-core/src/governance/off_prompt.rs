@@ -21,6 +21,23 @@ use std::sync::{Arc, Mutex};
 /// The tool the agent calls to pull a stored output back into context.
 pub const RETRIEVE_TOOL: &str = "retrieve_output";
 
+/// Canonical schema for the tool used to retrieve an off-prompt output. Hosts must advertise this
+/// spec alongside the wrapped executor; the runtime intentionally rejects unadvertised tools.
+pub fn retrieve_output_tool() -> crate::types::ToolSpec {
+    crate::types::ToolSpec::new(
+        RETRIEVE_TOOL,
+        "Retrieve the complete content of a previously stored off-prompt tool output by id.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "minLength": 1 }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 /// A keyed store of off-prompt tool outputs. Ids are deterministic (`out-1`, `out-2`, …).
 #[derive(Default)]
 pub struct OffPromptStore {
@@ -188,6 +205,14 @@ mod tests {
             .execute(RETRIEVE_TOOL, json!({ "id": "out-999" }))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn retrieval_tool_has_a_canonical_strict_schema() {
+        let spec = retrieve_output_tool();
+        assert_eq!(spec.name, RETRIEVE_TOOL);
+        assert_eq!(spec.input_schema["required"], json!(["id"]));
+        assert_eq!(spec.input_schema["additionalProperties"], json!(false));
     }
 
     #[tokio::test]

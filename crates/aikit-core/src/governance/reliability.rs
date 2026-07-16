@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single reliability constraint on one tool.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRequirement {
     /// The tool this requirement governs.
     pub tool: String,
@@ -58,6 +59,7 @@ impl ToolRequirement {
 
 /// A set of reliability requirements.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReliabilityPolicy {
     #[serde(default)]
     pub requirements: Vec<ToolRequirement>,
@@ -108,8 +110,27 @@ impl ReliabilityPolicy {
 
     /// Parse from JSON: `{ "requirements": [ { "tool": "deploy", "only_after": ["test"] }, ... ] }`.
     pub fn from_json(s: &str) -> crate::error::Result<Self> {
-        serde_json::from_str(s)
-            .map_err(|e| crate::error::AikitError::Other(format!("invalid reliability JSON: {e}")))
+        let mut policy: Self = serde_json::from_str(s).map_err(|e| {
+            crate::error::AikitError::Other(format!("invalid reliability JSON: {e}"))
+        })?;
+        for requirement in &mut policy.requirements {
+            requirement.tool = requirement.tool.trim().to_owned();
+            if requirement.tool.is_empty() {
+                return Err(crate::error::AikitError::Other(
+                    "reliability requirement has no tool name".into(),
+                ));
+            }
+            for prerequisite in &mut requirement.only_after {
+                *prerequisite = prerequisite.trim().to_owned();
+                if prerequisite.is_empty() {
+                    return Err(crate::error::AikitError::Other(format!(
+                        "reliability requirement for '{}' has an empty prerequisite",
+                        requirement.tool
+                    )));
+                }
+            }
+        }
+        Ok(policy)
     }
 
     /// Check whether `tool` may run given the run's `progress`. Every requirement for `tool` must be
@@ -251,6 +272,38 @@ mod tests {
             p.check("deploy", &RunProgress::new()),
             ReliabilityVerdict::Forbid(_) // test hasn't run
         ));
+    }
+
+    #[test]
+    fn json_rejects_empty_rule_names_instead_of_silently_allowing() {
+        assert!(ReliabilityPolicy::from_json(
+            r#"{ "requirements": [{ "tool": "  ", "forbidden": true }] }"#
+        )
+        .is_err());
+        assert!(ReliabilityPolicy::from_json(
+            r#"{ "requirements": [{ "tool": "deploy", "only_after": [" "] }] }"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn json_rejects_unknown_fields_instead_of_failing_open() {
+        assert!(ReliabilityPolicy::from_json(
+            r#"{ "requirements": [{ "tool": "deploy", "forbiden": true }] }"#
+        )
+        .is_err());
+        assert!(ReliabilityPolicy::from_json(r#"{ "requirments": [] }"#).is_err());
+    }
+
+    #[test]
+    fn json_normalizes_rule_names() {
+        let policy = ReliabilityPolicy::from_json(
+            r#"{ "requirements": [{ "tool": " deploy ", "only_after": [" test "] }] }"#,
+        )
+        .unwrap();
+        let mut progress = RunProgress::new();
+        progress.record("test");
+        assert_eq!(policy.check("deploy", &progress), allow());
     }
 
     #[test]

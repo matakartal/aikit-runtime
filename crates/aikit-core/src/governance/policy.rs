@@ -47,6 +47,7 @@ impl From<PolicyMode> for PermissionMode {
 
 /// A declarative permission policy: a default mode plus allow / ask / deny rule specs.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicySpec {
     #[serde(default)]
     pub mode: PolicyMode,
@@ -98,6 +99,14 @@ enum RuleKind {
 
 /// Compile one `Tool` / `Tool(glob)` spec into a [`Rule`] of the given kind.
 fn compile(kind: RuleKind, spec: &str) -> Result<Rule> {
+    let trimmed = spec.trim();
+    if (trimmed.contains('(') && !trimmed.ends_with(')'))
+        || (trimmed.contains(')') && !trimmed.contains('('))
+    {
+        return Err(AikitError::Other(format!(
+            "malformed policy rule: '{spec}'"
+        )));
+    }
     let (tool, glob) = parse_spec(spec);
     if tool.is_empty() {
         return Err(AikitError::Other(format!(
@@ -111,7 +120,9 @@ fn compile(kind: RuleKind, spec: &str) -> Result<Rule> {
     };
     match glob {
         Some(g) => {
-            let pattern = format!("^{}$", glob_to_regex(&g));
+            // Regex `.` does not match newlines by default. Shell input can be multiline, so a
+            // wildcard must cover line breaks too or a deny glob can be bypassed by inserting one.
+            let pattern = format!("(?s)^{}$", glob_to_regex(&g));
             base.matching(&pattern)
                 .map_err(|e| AikitError::Other(format!("bad glob '{g}': {e}")))
         }
@@ -220,6 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn glob_wildcards_cover_multiline_shell_input() {
+        let e = engine(r#"{ "deny": ["Bash(rm -rf *)"] }"#);
+        assert!(matches!(
+            e.evaluate("Bash", &json!({ "command": "rm -rf /tmp/data\necho done" })),
+            Outcome::Deny(_)
+        ));
+
+        let anywhere = engine(r#"{ "deny": ["Bash(*rm -rf *)"] }"#);
+        assert!(matches!(
+            anywhere.evaluate(
+                "Bash",
+                &json!({ "command": "echo start\nrm -rf /tmp/data" })
+            ),
+            Outcome::Deny(_)
+        ));
+    }
+
+    #[test]
     fn deny_wins_over_allow_regardless_of_lists() {
         let e = engine(r#"{ "allow": ["Bash(*)"], "deny": ["Bash(rm -rf *)"] }"#);
         assert!(matches!(
@@ -299,6 +328,23 @@ mod tests {
     #[test]
     fn invalid_json_is_an_error() {
         assert!(PolicySpec::from_json("{ not json").is_err());
+    }
+
+    #[test]
+    fn unknown_policy_fields_are_rejected_instead_of_failing_open() {
+        assert!(PolicySpec::from_json(r#"{ "denny": ["Bash(*)"] }"#).is_err());
+    }
+
+    #[test]
+    fn malformed_rule_syntax_is_rejected_instead_of_becoming_a_dead_tool_name() {
+        assert!(PolicySpec::from_json(r#"{ "deny": ["Bash(rm -rf *"] }"#)
+            .unwrap()
+            .build()
+            .is_err());
+        assert!(PolicySpec::from_json(r#"{ "deny": ["Bash)"] }"#)
+            .unwrap()
+            .build()
+            .is_err());
     }
 
     #[test]
