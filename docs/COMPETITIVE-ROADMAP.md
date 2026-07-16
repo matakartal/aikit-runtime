@@ -4,6 +4,11 @@
 frameworks, coding-agent harnesses, and governance/sandbox tooling. This is what to **take** from
 the field, phase by phase — disciplined by what actually defends aikit's moat.*
 
+> **Status note (docs refresh):** Phase 1 is largely landed and Phase 2 core primitives (declarative
+> policy, plan mode, heuristic SmartApprove, reliability rules, off-prompt output) ship in
+> `aikit-runtime-core`. Treat unchecked residual items and Phases 3–4 as forward planning. For
+> current public capabilities, prefer [`FEATURES.md`](FEATURES.md) and the root README.
+
 ## What the research changed (read this first)
 
 Three findings must reshape the plan and the pitch:
@@ -48,11 +53,11 @@ Three findings must reshape the plan and the pitch:
 *Goal: make "Claude-Code-grade governance, provider-neutral" literally true and deep. Without these
 two, a reviewer closes the tab.*
 
-| # | Take | From | Why (gap / moat) | Effort |
+| # | Take | From | Why (gap / moat) | Status |
 |---|------|------|------------------|--------|
-| 1.1 | **Content-safety guardrail pipeline** — a pluggable `Guardrail` stage on pre-model / pre-tool / post-model, with (a) built-in deterministic redactors (regex PII: emails, keys, cards, secrets), (b) a `Guardrail` trait, (c) an **interop adapter that runs Superagent `safety-agent` + Meta LlamaFirewall over our new MCP client** (injection/jailbreak detection + PII, keyless, self-hostable — don't build ML from scratch). | Guardrails AI, NeMo, LlamaFirewall, Superagent, Invariant, Lakera, Bedrock Guardrails | **Biggest content-security gap.** Injection/PII is table stakes for "production." Interop keeps us a governance *runtime*, not an ML vendor. | M–L |
-| 1.2 | **Real default OS sandbox**: make Bash sandbox **default-on**; add **Linux Landlock + seccomp** and a **network-egress allowlist proxy** (deny egress by default, allowlist domains). We already have Seatbelt/Docker containment + process hardening. | Codex (default Seatbelt/Landlock/seccomp), Claude Agent SDK (Seatbelt + bubblewrap + UDS network proxy), Goose | **Codex made default OS sandbox table stakes.** Network egress control kills the `echo $KEY | curl` exfiltration path. This is exactly where MS toolkit/Agno/Pydantic *concede* — our win. | L |
-| 1.3 | **Sandbox capability report + honest threat model per backend** (none / path-jail+hardening / Seatbelt / Landlock+seccomp / Docker / microVM), surfaced in `capabilities()`. | (our honesty constraint) | Never market a weak sandbox as containment; let callers pick their guarantee. | S |
+| 1.1 | **Content-safety guardrail pipeline** — pluggable `Guardrail` stage with deterministic secret/PII redactors, regex blocklist, and fail-closed MCP safety-server interop. | Guardrails AI, NeMo, LlamaFirewall, Superagent, Invariant, Lakera, Bedrock Guardrails | **Biggest content-security gap.** Injection/PII is table stakes for "production." Interop keeps us a governance *runtime*, not an ML vendor. | **Mostly done** — deterministic + MCP path ship; deeper ML interop is optional host config |
+| 1.2 | **Real default OS sandbox**: Bash **Required(Auto)** by default; Seatbelt / Linux ns+seccomp / Windows Job / digest-pinned Docker. Remaining: Landlock refinements and a network-egress allowlist proxy beyond Docker `--network=none`. | Codex (default Seatbelt/Landlock/seccomp), Claude Agent SDK (Seatbelt + bubblewrap + UDS network proxy), Goose | **Codex made default OS sandbox table stakes.** Network egress control kills the `echo $KEY \| curl` exfiltration path. | **Core done**; Landlock/egress-proxy polish remaining |
+| 1.3 | **Sandbox capability report + honest threat model per backend**, surfaced in containment capabilities. | (our honesty constraint) | Never market a weak sandbox as containment; let callers pick their guarantee. | **Done** — `THREAT-MODEL.md` + capability report |
 
 ---
 
@@ -61,13 +66,13 @@ two, a reviewer closes the tab.*
 *Goal: match or beat the Claude Agent SDK's governance ergonomics, using our existing engine +
 capability broker as the base.*
 
-| # | Take | From | Why | Effort |
+| # | Take | From | Why | Status |
 |---|------|------|-----|--------|
-| 2.1 | **Declarative policy config** — load allow/ask/deny rules from `aikit.policy.yaml` / settings, with **glob/arg patterns** (`Bash(rm *)`, `Write(./secrets/**)`, `Edit(**/*.env)`), deny-wins precedence. We have the engine; add config + patterns. | Claude Agent SDK settings.json, opencode rulesets, Continue `permissions.yaml`, MS toolkit YAML | Declarative config is how every serious harness ships rules. Ours is code-only today. | M |
-| 2.2 | **Plan mode** — the agent proposes a step plan; a human approves / comments / edits / rejects **before** execution. Builds on our capability-request broker. | grok-build plan mode, Claude Agent SDK `plan` mode | The proven HITL pattern; extends our "agent requests → human decides" primitive to whole plans. | M |
-| 2.3 | **Risk-scoring + LLM SmartApprove** — annotate each tool call LOW/MED/HIGH/UNKNOWN; an optional `LlmApprover` auto-approves low-risk, escalates high-risk to a human. | OpenHands security analyzer, Goose SmartApprove ("PermissionJudge") | Cuts approval fatigue (Anthropic cites ~84% fewer prompts) without losing control. Composes with our `ToolApprover`. | M |
-| 2.4 | **Reliability rules (declarative, distinct from security)** — tool-ordering / prerequisites / max-uses (`Forbidden`, `only_after`, `force_at_step`, caps) for *predictable* tool use. | BeeAI/IBM `ConditionalRequirement`, Letta Tool Rules, OpenAI Agents guardrail tripwires | Separates "is it *safe*" (permissions) from "is it *sensible*" (reliability) — reduces agent flailing. | M |
-| 2.5 | **Off-prompt tool output** — option to keep large/sensitive tool results out of the model context (store + reference). | Griptape "off-prompt by default" | Data-privacy + context-budget win; complements compaction. | S |
+| 2.1 | **Declarative policy config** — load allow/ask/deny rules from JSON, with **glob/arg patterns** (`Bash(rm *)`, `Write(./secrets/**)`, `Edit(**/*.env)`), deny-wins precedence. | Claude Agent SDK settings.json, opencode rulesets, Continue `permissions.yaml`, MS toolkit YAML | Declarative config is how every serious harness ships rules. | **Done** — `PolicySpec` + `examples/policy.rs` (YAML convenience remaining optional) |
+| 2.2 | **Plan mode** — the agent proposes a step plan; a human approves / comments / edits / rejects **before** execution. Builds on our capability-request broker. | grok-build plan mode, Claude Agent SDK `plan` mode | The proven HITL pattern; extends our "agent requests → human decides" primitive to whole plans. | **Done** — `governance/plan.rs` + `examples/plan_mode.rs` |
+| 2.3 | **Risk-scoring + SmartApprove** — annotate each tool call LOW/MED/HIGH; auto-approve low-risk, escalate the rest to a human. Optional LLM judge remains host-pluggable. | OpenHands security analyzer, Goose SmartApprove ("PermissionJudge") | Cuts approval fatigue without losing control. Composes with our `ToolApprover`. | **Done (heuristic)** — `HeuristicRiskScorer` + `SmartApprover`; built-in LLM judge deferred |
+| 2.4 | **Reliability rules (declarative, distinct from security)** — tool-ordering / prerequisites / max-uses (`Forbidden`, `only_after`, caps) for *predictable* tool use. | BeeAI/IBM `ConditionalRequirement`, Letta Tool Rules, OpenAI Agents guardrail tripwires | Separates "is it *safe*" (permissions) from "is it *sensible*" (reliability) — reduces agent flailing. | **Done** — `ReliabilityPolicy` + `examples/reliability.rs` |
+| 2.5 | **Off-prompt tool output** — option to keep large/sensitive tool results out of the model context (store + reference). | Griptape "off-prompt by default" | Data-privacy + context-budget win; complements compaction. | **Done** — `OffPromptExecutor` / `OffPromptStore` |
 
 ---
 
@@ -128,16 +133,17 @@ Taking "everything" means every **capability** relevant to a governed, provider-
 ## Sequencing & rationale
 
 ```
-P1  Complete the conjunction     ──►  guardrails (1.1) + real OS sandbox (1.2)   [credibility gate]
-P2  Governance depth ≥ Claude    ──►  policy config, plan mode, SmartApprove, reliability rules
+P1  Complete the conjunction     ──►  guardrails + real OS sandbox   [largely landed]
+P2  Governance depth ≥ Claude    ──►  policy, plan mode, SmartApprove, reliability, off-prompt  [landed in core]
 P3  Depth / isolation / scale    ──►  microVM, durable resume, model-compaction, worktrees, generic adapter
 P4  Ecosystem / interop          ──►  ACP, A2A+identity, plugins, Cedar/OPA, MCP-server, observability
-P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat)
+P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat) — project new P2 APIs to Py/TS next
 ```
 
-- **Do P1 first.** It closes the two holes that make "production governance" ring hollow, and 1.2 lands
-  squarely where the strongest governance rivals (MS toolkit, Agno, Pydantic AI) are weak.
-- **P2 makes the governance deep enough to survive the Claude-Agent-SDK comparison** (the reference design).
+- **P1 core is in tree** (guardrails, required containment, honest capability report). Residual work is
+  Landlock/egress-proxy polish, not greenfield.
+- **P2 core is in tree** (policy config, plan mode, heuristic SmartApprove, reliability, off-prompt).
+  Next obligation under P5: typed Python/TypeScript projections for each new primitive.
 - **P3/P4 widen the wedge**; sequence by demand.
 - **P5 is the moat and runs through all of it.** A feature that ships to Rust only is half-done.
 

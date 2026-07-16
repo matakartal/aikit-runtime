@@ -81,6 +81,89 @@ Tool executors can additionally be wrapped in deterministic guardrails. The shar
 recognized secrets, email/card/SSN data from tool output and can block configured input patterns.
 Semantic classifiers integrate through MCP and fail closed instead of embedding a billable model.
 
+### Declarative permission policy
+
+`PolicySpec` is the config front door to the permission engine. Load Claude-Code-style JSON and
+compile it into an enforcing `PermissionEngine`:
+
+```json
+{
+  "mode": "allow",
+  "deny": ["Bash(rm -rf *)", "Read(*.env)"],
+  "ask": ["Bash(git push *)"],
+  "allow": ["Read(*)", "Write(./workspace/**)"]
+}
+```
+
+Each rule is `Tool` (any input) or `Tool(glob)`. Globs match the whole decoded string leaf of the
+tool input (`*` = any run, `?` = one char). Deny remains authoritative regardless of rule order.
+`PolicySpec::from_json` / `from_file` and `build()` are the Rust entry points; Python and Node
+continue to accept structured permission rule lists that compile into the same engine.
+
+Modes: `allow` (default permissive with explicit denials), `deny` (least privilege), `ask`
+(escalate every unmatched call).
+
+### Plan mode
+
+Before tools run, the agent can propose a `Plan` (`goal` + ordered `PlanStep`s, optional tool names
+per step). A host `PlanReviewer` returns:
+
+- `Approve` — run the plan as proposed;
+- `ApproveRevised(plan)` — run a human-edited plan;
+- `Reject(reason)` — feed the reason back so the agent replans.
+
+`review_plan` is transport-agnostic and executes nothing; it only decides *what* may run. Use it
+when whole-approach HITL is stronger than per-tool approval.
+
+### Risk scoring and smart approval
+
+`RiskScorer` classifies a tool call as `Low`, `Medium`, or `High`. The default
+`HeuristicRiskScorer` is deterministic and keyless: read-only tools are Low (Medium if the path
+looks sensitive), Bash is High for dangerous verbs / Medium otherwise, writes escalate on
+sensitive paths, and unknowns lean cautious.
+
+`SmartApprover` wraps any human `ToolApprover`: calls at or below a risk threshold are
+auto-allowed; the rest escalate. `SmartApprover::heuristic(human)` auto-approves only Low-risk
+calls. Failure mode is "ask a human needlessly", never "run something dangerous silently".
+
+An LLM-backed risk judge remains optional host code; the core ships the scorer trait and the
+heuristic default so approval fatigue can drop without a billable dependency.
+
+### Reliability rules
+
+Permissions answer "is this call *safe*?". `ReliabilityPolicy` answers "does this call make sense
+*right now*?". Declarative `ToolRequirement`s support:
+
+- `forbidden` — soft control-flow forbid (distinct from a security deny);
+- `only_after` — require prior tools to have run;
+- `max_uses` — cap uses in one run;
+- `min_step` — block until a minimum tool-call index.
+
+`RunProgress` records tools after they execute; `ReliabilityPolicy::check` consults it before the
+next call and returns `Allow` or model-facing `Forbid(reason)`. Rules load from JSON like
+`PolicySpec`.
+
+### Off-prompt tool output
+
+`OffPromptExecutor` wraps any `ToolExecutor`. Outputs larger than `max_inline_bytes` are stored in
+an `OffPromptStore` and replaced with a compact reference plus preview. The agent retrieves full
+content only via the `retrieve_output` tool when needed. Small outputs pass through unchanged.
+This protects context budget and reduces replaying bulky or sensitive tool dumps every turn.
+
+### Capability requests
+
+Agents can request a tool they lack through the governed `request_capability` path. A human
+decides; grants are recorded and scoped. Silent escalation is never allowed.
+
+### Examples
+
+```bash
+cargo run -p aikit-runtime-core --example policy
+cargo run -p aikit-runtime-core --example plan_mode
+cargo run -p aikit-runtime-core --example smart_approval
+cargo run -p aikit-runtime-core --example reliability
+```
+
 ## Audit and OpenTelemetry
 
 `AuditTrail` emits typed run, request, route, provider-attempt, permission, hook, tool, usage,
@@ -201,5 +284,8 @@ are asserted instead.
 - Model-generated/two-pass summaries beyond deterministic extractive compaction.
 - MCP server mode and WASM/browser-runtime packaging.
 - Stronger Windows filesystem/network isolation beyond Job Objects.
+- Built-in LLM risk judge (the trait + heuristic scorer ship now; hosts can plug their own).
+- Network-egress allowlist proxy for contained Bash beyond Docker `--network=none`.
+- microVM containment backends, durable checkpoint resume, and ACP/A2A protocol surfaces.
 
 These are not silently represented as current capabilities.

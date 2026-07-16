@@ -4,6 +4,8 @@ This document defines the guarantees and limits of aikit's built-in tool securit
 default built-in Bash posture is `Required(Auto)`: if aikit cannot prove that a supported OS
 backend is ready, it returns `PermissionDenied` before starting the command.
 
+Related: [Security policy](../SECURITY.md) · [Feature reference](FEATURES.md) · [Documentation index](README.md)
+
 ## Protected assets and attacker
 
 The protected assets are host credentials and user files outside the selected workspace, host

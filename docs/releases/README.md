@@ -1,12 +1,25 @@
 # Release evidence records
 
-Each published version gets one immutable `vX.Y.Z.md` evidence record copied from
-[`RELEASE-EVIDENCE-TEMPLATE.md`](../RELEASE-EVIDENCE-TEMPLATE.md). Keep credentials, private model
-content, and raw provider responses out of these records.
+Each published (or release-candidate) version gets one immutable `vX.Y.Z.md` evidence record
+copied from [`RELEASE-EVIDENCE-TEMPLATE.md`](../RELEASE-EVIDENCE-TEMPLATE.md). Keep credentials,
+private model content, and raw provider responses out of these records.
 
-The evidence record is committed after the exact source candidate; its `commit_sha` points to that
-reachable source commit and the release tag targets the same SHA.
+## How evidence is committed
 
-The directory is intentionally empty until a real release candidate has a non-placeholder version,
-an exact committed source revision, current live-provider evidence, inspected multi-platform native
-artifacts, and verified publishing authority.
+1. Freeze the exact source commit that will be tagged.
+2. Copy the template to `docs/releases/vX.Y.Z.md` in a **follow-up** evidence commit.
+3. Set `commit_sha` to the reachable source commit (not the evidence commit itself).
+4. Fill toolchain, live-matrix, artifact, and authority fields without secrets.
+5. The release tag targets the same source SHA the evidence record describes.
+
+`release_status: ready` plus `verified` / `passed` fields are required before
+`./scripts/release-check.sh --release` accepts the record.
+
+## Records in this repository
+
+| Version | Status | Notes |
+|---|---|---|
+| [v0.1.0](v0.1.0.md) | `draft` | Source/native candidate recorded; live-provider matrix and registry authority still pending. |
+
+Until a record reaches `ready` and a signed version tag is pushed, no registry publication is
+claimed. See [`RELEASE.md`](../RELEASE.md) for the full checklist.

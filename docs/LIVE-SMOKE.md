@@ -2,7 +2,10 @@
 
 The normal suite is deterministic, keyless, and non-billable. It validates provider request and
 stream handling with local real-socket mock servers; it does not prove that a changing live API
-accepted the request. No live-provider run has been performed in this checkout.
+accepted the request.
+
+**Status:** no live-provider run is claimed for the current draft `v0.1.0` candidate. See
+[`releases/v0.1.0.md`](releases/v0.1.0.md).
 
 Every live mode requires `AIKIT_LIVE_SMOKE=1` as an explicit acknowledgement of network and
 billable calls. The wrapper exits before the test when that flag is absent.
