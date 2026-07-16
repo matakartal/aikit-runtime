@@ -68,7 +68,7 @@ impl PyMcpServer {
                 .list_resources(cursor.as_deref())
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &value)
                     .map(|v| v.unbind())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -83,7 +83,7 @@ impl PyMcpServer {
                 .read_resource(&uri)
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &value)
                     .map(|v| v.unbind())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -102,7 +102,7 @@ impl PyMcpServer {
                 .list_prompts(cursor.as_deref())
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &value)
                     .map(|v| v.unbind())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -124,7 +124,7 @@ impl PyMcpServer {
                 .get_prompt(&name, arguments)
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &value)
                     .map(|v| v.unbind())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -156,7 +156,7 @@ fn connect_mcp_http<'py>(
             .await
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let client = Arc::new(client);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             Py::new(
                 py,
                 PyMcpServer {
@@ -196,7 +196,7 @@ fn connect_mcp_stdio<'py>(
             .await
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let client = Arc::new(client);
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             Py::new(
                 py,
                 PyMcpServer {
@@ -344,7 +344,7 @@ async fn call_python(callback: Arc<PyHostCallback>, payload: Value) -> Result<Va
             "Python callback requires Agent.run/query to start inside an active asyncio loop"
                 .to_string()
         })?;
-    let future = Python::with_gil(|py| -> PyResult<_> {
+    let future = Python::attach(|py| -> PyResult<_> {
         let input = pythonize::pythonize(py, &payload)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let coroutine = callback.callable.bind(py).call1((input,))?;
@@ -353,9 +353,7 @@ async fn call_python(callback: Arc<PyHostCallback>, payload: Value) -> Result<Va
     .map_err(|error| error.to_string())?;
 
     let result = future.await.map_err(|error| error.to_string())?;
-    Python::with_gil(|py| {
-        pythonize::depythonize(result.bind(py)).map_err(|error| error.to_string())
-    })
+    Python::attach(|py| pythonize::depythonize(result.bind(py)).map_err(|error| error.to_string()))
 }
 
 #[async_trait]
@@ -614,7 +612,7 @@ fn python_messages(input: &Bound<'_, PyAny>) -> PyResult<Vec<Message>> {
 }
 
 fn py_error_with_info(message: String, info: aikit_core::ErrorInfo) -> PyErr {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let exception = AikitError::new_err(message);
         if let Ok(value) = pythonize::pythonize(py, &info) {
             let _ = exception.value(py).setattr("info", value);
@@ -735,7 +733,7 @@ impl ObjectStream {
             };
             match next {
                 Some(Ok(event)) => {
-                    Python::with_gil(|py| object_event_to_python(py, event, model_class.as_ref()))
+                    Python::attach(|py| object_event_to_python(py, event, model_class.as_ref()))
                 }
                 Some(Err(error)) => Err(py_core_error(error)),
                 None => Err(PyStopAsyncIteration::new_err("")),
@@ -971,7 +969,7 @@ impl QueryStream {
                 }
             };
             match next {
-                Some(delta) => Python::with_gil(|py| {
+                Some(delta) => Python::attach(|py| {
                     let obj = pythonize::pythonize(py, &delta)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     Ok(obj.unbind())
@@ -1021,7 +1019,7 @@ impl QueryStream {
         let recorder = self.recorder.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let outcome = close_query_stream(inner, recorder).await;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &outcome)
                     .map(Bound::unbind)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))
@@ -1710,7 +1708,7 @@ impl PyAgent {
         }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = tools.containment_capabilities().await;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 pythonize::pythonize(py, &report)
                     .map(Bound::unbind)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))
@@ -1932,7 +1930,7 @@ impl PyAgent {
             )
             .await
             .map_err(py_agent_error)?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let value = pythonize::pythonize(py, &generated)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(value.unbind())
@@ -2080,7 +2078,7 @@ impl PyAgent {
             let result = orchestrator.execute(spec, &context).await;
             let value =
                 serde_json::to_value(result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let value = pythonize::pythonize(py, &value)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(value.unbind())
@@ -2113,7 +2111,7 @@ impl PyAgent {
             let results = orchestrator.fan_out(specs, &context).await;
             let value = serde_json::to_value(results)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let value = pythonize::pythonize(py, &value)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(value.unbind())
@@ -2166,7 +2164,7 @@ impl PyAgent {
                 .await;
             let value =
                 serde_json::to_value(result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let value = pythonize::pythonize(py, &value)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(value.unbind())
@@ -2201,7 +2199,7 @@ impl PyAgent {
             let result = orchestrator.resume(&session_id, spec, &context).await;
             let value =
                 serde_json::to_value(result).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let value = pythonize::pythonize(py, &value)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(value.unbind())
@@ -2248,7 +2246,7 @@ impl PyAgent {
                 )
                 .await
                 .map_err(py_agent_error)?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let raw_value = pythonize::pythonize(py, &result.value)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let value = match model_class {

@@ -27,7 +27,8 @@ All notable changes to this project will be documented in this file. The format 
 ### Changed
 
 - Node native bindings now target N-API 3 for the declared Node.js compatibility floor.
-- Updated Tokio, Regex, and SQLite dependencies; SQLite revisions are converted explicitly at the
+- Updated Tokio, Regex, SQLite, and the Python FFI stack. PyO3, `pyo3-async-runtimes`, and
+  `pythonize` now use the patched 0.29 line; SQLite revisions are converted explicitly at the
   signed storage boundary.
 
 ### Documentation

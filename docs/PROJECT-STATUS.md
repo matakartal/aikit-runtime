@@ -22,8 +22,9 @@ before package publication.
 - No paid live-provider acceptance result is claimed for the current candidate.
 - The existing `v0.1.0` artifact evidence records an older draft source snapshot, not current
   `main`; release assembly must be rerun for the final tag commit.
-- Dependency-security clearance is still a release gate. The current PyO3 line has upstream
-  advisories with fixes in a newer line and must be upgraded and reverified before publication.
+- Dependency-security review remains a release gate. The Python FFI stack now uses the patched
+  PyO3 0.29 line and the repository lockfile passes `cargo audit`; registry publication must still
+  recheck GitHub alerts and the final release lockfile.
 
 ## Release decision
 
