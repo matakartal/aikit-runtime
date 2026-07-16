@@ -1,7 +1,8 @@
 # Release checklist
 
 The repository is an implementation candidate until a maintainer completes and records these
-steps. Passing keyless CI alone is not a live-provider or registry release.
+steps. Passing keyless CI alone is not a live-provider or registry release. Draft evidence for
+`v0.1.0` lives in [`releases/v0.1.0.md`](releases/v0.1.0.md).
 
 Run the non-billable candidate invariants during development:
 

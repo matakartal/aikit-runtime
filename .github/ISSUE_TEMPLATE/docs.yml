@@ -1,0 +1,42 @@
+name: Documentation
+description: Report a docs gap, incorrect claim, or missing example.
+title: "[docs] "
+labels: [documentation]
+body:
+  - type: markdown
+    attributes:
+      value: Use this for documentation accuracy and discoverability. For product defects, open a bug report instead.
+  - type: dropdown
+    id: location
+    attributes:
+      label: Where is the gap?
+      options:
+        - Root README
+        - Feature reference (docs/FEATURES.md)
+        - Threat model / SECURITY
+        - Release / live-smoke docs
+        - Contributing / community files
+        - Binding README (Python or Node)
+        - Missing page entirely
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: Quote the current text if it is incorrect, or describe the missing path a reader cannot complete.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: Optional rewrite, link target, or example you would expect.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked the current docs index (docs/README.md).
+          required: true

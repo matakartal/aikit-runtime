@@ -4,14 +4,17 @@ This directory contains the napi binding for the local aikit Rust workspace. It 
 canonical agent, streaming, structured-output, routing, memory, governance, and hook behavior as
 the Rust core, with TypeScript declarations in `index.d.ts`.
 
-> The npm distribution name is `aikit-runtime`; the existing bare `aikit` package is unrelated.
-> This package remains unpublished until the release evidence gates pass.
+> The npm distribution name is **`aikit-runtime`**; the existing bare `aikit` package is unrelated.
+> Native platform packages are published as `aikit-runtime-{platform}` and selected automatically by
+> the wrapper. This package remains unpublished until the release evidence gates pass.
 
-Build and load it from the repository checkout:
+## Build from this checkout
 
 ```bash
+# from the repository root
 ./scripts/build-node.sh
 node examples/node/agent_governance.cjs
+node examples/node/run_options.cjs
 ```
 
 ```js
@@ -131,5 +134,20 @@ Normal examples use the deterministic mock provider and make no billable API cal
 
 Python/Node host callbacks execute in the host process and are not covered by built-in Bash OS
 containment. Apply separate process isolation when callback code is untrusted.
+
+## Documentation
+
+| Guide | Purpose |
+|---|---|
+| [Root README](../../README.md) | Project overview and multi-language quick start |
+| [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
+| [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |
+| [Conformance](../../examples/node/conformance.cjs) | Cross-language parity driver |
+
+Cross-language parity:
+
+```bash
+./scripts/parity-check.sh
+```
 
 Licensed under MIT OR Apache-2.0; both license texts are included in the package.

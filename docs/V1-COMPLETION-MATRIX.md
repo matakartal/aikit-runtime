@@ -14,6 +14,11 @@ wire request or that an artifact has been published under an authorized registry
 | Text DX | `generate_text`, `stream_text`, reusable `Client`, canonical string/message/media input, transcript, and cancellation in all three languages | Rust facade; PyO3/napi Agent and Client surfaces; `INPUT` conformance | Complete |
 | Structured DX | Schema validation, honest `FidelityGrade`, bounded repair, multimodal `generate_object`/`stream_object`, and serde/Pydantic/Zod materialization | `dx.rs`; Rust/Python/Node typed, real-Zod, streaming, and media tests | Complete |
 | Governance | Pre-side-effect schema validation and global authoritative allow/ask/deny, including async approval and safe scoped grants | `governance/*`, `runtime.rs`, host callback tests | Complete |
+| Declarative policy | Claude-Code-style JSON `PolicySpec` with mode + allow/ask/deny globs compiled into the permission engine | `governance/policy.rs`, `examples/policy.rs` | Complete in Rust core |
+| Plan mode | Whole-approach HITL: propose plan, human approve/revise/reject before tools run | `governance/plan.rs`, `examples/plan_mode.rs` | Complete in Rust core |
+| Risk / smart approval | Keyless risk scoring and `SmartApprover` that auto-allows low risk and escalates the rest | `governance/risk.rs`, `examples/smart_approval.rs` | Complete in Rust core (LLM judge remains host-pluggable) |
+| Reliability rules | Declarative ordering, prerequisites, max uses, soft forbids separate from security | `governance/reliability.rs`, `examples/reliability.rs` | Complete in Rust core |
+| Off-prompt output | Store large/sensitive tool results by reference; retrieve on demand | `governance/off_prompt.rs` | Complete in Rust core |
 | Hooks | UserPrompt, PreTool, PostTool, tool-scoped PostToolFailure, general Failure, and Stop with bounded execution and rewrite/block semantics | `governance/hooks.rs`; Rust/Python/Node ordering tests | Complete |
 | Audit | Typed lifecycle, provider, permission, hook, tool, usage, budget, structured-output, and subagent events; metadata-only default; fail-closed JSONL; optional Rust-host OTel bridge | `observability.rs`; binding JSONL configuration; audit conformance | Complete; OTel exporter ownership remains with the Rust host |
 | Built-in tools | Read/Write/Edit/Glob/Grep and separately enabled Bash, with canonical schemas and host/builtin collision safety | `tools/builtin/*`; Rust/Python/Node public surfaces and runtime tests | Complete on supported jailed platforms |
@@ -30,8 +35,8 @@ wire request or that an artifact has been published under an authorized registry
 | TypeScript SDK | Typed napi package, async iterables/callbacks, canonical media input, typed errors, tool/DX helpers, Zod objects, audit, orchestration, and local stores | `crates/aikit-node`, strict tsc and runtime tests | Complete locally |
 | Conformance | Seven canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, and multimodal/routed input | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
-| OSS readiness | README, feature reference, threat model, security policy, contributing/code of conduct, issue/PR templates, and CI | Root docs and `.github` | Repository materials complete; verified remote/private security contact still required |
-| Distribution | Cargo package set, Python ABI3 wheels, npm wrapper/platform packages, licenses, readmes, and types | CI/release workflows plus `stage-node-platform.sh` and packaged-loader tests | Layout complete; remote multi-target run and registry authority remain release evidence gates |
+| OSS readiness | README, feature reference, threat model, security policy, contributing/code of conduct, issue/PR templates, and CI | Root docs and `.github` | Repository materials complete; source remote and private security reporting verified |
+| Distribution | Cargo package set, Python ABI3 wheels, npm wrapper/platform packages, licenses, readmes, and types | CI/release workflows plus `stage-node-platform.sh` and packaged-loader tests | Layout complete; registry ownership and live matrix remain external gates |
 
 ## Deliberate post-v1 boundaries
 
@@ -42,12 +47,25 @@ Linux/macOS-only.
 
 ## External release blockers
 
-The implementation candidate cannot honestly become a released v1 until a maintainer:
+The implementation candidate cannot honestly become a published v1 until a maintainer:
 
 1. runs and records the explicit four-provider live matrix with real keys and current model ids;
-2. verifies ownership/publication authority for the coordinated `aikit-runtime` names;
-3. configures a real source remote, private security contact, signing, and registry authority; and
-4. builds and inspects the final-name native artifacts on every supported release target.
+2. verifies ownership/publication authority for the coordinated `aikit-runtime` names on crates.io,
+   PyPI, and npm;
+3. completes signed-tag publication and post-upload install checks on every claimed platform.
+
+Source remote, private security reporting, CI, native multi-platform artifacts, and provenance
+attestation are already recorded for the draft `v0.1.0` candidate in
+[`releases/v0.1.0.md`](releases/v0.1.0.md). Remaining gaps are live-provider acceptance and
+registry authority.
 
 These are authority, credential, and release-environment gates. The keyless suite must not convert
 their absence into a synthetic pass.
+
+## Language-surface note
+
+Declarative policy, plan mode, smart approval, reliability rules, and off-prompt storage ship in
+`aikit-runtime-core` with Rust examples. Python and Node already expose permissions, hooks,
+approvers, tools, orchestration, and state through the shared binding contract. Projecting every
+new governance primitive into typed binding helpers remains ongoing work and must not silently
+imply parity before the surface lands in all three languages.

@@ -162,7 +162,11 @@ main();
 | Streaming | Incremental text, reasoning, tool-call, tool-result, usage, and terminal events. |
 | Structured output | JSON Schema validation, bounded repair, streaming attempts, Pydantic and Zod materialization. |
 | Canonical messages | Text, reasoning, tools, media, citations, usage, and provider-owned metadata without flattening. |
-| Governance | Global allow / ask / deny rules, async approval, lifecycle hooks, input rewrites, and authoritative denial. |
+| Governance | Global allow / ask / deny, declarative JSON policy, async approval, lifecycle hooks, and authoritative denial. |
+| Plan mode | Whole-approach HITL: the agent proposes a plan; a human approves, revises, or rejects before tools run. |
+| Smart approval | Keyless risk scoring auto-allows low-risk `ask` calls and escalates the rest to a human. |
+| Reliability rules | Declarative tool ordering, prerequisites, and use caps — separate from security permissions. |
+| Off-prompt output | Large or sensitive tool results stored by reference so they do not fill the model context. |
 | Guardrails | Deterministic secret/PII redaction, regex blocking, and fail-closed MCP safety-server interop. |
 | Self-extension | Human-governed capability requests: the agent asks for a tool it lacks, a human decides, the grant is recorded — never a silent escalation. |
 | Tool runtime | Host callbacks plus opt-in Read, Write, Edit, Glob, Grep, and contained Bash. |
@@ -234,6 +238,33 @@ agent.can_use_tool(approve)
 ```
 
 The same lifecycle exists in Rust and TypeScript; only the host callback syntax changes.
+
+### Declarative policy, plan mode, and reliability
+
+Rust also ships higher-level governance primitives that compose with the same engine:
+
+```rust
+// Declarative JSON → enforcing PermissionEngine
+use aikit_core::PolicySpec;
+let engine = PolicySpec::from_json(r#"{
+  "mode": "allow",
+  "deny": ["Bash(rm -rf *)"],
+  "ask": ["Bash(git push *)"],
+  "allow": ["Read(*)"]
+}"#)?.build()?;
+
+// Plan mode: review the whole approach before any tool runs
+// cargo run -p aikit-runtime-core --example plan_mode
+
+// Smart approval: auto-allow Low risk, escalate the rest
+// cargo run -p aikit-runtime-core --example smart_approval
+
+// Reliability: deploy only after test, at most once
+// cargo run -p aikit-runtime-core --example reliability
+```
+
+See the [feature reference](docs/FEATURES.md#governance-and-hooks) for plan review, risk scoring,
+reliability rules, off-prompt tool output, and capability requests.
 
 ## Provider fidelity
 
@@ -365,27 +396,32 @@ The GitHub matrix also verifies:
 ```text
 .
 ├── crates/
-│   ├── aikit/          # ergonomic Rust facade
-│   ├── aikit-core/     # canonical runtime and provider adapters
-│   ├── aikit-py/       # PyO3 binding + type declarations
+│   ├── aikit/          # ergonomic Rust facade (package: aikit-runtime)
+│   ├── aikit-core/     # canonical runtime, providers, governance
+│   ├── aikit-py/       # PyO3 binding + type stubs (import aikit)
 │   └── aikit-node/     # napi binding + TypeScript declarations
 ├── examples/
 │   ├── python/         # governance, options, and conformance
 │   └── node/           # governance, options, and conformance
-├── docs/               # features, threat model, release, and design notes
-└── scripts/            # build, parity, packaging, and release gates
+├── docs/               # features, threat model, release evidence, roadmap
+├── scripts/            # build, parity, packaging, and release gates
+├── CONTRIBUTING.md     # setup and design rules
+├── SECURITY.md         # private vulnerability reporting
+└── CHANGELOG.md        # Keep a Changelog history
 ```
 
 ## Documentation
 
 | Guide | Purpose |
 |---|---|
-| [Feature reference](docs/FEATURES.md) | Runtime capabilities, fidelity, routing, orchestration, state, and limits. |
+| [Documentation index](docs/README.md) | Full map of guides, policies, and historical notes. |
+| [Feature reference](docs/FEATURES.md) | Runtime capabilities, governance depth, fidelity, routing, state, and limits. |
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
 | [Release guide](docs/RELEASE.md) | Package identities, publication order, and release gates. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Completion matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed v1 implementation coverage. |
-| [Documentation index](docs/README.md) | Every design and historical document in one place. |
+| [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
+| [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |
 
 ## Contributing
 

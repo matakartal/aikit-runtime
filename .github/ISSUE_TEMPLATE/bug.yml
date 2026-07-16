@@ -5,12 +5,15 @@ labels: [bug]
 body:
   - type: markdown
     attributes:
-      value: Do not include API keys, private prompts, or vulnerability details. Follow SECURITY.md for vulnerabilities.
+      value: |
+        Do **not** include API keys, private prompts, or vulnerability details.
+        Security issues: [private advisory form](https://github.com/matakartal/aikit-runtime/security/advisories/new).
   - type: input
     id: version
     attributes:
       label: Version or commit
-      placeholder: commit SHA, crate/package version
+      description: Prefer a full commit SHA for unpublished candidates.
+      placeholder: e.g. a1eb362 or aikit-runtime 0.1.0
     validations:
       required: true
   - type: dropdown
@@ -22,28 +25,46 @@ body:
         - Python
         - Node.js / TypeScript
         - Provider adapter
-        - Governance / containment
+        - Governance / permissions / hooks
+        - Containment / built-in tools
+        - Sessions / memory / audit
         - Documentation
         - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Impact
+      options:
+        - Blocks production use
+        - Incorrect behavior with workaround
+        - Docs / DX only
+        - Unsure
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
       label: Expected behavior
+      description: What should have happened, including the safety or fidelity boundary if relevant.
     validations:
       required: true
   - type: textarea
     id: actual
     attributes:
       label: Actual behavior
+      description: What happened instead. Redact secrets.
     validations:
       required: true
   - type: textarea
     id: reproduce
     attributes:
       label: Minimal reproduction
-      description: Prefer a keyless mock-provider reproduction. Redact all secrets.
+      description: Prefer a keyless mock-provider reproduction. Include commands and a short code snippet.
+      placeholder: |
+        cargo run -p aikit-runtime --example quickstart
+        # or a minimal Python / Node snippet
     validations:
       required: true
   - type: textarea
@@ -62,5 +83,5 @@ body:
           required: true
         - label: I removed credentials and private data.
           required: true
-        - label: This is not a vulnerability report.
+        - label: This is not a vulnerability report (those use the private advisory form).
           required: true

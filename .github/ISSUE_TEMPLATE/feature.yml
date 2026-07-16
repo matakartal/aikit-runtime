@@ -3,35 +3,55 @@ description: Propose a scoped capability or API improvement.
 title: "[feature] "
 labels: [enhancement]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Prefer a narrow, testable proposal. Check [`docs/FEATURES.md`](https://github.com/matakartal/aikit-runtime/blob/main/docs/FEATURES.md)
+        deferred items and the [competitive roadmap](https://github.com/matakartal/aikit-runtime/blob/main/docs/COMPETITIVE-ROADMAP.md)
+        before opening a broad redesign.
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: What concrete user or agent workflow is blocked?
+      description: What concrete user or agent workflow is blocked today?
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
       label: Proposed behavior
-      description: Include the Rust/Python/Node shape if this is a public API.
+      description: Include the Rust / Python / Node shape if this is a public API. Note if it should start in the Rust core only.
     validations:
       required: true
   - type: textarea
     id: boundaries
     attributes:
       label: Safety and fidelity boundaries
-      description: How should permissions, provider differences, budgets, audit, and failure work?
+      description: How should permissions, provider differences, budgets, audit, containment, and failure modes work?
+    validations:
+      required: true
+  - type: dropdown
+    id: languages
+    attributes:
+      label: Language surfaces needed
+      options:
+        - Rust only first is acceptable
+        - Must ship Rust + Python + Node in one change
+        - Documentation only
+        - Unsure
     validations:
       required: true
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
+      description: Existing APIs, host-side workarounds, or deferred post-v1 items that almost fit.
   - type: checkboxes
     id: checks
     attributes:
       label: Checks
       options:
         - label: I searched existing issues and post-v1 deferred items.
+          required: true
+        - label: This proposal does not require public disclosure of a vulnerability.
           required: true
