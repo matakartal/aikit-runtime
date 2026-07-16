@@ -185,6 +185,7 @@ public static class AikitJob {
   public static int Run(string command, string cwd, string shell, uint processes, ulong memory) {
     if (cwd.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) cwd = @"\\" + cwd.Substring(8);
     else if (cwd.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) cwd = cwd.Substring(4);
+    Environment.CurrentDirectory = cwd;
     IntPtr job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception();
     var limits = new EXTENDED_LIMITS(); limits.BasicLimitInformation.LimitFlags = 0x2000u | 0x8u | 0x200u; limits.BasicLimitInformation.ActiveProcessLimit = processes; limits.JobMemoryLimit = (UIntPtr)memory;
     bool configured = SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits));
@@ -197,7 +198,7 @@ public static class AikitJob {
     }
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
     PROCESS_INFORMATION pi; var line = new StringBuilder("\"" + shell + "\" /d /s /c \"" + command.Replace("\"", "\\\"") + "\"");
-    Check(CreateProcessW(shell, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, cwd, ref si, out pi), "CreateProcessW");
+    Check(CreateProcessW(shell, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, null, ref si, out pi), "CreateProcessW");
     try { Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject"); ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, 0xffffffff); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code); }
     finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); }
   }
