@@ -12,6 +12,7 @@ pub mod capability;
 pub mod containment;
 pub mod guardrail;
 pub mod hooks;
+pub mod off_prompt;
 pub mod permissions;
 pub mod plan;
 pub mod policy;

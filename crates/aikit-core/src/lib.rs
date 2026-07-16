@@ -72,6 +72,7 @@ pub use governance::hooks::{
     PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext, PromptHookOutcome,
     StopContext,
 };
+pub use governance::off_prompt::{OffPromptExecutor, OffPromptStore, RETRIEVE_TOOL};
 pub use governance::permissions::{
     Outcome, PermissionDecision, PermissionEngine, PermissionMode, Rule, RuleEffect,
 };
