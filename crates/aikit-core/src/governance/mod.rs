@@ -13,7 +13,11 @@ pub mod containment;
 pub mod guardrail;
 pub mod hooks;
 pub mod permissions;
+pub mod plan;
+pub mod policy;
 pub mod process;
+pub mod reliability;
+pub mod risk;
 pub mod sandbox;
 
 use async_trait::async_trait;

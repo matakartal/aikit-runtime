@@ -75,7 +75,13 @@ pub use governance::hooks::{
 pub use governance::permissions::{
     Outcome, PermissionDecision, PermissionEngine, PermissionMode, Rule, RuleEffect,
 };
+pub use governance::plan::{review_plan, Plan, PlanOutcome, PlanReview, PlanReviewer, PlanStep};
+pub use governance::policy::{PolicyMode, PolicySpec};
 pub use governance::process::{run_bash_with_containment, BashPolicy};
+pub use governance::reliability::{
+    ReliabilityPolicy, ReliabilityVerdict, RunProgress, ToolRequirement,
+};
+pub use governance::risk::{HeuristicRiskScorer, RiskLevel, RiskScorer, SmartApprover};
 pub use governance::sandbox::{Sandbox, SandboxError};
 pub use governance::{
     ApprovalDecision, ApprovalRequest, Authorization, AuthorizationContext, AuthorizationReport,
