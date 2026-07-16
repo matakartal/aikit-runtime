@@ -1,5 +1,5 @@
 ---
-release_version: 0.0.0
+release_version: 0.1.0
 release_status: draft
 commit_sha:
 source_remote: pending
@@ -10,11 +10,14 @@ native_artifacts: pending
 signing_authority: pending
 ---
 
-# Release evidence: v0.0.0
+# Release evidence: v0.1.0
 
-Copy this file to `docs/releases/vX.Y.Z.md` and replace every placeholder. The release gate accepts
-only `release_status: ready`, `verified` authority fields, and `passed` test/artifact fields. Never
-record API keys, access tokens, private prompts, or raw provider responses here.
+After committing the exact source candidate, copy this file to `docs/releases/vX.Y.Z.md` in a
+follow-up evidence commit and replace every placeholder. `commit_sha` identifies the source/tag
+commit and must be reachable from the evidence commit; this avoids an impossible self-referential
+SHA. The release gate accepts only `release_status: ready`, `verified` authority fields, and
+`passed` test/artifact fields. Never record API keys, access tokens, private prompts, or raw
+provider responses here.
 
 ## Exact source
 

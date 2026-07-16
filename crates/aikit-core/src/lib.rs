@@ -1,4 +1,4 @@
-//! # aikit-core
+//! # aikit-runtime-core
 //!
 //! The agent-native, governed, provider-agnostic runtime **core** — "the brain". Pure Rust,
 //! no FFI: the PyO3 (`aikit-py`) and napi (`aikit-node`) bindings sit on top of this crate,

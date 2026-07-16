@@ -49,6 +49,17 @@ else
   fail "version drift: Cargo=$cargo_version Python=$python_version Node=$node_version"
 fi
 
+for manifest in crates/aikit-node/npm/*/package.json; do
+  platform_name="$(node -p "require('./$manifest').name")"
+  platform_version="$(node -p "require('./$manifest').version")"
+  pinned_version="$(node -p "require('./crates/aikit-node/package.json').optionalDependencies['$platform_name'] || ''")"
+  if [ "$platform_version" = "$node_version" ] && [ "$pinned_version" = "$node_version" ]; then
+    pass "$platform_name is exactly pinned at $node_version"
+  else
+    fail "$platform_name version drift: package=$platform_version optional=$pinned_version root=$node_version"
+  fi
+done
+
 metadata_versions="$(cargo metadata --no-deps --format-version 1 --locked | node -e '
 let input = "";
 process.stdin.on("data", chunk => input += chunk);
@@ -75,17 +86,17 @@ else
   pass ".env.example contains no credential values"
 fi
 
-if grep -Fq 'Registry-name blocker' README.md && grep -Fq 'Registry identity blocker' docs/RELEASE.md; then
-  pass "unresolved registry identity is disclosed"
+if grep -Fq 'aikit-runtime' README.md && grep -Fq '## Registry identity' docs/RELEASE.md; then
+  pass "coordinated aikit-runtime distribution identity is documented"
 else
-  note "registry blocker wording changed; verify ownership or coordinated rename evidence manually"
+  fail "coordinated distribution identity is not documented"
 fi
 
 if [ "$MODE" = "--candidate" ]; then
   if [ "$cargo_version" = "0.0.0" ]; then
     note "0.0.0 is accepted only for the unpublished implementation candidate"
   fi
-  note "candidate mode does not claim live-provider, registry, signing, or multi-platform release proof"
+  note "candidate mode does not claim live-provider, registry, signing, or remote multi-platform proof"
 else
   if [ "$cargo_version" = "0.0.0" ]; then
     fail "release mode rejects placeholder version 0.0.0"
@@ -145,10 +156,12 @@ else
     done
 
     evidence_sha="$(front_matter_value "$evidence" commit_sha)"
-    head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
-    [ -n "$evidence_sha" ] && [ "$evidence_sha" = "$head_sha" ] \
-      && pass "release evidence targets the exact HEAD commit" \
-      || fail "release evidence commit_sha does not match HEAD"
+    if [ -n "$evidence_sha" ] && git cat-file -e "$evidence_sha^{commit}" 2>/dev/null \
+      && git merge-base --is-ancestor "$evidence_sha" HEAD; then
+      pass "release evidence targets a committed source revision reachable from HEAD"
+    else
+      fail "release evidence commit_sha is missing, invalid, or not reachable from HEAD"
+    fi
   else
     fail "$evidence is missing; copy and complete docs/RELEASE-EVIDENCE-TEMPLATE.md"
   fi

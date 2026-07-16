@@ -1,0 +1,13 @@
+{
+  "name": "aikit-runtime-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Native aikit-runtime addon for macOS ARM64.",
+  "license": "MIT OR Apache-2.0",
+  "repository": "github:matakartal/aikit-runtime",
+  "main": "aikit_node.node",
+  "files": ["aikit_node.node", "LICENSE-APACHE", "LICENSE-MIT"],
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "engines": { "node": ">=18.17.0" },
+  "publishConfig": { "access": "public" }
+}

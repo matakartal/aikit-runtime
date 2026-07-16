@@ -11,14 +11,14 @@ over that core.
 > verifies the core, real-socket mock transports, containment probes, and cross-binding parity.
 > The environment-gated live smoke test exists, but no result is claimed until it is run with a
 > real provider key and model. Registry publication is also still an external release step.
-> Current package checks cover one host-built wheel/npm file set plus independent per-OS Node
-> addon loading; they do not yet assemble a publishable multi-platform native distribution.
+> The final distribution name is `aikit-runtime`; the Python import and Rust library name remain
+> `aikit`. Multi-platform wheel/native-package assembly is verified by the release workflow, but
+> no registry artifact or live-provider result is claimed until its external gate passes.
 
-> **Registry-name blocker:** the `aikit` names on [PyPI](https://pypi.org/project/aikit/),
-> [npm](https://www.npmjs.com/package/aikit), and [crates.io](https://crates.io/crates/aikit) are
-> already used by unrelated projects. Do not install those packages expecting this repository.
-> Publication requires verified ownership transfer or a coordinated package rename across all
-> three surfaces.
+> **Distribution identity:** unrelated projects already use the bare `aikit` registry names.
+> This project therefore uses the coordinated `aikit-runtime` distribution name and
+> `aikit-runtime-core` internal Rust crate. Until the first release is published, run examples from
+> this checkout rather than installing any similarly named third-party package.
 
 ## What is implemented
 
@@ -72,7 +72,7 @@ The packages have not been published yet, so these examples run from a checkout.
 ### Rust
 
 ```bash
-cargo run -p aikit --example quickstart
+cargo run -p aikit-runtime --example quickstart
 ```
 
 For a small complete response, use the lower-level `Agent` directly:
@@ -164,8 +164,9 @@ uncontained binding mode.
 ./scripts/build-node.sh
 ```
 
-This creates one addon for the current host. It is a checkout/development build, not a
-cross-platform npm artifact; the final package name and platform-package loader are release gates.
+This creates one addon for the current host. Published `aikit-runtime` installs use exact-version
+optional packages for macOS ARM64/x64, Linux ARM64/x64 glibc, and Windows x64; the wrapper selects
+the matching package and fails clearly on unsupported targets or omitted optional dependencies.
 
 ```js
 const { Agent } = require("./crates/aikit-node");
@@ -261,10 +262,9 @@ live-smoke path stays opt-in when no secrets are present.
 
 - Real-provider API acceptance is unknown until the live smoke is run; mock HTTP tests do not
   replace it.
-- Package publication is blocked until the occupied registry name is transferred or changed.
-  After that, the Rust core must be staged before the exact-version facade can be packaged, the
-  final multi-platform wheel/npm layout must be assembled and inspected, and a verified source
-  remote, security contact, signing, and registry authority are still required.
+- The collision-free distribution identity and multi-platform package layout are implemented.
+  Publication still requires registry ownership/authentication, current live-provider evidence,
+  a verified source revision, and signing/attestation evidence.
 - Full MCP client support, a Web tool, distributed durable sessions, advanced compaction,
   LiteLLM/long-tail adapters, and WASM/browser support are post-v1 work.
 - Native Linux namespace/seccomp launching and native Windows sandbox/job-object containment are

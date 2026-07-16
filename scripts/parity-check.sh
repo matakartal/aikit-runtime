@@ -37,9 +37,9 @@ node_conformance="$(node examples/node/conformance.cjs)"
 node_production_state="$(node crates/aikit-node/tests/production-state.cjs | grep '^PRODUCTION_STATE_JSON=')"
 
 echo "→ running Rust demo (cargo)"
-rust_output="$(cargo run -q -p aikit --example parity --locked)"
+rust_output="$(cargo run -q -p aikit-runtime --example parity --locked)"
 rust_line="$(grep '^PARITY_JSON=' <<<"$rust_output")"
-rust_conformance="$(cargo run -q -p aikit --example conformance --locked)"
+rust_conformance="$(cargo run -q -p aikit-runtime --example conformance --locked)"
 
 echo
 echo "rust:   $rust_line"

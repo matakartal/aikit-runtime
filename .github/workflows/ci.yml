@@ -42,9 +42,9 @@ jobs:
         run: |
           # The Rust facade and Python extension intentionally share the lib name `aikit`, so
           # rustdoc them into separate output directories to avoid a filename collision.
-          cargo doc -p aikit-core -p aikit -p aikit-node --all-features --no-deps --locked
+          cargo doc -p aikit-runtime-core -p aikit-runtime -p aikit-node --all-features --no-deps --locked
           cargo doc -p aikit-py --all-features --no-deps --locked --target-dir target/doc-python
-          cargo test -p aikit-core -p aikit --doc --all-features --locked
+          cargo test -p aikit-runtime-core -p aikit-runtime --doc --all-features --locked
 
   msrv:
     name: Rust 1.88 MSRV
@@ -77,8 +77,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Rust public-surface conformance
         run: |
-          cargo test -p aikit --locked
-          cargo check -p aikit --examples --locked
+          cargo test -p aikit-runtime --locked
+          cargo check -p aikit-runtime --examples --locked
       - name: Build Python binding
         run: |
           python -m venv .venv
@@ -123,7 +123,7 @@ jobs:
         run: ./scripts/parity-check.sh
 
   node-native:
-    name: Node ${{ matrix.node }} native load (${{ matrix.os }})
+    name: Node native package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -131,12 +131,24 @@ jobs:
         include:
           - os: ubuntu-latest
             node: "18.17.0"
-          - os: ubuntu-latest
+            target: linux-x64-gnu
+            native: target/release/libaikit_node.so
+          - os: ubuntu-24.04-arm
             node: "20"
+            target: linux-arm64-gnu
+            native: target/release/libaikit_node.so
           - os: macos-latest
             node: "20"
+            target: darwin-arm64
+            native: target/release/libaikit_node.dylib
+          - os: macos-15-intel
+            node: "20"
+            target: darwin-x64
+            native: target/release/libaikit_node.dylib
           - os: windows-latest
             node: "20"
+            target: win32-x64-msvc
+            native: target/release/aikit_node.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -145,21 +157,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release addon
         run: cargo build -p aikit-node --release --locked
-      - name: Stage platform library as a Node addon
+      - name: Stage local checkout addon
         shell: bash
         run: |
-          case "$RUNNER_OS" in
-            Linux)   cp target/release/libaikit_node.so crates/aikit-node/aikit_node.node ;;
-            macOS)   cp target/release/libaikit_node.dylib crates/aikit-node/aikit_node.node ;;
-            Windows) cp target/release/aikit_node.dll crates/aikit-node/aikit_node.node ;;
-            *) echo "unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
-          esac
+          cp "${{ matrix.native }}" crates/aikit-node/aikit_node.node
       - name: Load native package
         run: >-
           node -e "const { Agent } = require('./crates/aikit-node');
           if (Number(process.versions.napi) < 9) throw new Error('Node runtime lacks N-API 9');
           const a = Agent.fromEnv({});
           if (!Array.isArray(a.activeProviders())) throw new Error('native addon smoke failed');"
+      - name: Pack and load through optional platform dependency
+        shell: bash
+        run: ./scripts/test-node-package-layout.sh "${{ matrix.target }}" "${{ matrix.native }}"
 
   packages:
     name: Package dry-runs
@@ -175,14 +185,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Rust crates
         run: |
-          cargo package -p aikit-core --allow-dirty --locked
-          cargo package -p aikit-core --allow-dirty --list --locked > /tmp/aikit-core-package-files.txt
+          cargo package -p aikit-runtime-core --allow-dirty --locked
+          cargo package -p aikit-runtime-core --allow-dirty --list --locked > /tmp/aikit-core-package-files.txt
           grep -Fxq LICENSE-APACHE /tmp/aikit-core-package-files.txt
           grep -Fxq LICENSE-MIT /tmp/aikit-core-package-files.txt
           grep -Fxq README.md /tmp/aikit-core-package-files.txt
           # The facade depends on the exact core version, which is intentionally unpublished.
           # Check its publish file set now; full packaging becomes possible after core is staged.
-          cargo package -p aikit --allow-dirty --list --locked > /tmp/aikit-package-files.txt
+          cargo package -p aikit-runtime --allow-dirty --list --locked > /tmp/aikit-package-files.txt
           grep -Fxq Cargo.toml /tmp/aikit-package-files.txt
           grep -Fxq LICENSE-APACHE /tmp/aikit-package-files.txt
           grep -Fxq LICENSE-MIT /tmp/aikit-package-files.txt
@@ -207,7 +217,10 @@ jobs:
           grep -Fq '"path": "README.md"' /tmp/npm-pack.json
           grep -Fq '"path": "index.d.ts"' /tmp/npm-pack.json
           grep -Fq '"path": "index.js"' /tmp/npm-pack.json
-          grep -Fq '"path": "aikit_node.node"' /tmp/npm-pack.json
+          if grep -Fq '"path": "aikit_node.node"' /tmp/npm-pack.json; then
+            echo 'root npm wrapper must not embed one host-specific addon' >&2
+            exit 1
+          fi
 
   live-smoke-contract:
     name: Live smoke remains explicit and keyless CI skips it
@@ -216,7 +229,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Ignored smoke test is not executed by normal CI
-        run: cargo test -p aikit --test live_smoke --locked
+        run: cargo test -p aikit-runtime --test live_smoke --locked
       - name: Wrapper refuses calls without explicit acknowledgement
         shell: bash
         run: |

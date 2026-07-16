@@ -1,12 +1,18 @@
 [package]
-name = "aikit-core"
+name = "aikit-runtime-core"
 description = "The agent-native, governed, provider-agnostic runtime core (the brain)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "../../README.md"
+
+[lib]
+# Keep the established internal/public Rust path while using a collision-free registry package.
+name = "aikit_core"
 
 [features]
 default = []

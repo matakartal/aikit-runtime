@@ -1,4 +1,4 @@
-//! Node (napi-rs) binding over the shared `aikit-core` runtime.
+//! Node (napi-rs) binding over the shared `aikit-runtime-core` runtime.
 //!
 //! Mirrors the Python (`aikit-py`) surface exactly, so behaviour is identical across languages
 //! (the whole point of the "one brain, many bindings" architecture). Both hard FFI seams are

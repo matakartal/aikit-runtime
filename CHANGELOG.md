@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-16
+
 ### Added
 
 - A single Rust runtime with Rust, Python, and Node.js/TypeScript public surfaces.
@@ -20,6 +22,6 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Release status
 
-This is still an unpublished implementation candidate. No registry artifact or live-provider pass
+This is still an unpublished release candidate. No registry artifact or live-provider pass
 is claimed. See [`docs/RELEASE.md`](docs/RELEASE.md) and the
 [`v1 completion matrix`](docs/V1-COMPLETION-MATRIX.md) for the remaining external gates.

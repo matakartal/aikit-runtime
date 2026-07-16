@@ -26,10 +26,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "aikit"
-version = "0.0.0"
+name = "aikit-node"
+version = "0.1.0"
 dependencies = [
- "aikit-core",
+ "aikit-runtime-core",
+ "async-trait",
+ "futures",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "aikit-py"
+version = "0.1.0"
+dependencies = [
+ "aikit-runtime-core",
+ "async-trait",
+ "futures",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pythonize",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "aikit-runtime"
+version = "0.1.0"
+dependencies = [
+ "aikit-runtime-core",
  "async-trait",
  "futures",
  "serde",
@@ -39,8 +70,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "aikit-core"
-version = "0.0.0"
+name = "aikit-runtime-core"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -58,37 +89,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "wiremock",
-]
-
-[[package]]
-name = "aikit-node"
-version = "0.0.0"
-dependencies = [
- "aikit-core",
- "async-trait",
- "futures",
- "napi",
- "napi-build",
- "napi-derive",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "aikit-py"
-version = "0.0.0"
-dependencies = [
- "aikit-core",
- "async-trait",
- "futures",
- "pyo3",
- "pyo3-async-runtimes",
- "pythonize",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

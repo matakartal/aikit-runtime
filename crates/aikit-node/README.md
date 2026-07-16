@@ -4,9 +4,8 @@ This directory contains the napi binding for the local aikit Rust workspace. It 
 canonical agent, streaming, structured-output, routing, memory, governance, and hook behavior as
 the Rust core, with TypeScript declarations in `index.d.ts`.
 
-> This package is not published. The existing `aikit` package on npm is an unrelated project.
-> Publication requires an ownership transfer or a coordinated rename; do not run
-> `npm install aikit` expecting this code.
+> The npm distribution name is `aikit-runtime`; the existing bare `aikit` package is unrelated.
+> This package remains unpublished until the release evidence gates pass.
 
 Build and load it from the repository checkout:
 
@@ -123,11 +122,11 @@ enabling a built-in whose name already belongs to a callback, throws a determini
 error. Registered built-ins use the same canonical schemas and executor in normal runs, clients,
 fan-out, councils, and resumed subagents.
 
-The generated `aikit_node.node` binary is platform-specific. CI is configured to build and load it
-independently on Linux, macOS, and Windows; one binary must not be relabeled as cross-platform.
-The current npm dry-run contains only the addon built on that job's host. A publishable
-multi-platform npm layout (for example final-name platform packages plus a selecting loader) must
-be chosen after the registry-name decision; the current generic loader is for local checkout use.
+The generated `aikit_node.node` binary is platform-specific and is never relabeled as portable.
+The root `aikit-runtime` package contains the JavaScript/TypeScript surface and exact-version
+optional dependencies on `aikit-runtime-{platform}` packages. CI builds, stages, packs, installs,
+and loads each supported target independently. Local checkout builds still use the adjacent addon
+created by `scripts/build-node.sh`.
 Normal examples use the deterministic mock provider and make no billable API call.
 
 Python/Node host callbacks execute in the host process and are not covered by built-in Bash OS

@@ -1,0 +1,14 @@
+{
+  "name": "aikit-runtime-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "Native aikit-runtime addon for Linux x64 glibc.",
+  "license": "MIT OR Apache-2.0",
+  "repository": "github:matakartal/aikit-runtime",
+  "main": "aikit_node.node",
+  "files": ["aikit_node.node", "LICENSE-APACHE", "LICENSE-MIT"],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": { "node": ">=18.17.0" },
+  "publishConfig": { "access": "public" }
+}

@@ -3,7 +3,7 @@
 // The agent-native + governance surface from Node (keyless) — a byte-for-byte behavioural mirror
 // of examples/python/agent_governance.py, driven by the SAME Rust core. This is the cross-language
 // parity proof: a permission policy and the "key gir → güçlen" primitive behave identically in
-// Python and in Node because both are thin shells over aikit-core.
+// Python and in Node because both are thin shells over aikit-runtime-core.
 //
 // Build first:  ./scripts/build-node.sh   (then)  node examples/node/agent_governance.cjs
 

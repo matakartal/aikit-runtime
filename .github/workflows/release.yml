@@ -1,0 +1,197 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after every build and evidence gate passes
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    name: Source packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Candidate invariants
+        run: ./scripts/release-check.sh --candidate
+      - name: Package Rust core and facade file sets
+        run: |
+          mkdir -p dist/source
+          cargo package -p aikit-runtime-core --locked
+          cp target/package/aikit-runtime-core-*.crate dist/source/
+          cargo package -p aikit-runtime --allow-dirty --list --locked > dist/source/aikit-runtime-files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-packages
+          path: dist/source
+          if-no-files-found: error
+
+  node-native:
+    name: Node ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64-gnu
+            native: target/release/libaikit_node.so
+          - os: ubuntu-24.04-arm
+            target: linux-arm64-gnu
+            native: target/release/libaikit_node.so
+          - os: macos-latest
+            target: darwin-arm64
+            native: target/release/libaikit_node.dylib
+          - os: macos-15-intel
+            target: darwin-x64
+            native: target/release/libaikit_node.dylib
+          - os: windows-latest
+            target: win32-x64-msvc
+            native: target/release/aikit_node.dll
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build native addon
+        run: cargo build -p aikit-node --release --locked
+      - name: Verify installed optional-package layout
+        shell: bash
+        run: ./scripts/test-node-package-layout.sh "${{ matrix.target }}" "${{ matrix.native }}"
+      - name: Pack platform package
+        shell: bash
+        run: |
+          ./scripts/stage-node-platform.sh "${{ matrix.target }}" "${{ matrix.native }}"
+          mkdir -p dist/npm-pack
+          npm pack --pack-destination dist/npm-pack "./dist/npm/${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.target }}
+          path: dist/npm-pack/*.tgz
+          if-no-files-found: error
+
+  node-wrapper:
+    name: Node platform-selecting wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Assert wrapper contains no host binary
+        run: |
+          mkdir -p dist/npm-pack
+          npm pack --pack-destination dist/npm-pack ./crates/aikit-node
+          tar -tzf dist/npm-pack/*.tgz | grep -Fq package/index.js
+          tar -tzf dist/npm-pack/*.tgz | grep -Fq package/index.d.ts
+          if tar -tzf dist/npm-pack/*.tgz | grep -Eq '\.node$'; then
+            echo 'root wrapper embeds a host-specific native addon' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-wrapper
+          path: dist/npm-pack/*.tgz
+          if-no-files-found: error
+
+  python-wheel:
+    name: Python wheel (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-latest
+            target: macos-arm64
+          - os: macos-15-intel
+            target: macos-x64
+          - os: windows-latest
+            target: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build ABI3 wheel
+        run: |
+          python -m pip install --disable-pip-version-check "maturin>=1.5,<2"
+          python -m maturin build --manifest-path crates/aikit-py/Cargo.toml --release --locked --out dist/python
+      - name: Install and import wheel
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/python/*.whl
+          python -c "import aikit; assert aikit.__version__ == '0.1.0'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/python/*.whl
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble and attest release bundle
+    needs: [source, node-native, node-wrapper, python-wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+      - name: Verify complete target matrix and hash artifacts
+        run: |
+          test "$(find dist/release -name '*.whl' | wc -l)" -eq 5
+          test "$(find dist/release -name '*.tgz' | wc -l)" -eq 6
+          test "$(find dist/release -name '*.crate' | wc -l)" -eq 1
+          find dist/release -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > dist/release/SHA256SUMS
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/release/**/*.whl
+            dist/release/**/*.tgz
+            dist/release/**/*.crate
+            dist/release/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/release
+          if-no-files-found: error
+
+  publish-guard:
+    name: Publication authority guard
+    if: ${{ inputs.publish }}
+    needs: assemble
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a complete committed evidence record
+        run: ./scripts/release-check.sh --release
+      - name: Explain registry authority requirements
+        run: |
+          echo 'Build evidence is complete.'
+          echo 'Actual registry uploads require PyPI/npm trusted-publisher configuration and a crates.io token.'

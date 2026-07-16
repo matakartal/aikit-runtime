@@ -3,7 +3,7 @@
 //! forced-tool-call provider, so you can see that aikit reports *which* mechanism produced the
 //! object rather than pretending they are equivalent.
 //!
-//! Run: `cargo run -p aikit-core --example structured_output`
+//! Run: `cargo run -p aikit-runtime-core --example structured_output`
 
 use aikit_core::capabilities::FidelityGrade;
 use aikit_core::providers::{Provider, ProviderRequest};

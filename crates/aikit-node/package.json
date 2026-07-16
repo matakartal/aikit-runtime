@@ -1,9 +1,17 @@
 {
-  "name": "aikit",
-  "version": "0.0.0",
+  "name": "aikit-runtime",
+  "version": "0.1.0",
   "description": "Node (napi) binding for the aikit agent-native, governed, provider-agnostic runtime.",
   "license": "MIT OR Apache-2.0",
   "author": "aikit contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matakartal/aikit-runtime.git"
+  },
+  "homepage": "https://github.com/matakartal/aikit-runtime#readme",
+  "bugs": {
+    "url": "https://github.com/matakartal/aikit-runtime/issues"
+  },
   "keywords": [
     "ai",
     "agents",
@@ -19,8 +27,7 @@
     "index.d.ts",
     "LICENSE-APACHE",
     "LICENSE-MIT",
-    "README.md",
-    "*.node"
+    "README.md"
   ],
   "napi": {
     "name": "aikit_node"
@@ -35,5 +42,15 @@
     "zod": {
       "optional": true
     }
+  },
+  "optionalDependencies": {
+    "aikit-runtime-darwin-arm64": "0.1.0",
+    "aikit-runtime-darwin-x64": "0.1.0",
+    "aikit-runtime-linux-arm64-gnu": "0.1.0",
+    "aikit-runtime-linux-x64-gnu": "0.1.0",
+    "aikit-runtime-win32-x64-msvc": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -8,7 +8,55 @@
 // exposes an async `next()` returning the next delta or `null`) idiomatic to consume with
 // `for await`. Generation, memory, routing, orchestration, and governance stay in Rust.
 
-const native = require("./aikit_node.node");
+const fs = require("node:fs");
+const path = require("node:path");
+
+function nativePackageName() {
+  const key = `${process.platform}-${process.arch}`;
+  const packages = {
+    "darwin-arm64": "aikit-runtime-darwin-arm64",
+    "darwin-x64": "aikit-runtime-darwin-x64",
+    "linux-arm64": "aikit-runtime-linux-arm64-gnu",
+    "linux-x64": "aikit-runtime-linux-x64-gnu",
+    "win32-x64": "aikit-runtime-win32-x64-msvc",
+  };
+  const selected = packages[key];
+  if (selected == null) {
+    throw new Error(
+      `aikit-runtime does not publish a native addon for ${process.platform}/${process.arch}`,
+    );
+  }
+  if (process.platform === "linux") {
+    const header = process.report?.getReport?.().header;
+    if (header?.glibcVersionRuntime == null) {
+      throw new Error(
+        "aikit-runtime currently publishes glibc Linux addons only; musl is not yet supported",
+      );
+    }
+  }
+  return selected;
+}
+
+function loadNative() {
+  // Local builds intentionally remain simple: scripts/build-node.sh stages the addon beside this
+  // wrapper. Published installs omit that file and resolve the exact optional platform package.
+  const local = path.join(__dirname, "aikit_node.node");
+  if (fs.existsSync(local)) return require(local);
+
+  const packageName = nativePackageName();
+  try {
+    return require(packageName);
+  } catch (cause) {
+    const error = new Error(
+      `aikit-runtime could not load ${packageName}; optional dependencies may have been omitted ` +
+        "during installation",
+    );
+    error.cause = cause;
+    throw error;
+  }
+}
+
+const native = loadNative();
 const TYPED_ERROR_MARKER = "__AIKIT_TYPED_ERROR__";
 
 function normalizeNativeError(error) {

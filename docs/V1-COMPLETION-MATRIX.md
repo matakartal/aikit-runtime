@@ -29,7 +29,7 @@ wire request or that an artifact has been published under an authorized registry
 | Conformance | Seven canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, and multimodal/routed input | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
 | OSS readiness | README, feature reference, threat model, security policy, contributing/code of conduct, issue/PR templates, and CI | Root docs and `.github` | Repository materials complete; verified remote/private security contact still required |
-| Distribution | Cargo package set, Python wheel, npm package, native-load matrix, licenses, readmes, and types | CI verifies the core crate package, one host-built wheel/npm file set, and independent Node native loading on Linux/macOS/Windows | Local single-host packaging proof complete; final multi-target wheel/npm assembly remains a release gate alongside registry identity/authority |
+| Distribution | Cargo package set, Python ABI3 wheels, npm wrapper/platform packages, licenses, readmes, and types | CI/release workflows plus `stage-node-platform.sh` and packaged-loader tests | Layout complete; remote multi-target run and registry authority remain release evidence gates |
 
 ## Deliberate post-v1 boundaries
 
@@ -44,11 +44,9 @@ supports Linux and macOS.
 The implementation candidate cannot honestly become a released v1 until a maintainer:
 
 1. runs and records the explicit four-provider live matrix with real keys and current model ids;
-2. resolves the occupied `aikit` names through verified ownership or one coordinated rename;
+2. verifies ownership/publication authority for the coordinated `aikit-runtime` names;
 3. configures a real source remote, private security contact, signing, and registry authority; and
-4. chooses the final-name multi-platform distribution layout, then builds and inspects its native
-   artifacts on every supported release target. The current npm wrapper loads one host-specific
-   `aikit_node.node`; CI's per-OS load jobs do not yet assemble a cross-platform npm release.
+4. builds and inspects the final-name native artifacts on every supported release target.
 
 These are authority, credential, and release-environment gates. The keyless suite must not convert
 their absence into a synthetic pass.

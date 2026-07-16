@@ -10,11 +10,11 @@ before the first registry release.
 
 Please do **not** open a public issue for a suspected vulnerability.
 
-This checkout has no verified public repository or security mailbox yet. The security contact is
-therefore **TBD before public release**. Until a private reporting channel is published, contact
-the project owner through the private channel by which you received the source and ask for a
-secure reporting route **before** sending exploit details, credentials, private data, or logs.
-Do not open a public issue containing vulnerability details.
+Use GitHub's private vulnerability-reporting form at
+[`matakartal/aikit-runtime/security/advisories/new`](https://github.com/matakartal/aikit-runtime/security/advisories/new).
+Only the repository owner and explicitly added security managers can read a submitted report.
+If GitHub does not offer the private form, open a public issue containing only a request for a
+private contact route; do not include vulnerability details, credentials, private data, or logs.
 
 Include, when safe:
 
@@ -24,7 +24,7 @@ Include, when safe:
 - impact and suggested mitigation;
 - whether the issue is already public.
 
-Once a public reporting route exists, the target acknowledgement time will be seven days.
+The target acknowledgement time is seven days.
 Timelines for validation, remediation, and coordinated disclosure depend on severity and
 provider/dependency involvement. Please allow a reasonable remediation window before publication.
 

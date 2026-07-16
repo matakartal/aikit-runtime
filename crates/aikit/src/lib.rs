@@ -1,6 +1,6 @@
 //! The ergonomic Rust surface for `aikit`.
 //!
-//! All behavior lives in `aikit-core`; this crate is the stable package applications depend on.
+//! All behavior lives in `aikit-runtime-core`; this crate is the stable package applications depend on.
 //! Python and TypeScript bindings call the same core, so provider translation, governance,
 //! routing, audit, and structured output are implemented once.
 

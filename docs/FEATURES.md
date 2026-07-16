@@ -5,7 +5,7 @@ packages have been published or that changing live provider APIs have been valid
 
 ## One canonical runtime
 
-`aikit-core` owns messages, usage, provider options/metadata, provider translation, reasoning
+`aikit-runtime-core` owns messages, usage, provider options/metadata, provider translation, reasoning
 replay, the agent loop, governance, budget enforcement, routing, audit, sessions, and memory.
 The `aikit` Rust crate re-exports that surface. PyO3 and napi translate host values and callbacks
 at the edge; they do not reimplement policy.

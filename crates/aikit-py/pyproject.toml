@@ -3,8 +3,8 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
-name = "aikit"
-version = "0.0.0"
+name = "aikit-runtime"
+version = "0.1.0"
 description = "The agent-native, governed, provider-agnostic runtime (Python binding)."
 readme = "../../README.md"
 requires-python = ">=3.9"
@@ -27,6 +27,11 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries",
 ]
+
+[project.urls]
+Homepage = "https://github.com/matakartal/aikit-runtime"
+Repository = "https://github.com/matakartal/aikit-runtime"
+Issues = "https://github.com/matakartal/aikit-runtime/issues"
 
 [tool.maturin]
 # Native extension module `aikit` (matches [lib] name and the #[pymodule] fn).

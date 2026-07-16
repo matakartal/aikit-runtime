@@ -2,7 +2,7 @@
 //! sandbox + built-in tools + the permission engine — the combination no other multi-provider SDK
 //! ships in one package. No API key required.
 //!
-//! Run: `cargo run -p aikit-core --example governed_tools`
+//! Run: `cargo run -p aikit-runtime-core --example governed_tools`
 
 use aikit_core::{
     Authorization, BuiltinTools, Governance, PermissionEngine, PermissionMode, Rule, Sandbox,

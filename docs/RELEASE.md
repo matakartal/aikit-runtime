@@ -33,42 +33,35 @@ tree, unresolved public contacts, or incomplete authority/live/native-artifact e
 - The versioned evidence record points to the exact committed SHA and contains no credentials,
   private prompts, or raw provider responses.
 
-## Registry identity blocker
+## Registry identity
 
-The `aikit` names on [PyPI](https://pypi.org/project/aikit/),
-[npm](https://www.npmjs.com/package/aikit), and [crates.io](https://crates.io/crates/aikit) belong
-to unrelated projects. Local artifacts in this repository therefore must not be published under
-their current names without a verified ownership transfer.
+The bare `aikit` names on PyPI, npm, and crates.io belong to unrelated projects. The coordinated
+distribution identity is therefore:
 
-Before publication, maintainers must either:
+- Rust facade: `aikit-runtime` (library import remains `aikit`)
+- Rust core: `aikit-runtime-core`
+- Python distribution: `aikit-runtime` (Python import remains `aikit`)
+- npm wrapper: `aikit-runtime`
+- npm native packages: `aikit-runtime-{darwin-arm64,darwin-x64,linux-arm64-gnu,linux-x64-gnu,win32-x64-msvc}`
 
-- obtain and verify ownership of every intended registry name; or
-- choose a coordinated new distribution name and update Cargo package/dependency names, Python
-  project/import guidance, Node.js package/type declarations, docs, examples, and release tooling.
+The names were checked as available before implementation, but availability is not ownership.
+The release record must still prove that the maintainer authenticated to each registry and
+reserved/published the intended names. Never publish this repository under bare `aikit`.
 
-Until then, `pip install aikit`, `npm install aikit`, and `cargo add aikit` do not install this
-project and must not appear as launch instructions.
+## Native distribution layout
 
-## Native distribution layout blocker
-
-The current keyless package job proves one host-built Python wheel and one host-built npm file set.
-Separate CI jobs also prove that the Node addon can be built and loaded on Linux, macOS, and
-Windows. They do **not** assemble those binaries into one publishable cross-platform npm release:
-`index.js` currently loads a single platform-specific `aikit_node.node`.
-
-After the registry-name decision, choose and test a final layout (for example, final-name
-platform packages selected through optional dependencies, or explicitly OS/CPU-scoped packages).
-Likewise, build the final wheel matrix for every claimed Python platform. Do not relabel one
-host-built native artifact as multi-platform.
+The npm wrapper uses exact-version optional native packages selected by platform/architecture.
+The release workflow builds and smoke-loads each package on its matching hosted runner, then
+assembles the wrapper only after all target artifacts exist. Python uses ABI3 wheels built per
+claimed platform. Musl Linux and Windows ARM64 are not claimed in v0.1.0.
 
 ## Publication order
 
-1. Resolve the registry-name blocker and configure a verified source remote/security contact.
+1. Verify registry authority and the source remote/security contact.
 2. Choose one version across the workspace, Python package, Node.js package, and type stubs.
 3. Package and publish the core crate first under its final name.
 4. Package and publish the exact-version Rust facade after the core version is visible.
-5. Implement the chosen final-name multi-platform loader/package layout, then build/test its
-   platform wheels and Node.js native artifacts in clean release environments.
+5. Build/test the final-name platform wheels and Node.js native packages in clean release environments.
 6. Publish PyPI/npm artifacts only after inspecting their file lists and metadata.
 7. Create the signed tag/release notes from the exact commit whose evidence passed.
 

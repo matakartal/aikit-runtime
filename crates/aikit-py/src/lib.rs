@@ -1,4 +1,4 @@
-//! Python (PyO3) binding over the shared `aikit-core` runtime.
+//! Python (PyO3) binding over the shared `aikit-runtime-core` runtime.
 //!
 //! Keeps provider selection, routing, memory, orchestration, governance, and structured output in
 //! Rust while exposing Python-native awaitables and async iterators. The two cross-language seams
@@ -2056,7 +2056,7 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ObjectStream>()?;
     m.add_class::<PyAgent>()?;
     m.add_class::<PyClient>()?;
-    m.add("__version__", "0.0.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
 

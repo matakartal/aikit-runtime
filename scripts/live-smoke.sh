@@ -12,4 +12,4 @@ if [ "${AIKIT_LIVE_SMOKE_FULL:-}" = "1" ]; then
   echo "Running FULL live matrix: all four key+model pairs are required before any call."
 fi
 
-cargo test -p aikit --test live_smoke -- --ignored --nocapture
+cargo test -p aikit-runtime --test live_smoke -- --ignored --nocapture
