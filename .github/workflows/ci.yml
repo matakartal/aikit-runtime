@@ -195,8 +195,8 @@ jobs:
           grep -Fxq LICENSE-APACHE /tmp/aikit-core-package-files.txt
           grep -Fxq LICENSE-MIT /tmp/aikit-core-package-files.txt
           grep -Fxq README.md /tmp/aikit-core-package-files.txt
-          # The facade depends on the exact core version, which is intentionally unpublished.
-          # Check its publish file set now; full packaging becomes possible after core is staged.
+          # The facade depends on the sibling core package. Check its source file set without
+          # contacting an external package service.
           cargo package -p aikit-runtime --allow-dirty --list --locked > /tmp/aikit-package-files.txt
           grep -Fxq Cargo.toml /tmp/aikit-package-files.txt
           grep -Fxq LICENSE-APACHE /tmp/aikit-package-files.txt

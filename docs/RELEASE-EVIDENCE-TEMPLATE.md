@@ -1,48 +1,43 @@
 ---
-release_version: 0.1.0
-release_status: draft
+source_version: 0.1.0
+source_status: draft
 commit_sha:
 source_remote: pending
-registry_identity: pending
 security_contact: pending
-live_matrix: pending
+live_matrix: optional
 native_artifacts: pending
-signing_authority: pending
 ---
 
-# Release evidence: v0.1.0
+# Source-distribution evidence: v0.1.0
 
-After committing the exact source candidate, copy this file to `docs/releases/vX.Y.Z.md` in a
-follow-up evidence commit and replace every placeholder. `commit_sha` identifies the source/tag
-commit and must be reachable from the evidence commit; this avoids an impossible self-referential
-SHA. The release gate accepts only `release_status: ready`, `verified` authority fields, and
-`passed` test/artifact fields. Never record API keys, access tokens, private prompts, or raw
-provider responses here.
+Copy this file to `docs/releases/vX.Y.Z.md` when recording a manual artifact assembly. Never
+record API keys, access tokens, private prompts, or raw provider responses here.
 
 ## Exact source
 
 - Commit SHA:
 - Source remote URL:
 - CI run URL:
-- Signed tag:
+- Assembly run URL:
 - UTC evidence date:
 
-## Toolchain and clean-checkout gates
+## Keyless gates
 
 | Gate | Version or result | Evidence |
 |---|---|---|
 | Rust stable |  |  |
 | Rust MSRV 1.88 |  |  |
-| Python wheel matrix |  |  |
+| Python ABI3 wheel matrix |  |  |
 | Node.js native matrix |  |  |
 | Rust/Python/Node conformance |  |  |
 | Containment capability review |  |  |
 | CodeQL review |  |  |
 | Dependency advisory review |  |  |
 
-## Live-provider matrix
+## Optional live-provider matrix
 
-Use dedicated low-limit credentials. Record model ids and outcomes only.
+Use dedicated low-limit credentials only if the maintainer explicitly chooses this billable test.
+Record model ids and outcomes, never secrets.
 
 | Provider | Model id | Text | Object | Governed deny | Two-request replay |
 |---|---|---|---|---|---|
@@ -51,25 +46,17 @@ Use dedicated low-limit credentials. Record model ids and outcomes only.
 | DeepSeek |  |  |  |  |  |
 | Google |  |  |  |  |  |
 
-## Artifact inspection
+## Local artifact inspection
 
-| Registry/target | Final package name | Artifact | SHA-256 | Install/load result |
-|---|---|---|---|---|
-| crates.io core |  |  |  |  |
-| crates.io facade |  |  |  |  |
-| PyPI Linux |  |  |  |  |
-| PyPI macOS |  |  |  |  |
-| PyPI Windows |  |  |  |  |
-| npm Linux |  |  |  |  |
-| npm macOS |  |  |  |  |
-| npm Windows |  |  |  |  |
+| Target | Artifact | SHA-256 | Install/load result |
+|---|---|---|---|
+| Rust source package |  |  |  |
+| Python Linux/macOS/Windows |  |  |  |
+| Node Linux/macOS/Windows |  |  |  |
 
-## Authority and safety sign-off
+## Safety sign-off
 
-- Registry ownership or coordinated rename evidence:
 - Private security-reporting route verified by:
-- Publishing identities verified by:
-- Signing authority verified by:
 - Threat model and known limitations reviewed by:
-- Unresolved high/critical security findings (must be `none` or include an approved mitigation):
-- Final release approval:
+- Unresolved high/critical security findings:
+- Final source-distribution approval:

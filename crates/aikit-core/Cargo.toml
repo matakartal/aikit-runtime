@@ -9,9 +9,10 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "../../README.md"
+publish = false
 
 [lib]
-# Keep the established internal/public Rust path while using a collision-free registry package.
+# Keep the established internal/public Rust path for workspace consumers.
 name = "aikit_core"
 
 [features]

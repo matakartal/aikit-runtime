@@ -10,9 +10,9 @@ goes deeper: capabilities, security, release evidence, and historical design not
 | [Feature reference](FEATURES.md) | Builders | Runtime capabilities, fidelity, governance, routing, state, and limits. |
 | [Threat model](THREAT-MODEL.md) | Security reviewers | Guarantees and exclusions for built-in tools and Bash containment. |
 | [Live-provider harness](LIVE-SMOKE.md) | Maintainers | Explicit, billable real-provider acceptance contract. |
-| [Release guide](RELEASE.md) | Maintainers | Package identities, publication order, and release gates. |
+| [Distribution guide](RELEASE.md) | Maintainers | Source-first policy and manual artifact assembly. |
 | [v1 completion matrix](V1-COMPLETION-MATRIX.md) | Contributors | Implementation proof vs external release blockers. |
-| [Project status](PROJECT-STATUS.md) | Everyone | Current shareability and package-release gates. |
+| [Project status](PROJECT-STATUS.md) | Everyone | Current shareability and source-distribution boundaries. |
 
 ## Governance deep dive
 
@@ -41,10 +41,10 @@ Cross-language governance examples live under `examples/python/` and `examples/n
 
 | Document | Purpose |
 |---|---|
-| [Release guide](RELEASE.md) | Checklist, registry identity, publication order. |
+| [Distribution guide](RELEASE.md) | Source checkout, local artifacts, and non-publishing automation. |
 | [Evidence template](RELEASE-EVIDENCE-TEMPLATE.md) | Blank per-version proof record (no secrets). |
 | [Release evidence records](releases/README.md) | Index of committed version evidence. |
-| [v0.1.0 evidence](releases/v0.1.0.md) | Historical draft assembly snapshot; refresh required for the final tag commit. |
+| [v0.1.0 evidence](releases/v0.1.0.md) | Historical draft artifact-assembly snapshot. |
 
 ## Historical and planning notes
 

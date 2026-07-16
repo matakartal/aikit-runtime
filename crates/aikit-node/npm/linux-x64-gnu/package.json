@@ -1,6 +1,7 @@
 {
   "name": "aikit-runtime-linux-x64-gnu",
   "version": "0.1.0",
+  "private": true,
   "description": "Native aikit-runtime addon for Linux x64 glibc.",
   "license": "MIT OR Apache-2.0",
   "repository": {

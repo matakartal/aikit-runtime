@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a publishable optional native package from one CI-produced addon.
+# Build a locally testable optional native package from one CI-produced addon.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

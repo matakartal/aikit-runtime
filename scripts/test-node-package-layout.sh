@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Prove that the published root wrapper loads its sibling optional native package without a local
-# addon fallback. This mirrors an npm install while remaining registry-free.
+# Prove that the locally packed root wrapper loads its sibling optional native package without an
+# addon fallback. This mirrors an installed layout without external upload.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

@@ -1,7 +1,7 @@
 # aikit v1 feature reference
 
-This document describes the implementation candidate in this repository. It is not a claim that
-packages have been published or that changing live provider APIs have been validated.
+This document describes the source-first implementation in this repository. Public registry
+packages are not distributed, and changing live provider APIs are not claimed as validated.
 
 ## One canonical runtime
 

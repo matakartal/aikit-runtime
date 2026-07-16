@@ -11,10 +11,10 @@ homepage.workspace = true
 readme = "../../README.md"
 keywords = ["ai", "agents", "llm", "governance", "sdk"]
 categories = ["api-bindings", "asynchronous"]
+publish = false
 
 [lib]
-# Preserve the ergonomic `use aikit::...` Rust import while the collision-free registry package is
-# installed with `cargo add aikit-runtime`.
+# Preserve the ergonomic `use aikit::...` Rust import for source-checkout consumers.
 name = "aikit"
 
 [features]

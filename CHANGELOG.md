@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to this project will be documented in this file. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and published versions will follow
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and tagged versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
@@ -36,7 +36,7 @@ All notable changes to this project will be documented in this file. The format 
 - Expanded feature reference, documentation index, binding READMEs, and GitHub community templates
   to match the current governance surface and release-candidate status.
 
-## [0.1.0] - Unpublished candidate
+## [0.1.0] - Source preview
 
 ### Added
 
@@ -53,6 +53,5 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Release status
 
-This is still an unpublished release candidate. No registry artifact or live-provider pass
-is claimed. See [`docs/RELEASE.md`](docs/RELEASE.md) and the
-[`v1 completion matrix`](docs/V1-COMPLETION-MATRIX.md) for the remaining external gates.
+This is a source-first open-source preview. No public package registry or live-provider pass is
+claimed. See [`docs/RELEASE.md`](docs/RELEASE.md) for the distribution policy.

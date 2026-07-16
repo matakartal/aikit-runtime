@@ -2,19 +2,16 @@
 
 ## Supported versions
 
-`aikit-runtime` is currently an unpublished v0.1.0 implementation candidate. Until a release line
-is published to registries, security fixes land on the default branch only. Published support
-windows will be listed here before the first registry release.
+`aikit-runtime` is currently a source-first v0.1.0 implementation preview. Security fixes land on
+the default branch; no public package-registry support line is claimed.
 
-Package publication is blocked until release checks include a review of dependency and CodeQL
-alerts, with no unresolved high or critical finding unless a documented maintainer decision and
-mitigation exist. Source users should review the repository's current security state before
-deploying a pre-release commit.
+Source-distribution checks include dependency and CodeQL review. Source users should review the
+repository's current security state before deploying a commit.
 
 | Version | Supported |
 |---|---|
 | `main` (pre-release) | Yes |
-| Published crates/wheels/npm packages | None yet |
+| Public registry packages | Not distributed |
 
 ## Report a vulnerability
 

@@ -1,8 +1,8 @@
 # v1 completion matrix
 
-This matrix separates implementation proof from live-provider and publication proof. A keyless
-test can complete an implementation row, but it cannot prove that a changing provider accepts the
-wire request or that an artifact has been published under an authorized registry name.
+This matrix separates implementation proof from optional live-provider proof. A keyless test can
+complete an implementation row, but it cannot prove that a changing provider accepts the wire
+request.
 
 | Area | v1 requirement | Repository evidence | Status |
 |---|---|---|---|
@@ -36,7 +36,7 @@ wire request or that an artifact has been published under an authorized registry
 | Conformance | Seven canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, and multimodal/routed input | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
 | OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs and `.github` | Repository materials complete; source remote and private security reporting verified |
-| Distribution | Cargo package set, Python ABI3 wheels, npm wrapper/platform packages, licenses, readmes, and types | CI/release workflows plus `stage-node-platform.sh` and packaged-loader tests | Layout complete; registry ownership and live matrix remain external gates |
+| Distribution | Source checkout plus locally assembled Cargo, Python ABI3, and Node artifacts | CI/manual assembly workflow plus `stage-node-platform.sh` and packaged-loader tests | Complete; external registry publication is intentionally out of scope |
 
 ## Deliberate post-v1 boundaries
 
@@ -45,24 +45,12 @@ and stronger Windows filesystem/network isolation remain post-v1. Windows Job Ob
 claim process-tree/resource containment only; the descriptor-relative file jail remains
 Linux/macOS-only.
 
-## External release blockers
+## Optional external validation
 
-The implementation candidate cannot honestly become a published v1 until a maintainer:
-
-1. runs and records the explicit four-provider live matrix with real keys and current model ids;
-2. verifies ownership/publication authority for the coordinated `aikit-runtime` names on crates.io,
-   PyPI, and npm;
-3. clears dependency-security release gates, including unresolved high/critical advisories;
-4. completes signed-tag publication and post-upload install checks on every claimed platform.
-
-Source remote, private security reporting, CI, native multi-platform artifacts, and provenance
-attestation were recorded for an earlier draft `v0.1.0` source snapshot in
-[`releases/v0.1.0.md`](releases/v0.1.0.md). Because `main` has advanced, that assembly is historical
-evidence and must be regenerated for the final tag commit. Remaining gaps include dependency
-clearance, live-provider acceptance, registry authority, and final-commit assembly.
-
-These are authority, credential, and release-environment gates. The keyless suite must not convert
-their absence into a synthetic pass.
+The explicit four-provider live matrix still requires real keys, selected model ids, network
+access, and billable calls. It is not required for source distribution and the keyless suite must
+not convert its absence into a synthetic pass. The historical artifact snapshot remains in
+[`releases/v0.1.0.md`](releases/v0.1.0.md).
 
 ## Language-surface note
 

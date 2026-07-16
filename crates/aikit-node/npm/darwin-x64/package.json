@@ -1,6 +1,7 @@
 {
   "name": "aikit-runtime-darwin-x64",
   "version": "0.1.0",
+  "private": true,
   "description": "Native aikit-runtime addon for macOS x64.",
   "license": "MIT OR Apache-2.0",
   "repository": {

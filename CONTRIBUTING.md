@@ -82,10 +82,10 @@ node examples/node/agent_governance.cjs
 | `crates/aikit-core` | Canonical runtime, providers, governance, tools |
 | `crates/aikit` | Ergonomic Rust facade (`aikit-runtime` package) |
 | `crates/aikit-py` | PyO3 binding (`import aikit`) |
-| `crates/aikit-node` | napi binding (`aikit-runtime` npm package) |
+| `crates/aikit-node` | napi binding and local Node wrapper |
 | `examples/` | Cross-language demos and conformance drivers |
 | `docs/` | Feature reference, threat model, release evidence |
-| `scripts/` | Build, parity, live-smoke, and release gates |
+| `scripts/` | Build, parity, live-smoke, and source-distribution checks |
 
 See [`docs/README.md`](docs/README.md) for the full documentation map.
 

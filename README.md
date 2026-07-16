@@ -10,7 +10,7 @@ Build provider-aware agents in **Rust**, **Python**, and **TypeScript** without 
 streaming, tools, policy, routing, budgets, audit, memory, or sessions in every language.
 
 [![CI](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml)
-[![Release](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml/badge.svg)](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml)
+[![Artifacts](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml/badge.svg)](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml)
 [![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust)](Cargo.toml)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](crates/aikit-py/pyproject.toml)
 [![Node 18.17+](https://img.shields.io/badge/Node-18.17%2B-339933?logo=nodedotjs&logoColor=white)](crates/aikit-node/package.json)
@@ -349,23 +349,22 @@ agent.use_session_file("./state/sessions.json")
 
 If required containment is unavailable, built-in Bash is denied before process launch.
 
-## Package map
+## Source module map
 
-The coordinated release name is `aikit-runtime`; the bare `aikit` names on public registries refer
-to unrelated projects.
+`aikit-runtime` is distributed from this GitHub repository. Public registry packages are not part
+of the current project plan.
 
-| Ecosystem | Distribution | Import / library |
+| Ecosystem | Workspace package | Import / library |
 |---|---|---|
 | Rust facade | `aikit-runtime` | `aikit` |
 | Rust core | `aikit-runtime-core` | `aikit_core` |
 | Python | `aikit-runtime` | `import aikit` |
-| npm wrapper | `aikit-runtime` | `require("aikit-runtime")` |
-| npm native binaries | `aikit-runtime-{platform}` | selected automatically by the wrapper |
+| Node wrapper | `aikit-runtime` | local checkout wrapper |
+| Node native binaries | `aikit-runtime-{platform}` | selected locally by the wrapper |
 
-The current `v0.1.0` tree is an **unpublished implementation candidate**. Keyless source and
-package checks run in CI, but registry publication, a refreshed release assembly for the final
-commit, dependency-security clearance, and the optional billable live-provider matrix remain
-release gates. Until then, use the checkout commands in [Quick start](#quick-start).
+The current `v0.1.0` tree is a **source-first implementation preview**. Keyless source, binding,
+and local package-layout checks run in CI. Use the checkout commands in [Quick start](#quick-start);
+no npm, PyPI, or crates.io publication is claimed or planned at this stage.
 
 ### Supported binary targets
 
@@ -395,10 +394,9 @@ Normal GitHub CI verifies:
 - package dry-runs and native-addon loading
 - keyless provider wire contracts and fail-closed containment behavior
 
-The separate release-assembly workflow builds the five Python ABI3 wheels, assembles all native
-packages, records SHA-256 manifests, and produces GitHub provenance attestations. The committed
-[`v0.1.0` evidence](docs/releases/v0.1.0.md) is a historical draft snapshot; it must be regenerated
-for the final release commit before a tag is created.
+The manual source-distribution workflow builds the five Python ABI3 wheels, assembles the native
+artifacts, records SHA-256 manifests, and produces GitHub provenance attestations without uploading
+anything to a package registry.
 
 ## Repository map
 
@@ -413,7 +411,7 @@ for the final release commit before a tag is created.
 │   ├── python/         # governance, options, and conformance
 │   └── node/           # governance, options, and conformance
 ├── docs/               # features, threat model, release evidence, roadmap
-├── scripts/            # build, parity, packaging, and release gates
+├── scripts/            # build, parity, packaging, and source checks
 ├── CONTRIBUTING.md     # setup and design rules
 ├── SECURITY.md         # private vulnerability reporting
 └── CHANGELOG.md        # Keep a Changelog history
@@ -426,7 +424,7 @@ for the final release commit before a tag is created.
 | [Documentation index](docs/README.md) | Full map of guides, policies, and historical notes. |
 | [Feature reference](docs/FEATURES.md) | Runtime capabilities, governance depth, fidelity, routing, state, and limits. |
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
-| [Release guide](docs/RELEASE.md) | Package identities, publication order, and release gates. |
+| [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Completion matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed v1 implementation coverage. |
 | [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and still blocked for package release. |

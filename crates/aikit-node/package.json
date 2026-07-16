@@ -1,6 +1,7 @@
 {
   "name": "aikit-runtime",
   "version": "0.1.0",
+  "private": true,
   "description": "Node (napi) binding for the aikit agent-native, governed, provider-agnostic runtime.",
   "license": "MIT OR Apache-2.0",
   "author": "aikit contributors",
