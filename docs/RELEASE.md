@@ -58,12 +58,26 @@ claimed platform. Musl Linux and Windows ARM64 are not claimed in v0.1.0.
 ## Publication order
 
 1. Verify registry authority and the source remote/security contact.
-2. Choose one version across the workspace, Python package, Node.js package, and type stubs.
-3. Package and publish the core crate first under its final name.
-4. Package and publish the exact-version Rust facade after the core version is visible.
-5. Build/test the final-name platform wheels and Node.js native packages in clean release environments.
-6. Publish PyPI/npm artifacts only after inspecting their file lists and metadata.
-7. Create the signed tag/release notes from the exact commit whose evidence passed.
+2. Configure the PyPI pending Trusted Publisher for `matakartal/aikit-runtime`, `release.yml`, and
+   the `release` environment. A pending publisher does not reserve the name before first upload.
+3. Authenticate once to npm to bootstrap all six new package names. After the first release,
+   configure each package's Trusted Publisher for `matakartal/aikit-runtime`, `release.yml`, and
+   the `release` environment, then remove the bootstrap `NPM_TOKEN` secret.
+4. Store a least-privilege crates.io token as the `release` environment secret
+   `CARGO_REGISTRY_TOKEN`; crates.io does not currently offer the npm/PyPI OIDC flow.
+5. Choose one version across the workspace, Python package, Node.js package, and type stubs.
+6. Run `live-smoke.yml` with all four secret keys and deliberately selected model ids. Copy its
+   secret-free evidence into the versioned record, then mark every evidence field ready.
+7. Commit the evidence, wait for CI and the non-publishing release assembly, and create an
+   annotated signed `vX.Y.Z` tag that points at the reviewed commit.
+8. Push the tag. Only a version tag unlocks uploads: Node native packages before the wrapper,
+   Python wheels through Trusted Publishing, and the Rust core before the facade.
+9. The same workflow installs the public packages from npm, PyPI, and crates.io on every claimed
+   platform. It creates the GitHub Release only after those registry installation checks pass.
+
+Manual `workflow_dispatch` runs are always non-publishing dry runs. Registry publication is
+unlocked only by an annotated signed version tag whose version matches the manifests and whose
+committed evidence passes `./scripts/release-check.sh --release`.
 
 Registry publication, signing, and live API calls require maintainer authority and credentials;
 automation must not invent success when either is absent.

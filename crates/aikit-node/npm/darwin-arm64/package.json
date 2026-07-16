@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "Native aikit-runtime addon for macOS ARM64.",
   "license": "MIT OR Apache-2.0",
-  "repository": "github:matakartal/aikit-runtime",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matakartal/aikit-runtime.git"
+  },
   "main": "aikit_node.node",
   "files": ["aikit_node.node", "LICENSE-APACHE", "LICENSE-MIT"],
   "os": ["darwin"],

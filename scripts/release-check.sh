@@ -35,6 +35,9 @@ for file in \
   docs/RELEASE.md \
   docs/RELEASE-EVIDENCE-TEMPLATE.md \
   docs/V1-COMPLETION-MATRIX.md \
+  .github/allowed_signers \
+  .github/workflows/release.yml \
+  .github/workflows/live-smoke.yml \
   .env.example; do
   require_file "$file"
 done

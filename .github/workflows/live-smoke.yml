@@ -1,0 +1,76 @@
+name: live-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      anthropic_model:
+        description: Exact Anthropic model id to accept for this release
+        required: true
+        type: string
+      openai_model:
+        description: Exact OpenAI model id to accept for this release
+        required: true
+        type: string
+      deepseek_model:
+        description: Exact DeepSeek model id to accept for this release
+        required: true
+        type: string
+      google_model:
+        description: Exact Google model id to accept for this release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-smoke-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  four-provider-contract:
+    name: Four-provider billable contract
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve the full secret/model matrix before the first request
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          AIKIT_SMOKE_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+          AIKIT_SMOKE_OPENAI_MODEL: ${{ inputs.openai_model }}
+          AIKIT_SMOKE_DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
+          AIKIT_SMOKE_GOOGLE_MODEL: ${{ inputs.google_model }}
+          AIKIT_LIVE_SMOKE: "1"
+          AIKIT_LIVE_SMOKE_FULL: "1"
+        run: ./scripts/live-smoke.sh
+      - name: Write a secret-free evidence artifact
+        shell: bash
+        env:
+          ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+          OPENAI_MODEL: ${{ inputs.openai_model }}
+          DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
+          GOOGLE_MODEL: ${{ inputs.google_model }}
+        run: |
+          mkdir -p dist
+          {
+            printf 'commit_sha=%s\n' "$GITHUB_SHA"
+            printf 'run_url=%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'tested_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'anthropic_model=%s\n' "$ANTHROPIC_MODEL"
+            printf 'openai_model=%s\n' "$OPENAI_MODEL"
+            printf 'deepseek_model=%s\n' "$DEEPSEEK_MODEL"
+            printf 'google_model=%s\n' "$GOOGLE_MODEL"
+            printf 'text=passed\nobject=passed\ngoverned_deny=passed\ntwo_request_replay=passed\n'
+          } > dist/live-smoke-evidence.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: live-smoke-evidence
+          path: dist/live-smoke-evidence.txt
+          if-no-files-found: error
