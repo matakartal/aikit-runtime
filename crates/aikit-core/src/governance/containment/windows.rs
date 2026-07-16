@@ -106,6 +106,15 @@ pub(super) fn prepare(
                     workspace.into_os_string(),
                 ),
                 (
+                    OsString::from("AIKIT_JOB_SHELL"),
+                    std::env::var_os("SystemRoot")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+                        .join("System32")
+                        .join("cmd.exe")
+                        .into_os_string(),
+                ),
+                (
                     OsString::from("AIKIT_JOB_PROCESS_LIMIT"),
                     OsString::from(process_limit.to_string()),
                 ),
@@ -173,7 +182,7 @@ public static class AikitJob {
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
   static void Check(bool ok, string op) { if (!ok) { int code = Marshal.GetLastWin32Error(); throw new Win32Exception(code, op + " (Win32 " + code + ")"); } }
-  public static int Run(string command, string cwd, uint processes, ulong memory) {
+  public static int Run(string command, string cwd, string shell, uint processes, ulong memory) {
     if (cwd.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) cwd = @"\\" + cwd.Substring(8);
     else if (cwd.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) cwd = cwd.Substring(4);
     IntPtr job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception();
@@ -187,7 +196,7 @@ public static class AikitJob {
       Check(SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "SetInformationJobObject");
     }
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
-    PROCESS_INFORMATION pi; string shell = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"); var line = new StringBuilder("\"" + shell + "\" /d /s /c \"" + command.Replace("\"", "\\\"") + "\"");
+    PROCESS_INFORMATION pi; var line = new StringBuilder("\"" + shell + "\" /d /s /c \"" + command.Replace("\"", "\\\"") + "\"");
     Check(CreateProcessW(shell, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, cwd, ref si, out pi), "CreateProcessW");
     try { Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject"); ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, 0xffffffff); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code); }
     finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); }
@@ -195,8 +204,8 @@ public static class AikitJob {
 }
 '@
 Add-Type -TypeDefinition $src -Language CSharp
-$command = $env:AIKIT_JOB_COMMAND; $cwd = $env:AIKIT_JOB_WORKDIR
+$command = $env:AIKIT_JOB_COMMAND; $cwd = $env:AIKIT_JOB_WORKDIR; $shell = $env:AIKIT_JOB_SHELL
 $processes = [uint32]$env:AIKIT_JOB_PROCESS_LIMIT; $memory = [uint64]$env:AIKIT_JOB_MEMORY_LIMIT
-$env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null
-exit [AikitJob]::Run($command, $cwd, $processes, $memory)
+$env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null; $env:AIKIT_JOB_SHELL = $null
+exit [AikitJob]::Run($command, $cwd, $shell, $processes, $memory)
 "#;
