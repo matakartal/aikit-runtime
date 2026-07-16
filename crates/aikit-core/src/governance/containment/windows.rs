@@ -174,6 +174,8 @@ public static class AikitJob {
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
   static void Check(bool ok, string op) { if (!ok) { int code = Marshal.GetLastWin32Error(); throw new Win32Exception(code, op + " (Win32 " + code + ")"); } }
   public static int Run(string command, string cwd, uint processes, ulong memory) {
+    if (cwd.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) cwd = @"\\" + cwd.Substring(8);
+    else if (cwd.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) cwd = cwd.Substring(4);
     IntPtr job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception();
     var limits = new EXTENDED_LIMITS(); limits.BasicLimitInformation.LimitFlags = 0x2000u | 0x8u | 0x200u; limits.BasicLimitInformation.ActiveProcessLimit = processes; limits.JobMemoryLimit = (UIntPtr)memory;
     bool configured = SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits));
