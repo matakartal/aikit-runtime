@@ -183,6 +183,8 @@ public static class AikitJob {
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
   static void Check(bool ok, string op) { if (!ok) { int code = Marshal.GetLastWin32Error(); throw new Win32Exception(code, op + " (Win32 " + code + ")"); } }
   public static int Run(string command, string cwd, string shell, uint processes, ulong memory) {
+    if (String.IsNullOrWhiteSpace(cwd)) cwd = Environment.CurrentDirectory;
+    if (String.IsNullOrWhiteSpace(shell)) shell = @"C:\Windows\System32\cmd.exe";
     if (cwd.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) cwd = @"\\" + cwd.Substring(8);
     else if (cwd.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) cwd = cwd.Substring(4);
     Environment.CurrentDirectory = cwd;
