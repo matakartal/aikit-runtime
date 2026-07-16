@@ -1,6 +1,7 @@
 import {
   Agent,
   Client,
+  McpServer,
   tool,
   type ApprovalResponse,
   type ContainmentCapabilityReport,
@@ -62,6 +63,10 @@ agent.configureJsonlAudit(
 );
 agent.useMemoryFile("/tmp/aikit-memory.json", "tenant-a");
 agent.useSessionFile("/tmp/aikit-sessions.json");
+agent.useSqliteMemory("/tmp/aikit-state.db", "tenant-a");
+agent.useSqliteSessions("/tmp/aikit-state.db");
+agent.registerWebTools(["example.com"], "https://example.com/search?q={query}");
+agent.registerBrowserTools("http://127.0.0.1:4444", "session", ["example.com"]);
 const stream: ObjectStream<Invoice> = agent.streamObject(
   messages,
   invoiceSchema,
@@ -97,6 +102,19 @@ agent.enableBashWithRequiredContainment({
   cpus: 1,
   tmpfsMiB: 64,
 });
+agent.enableCapabilityRequests(["Bash"]);
+agent.enableDefaultGuardrails(["ignore previous instructions"]);
+
+async function configureMcp(): Promise<void> {
+  const http = await McpServer.connectHttp("https://mcp.example.com", "remote");
+  const stdio = await McpServer.connectStdio("server", [], "local", {}, false);
+  agent.registerMcp(http);
+  await http.listResources();
+  await http.listPrompts();
+  await http.readResource("file:///guide");
+  await http.getPrompt("review", {});
+  void stdio;
+}
 
 async function inspectContainment(): Promise<void> {
   const report: ContainmentCapabilityReport =
@@ -113,6 +131,7 @@ const runOptions: RunOptions = {
   providerOptions: { openai: { temperature: 0 } },
   budget: { maxTotalTokens: 1000 },
   retry: { maxAttemptsPerModel: 2 },
+  compaction: { maxContextTokens: 4096, keepRecentMessages: 8 },
   routing: {
     profiles: [
       {

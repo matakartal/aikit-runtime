@@ -32,6 +32,10 @@ it, so stores and host logs must protect it like prompts and model output.
 | OpenAI | Opaque Responses item replay | Yes | No | `native_constrained` |
 | Google | Gemini 3 signature replay on the exact function-call part | Yes | Yes | `native_constrained` via `responseJsonSchema` |
 | DeepSeek | Full reasoning replay for thinking turns with tool calls | No | No | `prompted_and_parsed` |
+| OpenRouter | Model-dependent; dropped on replay | Yes | No | `prompted_and_parsed` |
+| Groq | No replay claim | No | No | `prompted_and_parsed` |
+| Mistral | No replay claim | Yes | No | `prompted_and_parsed` |
+| xAI | Reasoning supported; dropped on replay | Yes | No | `prompted_and_parsed` |
 
 These are capability declarations and tested adapter behavior, not a promise that every model in
 a provider's catalog supports every feature. The caller still chooses a compatible model.
@@ -72,6 +76,10 @@ Hooks have bounded timeouts. Permission decisions include their rule/default sou
 record. A model-named tool that was not advertised for the run is rejected before the executor.
 Child agents receive a narrowed executor and cannot broaden the parent's advertised tool set or
 permission scope.
+
+Tool executors can additionally be wrapped in deterministic guardrails. The shared defaults redact
+recognized secrets, email/card/SSN data from tool output and can block configured input patterns.
+Semantic classifiers integrate through MCP and fail closed instead of embedding a billable model.
 
 ## Audit and OpenTelemetry
 
@@ -145,9 +153,17 @@ deterministic keyword/tag recall. Model output is never written automatically; c
 `remember`, which avoids turning prompt injection into silent long-term memory poisoning. The file
 store canonicalizes path aliases into shared process state, rejects final symlinks, uses private
 regular files and atomic same-directory replacement, but does not claim cross-process locking.
-Python and Node expose explicit memory-file/namespace and session-file selection; their defaults
-remain in-memory. Reopening the same local files restores explicit memories and resumable subagent
-sessions, while namespace and revision checks remain enforced by the Rust core.
+Python and Node expose JSON and SQLite memory/session selection; their defaults remain in-memory.
+SQLite uses WAL and transactions for cross-process local persistence and optimistic CAS. It is not
+a remote or geographically distributed database.
+
+## MCP, Web, Browser, and compaction
+
+MCP supports stdio and Streamable HTTP, lifecycle initialization, caller-owned bearer auth,
+paginated tools/resources/prompts, resource reads, prompt retrieval, and governed tool execution.
+Web requires an exact HTTPS host allowlist and bounded responses. Browser drives an existing W3C
+WebDriver session with the same navigation allowlist. Opt-in deterministic compaction preserves
+the task anchor, recent tail, and tool pairs.
 
 ## Containment
 
@@ -155,6 +171,10 @@ The containment policy applies to built-in Bash. It combines environment scrubbi
 output limits, rlimits, process-group termination, and one OS boundary:
 
 - macOS: an actively probed Seatbelt profile;
+- Linux: actively probed namespaces, read-only host root, writable workspace, private temp, and a
+  seccomp deny filter through bubblewrap;
+- Windows: suspended child assignment to a kill-on-close Job Object with process/memory limits;
+  filesystem and network isolation are explicitly not claimed;
 - macOS/Linux/Windows hosts with Docker: a local digest-pinned image, no network, read-only root,
   dropped capabilities, non-root user, bounded resources, and Docker's default seccomp profile;
 - unsupported/unready required backend: deny before process launch.
@@ -162,8 +182,8 @@ output limits, rlimits, process-group termination, and one OS boundary:
 Read/Write/Edit/Glob/Grep use the in-process path jail. Host callbacks and custom Rust executors are
 outside this OS boundary. See [`THREAT-MODEL.md`](THREAT-MODEL.md) for guarantees and exclusions.
 The Python/Node surfaces expose the jailed file suite separately from Bash and can configure a
-digest-pinned Docker fallback, but never expose uncontained Bash. The descriptor-relative jail is
-currently Linux/macOS-only; other hosts fail closed.
+digest-pinned Docker fallback, but never expose uncontained Bash. The descriptor-relative jail
+remains Linux/macOS-only; Windows file operations fail closed even though Bash can use Job Objects.
 
 ## Cross-language conformance
 
@@ -176,11 +196,9 @@ are asserted instead.
 
 ## Deferred after v1
 
-- Full MCP client support and a built-in Web tool.
-- Distributed durable session backends and advanced context compaction.
-- LiteLLM/long-tail provider adapters.
-- WASM/browser support.
-- Native Linux namespace/seccomp launch and Windows sandbox/job-object backends beyond the current
-  Seatbelt/Docker selection.
+- Remote/distributed database adapters beyond transactional local SQLite.
+- Model-generated/two-pass summaries beyond deterministic extractive compaction.
+- MCP server mode and WASM/browser-runtime packaging.
+- Stronger Windows filesystem/network isolation beyond Job Objects.
 
 These are not silently represented as current capabilities.

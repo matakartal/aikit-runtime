@@ -40,6 +40,9 @@ pub struct RunConfig {
     /// Token/USD governor. USD budgets require explicit pricing; unknown models never count as
     /// free. Enforcement occurs before any tool emitted in an over-budget turn is executed.
     pub budget: crate::budget::BudgetPolicy,
+    /// Transcript compaction. Disabled by default; when enabled, the working transcript is bounded
+    /// to a token budget at the start of each turn (first message + recent tail kept verbatim).
+    pub compaction: crate::compaction::CompactionPolicy,
     /// Completion handle retained by the caller. Records canonical messages, not reconstructed
     /// final text, so reasoning/tool history remains resumable.
     pub recorder: crate::session::RunRecorder,
@@ -65,6 +68,7 @@ impl RunConfig {
             governance: crate::governance::Governance::default(),
             audit: crate::observability::AuditTrail::default(),
             budget: crate::budget::BudgetPolicy::default(),
+            compaction: crate::compaction::CompactionPolicy::default(),
             recorder: crate::session::RunRecorder::default(),
             cancellation: crate::cancellation::CancellationToken::new(),
             shared_wall_time_deadline: None,
@@ -492,6 +496,13 @@ pub fn run_agent(
                     info,
                 );
                 break 'agent;
+            }
+
+            // Bound the transcript to the context window before building the request. No-op unless
+            // compaction is enabled; keeps the task anchor + recent tail and preserves tool pairing.
+            if let Some(compacted) = crate::compaction::compact_messages(&cfg.messages, &cfg.compaction)
+            {
+                cfg.messages = compacted;
             }
 
             if let Err(error) = cfg.audit.emit(AuditEvent::RequestStarted {

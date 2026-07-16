@@ -24,17 +24,21 @@ use std::sync::{Arc, RwLock};
 
 use aikit_core::orchestration::{ExecutionContext, Orchestrator, SubagentSpec};
 use aikit_core::{
-    Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions, AikitError, ApprovalDecision,
-    ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail, BudgetLedger, BudgetLimits,
-    BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, Client as CoreClient,
-    ContainmentPolicy, DockerConfig, FailureContext, FailureHookOutcome, GeneratedText, Governance,
-    HookDispatcher, HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore,
-    JsonFileSessionStore, JsonlAuditSink, Message, ModelCatalog, ModelPricing, ModelProfile,
-    NoTools, ObjectOptions, ObjectStream as CoreObjectStream, PermissionEngine, PermissionMode,
-    PermissionUpdate, PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext,
-    PromptHookOutcome, ProviderOptions, RetryPolicy, RouteRequest,
+    request_capability_tool, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions,
+    AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
+    AuditTrail, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
+    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, Client as CoreClient,
+    CompactionPolicy, ContainmentPolicy, DockerConfig, FailureContext, FailureHookOutcome,
+    GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher,
+    HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink,
+    McpClient, McpToolExecutor, Message, ModelCatalog, ModelPricing, ModelProfile, NoTools,
+    ObjectOptions, ObjectStream as CoreObjectStream, PermissionEngine, PermissionMode,
+    PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext, PreToolUseContext,
+    PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
     RoutingOptions as CoreRoutingOptions, Rule, RunConfig, RunRecorder, RunTerminalStatus, Sandbox,
-    SessionStore, StopContext, StreamDelta, ToolApprover, ToolExecutor, ToolSpec,
+    SecretRedactor, SessionStore, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
+    StopContext, StreamDelta, StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter,
+    ToolSpec, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -60,6 +64,7 @@ struct NodeToolExecutor {
 struct NodeAgentToolExecutor {
     host: Arc<NodeToolExecutor>,
     builtins: Option<Arc<BuiltinTools>>,
+    external: Arc<ToolRouter>,
 }
 
 /// Optional immutable Docker fallback for `Required(Auto)` Bash containment. Images are never
@@ -105,6 +110,9 @@ impl ToolExecutor for NodeAgentToolExecutor {
             if builtins.tool_names().contains(&name) {
                 return builtins.execute(name, input).await;
             }
+        }
+        if self.external.contains(name) {
+            return self.external.execute(name, input).await;
         }
         self.host.execute(name, input).await
     }
@@ -489,6 +497,112 @@ impl ToolExecutor for NodeToolExecutor {
     }
 }
 
+#[napi]
+pub struct McpServer {
+    specs: Vec<ToolSpec>,
+    executor: Arc<McpToolExecutor>,
+    client: Arc<McpClient>,
+}
+
+#[napi]
+impl McpServer {
+    #[napi(factory)]
+    pub async fn connect_http(
+        endpoint: String,
+        name: String,
+        bearer_token: Option<String>,
+    ) -> Result<Self> {
+        let transport = Arc::new(
+            StreamableHttpTransport::new(&endpoint, bearer_token)
+                .map_err(|error| Error::from_reason(error.to_string()))?,
+        );
+        let mut client = McpClient::new(transport, name);
+        client
+            .initialize()
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let specs = client
+            .list_tools()
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let client = Arc::new(client);
+        Ok(Self {
+            specs,
+            executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
+            client,
+        })
+    }
+
+    #[napi(factory)]
+    pub async fn connect_stdio(
+        program: String,
+        args: Vec<String>,
+        name: String,
+        env: Option<HashMap<String, String>>,
+        inherit_env: Option<bool>,
+    ) -> Result<Self> {
+        let env = env.unwrap_or_default().into_iter().collect();
+        let transport = Arc::new(
+            StdioTransport::spawn_with_env(&program, &args, &env, inherit_env.unwrap_or(false))
+                .await
+                .map_err(|error| Error::from_reason(error.to_string()))?,
+        );
+        let mut client = McpClient::new(transport, name);
+        client
+            .initialize()
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let specs = client
+            .list_tools()
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let client = Arc::new(client);
+        Ok(Self {
+            specs,
+            executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
+            client,
+        })
+    }
+
+    #[napi]
+    pub async fn list_resources(&self, cursor: Option<String>) -> Result<Value> {
+        serde_json::to_value(
+            self.client
+                .list_resources(cursor.as_deref())
+                .await
+                .map_err(|error| Error::from_reason(error.to_string()))?,
+        )
+        .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    #[napi]
+    pub async fn read_resource(&self, uri: String) -> Result<Value> {
+        self.client
+            .read_resource(&uri)
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    #[napi]
+    pub async fn list_prompts(&self, cursor: Option<String>) -> Result<Value> {
+        serde_json::to_value(
+            self.client
+                .list_prompts(cursor.as_deref())
+                .await
+                .map_err(|error| Error::from_reason(error.to_string()))?,
+        )
+        .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    #[napi]
+    pub async fn get_prompt(&self, name: String, arguments: Value) -> Result<Value> {
+        self.client
+            .get_prompt(&name, arguments)
+            .await
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+}
+
 /// The agent-native primitive: drop in an API key → the agent gets stronger. Identical surface
 /// to `aikit.Agent` in Python.
 #[napi]
@@ -497,11 +611,15 @@ pub struct Agent {
     executor: Arc<NodeToolExecutor>,
     builtin_sandbox: Option<Sandbox>,
     builtin_tools: Option<Arc<BuiltinTools>>,
+    external_tools: Arc<ToolRouter>,
     session_store: Arc<dyn SessionStore>,
     audit: AuditTrail,
     permissions: PermissionEngine,
     hooks: HookDispatcher,
     approver: Option<Arc<dyn ToolApprover>>,
+    gated_tools: Vec<String>,
+    input_guardrails: Arc<GuardrailChain>,
+    output_guardrails: Arc<GuardrailChain>,
 }
 
 impl Agent {
@@ -511,11 +629,15 @@ impl Agent {
             executor: Arc::new(NodeToolExecutor::default()),
             builtin_sandbox: None,
             builtin_tools: None,
+            external_tools: Arc::new(ToolRouter::default()),
             session_store: Arc::new(InMemorySessionStore::default()),
             audit: AuditTrail::new(),
             permissions: PermissionEngine::default(),
             hooks: HookDispatcher::new(),
             approver: None,
+            gated_tools: Vec::new(),
+            input_guardrails: Arc::new(GuardrailChain::default()),
+            output_guardrails: Arc::new(GuardrailChain::default()),
         }
     }
 
@@ -528,10 +650,52 @@ impl Agent {
     }
 
     fn tool_executor(&self) -> Arc<dyn ToolExecutor> {
-        Arc::new(NodeAgentToolExecutor {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(NodeAgentToolExecutor {
             host: self.executor.clone(),
             builtins: self.builtin_tools.clone(),
-        })
+            external: self.external_tools.clone(),
+        });
+        let executor = match (&self.approver, self.gated_tools.is_empty()) {
+            (Some(approver), false) => Arc::new(CapabilityGate::new(
+                Arc::new(CapabilityBroker::new(
+                    approver.clone(),
+                    self.audit.run_id().to_string(),
+                )),
+                executor,
+                self.gated_tools.clone(),
+            )),
+            _ => executor,
+        };
+        Arc::new(GuardedExecutor::new(
+            executor,
+            self.input_guardrails.clone(),
+            self.output_guardrails.clone(),
+        ))
+    }
+
+    fn install_external_tools(
+        &mut self,
+        specs: Vec<ToolSpec>,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> Result<()> {
+        if let Some(collision) = specs.iter().find(|spec| {
+            self.inner
+                .tool_specs()
+                .iter()
+                .any(|existing| existing.name == spec.name)
+        }) {
+            return Err(Error::from_reason(format!(
+                "tool '{}' is already registered",
+                collision.name
+            )));
+        }
+        self.external_tools
+            .register(&specs, executor)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        for spec in specs {
+            self.inner.add_tool(spec);
+        }
+        Ok(())
     }
 
     fn install_builtin_tools(&mut self, sandbox: Sandbox, tools: Arc<BuiltinTools>) -> Result<()> {
@@ -671,6 +835,117 @@ impl Agent {
             return Err(Error::from_reason("session file path must not be empty"));
         }
         self.session_store = Arc::new(JsonFileSessionStore::new(path));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn use_sqlite_memory(&mut self, path: String, namespace: Option<String>) -> Result<()> {
+        let namespace = namespace.unwrap_or_else(|| "default".into());
+        if namespace.trim().is_empty() {
+            return Err(Error::from_reason("memory namespace must not be empty"));
+        }
+        let store = SqliteMemoryStore::open(path)
+            .map_err(|error| Error::from_reason(format!("failed to open SQLite: {error}")))?;
+        self.inner.set_memory_store(Arc::new(store), namespace);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn use_sqlite_sessions(&mut self, path: String) -> Result<()> {
+        self.session_store = Arc::new(
+            SqliteSessionStore::open(path)
+                .map_err(|error| Error::from_reason(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    #[napi]
+    pub fn register_web_tools(
+        &mut self,
+        allowed_hosts: Vec<String>,
+        search_endpoint: Option<String>,
+        max_response_bytes: Option<u32>,
+    ) -> Result<()> {
+        let mut tools =
+            WebTools::new(allowed_hosts).map_err(|error| Error::from_reason(error.to_string()))?;
+        if let Some(endpoint) = search_endpoint {
+            tools = tools
+                .with_search_endpoint(endpoint)
+                .map_err(|error| Error::from_reason(error.to_string()))?;
+        }
+        if let Some(bytes) = max_response_bytes {
+            tools = tools.with_max_response_bytes(bytes as usize);
+        }
+        let specs = tools.specs();
+        self.install_external_tools(specs, Arc::new(tools))
+    }
+
+    #[napi]
+    pub fn register_browser_tools(
+        &mut self,
+        webdriver_endpoint: String,
+        session_id: String,
+        allowed_hosts: Vec<String>,
+    ) -> Result<()> {
+        let tools = BrowserTools::new(&webdriver_endpoint, &session_id, allowed_hosts)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        let specs = tools.specs();
+        self.install_external_tools(specs, Arc::new(tools))
+    }
+
+    #[napi]
+    pub fn register_mcp(&mut self, server: &McpServer) -> Result<()> {
+        self.install_external_tools(server.specs.clone(), server.executor.clone())
+    }
+
+    #[napi]
+    pub fn enable_capability_requests(&mut self, gated_tools: Vec<String>) -> Result<()> {
+        if self.approver.is_none() {
+            return Err(Error::from_reason(
+                "configure canUseTool before enabling capability requests",
+            ));
+        }
+        if let Some(name) = gated_tools.iter().find(|name| {
+            !self
+                .inner
+                .tool_specs()
+                .iter()
+                .any(|tool| tool.name == **name)
+        }) {
+            return Err(Error::from_reason(format!(
+                "cannot gate unregistered tool '{name}'"
+            )));
+        }
+        if !self
+            .inner
+            .tool_specs()
+            .iter()
+            .any(|tool| tool.name == "request_capability")
+        {
+            self.inner.add_tool(request_capability_tool());
+        }
+        self.gated_tools = gated_tools;
+        Ok(())
+    }
+
+    #[napi]
+    pub fn enable_default_guardrails(
+        &mut self,
+        blocked_input_patterns: Option<Vec<String>>,
+    ) -> Result<()> {
+        let patterns = blocked_input_patterns.unwrap_or_default();
+        let pairs: Vec<_> = patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| (pattern.as_str(), format!("rule_{index}")))
+            .collect();
+        let blocklist = RegexBlocklist::new("blocked_input", pairs)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        self.input_guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(blocklist)]));
+        self.output_guardrails = Arc::new(GuardrailChain::new(vec![
+            Arc::new(SecretRedactor::default()),
+            Arc::new(PiiRedactor::default()),
+        ]));
         Ok(())
     }
 
@@ -1285,6 +1560,7 @@ pub struct RunOptions {
     pub budget: Option<Value>,
     pub retry: Option<Value>,
     pub routing: Option<Value>,
+    pub compaction: Option<Value>,
     /// Wrapper-private bridge for an AbortSignal that was already aborted before `run()`.
     pub cancel_before_start: Option<bool>,
 }
@@ -1462,6 +1738,23 @@ fn build_agent_options(
     mapped.budget = parse_budget_policy(options.budget)?;
     mapped.retry = parse_retry_policy(options.retry)?;
     mapped.routing = parse_routing_options(options.routing)?;
+    if let Some(compaction) = options.compaction.filter(|value| !value.is_null()) {
+        let object = compaction
+            .as_object()
+            .ok_or_else(|| Error::from_reason("RunOptions.compaction must be an object"))?;
+        let max_context_tokens = optional_u64(object, "max_context_tokens", "maxContextTokens")?
+            .ok_or_else(|| {
+                Error::from_reason("RunOptions.compaction.maxContextTokens is required")
+            })?;
+        let keep_recent_messages =
+            optional_u64(object, "keep_recent_messages", "keepRecentMessages")?.unwrap_or(8);
+        mapped.compaction = CompactionPolicy::new(
+            max_context_tokens,
+            usize::try_from(keep_recent_messages).map_err(|_| {
+                Error::from_reason("RunOptions.compaction.keepRecentMessages exceeds usize")
+            })?,
+        );
+    }
     if options.cancel_before_start.unwrap_or(false) {
         mapped.cancellation.cancel();
     }
@@ -1509,6 +1802,7 @@ pub struct QueryOptions {
     pub budget: Option<Value>,
     pub retry: Option<Value>,
     pub routing: Option<Value>,
+    pub compaction: Option<Value>,
     pub permissions: Option<Vec<RuleSpec>>,
     pub default_mode: Option<String>,
     /// Wrapper-private bridge for an AbortSignal that was already aborted before `query()`.
@@ -1585,6 +1879,7 @@ pub fn query(
         budget: None,
         retry: None,
         routing: None,
+        compaction: None,
         permissions: None,
         default_mode: None,
         cancel_before_start: None,
@@ -1615,6 +1910,7 @@ pub fn query(
         budget,
         retry,
         routing,
+        compaction,
         permissions,
         default_mode,
         cancel_before_start,
@@ -1639,6 +1935,7 @@ pub fn query(
             budget,
             retry,
             routing,
+            compaction,
             cancel_before_start,
         }),
         governance,
@@ -1901,6 +2198,10 @@ mod tests {
                     "perAttemptTimeoutMs": 30
                 })),
                 routing: None,
+                compaction: Some(serde_json::json!({
+                    "maxContextTokens": 2_000,
+                    "keepRecentMessages": 6
+                })),
                 cancel_before_start: Some(true),
             }),
             Governance::default(),
@@ -1916,6 +2217,8 @@ mod tests {
         assert_eq!(options.budget.pricing.unwrap().output_per_million_usd, 4.0);
         assert_eq!(options.retry.max_attempts_per_model, 3);
         assert_eq!(options.retry.per_attempt_timeout_ms, 30);
+        assert_eq!(options.compaction.max_context_tokens, 2_000);
+        assert_eq!(options.compaction.keep_recent_messages, 6);
         assert!(options.cancellation.is_cancelled());
     }
 

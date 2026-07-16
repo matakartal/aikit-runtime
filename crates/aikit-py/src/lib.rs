@@ -19,17 +19,21 @@ use aikit_core::orchestration::{
     ExecutionContext, ModelRouteRequirements, Orchestrator, SubagentSpec,
 };
 use aikit_core::{
-    tools::ToolExecutor, Agent, AgentError, AgentOptions as CoreAgentOptions, ApprovalDecision,
-    ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail, BudgetLedger, BudgetLimits,
-    BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, Client as CoreClient,
-    ContainmentPolicy, DockerConfig, FailureContext, FailureHookOutcome, GeneratedText, Governance,
-    HookDispatcher, HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore,
-    JsonFileSessionStore, JsonlAuditSink, Message, ModelCatalog, ModelPricing, ModelProfile,
+    request_capability_tool, tools::ToolExecutor, Agent, AgentError,
+    AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
+    AuditPayloadPolicy, AuditTrail, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
+    BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
+    Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig, FailureContext,
+    FailureHookOutcome, GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher,
+    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
+    JsonlAuditSink, McpClient, McpToolExecutor, Message, ModelCatalog, ModelPricing, ModelProfile,
     ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent, PermissionEngine,
-    PermissionMode, PermissionUpdate, PostToolOutcome, PostToolUseContext, PreToolUseContext,
-    PromptContext, PromptHookOutcome, ProviderOptions, RetryPolicy, RouteRequest, RoutingOptions,
-    Rule, RunRecorder, RunTerminalStatus, Sandbox, SessionStore, StopContext, StreamDelta,
-    ToolApprover, ToolSpec,
+    PermissionMode, PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext,
+    PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist,
+    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunRecorder, RunTerminalStatus, Sandbox,
+    SecretRedactor, SessionStore, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
+    StopContext, StreamDelta, StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec,
+    WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -43,6 +47,167 @@ use tokio::sync::Mutex as TokioMutex;
 pyo3::create_exception!(aikit, AikitError, PyRuntimeError);
 
 type CallbackLocals = Arc<RwLock<Option<Arc<pyo3_async_runtimes::TaskLocals>>>>;
+
+#[pyclass(name = "McpServer")]
+struct PyMcpServer {
+    specs: Vec<ToolSpec>,
+    executor: Arc<McpToolExecutor>,
+    client: Arc<McpClient>,
+}
+
+#[pymethods]
+impl PyMcpServer {
+    fn list_resources<'py>(
+        &self,
+        py: Python<'py>,
+        cursor: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = client
+                .list_resources(cursor.as_deref())
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Python::with_gil(|py| {
+                pythonize::pythonize(py, &value)
+                    .map(|v| v.unbind())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    fn read_resource<'py>(&self, py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = client
+                .read_resource(&uri)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Python::with_gil(|py| {
+                pythonize::pythonize(py, &value)
+                    .map(|v| v.unbind())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    fn list_prompts<'py>(
+        &self,
+        py: Python<'py>,
+        cursor: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = client
+                .list_prompts(cursor.as_deref())
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Python::with_gil(|py| {
+                pythonize::pythonize(py, &value)
+                    .map(|v| v.unbind())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    fn get_prompt<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        arguments: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let arguments: Value =
+            pythonize::depythonize(&arguments).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = client
+                .get_prompt(&name, arguments)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Python::with_gil(|py| {
+                pythonize::pythonize(py, &value)
+                    .map(|v| v.unbind())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            })
+        })
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (endpoint, name, bearer_token=None))]
+fn connect_mcp_http<'py>(
+    py: Python<'py>,
+    endpoint: String,
+    name: String,
+    bearer_token: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let transport = Arc::new(
+            StreamableHttpTransport::new(&endpoint, bearer_token)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+        );
+        let mut client = McpClient::new(transport, name);
+        client
+            .initialize()
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let specs = client
+            .list_tools()
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let client = Arc::new(client);
+        Python::with_gil(|py| {
+            Py::new(
+                py,
+                PyMcpServer {
+                    specs,
+                    executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
+                    client,
+                },
+            )
+        })
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (program, args, name, env=None, inherit_env=false))]
+fn connect_mcp_stdio<'py>(
+    py: Python<'py>,
+    program: String,
+    args: Vec<String>,
+    name: String,
+    env: Option<HashMap<String, String>>,
+    inherit_env: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let env = env.unwrap_or_default().into_iter().collect();
+        let transport = Arc::new(
+            StdioTransport::spawn_with_env(&program, &args, &env, inherit_env)
+                .await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+        );
+        let mut client = McpClient::new(transport, name);
+        client
+            .initialize()
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let specs = client
+            .list_tools()
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let client = Arc::new(client);
+        Python::with_gil(|py| {
+            Py::new(
+                py,
+                PyMcpServer {
+                    specs,
+                    executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
+                    client,
+                },
+            )
+        })
+    })
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +314,7 @@ struct PyToolExecutor {
 struct PyAgentToolExecutor {
     host: Arc<PyToolExecutor>,
     builtins: Option<Arc<BuiltinTools>>,
+    external: Arc<ToolRouter>,
 }
 
 #[async_trait]
@@ -158,6 +324,9 @@ impl ToolExecutor for PyAgentToolExecutor {
             if builtins.tool_names().contains(&name) {
                 return builtins.execute(name, input).await;
             }
+        }
+        if self.external.contains(name) {
+            return self.external.execute(name, input).await;
         }
         self.host.execute(name, input).await
     }
@@ -744,6 +913,20 @@ fn build_agent_options(
         options.max_turns = usize::try_from(max_turns)
             .map_err(|_| "RunOptions.max_turns exceeds usize".to_string())?;
     }
+    if let Some(compaction) = object.get("compaction").filter(|value| !value.is_null()) {
+        let compaction = compaction
+            .as_object()
+            .ok_or_else(|| "RunOptions.compaction must be a mapping".to_string())?;
+        let max_context_tokens = optional_u64(compaction, "max_context_tokens")?
+            .ok_or_else(|| "RunOptions.compaction.max_context_tokens is required".to_string())?;
+        let keep_recent_messages = optional_u64(compaction, "keep_recent_messages")?.unwrap_or(8);
+        options.compaction = CompactionPolicy::new(
+            max_context_tokens,
+            usize::try_from(keep_recent_messages).map_err(|_| {
+                "RunOptions.compaction.keep_recent_messages exceeds usize".to_string()
+            })?,
+        );
+    }
     if let Some(provider_options) = object.get("provider_options") {
         options.provider_options = serde_json::from_value(provider_options.clone())
             .map_err(|error| format!("invalid RunOptions.provider_options: {error}"))?;
@@ -1069,11 +1252,15 @@ struct PyAgent {
     executor: Arc<PyToolExecutor>,
     builtin_sandbox: Option<Sandbox>,
     builtin_tools: Option<Arc<BuiltinTools>>,
+    external_tools: Arc<ToolRouter>,
     session_store: Arc<dyn SessionStore>,
     audit: AuditTrail,
     permissions: PermissionEngine,
     hooks: HookDispatcher,
     approver: Option<Arc<dyn ToolApprover>>,
+    gated_tools: Vec<String>,
+    input_guardrails: Arc<GuardrailChain>,
+    output_guardrails: Arc<GuardrailChain>,
     callback_locals: CallbackLocals,
 }
 
@@ -1084,11 +1271,15 @@ impl PyAgent {
             executor: Arc::new(PyToolExecutor::default()),
             builtin_sandbox: None,
             builtin_tools: None,
+            external_tools: Arc::new(ToolRouter::default()),
             session_store: Arc::new(InMemorySessionStore::default()),
             audit: AuditTrail::new(),
             permissions: PermissionEngine::default(),
             hooks: HookDispatcher::new(),
             approver: None,
+            gated_tools: Vec::new(),
+            input_guardrails: Arc::new(GuardrailChain::default()),
+            output_guardrails: Arc::new(GuardrailChain::default()),
             callback_locals: Arc::new(RwLock::new(None)),
         }
     }
@@ -1102,10 +1293,52 @@ impl PyAgent {
     }
 
     fn tool_executor(&self) -> Arc<dyn ToolExecutor> {
-        Arc::new(PyAgentToolExecutor {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(PyAgentToolExecutor {
             host: self.executor.clone(),
             builtins: self.builtin_tools.clone(),
-        })
+            external: self.external_tools.clone(),
+        });
+        let executor = match (&self.approver, self.gated_tools.is_empty()) {
+            (Some(approver), false) => Arc::new(CapabilityGate::new(
+                Arc::new(CapabilityBroker::new(
+                    approver.clone(),
+                    self.audit.run_id().to_string(),
+                )),
+                executor,
+                self.gated_tools.clone(),
+            )),
+            _ => executor,
+        };
+        Arc::new(GuardedExecutor::new(
+            executor,
+            self.input_guardrails.clone(),
+            self.output_guardrails.clone(),
+        ))
+    }
+
+    fn install_external_tools(
+        &mut self,
+        specs: Vec<ToolSpec>,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> PyResult<()> {
+        if let Some(collision) = specs.iter().find(|spec| {
+            self.inner
+                .tool_specs()
+                .iter()
+                .any(|existing| existing.name == spec.name)
+        }) {
+            return Err(PyValueError::new_err(format!(
+                "tool '{}' is already registered",
+                collision.name
+            )));
+        }
+        self.external_tools
+            .register(&specs, executor)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        for spec in specs {
+            self.inner.add_tool(spec);
+        }
+        Ok(())
     }
 
     fn install_builtin_tools(
@@ -1276,6 +1509,108 @@ impl PyAgent {
             return Err(PyValueError::new_err("session file path must not be empty"));
         }
         self.session_store = Arc::new(JsonFileSessionStore::new(path));
+        Ok(())
+    }
+
+    #[pyo3(signature = (path, namespace="default"))]
+    fn use_sqlite_memory(&mut self, path: &str, namespace: &str) -> PyResult<()> {
+        if namespace.trim().is_empty() {
+            return Err(PyValueError::new_err("memory namespace must not be empty"));
+        }
+        let store = SqliteMemoryStore::open(path)
+            .map_err(|error| PyRuntimeError::new_err(format!("failed to open SQLite: {error}")))?;
+        self.inner.set_memory_store(Arc::new(store), namespace);
+        Ok(())
+    }
+
+    fn use_sqlite_sessions(&mut self, path: &str) -> PyResult<()> {
+        self.session_store = Arc::new(
+            SqliteSessionStore::open(path)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    #[pyo3(signature = (allowed_hosts, search_endpoint=None, max_response_bytes=None))]
+    fn register_web_tools(
+        &mut self,
+        allowed_hosts: Vec<String>,
+        search_endpoint: Option<String>,
+        max_response_bytes: Option<usize>,
+    ) -> PyResult<()> {
+        let mut tools = WebTools::new(allowed_hosts)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        if let Some(endpoint) = search_endpoint {
+            tools = tools
+                .with_search_endpoint(endpoint)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        }
+        if let Some(bytes) = max_response_bytes {
+            tools = tools.with_max_response_bytes(bytes);
+        }
+        let specs = tools.specs();
+        self.install_external_tools(specs, Arc::new(tools))
+    }
+
+    fn register_browser_tools(
+        &mut self,
+        webdriver_endpoint: &str,
+        session_id: &str,
+        allowed_hosts: Vec<String>,
+    ) -> PyResult<()> {
+        let tools = BrowserTools::new(webdriver_endpoint, session_id, allowed_hosts)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let specs = tools.specs();
+        self.install_external_tools(specs, Arc::new(tools))
+    }
+
+    fn register_mcp(&mut self, server: PyRef<'_, PyMcpServer>) -> PyResult<()> {
+        self.install_external_tools(server.specs.clone(), server.executor.clone())
+    }
+
+    fn enable_capability_requests(&mut self, gated_tools: Vec<String>) -> PyResult<()> {
+        if self.approver.is_none() {
+            return Err(PyValueError::new_err(
+                "configure can_use_tool before enabling capability requests",
+            ));
+        }
+        if let Some(name) = gated_tools.iter().find(|name| {
+            !self
+                .inner
+                .tool_specs()
+                .iter()
+                .any(|tool| tool.name == **name)
+        }) {
+            return Err(PyValueError::new_err(format!(
+                "cannot gate unregistered tool '{name}'"
+            )));
+        }
+        if !self
+            .inner
+            .tool_specs()
+            .iter()
+            .any(|tool| tool.name == "request_capability")
+        {
+            self.inner.add_tool(request_capability_tool());
+        }
+        self.gated_tools = gated_tools;
+        Ok(())
+    }
+
+    #[pyo3(signature = (blocked_input_patterns=Vec::new()))]
+    fn enable_default_guardrails(&mut self, blocked_input_patterns: Vec<String>) -> PyResult<()> {
+        let pairs: Vec<_> = blocked_input_patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| (pattern.as_str(), format!("rule_{index}")))
+            .collect();
+        let blocklist = RegexBlocklist::new("blocked_input", pairs)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.input_guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(blocklist)]));
+        self.output_guardrails = Arc::new(GuardrailChain::new(vec![
+            Arc::new(SecretRedactor::default()),
+            Arc::new(PiiRedactor::default()),
+        ]));
         Ok(())
     }
 
@@ -2051,10 +2386,13 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AikitError", m.py().get_type::<AikitError>())?;
     m.add_function(wrap_pyfunction!(tool, m)?)?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
+    m.add_function(wrap_pyfunction!(connect_mcp_http, m)?)?;
+    m.add_function(wrap_pyfunction!(connect_mcp_stdio, m)?)?;
     m.add_class::<PyToolDecorator>()?;
     m.add_class::<QueryStream>()?;
     m.add_class::<ObjectStream>()?;
     m.add_class::<PyAgent>()?;
+    m.add_class::<PyMcpServer>()?;
     m.add_class::<PyClient>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

@@ -14,10 +14,12 @@ pub mod budget;
 pub mod cancellation;
 pub mod capabilities;
 pub mod client;
+pub mod compaction;
 pub mod credentials;
 pub mod dx;
 pub mod error;
 pub mod governance;
+pub mod mcp;
 pub mod memory;
 pub mod observability;
 pub mod orchestration;
@@ -27,6 +29,7 @@ pub mod resilience;
 pub mod routing;
 pub mod runtime;
 pub mod session;
+pub mod sqlite;
 pub mod tools;
 pub mod types;
 
@@ -42,6 +45,7 @@ pub use client::{
     query_messages_with_executor, query_with_executor, AgentOptions, CancellableRun, Client,
     DeltaStream, RoutingOptions,
 };
+pub use compaction::{compact_messages, estimate_tokens, CompactionPolicy};
 pub use credentials::{resolve_provider, KeyGuess, ResolveError};
 pub use dx::{
     generate_object, generate_object_messages, generate_object_messages_observed,
@@ -50,10 +54,18 @@ pub use dx::{
     GeneratedObject, ObjectOptions, ObjectStream, ObjectStreamEvent, TypedGeneratedObject,
 };
 pub use error::{AikitError, ErrorCode, ErrorInfo, ProviderError, ProviderErrorKind, Result};
+pub use governance::capability::{
+    request_capability_tool, CapabilityBroker, CapabilityDecision, CapabilityGate,
+    REQUEST_CAPABILITY_TOOL,
+};
 pub use governance::containment::{
     containment_capabilities, ActiveContainmentBackend, BackendCapability, BackendSelector,
     ContainmentCapabilityReport, ContainmentGuarantees, ContainmentPolicy, ContainmentRequirement,
     DockerConfig,
+};
+pub use governance::guardrail::{
+    GuardedExecutor, Guardrail, GuardrailChain, GuardrailVerdict, McpGuardrail, PiiRedactor,
+    RegexBlocklist, SecretRedactor,
 };
 pub use governance::hooks::{
     FailureContext, FailureHookOutcome, FailureStage, HookDispatcher, HookMatcher, HookOutcome,
@@ -68,6 +80,10 @@ pub use governance::sandbox::{Sandbox, SandboxError};
 pub use governance::{
     ApprovalDecision, ApprovalRequest, Authorization, AuthorizationContext, AuthorizationReport,
     Governance, PermissionUpdate, ToolApprover,
+};
+pub use mcp::{
+    McpClient, McpPrompt, McpResource, McpToolExecutor, McpTransport, StdioTransport,
+    StreamableHttpTransport, MCP_PROTOCOL_VERSION,
 };
 pub use memory::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryEntry, MemoryQuery, MemoryStore};
 #[cfg(feature = "opentelemetry")]
@@ -102,8 +118,10 @@ pub use session::{
     InMemorySessionStore, JsonFileSessionStore, RunOutcome, RunRecorder, RunTerminalStatus,
     Session, SessionStore, SessionStoreError, SessionStoreResult,
 };
+pub use sqlite::{SqliteMemoryStore, SqliteSessionStore};
 pub use tools::builtin::BuiltinTools;
-pub use tools::{tool, NoTools, ToolExecutor};
+pub use tools::web::{BrowserTools, WebTools};
+pub use tools::{tool, NoTools, ToolExecutor, ToolRouter};
 pub use types::{
     ContentBlock, MediaSource, Message, ProviderMetadata, ProviderOptions, Role, StreamDelta,
     ToolSpec, Usage,

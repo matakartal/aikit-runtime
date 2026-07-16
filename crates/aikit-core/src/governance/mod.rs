@@ -8,7 +8,9 @@
 //! Pydantic AI = approval-only, the Claude Agent SDK = Claude-only). Here it is provider-agnostic
 //! and runs identically on every provider.
 
+pub mod capability;
 pub mod containment;
+pub mod guardrail;
 pub mod hooks;
 pub mod permissions;
 pub mod process;

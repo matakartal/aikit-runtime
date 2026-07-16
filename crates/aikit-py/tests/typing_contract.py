@@ -19,6 +19,7 @@ from aikit import (
     HookResponse,
     JsonValue,
     Message,
+    McpServer,
     ModelProfile,
     ModelRouteRequirements,
     ObjectStream,
@@ -30,6 +31,8 @@ from aikit import (
     SubagentResult,
     SubagentSpec,
     Tool,
+    connect_mcp_http,
+    connect_mcp_stdio,
     query,
     tool,
 )
@@ -80,6 +83,10 @@ agent.configure_jsonl_audit(
 )
 agent.use_memory_file("/tmp/aikit-memory.json", namespace="tenant-a")
 agent.use_session_file("/tmp/aikit-sessions.json")
+agent.use_sqlite_memory("/tmp/aikit-state.db", namespace="tenant-a")
+agent.use_sqlite_sessions("/tmp/aikit-state.db")
+agent.register_web_tools(["example.com"], "https://example.com/search?q={query}")
+agent.register_browser_tools("http://127.0.0.1:4444", "session", ["example.com"])
 stream = agent.stream_object(
     "stream an invoice",
     Invoice,
@@ -153,6 +160,19 @@ agent.enable_bash_with_required_containment(
         "tmpfs_mib": 64,
     }
 )
+agent.enable_capability_requests(["Bash"])
+agent.enable_default_guardrails([r"ignore previous instructions"])
+
+async def configure_mcp() -> None:
+    http_server: McpServer = await connect_mcp_http("https://mcp.example.com", "remote")
+    stdio_server: McpServer = await connect_mcp_stdio("server", [], "local", env={}, inherit_env=False)
+    agent.register_mcp(http_server)
+    await http_server.list_resources()
+    await http_server.list_prompts()
+    await http_server.read_resource("file:///guide")
+    await http_server.get_prompt("review", {})
+    void_server = stdio_server
+    assert_type(void_server, McpServer)
 
 run_options: RunOptions = {
     "model": "mock-1",
@@ -162,6 +182,7 @@ run_options: RunOptions = {
     "provider_options": {"openai": {"temperature": 0}},
     "budget": {"max_total_tokens": 1000},
     "retry": {"max_attempts_per_model": 2},
+    "compaction": {"max_context_tokens": 4096, "keep_recent_messages": 8},
 }
 run_stream: QueryStream = agent.run(messages, run_options)
 client = Client(agent)

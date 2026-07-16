@@ -14,6 +14,7 @@ use crate::credentials::{provider_from_env_var, resolve_provider, ResolveError};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::deepseek::DeepSeekProvider;
 use crate::providers::google::GeminiProvider;
+use crate::providers::openai::OpenAiProvider;
 use crate::providers::openai_responses::OpenAiResponsesProvider;
 use crate::providers::{MockProvider, Provider};
 use crate::runtime::{run_agent, RunConfig};
@@ -208,7 +209,11 @@ impl Agent {
                 "audit".into(),
                 "budget_reservations".into(),
                 "cancellation".into(),
+                "compaction".into(),
+                "human_governed_capabilities".into(),
+                "mcp".into(),
                 "governance_hooks".into(),
+                "guardrails".into(),
                 "memory".into(),
                 "os_containment".into(),
                 "routing".into(),
@@ -239,6 +244,10 @@ impl Agent {
             "deepseek" => "deepseek",
             "openai" => "openai",
             "google" => "google",
+            "openrouter" => "openrouter",
+            "groq" => "groq",
+            "mistral" => "mistral",
+            "xai" => "xai",
             _ => return Err(AgentError::NoAdapter("unknown")),
         };
         let key = self
@@ -251,6 +260,26 @@ impl Agent {
             "deepseek" => Ok(Arc::new(DeepSeekProvider::new(key))),
             "openai" => Ok(Arc::new(OpenAiResponsesProvider::new(key))),
             "google" => Ok(Arc::new(GeminiProvider::new(key))),
+            "openrouter" => Ok(Arc::new(OpenAiProvider::compatible(
+                "openrouter",
+                key,
+                "https://openrouter.ai/api/v1",
+            ))),
+            "groq" => Ok(Arc::new(OpenAiProvider::compatible(
+                "groq",
+                key,
+                "https://api.groq.com/openai/v1",
+            ))),
+            "mistral" => Ok(Arc::new(OpenAiProvider::compatible(
+                "mistral",
+                key,
+                "https://api.mistral.ai/v1",
+            ))),
+            "xai" => Ok(Arc::new(OpenAiProvider::compatible(
+                "xai",
+                key,
+                "https://api.x.ai/v1",
+            ))),
             other => Err(AgentError::NoAdapter(other)),
         }
     }
@@ -763,6 +792,14 @@ fn provider_for_model(model: &str) -> Option<&'static str> {
         Some("openai")
     } else if m.starts_with("gemini") {
         Some("google")
+    } else if m.starts_with("openrouter:") {
+        Some("openrouter")
+    } else if m.starts_with("groq:") {
+        Some("groq")
+    } else if m.starts_with("mistral:") {
+        Some("mistral")
+    } else if m.starts_with("xai:") {
+        Some("xai")
     } else {
         None
     }
@@ -1102,6 +1139,24 @@ mod tests {
             agent.provider_for("gemini-2.5-pro").unwrap().name(),
             "google"
         );
+    }
+
+    #[test]
+    fn compatible_providers_keep_distinct_credentials_and_model_namespaces() {
+        let agent = Agent::from_env([
+            ("OPENROUTER_API_KEY", "or-key"),
+            ("GROQ_API_KEY", "groq-key"),
+            ("MISTRAL_API_KEY", "mistral-key"),
+            ("XAI_API_KEY", "xai-key"),
+        ]);
+        for (model, provider) in [
+            ("openrouter:openai/gpt-4o", "openrouter"),
+            ("groq:llama-3.3-70b-versatile", "groq"),
+            ("mistral:mistral-large-latest", "mistral"),
+            ("xai:grok-3", "xai"),
+        ] {
+            assert_eq!(agent.provider_for(model).unwrap().name(), provider);
+        }
     }
 
     #[tokio::test]

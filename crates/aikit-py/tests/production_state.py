@@ -116,6 +116,7 @@ async def main() -> None:
         full_path = tmp / "full.jsonl"
         memory_path = tmp / "memory.json"
         session_path = tmp / "sessions.json"
+        sqlite_path = tmp / "state.db"
 
         invalid_enums = invalid_configuration_rejected(tmp / "invalid.jsonl")
         symlink = symlink_guard(tmp)
@@ -178,6 +179,36 @@ async def main() -> None:
         recalled = memory_reopened.recall("EUR")
         memory_isolated = Agent.from_env({})
         memory_isolated.use_memory_file(str(memory_path), namespace="tenant-b")
+
+        sqlite_writer = Agent.from_env({})
+        sqlite_writer.use_sqlite_memory(str(sqlite_path), namespace="tenant-a")
+        sqlite_writer.remember("sqlite_note", "durable SQLite")
+        sqlite_reader = Agent.from_env({})
+        sqlite_reader.use_sqlite_memory(str(sqlite_path), namespace="tenant-a")
+        assert sqlite_reader.recall("SQLite")[0]["key"] == "sqlite_note"
+
+        sqlite_sessions = Agent.from_env({})
+        sqlite_sessions.use_sqlite_sessions(str(sqlite_path))
+        sqlite_created = await sqlite_sessions.run_subagent(
+            child_spec("sqlite-session"), PROFILES
+        )
+        assert sqlite_created["status"] == "succeeded", sqlite_created
+        sqlite_reopened = Agent.from_env({})
+        sqlite_reopened.use_sqlite_sessions(str(sqlite_path))
+        sqlite_resumed = await sqlite_reopened.resume_subagent(
+            "sqlite-session", child_spec("sqlite-session-resumed"), PROFILES
+        )
+        assert sqlite_resumed["status"] == "succeeded", sqlite_resumed
+
+        network_tools = Agent.from_env({})
+        network_tools.register_web_tools(
+            ["example.com"], "https://example.com/search?q={query}"
+        )
+        network_tools.register_browser_tools(
+            "http://127.0.0.1:4444", "session", ["example.com"]
+        )
+        network_names = set(network_tools.capabilities()["tools"])
+        assert {"WebFetch", "WebSearch", "BrowserNavigate", "BrowserSnapshot"} <= network_names
 
         created = await agent.run_subagent(child_spec("persist-session"), PROFILES)
         assert created["status"] == "succeeded", created

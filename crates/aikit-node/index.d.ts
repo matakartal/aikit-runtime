@@ -175,6 +175,10 @@ export interface RunOptions {
   retry?: RetryPolicy;
   /** Caller-owned catalog/request used to select the model immediately before provider startup. */
   routing?: RoutingConfig;
+  compaction?: {
+    maxContextTokens: number;
+    keepRecentMessages?: number;
+  };
   /** Cancels and fully closes the run when aborted, including before the first delta. */
   signal?: AbortSignal;
 }
@@ -497,6 +501,15 @@ export type FailureHookResponse =
   | { action: "continue" }
   | { action: "rewrite"; error: string };
 
+export class McpServer {
+  static connectHttp(endpoint: string, name: string, bearerToken?: string): Promise<McpServer>;
+  static connectStdio(program: string, args: string[], name: string, env?: Record<string, string>, inheritEnv?: boolean): Promise<McpServer>;
+  listResources(cursor?: string): Promise<JsonValue>;
+  readResource(uri: string): Promise<JsonValue>;
+  listPrompts(cursor?: string): Promise<JsonValue>;
+  getPrompt(name: string, arguments: JsonValue): Promise<JsonValue>;
+}
+
 export class Agent {
   constructor();
   static fromEnv(env: Record<string, string>): Agent;
@@ -507,6 +520,13 @@ export class Agent {
   ): void;
   useMemoryFile(path: string, namespace?: string): void;
   useSessionFile(path: string): void;
+  useSqliteMemory(path: string, namespace?: string): void;
+  useSqliteSessions(path: string): void;
+  registerWebTools(allowedHosts: string[], searchEndpoint?: string, maxResponseBytes?: number): void;
+  registerBrowserTools(webdriverEndpoint: string, sessionId: string, allowedHosts: string[]): void;
+  registerMcp(server: McpServer): void;
+  enableCapabilityRequests(gatedTools: string[]): void;
+  enableDefaultGuardrails(blockedInputPatterns?: string[]): void;
   addKey(key: string, provider?: string): string;
   activeProviders(): string[];
   hasProvider(provider: string): boolean;

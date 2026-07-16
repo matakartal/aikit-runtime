@@ -11,10 +11,13 @@
 //! other multi-provider SDK bundles.
 
 pub mod builtin;
+pub mod web;
 
 use crate::error::{AikitError, Result};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 /// Ergonomic canonical tool-schema constructor. Execution is attached separately through a
 /// [`ToolExecutor`], keeping schema registration and side effects explicit.
@@ -42,5 +45,69 @@ impl ToolExecutor for NoTools {
         Err(AikitError::ToolExecution(format!(
             "no tool executor registered for '{name}'"
         )))
+    }
+}
+
+struct ToolRoute {
+    names: BTreeSet<String>,
+    executor: Arc<dyn ToolExecutor>,
+}
+
+/// Thread-safe registry that composes built-in, MCP, web, browser, and host-owned executors
+/// without allowing ambiguous tool-name shadowing.
+#[derive(Default)]
+pub struct ToolRouter {
+    routes: RwLock<Vec<ToolRoute>>,
+}
+
+impl ToolRouter {
+    pub fn register(
+        &self,
+        specs: &[crate::types::ToolSpec],
+        executor: Arc<dyn ToolExecutor>,
+    ) -> Result<()> {
+        let names: BTreeSet<_> = specs.iter().map(|spec| spec.name.clone()).collect();
+        if names.len() != specs.len() {
+            return Err(AikitError::Configuration(
+                "tool registration contains duplicate names".into(),
+            ));
+        }
+        let mut routes = self
+            .routes
+            .write()
+            .map_err(|_| AikitError::ToolExecution("tool router poisoned".into()))?;
+        if let Some(collision) = routes
+            .iter()
+            .flat_map(|route| route.names.iter())
+            .find(|name| names.contains(*name))
+        {
+            return Err(AikitError::Configuration(format!(
+                "tool '{collision}' is already routed"
+            )));
+        }
+        routes.push(ToolRoute { names, executor });
+        Ok(())
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.routes
+            .read()
+            .map(|routes| routes.iter().any(|route| route.names.contains(name)))
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ToolRouter {
+    async fn execute(&self, name: &str, input: Value) -> Result<String> {
+        let executor = self
+            .routes
+            .read()
+            .map_err(|_| AikitError::ToolExecution("tool router poisoned".into()))?
+            .iter()
+            .find(|route| route.names.contains(name))
+            .map(|route| route.executor.clone())
+            .ok_or_else(|| AikitError::ToolExecution(format!("unknown routed tool '{name}'")))?;
+        executor.execute(name, input).await
     }
 }

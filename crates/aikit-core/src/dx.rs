@@ -46,6 +46,18 @@ pub struct GeneratedObject {
     pub provider_metadata: crate::types::ProviderMetadata,
 }
 
+impl GeneratedObject {
+    /// Whether the object passed schema validation on the very first model round-trip. This is the
+    /// honest counterpart to [`fidelity`](Self::fidelity): the grade names the *mechanism* aikit
+    /// asked for, and this says whether that mechanism actually produced a valid object first-try.
+    /// A `NativeConstrained` grade with `held_on_first_try() == false` means the "constrained"
+    /// decoding still needed a repair round this call (e.g. a schema edge the constraint missed) —
+    /// surfaced, never hidden.
+    pub fn held_on_first_try(&self) -> bool {
+        self.attempts == 1
+    }
+}
+
 /// A schema-derived Rust value. `T` supplies both its JSON Schema and its deserializer, so native
 /// Rust callers never need to manually duplicate a serde type as an untyped JSON schema.
 #[derive(Debug, Clone)]

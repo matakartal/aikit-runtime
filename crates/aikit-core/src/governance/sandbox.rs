@@ -328,8 +328,22 @@ fn open_capability_root(path: &Path) -> Result<Arc<CapabilityRoot>, SandboxError
 }
 
 #[cfg(not(unix))]
-fn open_capability_root(_path: &Path) -> Result<Arc<CapabilityRoot>, SandboxError> {
-    Err(unsupported_platform())
+fn open_capability_root(path: &Path) -> Result<Arc<CapabilityRoot>, SandboxError> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| SandboxError::Io(format!("resolve {}: {error}", path.display())))?;
+    if !std::fs::metadata(&canonical)
+        .map_err(|error| SandboxError::Io(error.to_string()))?
+        .is_dir()
+    {
+        return Err(SandboxError::Io(format!(
+            "sandbox root is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(Arc::new(CapabilityRoot {
+        path: canonical.clone(),
+        aliases: vec![canonical],
+    }))
 }
 
 #[cfg(not(unix))]

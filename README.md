@@ -163,11 +163,16 @@ main();
 | Structured output | JSON Schema validation, bounded repair, streaming attempts, Pydantic and Zod materialization. |
 | Canonical messages | Text, reasoning, tools, media, citations, usage, and provider-owned metadata without flattening. |
 | Governance | Global allow / ask / deny rules, async approval, lifecycle hooks, input rewrites, and authoritative denial. |
+| Guardrails | Deterministic secret/PII redaction, regex blocking, and fail-closed MCP safety-server interop. |
+| Self-extension | Human-governed capability requests: the agent asks for a tool it lacks, a human decides, the grant is recorded — never a silent escalation. |
 | Tool runtime | Host callbacks plus opt-in Read, Write, Edit, Glob, Grep, and contained Bash. |
+| MCP | Stdio and Streamable HTTP client with tools, resources, prompts, auth/session propagation, and governed execution. |
 | Routing | Explicit or automatic model selection from a caller-owned catalog with hard capability and cost gates. |
 | Resilience | Typed failures, bounded retry, pre-stream fallback, cancellation, deadlines, and terminal outcomes. |
 | Orchestration | Scoped subagents, ordered parallel fan-out, council synthesis, quorum, and shared budget accounting. |
-| State | Namespaced memory, revisioned sessions, canonical run recording, and resumable subagents. |
+| State | Namespaced memory, revisioned sessions, JSON/transactional SQLite persistence, canonical recording, and resume. |
+| Compaction | Opt-in transcript bounding: keep the task anchor and recent tail within a token budget, preserving tool pairing. |
+| Web and browser | HTTPS allowlisted fetch/search plus an existing-session WebDriver executor; both use the shared governed tool boundary. |
 | Observability | Typed audit lifecycle, metadata-only redaction by default, JSONL sinks, and an optional Rust OpenTelemetry bridge. |
 
 ## Governed tool execution

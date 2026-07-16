@@ -83,6 +83,42 @@ impl CapabilityRegistry {
                     structured_output: FidelityGrade::PromptedAndParsed,
                     reasoning_replay: ReplayPolicy::PreserveForToolCalls,
                 },
+                Capabilities {
+                    provider: "openrouter".into(),
+                    supports_reasoning: true,
+                    supports_prompt_cache: false,
+                    supports_citations: false,
+                    supports_vision: true,
+                    structured_output: FidelityGrade::PromptedAndParsed,
+                    reasoning_replay: ReplayPolicy::DropOnReplay,
+                },
+                Capabilities {
+                    provider: "groq".into(),
+                    supports_reasoning: false,
+                    supports_prompt_cache: false,
+                    supports_citations: false,
+                    supports_vision: false,
+                    structured_output: FidelityGrade::PromptedAndParsed,
+                    reasoning_replay: ReplayPolicy::DropOnReplay,
+                },
+                Capabilities {
+                    provider: "mistral".into(),
+                    supports_reasoning: false,
+                    supports_prompt_cache: false,
+                    supports_citations: false,
+                    supports_vision: true,
+                    structured_output: FidelityGrade::PromptedAndParsed,
+                    reasoning_replay: ReplayPolicy::DropOnReplay,
+                },
+                Capabilities {
+                    provider: "xai".into(),
+                    supports_reasoning: true,
+                    supports_prompt_cache: false,
+                    supports_citations: false,
+                    supports_vision: true,
+                    structured_output: FidelityGrade::PromptedAndParsed,
+                    reasoning_replay: ReplayPolicy::DropOnReplay,
+                },
             ],
         }
     }
@@ -167,6 +203,8 @@ mod tests {
             reasoning_replay: ReplayPolicy::DropOnReplay,
         });
         assert!(reg.get("openai_compat:together").is_some());
-        assert_eq!(reg.providers().count(), 5);
+        // Robust against the built-in provider set growing: upsert must add exactly one.
+        let builtin_count = CapabilityRegistry::builtin().providers().count();
+        assert_eq!(reg.providers().count(), builtin_count + 1);
     }
 }

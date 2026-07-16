@@ -7,7 +7,16 @@
 //! guessing wrong — the caller disambiguates with an explicit provider or the env-var name.
 
 /// Canonical provider names aikit knows how to activate from a credential.
-pub const KNOWN_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "deepseek"];
+pub const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "deepseek",
+    "openrouter",
+    "groq",
+    "mistral",
+    "xai",
+];
 
 /// What a raw key's *format* tells us about its provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +63,10 @@ pub fn provider_from_env_var(name: &str) -> Option<&'static str> {
         "OPENAI_API_KEY" => Some("openai"),
         "DEEPSEEK_API_KEY" => Some("deepseek"),
         "GEMINI_API_KEY" | "GOOGLE_API_KEY" => Some("google"),
+        "OPENROUTER_API_KEY" => Some("openrouter"),
+        "GROQ_API_KEY" => Some("groq"),
+        "MISTRAL_API_KEY" => Some("mistral"),
+        "XAI_API_KEY" => Some("xai"),
         _ => None,
     }
 }

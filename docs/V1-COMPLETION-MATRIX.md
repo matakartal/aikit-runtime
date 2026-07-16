@@ -18,11 +18,13 @@ wire request or that an artifact has been published under an authorized registry
 | Audit | Typed lifecycle, provider, permission, hook, tool, usage, budget, structured-output, and subagent events; metadata-only default; fail-closed JSONL; optional Rust-host OTel bridge | `observability.rs`; binding JSONL configuration; audit conformance | Complete; OTel exporter ownership remains with the Rust host |
 | Built-in tools | Read/Write/Edit/Glob/Grep and separately enabled Bash, with canonical schemas and host/builtin collision safety | `tools/builtin/*`; Rust/Python/Node public surfaces and runtime tests | Complete on supported jailed platforms |
 | Filesystem jail | Descriptor-relative access, no symlink following, multiple roots, regular-file enforcement, and race-resistant writes | `governance/sandbox.rs`, `tools/builtin/fs.rs` tests | Complete on Linux/macOS; unsupported platforms fail closed |
-| Bash containment | Environment/resource limits, cancellation cleanup, and required Seatbelt or hardened Docker isolation | `governance/process.rs`, `governance/containment/*`, threat model and binding capability probe | Complete for documented Seatbelt/Docker boundary; not a universal native OS sandbox |
+| Bash containment | Environment/resource limits, cancellation cleanup, and required native/Docker isolation | `governance/process.rs`, `governance/containment/*`, threat model and platform probes | Seatbelt, Linux namespace+seccomp, Windows Job, and Docker implemented with distinct guarantees |
 | Budget/resilience | Turn/token/USD/wall-time limits, shared reservations, caller pricing, retry/backoff, fallback-before-first-delta, and typed errors | `budget.rs`, `resilience.rs`, `runtime.rs`, `orchestration.rs` | Complete |
 | Routing/council | Caller-owned model catalog, deterministic explicit/automatic normal-run routing, bounded fan-out, and quorum synthesis | `routing.rs`, `client.rs`, `orchestration.rs`, `INPUT` conformance | Complete |
 | Subagents | Inherited governance/hooks/approver/tools, narrowed scope, shared budget/deadline, audit correlation, and resume | `orchestration.rs`; Python/Node context and resume tests | Complete |
-| Memory/session | Explicit namespaced memory, persistent local JSON stores, canonical run recording, revisioned CAS sessions, and resume | `memory.rs`, `session.rs`; binding file-store/reopen tests | Complete for process-local stores; distributed durability is deferred |
+| Memory/session | Explicit namespaced memory, JSON and transactional SQLite stores, canonical recording, revisioned CAS, and resume | `memory.rs`, `session.rs`, `sqlite.rs`; reopen and cross-instance conflict tests | Complete for in-memory, file, and cross-process local SQLite stores |
+| Agent extensions | MCP stdio/HTTP tools/resources/prompts, governed Web/Browser, human-approved capability requests, and compaction | `mcp.rs`, `tools/web.rs`, `governance/capability.rs`, `compaction.rs`; three SDK surfaces | Complete keylessly |
+| Provider breadth | Four native adapters plus isolated OpenRouter, Groq, Mistral, and xAI compatible endpoints | provider, credential, capability, and routing tests | Implementation complete; live acceptance remains explicit and billable |
 | Rust SDK | Ergonomic `aikit` facade over the single core | `crates/aikit`, examples, rustdoc/doctests | Complete locally |
 | Python SDK | Typed PyO3 package, async streams/callbacks, canonical media input, typed errors, tool/DX helpers, governance, objects, audit, orchestration, and local stores | `crates/aikit-py`, strict mypy and runtime tests | Complete locally |
 | TypeScript SDK | Typed napi package, async iterables/callbacks, canonical media input, typed errors, tool/DX helpers, Zod objects, audit, orchestration, and local stores | `crates/aikit-node`, strict tsc and runtime tests | Complete locally |
@@ -33,11 +35,10 @@ wire request or that an artifact has been published under an authorized registry
 
 ## Deliberate post-v1 boundaries
 
-Full MCP client support, a built-in Web tool, distributed session transactions, advanced context
-compaction, LiteLLM/long-tail adapters, and WASM/browser support remain post-v1. Native Linux
-namespace/seccomp launch and Windows job-object/sandbox support are also not claimed: required Bash
-uses a configured hardened Docker backend there, while the descriptor-relative file jail currently
-supports Linux and macOS.
+Remote database services, model-generated compaction summaries, MCP server mode, WASM packaging,
+and stronger Windows filesystem/network isolation remain post-v1. Windows Job Objects deliberately
+claim process-tree/resource containment only; the descriptor-relative file jail remains
+Linux/macOS-only.
 
 ## External release blockers
 

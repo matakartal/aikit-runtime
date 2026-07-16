@@ -5,7 +5,9 @@
 //! backend can be proved available, command preparation fails before untrusted code starts.
 
 mod container;
+mod linux;
 mod macos;
+mod windows;
 
 use crate::error::{AikitError, Result};
 use serde::{Deserialize, Serialize};
@@ -17,8 +19,9 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendSelector {
-    /// Prefer the native backend on macOS, otherwise use a configured Docker backend.
+    /// Prefer the native backend for the host OS, otherwise use configured Docker.
     Auto,
+    Native,
     Seatbelt,
     Docker,
 }
@@ -90,6 +93,13 @@ impl ContainmentPolicy {
         }
     }
 
+    pub fn required_native() -> Self {
+        ContainmentPolicy {
+            requirement: ContainmentRequirement::Required(BackendSelector::Native),
+            docker: None,
+        }
+    }
+
     pub fn required_docker(config: DockerConfig) -> Self {
         ContainmentPolicy {
             requirement: ContainmentRequirement::Required(BackendSelector::Docker),
@@ -118,6 +128,8 @@ impl ContainmentPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ActiveContainmentBackend {
     Seatbelt,
+    LinuxNamespace,
+    WindowsJob,
     Docker,
     Uncontained,
 }
@@ -153,6 +165,28 @@ impl ContainmentGuarantees {
             network_boundary: true,
             descendant_inheritance: true,
             syscall_filter: true,
+            resource_limits: true,
+        }
+    }
+
+    const fn linux_namespace() -> Self {
+        ContainmentGuarantees {
+            filesystem_write_boundary: true,
+            sensitive_home_read_boundary: true,
+            network_boundary: true,
+            descendant_inheritance: true,
+            syscall_filter: true,
+            resource_limits: true,
+        }
+    }
+
+    const fn windows_job() -> Self {
+        ContainmentGuarantees {
+            filesystem_write_boundary: false,
+            sensitive_home_read_boundary: false,
+            network_boundary: false,
+            descendant_inheritance: true,
+            syscall_filter: false,
             resource_limits: true,
         }
     }
@@ -303,6 +337,8 @@ pub async fn containment_capabilities(
     }
 
     let seatbelt = macos::capability(workdir).await;
+    let linux = linux::capability(workdir).await;
+    let windows = windows::capability(workdir).await;
     let docker = match (&policy.docker, workdir) {
         (Some(config), Some(workdir)) => container::capability(config, workdir).await,
         (None, _) => BackendCapability::unavailable(
@@ -324,9 +360,24 @@ pub async fn containment_capabilities(
         ContainmentRequirement::Required(BackendSelector::Docker) if docker.available => {
             Some(ActiveContainmentBackend::Docker)
         }
+        ContainmentRequirement::Required(BackendSelector::Native) => {
+            if cfg!(target_os = "macos") && seatbelt.available {
+                Some(ActiveContainmentBackend::Seatbelt)
+            } else if cfg!(target_os = "linux") && linux.available {
+                Some(ActiveContainmentBackend::LinuxNamespace)
+            } else if cfg!(target_os = "windows") && windows.available {
+                Some(ActiveContainmentBackend::WindowsJob)
+            } else {
+                None
+            }
+        }
         ContainmentRequirement::Required(BackendSelector::Auto) => {
             if cfg!(target_os = "macos") && seatbelt.available {
                 Some(ActiveContainmentBackend::Seatbelt)
+            } else if cfg!(target_os = "linux") && linux.available {
+                Some(ActiveContainmentBackend::LinuxNamespace)
+            } else if cfg!(target_os = "windows") && windows.available {
+                Some(ActiveContainmentBackend::WindowsJob)
             } else if docker.available {
                 Some(ActiveContainmentBackend::Docker)
             } else {
@@ -340,7 +391,7 @@ pub async fn containment_capabilities(
         requirement: policy.requirement,
         selected_backend,
         fail_closed: true,
-        backends: vec![seatbelt, docker],
+        backends: vec![seatbelt, linux, windows, docker],
     }
 }
 
@@ -352,8 +403,18 @@ pub(crate) async fn prepare_command(
     limits: ContainmentLimits,
 ) -> Result<PreparedCommand> {
     if matches!(policy.requirement, ContainmentRequirement::Uncontained) {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
+        #[cfg(windows)]
+        let cmd = {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.args(["/d", "/s", "/c"]).arg(command);
+            cmd
+        };
+        #[cfg(not(windows))]
+        let cmd = {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(command);
+            cmd
+        };
         return Ok(PreparedCommand {
             command: cmd,
             backend: ActiveContainmentBackend::Uncontained,
@@ -381,6 +442,7 @@ pub(crate) async fn prepare_command(
 
     match selected {
         ActiveContainmentBackend::Seatbelt => macos::prepare(command, workdir),
+        ActiveContainmentBackend::LinuxNamespace => linux::prepare(command, workdir),
         ActiveContainmentBackend::Docker => {
             let config = policy.docker.as_ref().ok_or_else(|| {
                 AikitError::Sandbox(
@@ -389,6 +451,7 @@ pub(crate) async fn prepare_command(
             })?;
             container::prepare(command, workdir, config, environment, limits)
         }
+        ActiveContainmentBackend::WindowsJob => windows::prepare(command, workdir, limits),
         ActiveContainmentBackend::Uncontained => unreachable!("required policy selected opt-out"),
     }
 }

@@ -167,6 +167,11 @@ jobs:
           if (Number(process.versions.napi) < 9) throw new Error('Node runtime lacks N-API 9');
           const a = Agent.fromEnv({});
           if (!Array.isArray(a.activeProviders())) throw new Error('native addon smoke failed');"
+      - name: Probe Windows Job containment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          node -e "const fs=require('fs'),os=require('os'),path=require('path'); (async()=>{ const {Agent}=require('./crates/aikit-node'); const root=fs.mkdtempSync(path.join(os.tmpdir(),'aikit-job-')); const a=Agent.fromEnv({}); a.registerBuiltinTools([root]); a.enableBashWithRequiredContainment(); const r=await a.builtinContainmentCapabilities(); if(r.selected_backend!=='windows_job') throw new Error(JSON.stringify(r)); })().catch(e=>{console.error(e);process.exit(1)})"
       - name: Pack and load through optional platform dependency
         shell: bash
         run: ./scripts/test-node-package-layout.sh "${{ matrix.target }}" "${{ matrix.native }}"

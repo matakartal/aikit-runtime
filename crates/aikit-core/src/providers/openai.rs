@@ -373,8 +373,10 @@ const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 /// Live OpenAI Chat Completions adapter: `build_request` → POST (SSE) → [`OpenAiStreamParser`]
 /// → canonical [`StreamDelta`]s. `base_url` is overridable for tests (point it at a mock server).
 pub struct OpenAiProvider {
+    provider_name: String,
     api_key: String,
     base_url: String,
+    model_prefix: Option<String>,
     client: reqwest::Client,
 }
 
@@ -385,6 +387,25 @@ impl OpenAiProvider {
 
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         OpenAiProvider {
+            provider_name: "openai".into(),
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model_prefix: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Connect an OpenAI Chat Completions compatible provider without mislabelling its
+    /// credentials, options, audit errors, or model namespace as OpenAI.
+    pub fn compatible(
+        provider_name: impl Into<String>,
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let provider_name = provider_name.into();
+        Self {
+            model_prefix: Some(format!("{provider_name}:")),
+            provider_name,
             api_key: api_key.into(),
             base_url: base_url.into(),
             client: reqwest::Client::new(),
@@ -395,7 +416,7 @@ impl OpenAiProvider {
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
-        "openai"
+        &self.provider_name
     }
 
     async fn stream(
@@ -403,8 +424,13 @@ impl Provider for OpenAiProvider {
         req: ProviderRequest,
     ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
         let options = req.options_for(self.name());
+        let wire_model = self
+            .model_prefix
+            .as_deref()
+            .and_then(|prefix| req.model.strip_prefix(prefix))
+            .unwrap_or(&req.model);
         let body = build_request(
-            &req.model,
+            wire_model,
             req.max_tokens,
             &req.messages,
             &req.tools,
@@ -419,14 +445,14 @@ impl Provider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| super::transport_failure("openai", &req.model, error))?;
+            .map_err(|error| super::transport_failure(self.name(), &req.model, error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
             let text = resp.text().await.unwrap_or_default();
             return Err(super::http_failure(
-                "openai",
+                self.name(),
                 &req.model,
                 status,
                 retry_after.as_ref(),
@@ -435,6 +461,7 @@ impl Provider for OpenAiProvider {
         }
 
         let model = req.model.clone();
+        let provider_name = self.provider_name.clone();
         let mut byte_stream = resp.bytes_stream().boxed();
         let out = async_stream::stream! {
             let mut parser = OpenAiStreamParser::new();
@@ -454,7 +481,7 @@ impl Provider for OpenAiProvider {
                                 }
                                 if data == "[DONE]" {
                                     for d in parser.finish() {
-                                        yield super::with_stream_context(d, "openai", &model);
+                                        yield super::with_stream_context(d, &provider_name, &model);
                                     }
                                     done = true;
                                     break;
@@ -462,12 +489,12 @@ impl Provider for OpenAiProvider {
                                 match serde_json::from_str::<Value>(data) {
                                     Ok(json) => {
                                         for d in parser.push_chunk(&json) {
-                                            yield super::with_stream_context(d, "openai", &model);
+                                            yield super::with_stream_context(d, &provider_name, &model);
                                         }
                                     }
                                     Err(_) => {
                                         yield super::stream_failure(
-                                            "openai",
+                                            &provider_name,
                                             &model,
                                             crate::error::ProviderErrorKind::Protocol,
                                             "malformed OpenAI Chat SSE data",
@@ -483,7 +510,7 @@ impl Provider for OpenAiProvider {
                     }
                     Err(_) => {
                         yield super::stream_failure(
-                            "openai",
+                            &provider_name,
                             &model,
                             crate::error::ProviderErrorKind::Transport,
                             "OpenAI Chat response stream transport failed",
@@ -495,7 +522,7 @@ impl Provider for OpenAiProvider {
             // Flush a terminal Usage + MessageStop even if the server closed without `[DONE]`.
             if !done {
                 for d in parser.finish() {
-                    yield super::with_stream_context(d, "openai", &model);
+                    yield super::with_stream_context(d, &provider_name, &model);
                 }
             }
         };
@@ -754,5 +781,36 @@ mod tests {
         assert!(out.contains(&StreamDelta::MessageStop {
             stop_reason: "end_turn".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn compatible_provider_strips_only_its_routing_prefix() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::compatible("groq", "key", server.uri());
+        let req = ProviderRequest {
+            model: "groq:llama-3.3".into(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 10,
+            options: serde_json::Map::new(),
+            provider_options: crate::types::ProviderOptions::new(),
+        };
+        let _: Vec<_> = provider.stream(req).await.unwrap().collect().await;
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "llama-3.3");
+        assert_eq!(provider.name(), "groq");
     }
 }

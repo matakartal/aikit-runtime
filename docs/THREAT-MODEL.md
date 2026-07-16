@@ -21,7 +21,8 @@ a compromised Docker daemon, a malicious host callback, or a privileged actor on
    descriptor-relatively with symlink following disabled for Read/Write/Edit/Grep/Glob.
 3. `BashPolicy` scrubs the child environment, caps output and time, applies Unix rlimits, and kills
    the process group on timeout.
-4. `ContainmentPolicy` places built-in Bash behind Seatbelt or a hardened Docker container.
+4. `ContainmentPolicy` places built-in Bash behind Seatbelt, Linux namespaces+seccomp, a Windows
+   Job Object, or hardened Docker.
 
 These layers are independent. In particular, the in-process path jail cannot contain a shell.
 
@@ -29,7 +30,8 @@ These layers are independent. In particular, the in-process path jail cannot con
 
 | Policy | Behavior |
 |---|---|
-| `Required(Auto)` | On macOS, select a successfully probed Seatbelt backend. Otherwise select a configured and successfully probed Docker backend. If neither is ready, deny execution. |
+| `Required(Auto)` | Select a successfully probed host-native backend (Seatbelt, Linux namespaces+seccomp, or Windows Job), then configured Docker; otherwise deny. |
+| `Required(Native)` | Use only the successfully probed native backend for the host OS. |
 | `Required(Seatbelt)` | Use only the probed macOS Seatbelt backend; deny elsewhere or on probe failure. |
 | `Required(Docker)` | Use only the configured Docker backend; deny if its executable, daemon security, or immutable local image check fails. |
 | `Uncontained` | Explicit opt-out. Only `BashPolicy` hardening remains; the capability report says `fail_closed: false`. |
@@ -57,16 +59,15 @@ security boundary. The Python and Node built-in APIs do not expose this opt-out.
 
 ## Backend guarantees
 
-| Mechanism | macOS Seatbelt | Hardened Docker |
-|---|---|---|
-| Workspace | Read/write | Read/write bind mount at `/workspace` |
-| Other filesystem writes | Denied, except private temp and `/dev/null` | Read-only image root; private bounded tmpfs |
-| Sensitive home reads | Other `/Users` homes and the real home outside workspace are denied; child gets a private `HOME` | Host home is not mounted; child gets `/tmp` as `HOME` |
-| Network | `network*` denied | `--network=none` |
-| Descendants | Seatbelt policy is inherited; normal descendants are process-group terminated on timeout/cancellation | Container boundary is inherited; named container is force-removed on timeout/cancellation |
-| Privilege | Apple Events and LaunchServices sends denied | All capabilities dropped, `no-new-privileges`, non-root user |
-| Syscalls | No aikit-authored syscall allow-list | Docker builtin seccomp profile required and selected |
-| Resources | `BashPolicy` timeout, output cap, rlimits | Timeout/output cap plus CPU, memory/swap, pids, ulimits, bounded tmpfs |
+| Mechanism | Seatbelt | Linux namespace | Windows Job | Docker |
+|---|---|---|---|---|
+| Workspace writes | Yes | Yes | Host ACLs only | Bind mount |
+| Other writes | Denied except private temp | Read-only root, private temp | Not isolated | Read-only root, tmpfs |
+| Sensitive home reads | Denied outside workspace | Host root readable; real home hidden by scrubbed `HOME` but not a read boundary | Not isolated | Host home not mounted |
+| Network | Denied | New network namespace | Not isolated | None |
+| Descendants | Policy inherited | Namespace/filter inherited | Kill-on-close job inherited | Container inherited |
+| Syscalls | No custom filter | Deny filter for privilege/escape syscalls | No syscall filter | Runtime seccomp profile |
+| Resources | Timeout/output/rlimits | Timeout/output/rlimits | Process count, memory, timeout/output | CPU/memory/pids/ulimits/tmpfs |
 
 Outer command construction is argv-safe: workspace paths, environment keys, image references, and
 Docker options are separate arguments. The final model-produced command is intentionally passed as
@@ -107,6 +108,22 @@ its argv.
 - Cancellation starts an argv-safe `docker rm -f` before the dropped future returns. This is
   necessarily best-effort if the trusted Docker executable or daemon itself is unavailable.
 
+### Linux namespace and seccomp
+
+- Selection requires `/usr/bin/bwrap` and an active enforcement probe. User, mount, PID, IPC, UTS,
+  cgroup, and network namespaces are created; the host root is read-only and the workspace is
+  rebound writable.
+- The seccomp filter denies selected privilege/escape syscalls and defaults to allow for developer
+  tool compatibility. It is not a complete syscall allowlist or VM boundary.
+
+### Windows Job Object
+
+- PowerShell hosts a small P/Invoke launcher. The command process is created suspended, assigned to
+  a kill-on-close Job Object with active-process and memory limits, then resumed.
+- Job Objects do not isolate filesystem reads/writes, network access, registry access, or syscalls.
+  The capability report marks those guarantees false. Use Docker or an external Windows sandbox
+  when those boundaries are required.
+
 ## Scope and unsupported surfaces
 
 OS containment currently covers the built-in Bash executor. Read/Write/Edit/Grep/Glob use the
@@ -126,11 +143,9 @@ do not provide encryption, tenant authentication, backup policy, or cross-proces
 Concurrent JSONL sinks for the same canonical path serialize appends only inside one process;
 multi-process writers need external coordination.
 
-There is no native Linux namespace/seccomp launcher or Windows sandbox backend in this slice.
-Linux and Windows therefore need the configured Docker backend for required Bash containment.
-The descriptor-relative file-tool jail itself supports Linux/macOS and fails closed on Windows, so
-the current Python/Node combined built-in suite is not a Windows file-tool surface. Without Docker,
-Windows can terminate only the direct child; it has no built-in descendant-tree job-object
-integration in this release.
+The descriptor-relative file-tool jail supports Linux/macOS and fails closed for file operations
+on Windows. The Windows Job backend is therefore a Bash process/resource boundary, not a Windows
+file-tool sandbox. Docker remains the stronger documented Windows option when filesystem and
+network isolation are required.
 `run_bash()` remains uncontained for source compatibility; security-sensitive callers must use
 `run_bash_with_containment()` or `BuiltinTools::with_bash()`.

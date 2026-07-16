@@ -28,6 +28,8 @@ async-stream.workspace = true
 thiserror.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+url = "2"
 jsonschema = { version = "0.47", default-features = false }
 schemars = "1"
 tempfile = "3"

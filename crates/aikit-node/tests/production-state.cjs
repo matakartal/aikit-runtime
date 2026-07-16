@@ -110,6 +110,7 @@ async function main() {
     const fullPath = path.join(tmp, "full.jsonl");
     const memoryPath = path.join(tmp, "memory.json");
     const sessionPath = path.join(tmp, "sessions.json");
+    const sqlitePath = path.join(tmp, "state.db");
 
     const invalidEnums = invalidConfigurationRejected(path.join(tmp, "invalid.jsonl"));
     const symlink = symlinkGuard(tmp);
@@ -167,6 +168,38 @@ async function main() {
     const recalled = memoryReopened.recall("EUR");
     const memoryIsolated = Agent.fromEnv({});
     memoryIsolated.useMemoryFile(memoryPath, "tenant-b");
+
+    const sqliteWriter = Agent.fromEnv({});
+    sqliteWriter.useSqliteMemory(sqlitePath, "tenant-a");
+    sqliteWriter.remember("sqlite_note", "durable SQLite");
+    const sqliteReader = Agent.fromEnv({});
+    sqliteReader.useSqliteMemory(sqlitePath, "tenant-a");
+    assert.equal(sqliteReader.recall("SQLite")[0].key, "sqlite_note");
+
+    const sqliteSessions = Agent.fromEnv({});
+    sqliteSessions.useSqliteSessions(sqlitePath);
+    const sqliteCreated = await sqliteSessions.runSubagent(
+      childSpec("sqlite-session"), profiles,
+    );
+    assert.equal(sqliteCreated.status, "succeeded");
+    const sqliteReopened = Agent.fromEnv({});
+    sqliteReopened.useSqliteSessions(sqlitePath);
+    const sqliteResumed = await sqliteReopened.resumeSubagent(
+      "sqlite-session", childSpec("sqlite-session-resumed"), profiles,
+    );
+    assert.equal(sqliteResumed.status, "succeeded");
+
+    const networkTools = Agent.fromEnv({});
+    networkTools.registerWebTools(
+      ["example.com"], "https://example.com/search?q={query}",
+    );
+    networkTools.registerBrowserTools(
+      "http://127.0.0.1:4444", "session", ["example.com"],
+    );
+    const networkNames = new Set(networkTools.capabilities().tools);
+    for (const name of ["WebFetch", "WebSearch", "BrowserNavigate", "BrowserSnapshot"]) {
+      assert(networkNames.has(name));
+    }
 
     const created = await agent.runSubagent(childSpec("persist-session"), profiles);
     assert.equal(created.status, "succeeded");

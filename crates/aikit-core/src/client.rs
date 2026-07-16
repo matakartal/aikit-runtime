@@ -3,6 +3,7 @@
 use crate::agent::{Agent, AgentError};
 use crate::budget::BudgetPolicy;
 use crate::cancellation::{CancellationHandle, CancellationToken};
+use crate::compaction::CompactionPolicy;
 use crate::governance::Governance;
 use crate::observability::AuditTrail;
 use crate::resilience::RetryPolicy;
@@ -94,6 +95,8 @@ pub struct AgentOptions {
     pub governance: Governance,
     pub audit: AuditTrail,
     pub budget: BudgetPolicy,
+    /// Optional transcript bounding for long-running agents. Disabled by default.
+    pub compaction: CompactionPolicy,
     pub retry: RetryPolicy,
     /// Optional caller-owned catalog/request. When present, routing selects `model` immediately
     /// before provider construction; the explicit `model` field becomes only the fallback default.
@@ -126,6 +129,7 @@ impl Default for AgentOptions {
             governance: Governance::default(),
             audit: AuditTrail::default(),
             budget: BudgetPolicy::default(),
+            compaction: CompactionPolicy::default(),
             retry: RetryPolicy::default(),
             routing: None,
             cancellation: CancellationToken::new(),
@@ -318,6 +322,7 @@ impl Client {
         config.governance = options.governance;
         config.audit = options.audit;
         config.budget = options.budget;
+        config.compaction = options.compaction;
         config.cancellation = options.cancellation;
         if let Some(recorder) = recorder {
             config.recorder = recorder;
