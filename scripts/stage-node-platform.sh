@@ -29,6 +29,8 @@ cp "$TEMPLATE" "$DEST/package.json"
 cp LICENSE-APACHE LICENSE-MIT "$DEST/"
 cp "$NATIVE_FILE" "$DEST/aikit_node.node"
 
+# Keep JavaScript single-quoted so the shell cannot expand template literals.
+# shellcheck disable=SC2016
 node -e '
 const fs = require("fs");
 const path = require("path");

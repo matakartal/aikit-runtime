@@ -12,4 +12,13 @@ if [ "${AIKIT_LIVE_SMOKE_FULL:-}" = "1" ]; then
   echo "Running FULL live matrix: all four key+model pairs are required before any call."
 fi
 
-cargo test -p aikit-runtime --test live_smoke -- --ignored --nocapture
+if [ -n "${AIKIT_LIVE_SMOKE_BIN:-}" ]; then
+  if [ ! -x "$AIKIT_LIVE_SMOKE_BIN" ]; then
+    echo "Configured live-smoke binary is not executable: $AIKIT_LIVE_SMOKE_BIN" >&2
+    exit 2
+  fi
+
+  exec "$AIKIT_LIVE_SMOKE_BIN" --ignored --nocapture
+fi
+
+cargo test -p aikit-runtime --test live_smoke --locked -- --ignored --nocapture

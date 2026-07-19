@@ -18,18 +18,32 @@ jobs:
     name: Rust strict gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
       - name: Release-candidate metadata invariants
         run: ./scripts/release-check.sh --candidate
+      - name: Release gate rejects incomplete tag history
+        run: |
+          shallow_root="$(mktemp -d)"
+          trap 'rm -r "$shallow_root"' EXIT
+          git clone --quiet --depth 1 --no-tags "file://$GITHUB_WORKSPACE" "$shallow_root/repo"
+          if "$shallow_root/repo/scripts/release-check.sh" --candidate >"$shallow_root/output" 2>&1; then
+            echo "release gate unexpectedly accepted a shallow checkout" >&2
+            exit 1
+          fi
+          grep -Fq "require a non-shallow Git checkout with fetched tags" "$shallow_root/output"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (workspace, all targets and features)
@@ -50,14 +64,14 @@ jobs:
     name: Rust 1.88 MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "20"
-      - uses: dtolnay/rust-toolchain@master
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.88.0"
       - name: Check declared MSRV
@@ -67,14 +81,16 @@ jobs:
     name: Rust, Python, and Node conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
       - name: Rust public-surface conformance
         run: |
           cargo test -p aikit-runtime --locked
@@ -83,7 +99,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --disable-pip-version-check \
-            "maturin>=1.5,<2" "mypy==1.19.1" "pydantic==2.13.4"
+            "maturin==1.14.1" "mypy==1.19.1" "pydantic==2.13.4"
           .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml --locked
       - name: Python FFI and governed-agent scenarios
         run: |
@@ -93,6 +109,9 @@ jobs:
           .venv/bin/python examples/python/conformance.py
           .venv/bin/python crates/aikit-py/tests/subagent_context.py
           .venv/bin/python crates/aikit-py/tests/builtin_tools.py
+          .venv/bin/python crates/aikit-py/tests/mcp_filter.py
+          .venv/bin/python crates/aikit-py/tests/semantic_validator.py
+          .venv/bin/python crates/aikit-py/tests/evaluate_outcome.py
           .venv/bin/python crates/aikit-py/tests/production_state.py
           .venv/bin/python crates/aikit-py/tests/multimodal_messages.py
           .venv/bin/mypy --strict crates/aikit-py/tests/typing_contract.py
@@ -112,6 +131,9 @@ jobs:
           node examples/node/conformance.cjs
           node crates/aikit-node/tests/subagent-context.cjs
           node crates/aikit-node/tests/builtin-tools.cjs
+          node crates/aikit-node/tests/mcp-filter.cjs
+          node crates/aikit-node/tests/semantic-validator.cjs
+          node crates/aikit-node/tests/evaluate-outcome.cjs
           node crates/aikit-node/tests/production-state.cjs
           node crates/aikit-node/tests/multimodal-messages.cjs
           npx --yes --package typescript@5.9.3 tsc --noEmit --strict --target ES2020 \
@@ -134,27 +156,29 @@ jobs:
             target: linux-x64-gnu
             native: target/release/libaikit_node.so
           - os: ubuntu-24.04-arm
-            node: "20"
+            node: "24"
             target: linux-arm64-gnu
             native: target/release/libaikit_node.so
           - os: macos-latest
-            node: "20"
+            node: "24"
             target: darwin-arm64
             native: target/release/libaikit_node.dylib
           - os: macos-15-intel
-            node: "20"
+            node: "24"
             target: darwin-x64
             native: target/release/libaikit_node.dylib
           - os: windows-latest
-            node: "20"
+            node: "24"
             target: win32-x64-msvc
             native: target/release/aikit_node.dll
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
       - name: Build release addon
         run: cargo build -p aikit-node --release --locked
       - name: Stage local checkout addon
@@ -180,14 +204,16 @@ jobs:
     name: Package dry-runs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: "20"
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
       - name: Rust crates
         run: |
           cargo package -p aikit-runtime-core --allow-dirty --locked
@@ -205,7 +231,7 @@ jobs:
           grep -Fxq src/lib.rs /tmp/aikit-package-files.txt
       - name: Python wheel
         run: |
-          python -m pip install --disable-pip-version-check "maturin>=1.5,<2"
+          python -m pip install --disable-pip-version-check "maturin==1.14.1"
           maturin build --manifest-path crates/aikit-py/Cargo.toml --release --locked --out dist/python
           wheel="$(find dist/python -name '*.whl' -print -quit)"
           test -n "$wheel"
@@ -231,8 +257,10 @@ jobs:
     name: Live smoke remains explicit and keyless CI skips it
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
       - name: Ignored smoke test is not executed by normal CI
         run: cargo test -p aikit-runtime --test live_smoke --locked
       - name: Wrapper refuses calls without explicit acknowledgement

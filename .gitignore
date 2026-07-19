@@ -30,3 +30,6 @@ npm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+
+# Local tool state (for example GitHub CLI device identifiers)
+.local/

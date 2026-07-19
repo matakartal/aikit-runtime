@@ -31,10 +31,21 @@ jobs:
   four-provider-contract:
     name: Four-provider billable contract
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: release
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Build the smoke-test binary without provider secrets
+        id: build
+        shell: bash
+        run: |
+          cargo test -p aikit-runtime --test live_smoke --locked --no-run
+          binary="$(find target/debug/deps -maxdepth 1 -type f -name 'live_smoke-*' -perm -111 -print -quit)"
+          test -n "$binary"
+          printf 'binary=%s\n' "$binary" >> "$GITHUB_OUTPUT"
       - name: Resolve the full secret/model matrix before the first request
         shell: bash
         env:
@@ -49,6 +60,7 @@ jobs:
           AIKIT_SMOKE_GOOGLE_MODEL: ${{ inputs.google_model }}
           AIKIT_LIVE_SMOKE: "1"
           AIKIT_LIVE_SMOKE_FULL: "1"
+          AIKIT_LIVE_SMOKE_BIN: ${{ steps.build.outputs.binary }}
         run: ./scripts/live-smoke.sh
       - name: Write a secret-free evidence artifact
         shell: bash
@@ -69,7 +81,7 @@ jobs:
             printf 'google_model=%s\n' "$GOOGLE_MODEL"
             printf 'text=passed\nobject=passed\ngoverned_deny=passed\ntwo_request_replay=passed\n'
           } > dist/live-smoke-evidence.txt
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: live-smoke-evidence
           path: dist/live-smoke-evidence.txt

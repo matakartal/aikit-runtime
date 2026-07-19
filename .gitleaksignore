@@ -1,0 +1,2 @@
+# Deterministic fake GitHub PAT used only to verify SecretRedactor detection.
+08543d049e71a7dd9c12be3d897375b95387561d:crates/aikit-core/src/governance/guardrail.rs:github-pat:474
