@@ -45,7 +45,22 @@ pub fn build_request(
     messages: &[Message],
     tools: &[ToolSpec],
     provider_options: Option<&serde_json::Map<String, Value>>,
-) -> Value {
+) -> crate::error::Result<Value> {
+    super::reject_protected_options(
+        "openai",
+        model,
+        provider_options,
+        &[
+            "model",
+            "messages",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "tools",
+            "stream",
+            "stream_options",
+        ],
+    )?;
     let mut wire: Vec<Value> = Vec::new();
 
     for m in messages {
@@ -115,7 +130,7 @@ pub fn build_request(
         "model": model,
         // `max_completion_tokens` is accepted by BOTH reasoning (o1/o3/o4-mini/gpt-5) and current
         // non-reasoning chat models; the legacy `max_tokens` is rejected (HTTP 400) by reasoning
-        // models. provider_options is merged afterward, so callers can still override.
+        // models. Provider options may not replace this canonical output ceiling.
         "max_completion_tokens": max_tokens,
         "messages": wire,
         "stream": true,
@@ -145,7 +160,7 @@ pub fn build_request(
             map.insert(k.clone(), v.clone());
         }
     }
-    req
+    Ok(req)
 }
 
 fn join_text(blocks: &[ContentBlock]) -> String {
@@ -209,10 +224,12 @@ struct ToolCallAccum {
 #[derive(Default)]
 pub struct OpenAiStreamParser {
     started: bool,
+    terminal: bool,
     tool_calls: BTreeMap<u64, ToolCallAccum>,
     tool_calls_emitted: bool,
     stop_reason: String,
     usage: Usage,
+    retention: super::StreamRetentionBudget,
 }
 
 impl OpenAiStreamParser {
@@ -220,7 +237,14 @@ impl OpenAiStreamParser {
         Self::default()
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     pub fn push_chunk(&mut self, chunk: &Value) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
         let mut out = Vec::new();
 
         if !self.started {
@@ -259,24 +283,41 @@ impl OpenAiStreamParser {
         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
             for tc in tcs {
                 let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = tc["function"]
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let args = tc["function"]
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let new_call = usize::from(!self.tool_calls.contains_key(&index));
+                if !self.retention.retain(
+                    id.len()
+                        .saturating_add(name.len())
+                        .saturating_add(args.len()),
+                    new_call,
+                ) {
+                    return self.retained_state_failure();
+                }
                 let entry = self.tool_calls.entry(index).or_default();
-                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        entry.id = id.to_string();
-                    }
+                if !id.is_empty() {
+                    entry.id = id.to_string();
                 }
-                if let Some(name) = tc["function"].get("name").and_then(Value::as_str) {
-                    if !name.is_empty() {
-                        entry.name = name.to_string();
-                    }
+                if !name.is_empty() {
+                    entry.name = name.to_string();
                 }
-                if let Some(args) = tc["function"].get("arguments").and_then(Value::as_str) {
+                if !args.is_empty() {
                     entry.args.push_str(args);
                 }
             }
         }
 
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !self.retention.retain(fr.len(), 0) {
+                return self.retained_state_failure();
+            }
             self.stop_reason = map_finish_reason(fr);
             out.extend(self.emit_tool_calls());
         }
@@ -288,6 +329,21 @@ impl OpenAiStreamParser {
     fn emit_tool_calls(&mut self) -> Vec<StreamDelta> {
         if self.tool_calls_emitted || self.tool_calls.is_empty() {
             return Vec::new();
+        }
+        if let Some(message) = self.tool_calls.values().find_map(|call| {
+            if call.id.is_empty() {
+                Some("OpenAI tool call is missing its id".to_string())
+            } else if call.name.is_empty() {
+                Some(format!("OpenAI tool call {} is missing its name", call.id))
+            } else if !call.args.trim().is_empty()
+                && serde_json::from_str::<Value>(&call.args).is_err()
+            {
+                Some(format!("malformed tool_call arguments for {}", call.id))
+            } else {
+                None
+            }
+        }) {
+            return self.terminal_protocol_failure(message);
         }
         self.tool_calls_emitted = true;
         let mut out = Vec::new();
@@ -302,27 +358,31 @@ impl OpenAiStreamParser {
                     id: accum.id.clone(),
                     input: Value::Object(Default::default()),
                 });
-            } else {
-                // Never coerce malformed arguments to null and run the tool with it; surface
-                // the parse failure as an Error delta so the loop can reject the tool call.
-                match serde_json::from_str::<Value>(&accum.args) {
-                    Ok(input) => out.push(StreamDelta::ToolCallInput {
-                        id: accum.id.clone(),
-                        input,
-                    }),
-                    Err(_) => out.push(super::protocol_failure(
-                        "openai",
-                        format!("malformed tool_call arguments for {}", accum.id),
-                    )),
-                }
+            } else if let Ok(input) = serde_json::from_str::<Value>(&accum.args) {
+                out.push(StreamDelta::ToolCallInput {
+                    id: accum.id.clone(),
+                    input,
+                });
             }
         }
+        self.tool_calls.clear();
         out
     }
 
     /// Call on `[DONE]` / stream end: flush any un-emitted tool calls, then Usage + MessageStop.
     pub fn finish(&mut self) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if self.stop_reason.is_empty() {
+            return self
+                .terminal_protocol_failure("OpenAI Chat [DONE] arrived before finish_reason");
+        }
         let mut out = self.emit_tool_calls();
+        if self.terminal {
+            return out;
+        }
+        self.terminal = true;
         out.push(StreamDelta::Usage(self.usage));
         let stop_reason = if self.stop_reason.is_empty() {
             "end_turn".to_string()
@@ -331,6 +391,20 @@ impl OpenAiStreamParser {
         };
         out.push(StreamDelta::MessageStop { stop_reason });
         out
+    }
+
+    fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.tool_calls.clear();
+        self.stop_reason.clear();
+        vec![super::retained_state_failure("openai")]
+    }
+
+    fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.tool_calls.clear();
+        self.stop_reason.clear();
+        vec![super::protocol_failure("openai", message)]
     }
 
     fn absorb_usage(&mut self, u: &Value) {
@@ -391,7 +465,7 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
             model_prefix: None,
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 
@@ -408,7 +482,7 @@ impl OpenAiProvider {
             provider_name,
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 }
@@ -435,7 +509,15 @@ impl Provider for OpenAiProvider {
             &req.messages,
             &req.tools,
             Some(&options),
-        );
+        )
+        .map_err(|error| {
+            crate::error::ProviderError::new(
+                self.name(),
+                &req.model,
+                crate::error::ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
@@ -450,7 +532,7 @@ impl Provider for OpenAiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
-            let text = resp.text().await.unwrap_or_default();
+            let text = super::read_error_body(resp).await;
             return Err(super::http_failure(
                 self.name(),
                 &req.model,
@@ -470,7 +552,15 @@ impl Provider for OpenAiProvider {
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        buf.extend_from_slice(&bytes);
+                        if !super::append_sse_chunk(&mut buf, &bytes) {
+                            yield super::stream_failure(
+                                &provider_name,
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                "OpenAI Chat SSE event exceeded the size limit",
+                            );
+                            return;
+                        }
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
                             let line = String::from_utf8_lossy(&line_bytes);
@@ -491,6 +581,9 @@ impl Provider for OpenAiProvider {
                                         for d in parser.push_chunk(&json) {
                                             yield super::with_stream_context(d, &provider_name, &model);
                                         }
+                                        if parser.is_terminal() {
+                                            return;
+                                        }
                                     }
                                     Err(_) => {
                                         yield super::stream_failure(
@@ -508,22 +601,26 @@ impl Provider for OpenAiProvider {
                             break;
                         }
                     }
-                    Err(_) => {
-                        yield super::stream_failure(
+                    Err(error) => {
+                        yield super::response_stream_failure(
                             &provider_name,
                             &model,
-                            crate::error::ProviderErrorKind::Transport,
-                            "OpenAI Chat response stream transport failed",
+                            error,
+                            "OpenAI Chat",
                         );
-                        break;
+                        return;
                     }
                 }
             }
-            // Flush a terminal Usage + MessageStop even if the server closed without `[DONE]`.
+            // `[DONE]` is the Chat Completions commit marker. Never turn a truncated clean EOF
+            // into a successful MessageStop.
             if !done {
-                for d in parser.finish() {
-                    yield super::with_stream_context(d, &provider_name, &model);
-                }
+                yield super::stream_failure(
+                    &provider_name,
+                    &model,
+                    crate::error::ProviderErrorKind::Protocol,
+                    "OpenAI Chat stream ended before [DONE]",
+                );
             }
         };
         Ok(Box::pin(out))
@@ -572,7 +669,7 @@ mod tests {
             input_schema: json!({ "type": "object" }),
         }];
 
-        let req = build_request("gpt-4o", 2048, &messages, &tools, None);
+        let req = build_request("gpt-4o", 2048, &messages, &tools, None).unwrap();
 
         // stream + usage opt-in set on the body.
         assert_eq!(req["stream"], true);
@@ -635,7 +732,7 @@ mod tests {
                 text: "Here you go.".into(),
             }],
         }];
-        let req = build_request("gpt-4o", 128, &text_only, &[], None);
+        let req = build_request("gpt-4o", 128, &text_only, &[], None).unwrap();
         let assistant = &req["messages"].as_array().unwrap()[0];
         assert_eq!(assistant["content"], "Here you go.");
         assert!(assistant.get("tool_calls").is_none());
@@ -650,10 +747,59 @@ mod tests {
                 opaque: None,
             }],
         }];
-        let req = build_request("gpt-4o", 128, &reasoning_only, &[], None);
+        let req = build_request("gpt-4o", 128, &reasoning_only, &[], None).unwrap();
         let assistant = &req["messages"].as_array().unwrap()[0];
         assert_eq!(assistant["content"], "");
         assert!(!assistant["content"].is_null());
+    }
+
+    #[test]
+    fn provider_options_cannot_replace_openai_chat_contract_fields() {
+        for (key, value) in [
+            ("model", json!("other-model")),
+            ("messages", json!([])),
+            ("max_tokens", json!(1)),
+            ("max_output_tokens", json!(1)),
+            ("max_completion_tokens", json!(1)),
+            ("tools", json!([])),
+            ("stream", json!(false)),
+            ("stream_options", json!({ "include_usage": false })),
+        ] {
+            let options = serde_json::Map::from_iter([(key.to_string(), value)]);
+            let error = build_request(
+                "gpt-4o",
+                100,
+                &[Message::user("hello")],
+                &[],
+                Some(&options),
+            )
+            .unwrap_err();
+            let error = error.provider_error().expect("typed provider error");
+            assert_eq!(error.kind, crate::error::ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains(key));
+        }
+
+        let options = serde_json::Map::from_iter([("temperature".into(), json!(0.2))]);
+        let request = build_request(
+            "gpt-4o",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["temperature"], 0.2);
+
+        let options = serde_json::Map::from_iter([("tool_choice".into(), json!("required"))]);
+        let request = build_request(
+            "gpt-4o",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["tool_choice"], "required");
     }
 
     #[test]
@@ -729,10 +875,6 @@ mod tests {
         }
         out.extend(p.finish());
 
-        assert!(out.contains(&StreamDelta::ToolCallStart {
-            id: "call_bad".into(),
-            name: "search".into()
-        }));
         assert!(out.iter().any(|d| matches!(
             d,
             StreamDelta::Error { message, .. } if message.contains("malformed")
@@ -741,6 +883,77 @@ mod tests {
             d,
             StreamDelta::ToolCallInput { input, .. } if input.is_null()
         )));
+    }
+
+    #[test]
+    fn many_small_tool_argument_fragments_fail_terminally() {
+        let mut parser = OpenAiStreamParser::new();
+        parser.retention = crate::providers::StreamRetentionBudget::with_limits(32, 8);
+        let start = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "c",
+                "function": {"name": "f", "arguments": ""}
+            }]}}]
+        });
+        assert!(!parser
+            .push_chunk(&start)
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::Error { .. })));
+
+        let fragment = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": "x"}
+            }]}}]
+        });
+        let failure = (0..64)
+            .find_map(|_| {
+                parser
+                    .push_chunk(&fragment)
+                    .into_iter()
+                    .find(|delta| matches!(delta, StreamDelta::Error { .. }))
+            })
+            .expect("many small fragments must exceed retained state");
+        assert!(
+            matches!(failure, StreamDelta::Error { message, .. } if message.contains("retained parser-state"))
+        );
+        assert!(parser.terminal);
+        assert!(parser.tool_calls.is_empty());
+        assert!(parser.push_chunk(&fragment).is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn done_without_finish_reason_is_a_terminal_protocol_failure() {
+        let mut parser = OpenAiStreamParser::new();
+        let out = parser.finish();
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("before finish_reason")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+    }
+
+    #[test]
+    fn tool_call_without_name_fails_before_emission() {
+        let mut parser = OpenAiStreamParser::new();
+        let out = parser.push_chunk(&json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "id": "call", "function": {"arguments": "{}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        }));
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("missing its name")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::ToolCallStart { .. })));
+        assert!(parser.terminal);
     }
 
     #[tokio::test]
@@ -781,6 +994,47 @@ mod tests {
         assert!(out.contains(&StreamDelta::MessageStop {
             stop_reason: "end_turn".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_before_done_is_a_protocol_failure() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("sk-openai-test", server.uri());
+        let out: Vec<_> = provider
+            .stream(ProviderRequest {
+                model: "gpt-4o".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: serde_json::Map::new(),
+                provider_options: crate::types::ProviderOptions::new(),
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
     }
 
     #[tokio::test]

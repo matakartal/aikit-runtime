@@ -59,7 +59,13 @@ async fn main() {
     let result = stack.execute("Read", json!({})).await.unwrap();
     let shown: String = result.replace('\n', " ").chars().take(150).collect();
     println!("\n2. Execution layer (guardrail + off-prompt) returns:\n     {shown}");
-    let stored = store.retrieve("out-1").unwrap_or_default();
+    let id = result
+        .split_once("id=")
+        .and_then(|(_, rest)| rest.split_once(',').map(|(id, _)| id))
+        .expect("off-prompt output must return its opaque reference id");
+    let stored = store
+        .retrieve(id)
+        .expect("the returned off-prompt reference must resolve");
     println!(
         "     secret redacted before it was stored off-prompt: {}",
         !stored.contains("sk-ant-")

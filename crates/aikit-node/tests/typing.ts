@@ -2,14 +2,20 @@ import {
   Agent,
   Client,
   McpServer,
+  evaluateOutcome,
   tool,
   type ApprovalResponse,
   type ContainmentCapabilityReport,
   type FailureContext,
+  type EvalGate,
+  type EvalVerdict,
   type ModelInput,
+  type McpToolFilter,
   type ObjectStream,
   type QueryStream,
   type RunOptions,
+  type RunOutcome,
+  type SemanticValidationDecision,
   type ModelProfile,
   type SubagentResult,
   type SubagentSpec,
@@ -31,6 +37,10 @@ const invoiceSchema: ZodSchemaLike<Invoice> = {
 };
 
 const agent = Agent.fromEnv({});
+const semanticValidator = async (): Promise<SemanticValidationDecision> => ({
+  action: "retry",
+  reason: "business invariant not met",
+});
 agent.addToolDefinition(
   tool(
     "typed_search",
@@ -56,6 +66,29 @@ const messages: ModelInput = [
     ],
   },
 ];
+const evalOutcome: RunOutcome = {
+  messages,
+  usage: {
+    input_tokens: 8,
+    output_tokens: 5,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    reasoning_tokens: 0,
+  },
+  terminal_status: "completed",
+  stop_reason: "stop",
+  model_attempts: ["mock-1"],
+  invocation_start_message_index: 0,
+};
+const evalGates: EvalGate[] = [
+  { type: "output_contains", value: "chart" },
+  { type: "terminal_status", status: "completed" },
+  { type: "tool_sequence", names: ["search"], exact: false },
+  { type: "no_tool_errors" },
+  { type: "max_total_tokens", value: 32 },
+];
+const evalVerdict: EvalVerdict = evaluateOutcome(evalOutcome, evalGates);
+void evalVerdict;
 agent.configureJsonlAudit(
   "/tmp/aikit-audit.jsonl",
   "metadata_only",
@@ -63,15 +96,25 @@ agent.configureJsonlAudit(
 );
 agent.useMemoryFile("/tmp/aikit-memory.json", "tenant-a");
 agent.useSessionFile("/tmp/aikit-sessions.json");
+const recoveredRevision: number = agent.recoverExpiredSession("typed-session", true);
+void recoveredRevision;
+// @ts-expect-error recovery requires an explicit compile-time reconciliation assertion
+agent.recoverExpiredSession("typed-session", false);
 agent.useSqliteMemory("/tmp/aikit-state.db", "tenant-a");
 agent.useSqliteSessions("/tmp/aikit-state.db");
 agent.registerWebTools(["example.com"], "https://example.com/search?q={query}");
-agent.registerBrowserTools("http://127.0.0.1:4444", "session", ["example.com"]);
+agent.registerBrowserTools(
+  "http://127.0.0.1:4444",
+  "session",
+  ["example.com"],
+  { externalEgressEnforced: true },
+);
 const stream: ObjectStream<Invoice> = agent.streamObject(
   messages,
   invoiceSchema,
   {
     providerOptions: { openai: { temperature: 0 } },
+    validator: semanticValidator,
   },
 );
 
@@ -106,8 +149,26 @@ agent.enableCapabilityRequests(["Bash"]);
 agent.enableDefaultGuardrails(["ignore previous instructions"]);
 
 async function configureMcp(): Promise<void> {
-  const http = await McpServer.connectHttp("https://mcp.example.com", "remote");
-  const stdio = await McpServer.connectStdio("server", [], "local", {}, false);
+  const toolFilter: McpToolFilter = {
+    allow: ["read_file", "search"],
+    deny: ["write_file"],
+  };
+  const http = await McpServer.connectHttp(
+    "https://mcp.example.com",
+    "remote",
+    undefined,
+    toolFilter,
+  );
+  const stdio = await McpServer.connectStdio(
+    "server",
+    [],
+    "local",
+    {},
+    false,
+    { deny: ["Bash"] },
+  );
+  // @ts-expect-error MCP filters fail closed on unknown fields
+  void McpServer.connectHttp("https://mcp.example.com", "bad", undefined, { unknown: [] });
   agent.registerMcp(http);
   await http.listResources();
   await http.listPrompts();

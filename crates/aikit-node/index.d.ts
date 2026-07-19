@@ -140,6 +140,17 @@ export interface GeneratedObject<T = JsonValue> {
   provider_metadata: Record<string, JsonValue[]>;
 }
 
+export type SemanticValidationDecision =
+  | "accept"
+  | { action: "accept" }
+  | { action: "retry"; reason: string }
+  | { action: "reject"; reason: string };
+
+/** Runs after JSON Schema succeeds and before Zod materialization. Keep it pure and idempotent. */
+export type SemanticValidator = (
+  value: JsonValue,
+) => Promise<SemanticValidationDecision>;
+
 export interface GenerateTextOptions {
   model?: string;
   maxTokens?: number;
@@ -189,6 +200,7 @@ export interface GenerateObjectOptions {
   maxTokens?: number;
   name?: string;
   providerOptions?: Record<string, Record<string, JsonValue>>;
+  validator?: SemanticValidator;
 }
 
 export type ModelCapability =
@@ -301,6 +313,15 @@ export interface DockerContainmentOptions {
   tmpfsMiB?: number;
 }
 
+export interface BrowserToolsOptions {
+  /**
+   * Explicit caller assertion that an external proxy, BiDi interceptor, or equivalent boundary
+   * already enforces the exact allowed hosts and public-IP policy before every browser request.
+   * This flag does not install or verify that boundary.
+   */
+  externalEgressEnforced: true;
+}
+
 export interface ModelRouteRequirements {
   policy: RoutePolicy;
   max_cost_usd: number | null;
@@ -340,9 +361,48 @@ export interface RunOutcome {
   stop_reason: string | null;
   model_attempts: string[];
   final_text?: string;
+  /** First message belonging to this invocation; omitted only by legacy persisted outcomes. */
+  invocation_start_message_index?: number;
   /** Omitted by the canonical serializer when no provider metadata was observed. */
   provider_metadata?: Record<string, JsonValue[]>;
 }
+
+export type EvalTerminalStatus = Exclude<RunOutcome["terminal_status"], "running">;
+
+export type EvalGate =
+  | { type: "output_exact"; value: string }
+  | { type: "output_contains"; value: string }
+  | { type: "output_not_contains"; value: string }
+  | { type: "terminal_status"; status: EvalTerminalStatus }
+  | { type: "called_tool"; name: string }
+  | { type: "did_not_call_tool"; name: string }
+  | { type: "tool_sequence"; names: string[]; exact?: boolean }
+  | { type: "no_tool_errors" }
+  | { type: "max_turns"; value: number }
+  | { type: "max_input_tokens"; value: number }
+  | { type: "max_output_tokens"; value: number }
+  | { type: "max_total_tokens"; value: number }
+  | { type: "max_model_attempts"; value: number };
+
+export interface EvalCheck {
+  gate: string;
+  passed: boolean;
+  message: string;
+}
+
+export interface EvalVerdict {
+  passed: boolean;
+  passed_checks: number;
+  total_checks: number;
+  score: number;
+  checks: EvalCheck[];
+}
+
+/** Pure, deterministic evaluation over a canonical recorded outcome. */
+export function evaluateOutcome(
+  outcome: RunOutcome,
+  gates: readonly EvalGate[],
+): EvalVerdict;
 
 export interface SubagentResult {
   id: string;
@@ -501,9 +561,16 @@ export type FailureHookResponse =
   | { action: "continue" }
   | { action: "rewrite"; error: string };
 
+/** Exact, case-sensitive MCP tool visibility policy. Deny entries always win. */
+export interface McpToolFilter {
+  /** Omit to allow every non-denied tool; an empty list exposes no tools. */
+  allow?: readonly string[];
+  deny?: readonly string[];
+}
+
 export class McpServer {
-  static connectHttp(endpoint: string, name: string, bearerToken?: string): Promise<McpServer>;
-  static connectStdio(program: string, args: string[], name: string, env?: Record<string, string>, inheritEnv?: boolean): Promise<McpServer>;
+  static connectHttp(endpoint: string, name: string, bearerToken?: string, toolFilter?: McpToolFilter): Promise<McpServer>;
+  static connectStdio(program: string, args: string[], name: string, env?: Record<string, string>, inheritEnv?: boolean, toolFilter?: McpToolFilter): Promise<McpServer>;
   listResources(cursor?: string): Promise<JsonValue>;
   readResource(uri: string): Promise<JsonValue>;
   listPrompts(cursor?: string): Promise<JsonValue>;
@@ -522,8 +589,15 @@ export class Agent {
   useSessionFile(path: string): void;
   useSqliteMemory(path: string, namespace?: string): void;
   useSqliteSessions(path: string): void;
+  /** Clear an expired lease after reconciliation; does not execute or resume work. */
+  recoverExpiredSession(sessionId: string, sideEffectsReconciled: true): number;
   registerWebTools(allowedHosts: string[], searchEndpoint?: string, maxResponseBytes?: number): void;
-  registerBrowserTools(webdriverEndpoint: string, sessionId: string, allowedHosts: string[]): void;
+  registerBrowserTools(
+    webdriverEndpoint: string,
+    sessionId: string,
+    allowedHosts: string[],
+    options: BrowserToolsOptions,
+  ): void;
   registerMcp(server: McpServer): void;
   enableCapabilityRequests(gatedTools: string[]): void;
   enableDefaultGuardrails(blockedInputPatterns?: string[]): void;

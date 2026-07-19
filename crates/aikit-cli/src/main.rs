@@ -1,12 +1,27 @@
-use aikit::{Agent, BuiltinTools, Message, Sandbox};
+use aikit::{
+    evaluate_outcome, Agent, BuiltinTools, ErrorCode, ErrorInfo, EvalCaseReport, EvalDataset,
+    EvalReport, EvalVerdict, Message, NoTools, RunConfig, RunRecorder, Sandbox, StreamDelta,
+};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::env;
+use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+const MAX_EVAL_DATASET_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_LIVE_CASES: u64 = 8;
+const DEFAULT_MAX_LIVE_INPUT_BYTES: u64 = 512 * 1024;
+const DEFAULT_MAX_LIVE_OUTPUT_TOKENS: u64 = 32_768;
+const DEFAULT_MAX_LIVE_WALL_SECONDS: u64 = 600;
 
 const PROVIDERS: [(&str, &str, &str); 8] = [
     ("anthropic", "ANTHROPIC_API_KEY", "claude-*"),
@@ -58,6 +73,8 @@ enum Command {
     Capabilities,
     /// Diagnose credentials, workspace access, and containment.
     Doctor(DoctorArgs),
+    /// Run a deterministic JSON evaluation dataset; live models require --allow-live.
+    Eval(EvalArgs),
     /// Generate a shell completion script on stdout.
     Completions(CompletionArgs),
 }
@@ -104,6 +121,33 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Args)]
+struct EvalArgs {
+    /// JSON dataset containing prompts and deterministic gates.
+    #[arg(value_name = "DATASET")]
+    dataset: PathBuf,
+
+    /// Permit non-mock models. Without this flag evaluation is keyless and cannot spend money.
+    #[arg(long)]
+    allow_live: bool,
+
+    /// Maximum number of paid/network cases permitted in one invocation.
+    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_CASES, value_parser = clap::value_parser!(u64).range(1..=256))]
+    max_live_cases: u64,
+
+    /// Aggregate prompt and system-instruction byte ceiling across all live cases.
+    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_INPUT_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    max_live_input_bytes: u64,
+
+    /// Aggregate requested output-token ceiling across all live cases.
+    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_OUTPUT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
+    max_live_output_tokens: u64,
+
+    /// Hard wall-time ceiling shared by all live cases in this invocation.
+    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_WALL_SECONDS, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    max_live_wall_seconds: u64,
+}
+
+#[derive(Debug, Args)]
 struct CompletionArgs {
     /// Target shell.
     #[arg(value_enum)]
@@ -120,6 +164,11 @@ enum CliError {
     Io(#[from] io::Error),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("evaluation failed: {failed_cases} of {total_cases} case(s) failed")]
+    EvalFailed {
+        failed_cases: usize,
+        total_cases: usize,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +222,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         Command::Providers => print_providers(&agent, cli.format),
         Command::Capabilities => print_value(&agent.capabilities(), cli.format),
         Command::Doctor(args) => doctor(&agent, args, cli.format).await,
+        Command::Eval(args) => run_eval(&agent, args, cli.format).await,
         Command::Completions(args) => {
             generate(args.shell, &mut Cli::command(), "aikit", &mut io::stdout());
             Ok(())
@@ -180,8 +230,288 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result<(), CliError> {
+    let loaded = load_eval_dataset(&args.dataset)?;
+    let dataset = loaded.dataset;
+    dataset
+        .validate()
+        .map_err(|error| CliError::Input(error.to_string()))?;
+
+    let live_cases = dataset
+        .cases
+        .iter()
+        .filter(|case| is_live_model(dataset.resolved_model(case)))
+        .collect::<Vec<_>>();
+    if !args.allow_live && !live_cases.is_empty() {
+        let live_models = live_cases
+            .iter()
+            .map(|case| dataset.resolved_model(case))
+            .collect::<std::collections::BTreeSet<_>>();
+        return Err(CliError::Input(format!(
+            "dataset requests live model(s) {}; pass --allow-live to acknowledge network use and possible cost",
+            live_models.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    if u64::try_from(live_cases.len()).unwrap_or(u64::MAX) > args.max_live_cases {
+        return Err(CliError::Input(format!(
+            "dataset requests {} live case(s); --max-live-cases is {}",
+            live_cases.len(),
+            args.max_live_cases
+        )));
+    }
+    let requested_live_input_bytes = live_cases.iter().try_fold(0_u64, |total, case| {
+        let case_bytes = case
+            .prompt
+            .len()
+            .saturating_add(case.system.as_ref().map_or(0, String::len));
+        total.checked_add(u64::try_from(case_bytes).unwrap_or(u64::MAX))
+    });
+    let Some(requested_live_input_bytes) = requested_live_input_bytes else {
+        return Err(CliError::Input(
+            "aggregate live input byte count overflowed".into(),
+        ));
+    };
+    if requested_live_input_bytes > args.max_live_input_bytes {
+        return Err(CliError::Input(format!(
+            "dataset requests {requested_live_input_bytes} live input byte(s); --max-live-input-bytes is {}",
+            args.max_live_input_bytes
+        )));
+    }
+    let requested_live_output_tokens = live_cases.iter().try_fold(0_u64, |total, case| {
+        total.checked_add(dataset.resolved_max_tokens(case))
+    });
+    let Some(requested_live_output_tokens) = requested_live_output_tokens else {
+        return Err(CliError::Input(
+            "aggregate live output-token request overflowed".into(),
+        ));
+    };
+    if requested_live_output_tokens > args.max_live_output_tokens {
+        return Err(CliError::Input(format!(
+            "dataset requests {requested_live_output_tokens} live output token(s); --max-live-output-tokens is {}",
+            args.max_live_output_tokens
+        )));
+    }
+    let live_deadline = if live_cases.is_empty() {
+        None
+    } else {
+        Instant::now().checked_add(Duration::from_secs(args.max_live_wall_seconds))
+    };
+    if !live_cases.is_empty() && live_deadline.is_none() {
+        return Err(CliError::Input(
+            "--max-live-wall-seconds is too large".into(),
+        ));
+    }
+
+    // Deliberately sequential: an accidental dataset cannot fan out paid provider calls. Hosts
+    // that need controlled parallel evaluation can compose evaluate_outcome over their own runs.
+    let mut reports = Vec::with_capacity(dataset.cases.len());
+    let mut infrastructure_failures = 0_usize;
+    for case in &dataset.cases {
+        let model = dataset.resolved_model(case).to_string();
+        let is_live = is_live_model(&model);
+        let max_tokens = dataset.resolved_max_tokens(case);
+        let case_messages = messages(case.system.clone(), case.prompt.clone());
+        let recorder = RunRecorder::default();
+        let mut config = RunConfig::new(&model, case_messages);
+        config.max_tokens = max_tokens;
+        config.recorder = recorder.clone();
+        let cancellation = config.cancellation.clone();
+        match agent.run_with_config(config, Arc::new(NoTools)) {
+            Ok(stream) => {
+                futures::pin_mut!(stream);
+                let mut stream_error = None;
+                let drain = async {
+                    while let Some(delta) = stream.next().await {
+                        if let StreamDelta::Error { info, .. } = delta {
+                            stream_error = Some(info);
+                        }
+                    }
+                };
+                let timed_out = if is_live {
+                    let remaining = live_deadline
+                        .expect("live cases always have a validated deadline")
+                        .saturating_duration_since(Instant::now());
+                    remaining.is_zero() || tokio::time::timeout(remaining, drain).await.is_err()
+                } else {
+                    drain.await;
+                    false
+                };
+                if timed_out {
+                    cancellation.cancel();
+                    infrastructure_failures = infrastructure_failures.saturating_add(1);
+                    let outcome = recorder.outcome();
+                    let mut info = ErrorInfo::new(ErrorCode::ProviderTimeout);
+                    info.model = Some(model.clone());
+                    reports.push(EvalCaseReport::new(
+                        case.name.clone(),
+                        model,
+                        EvalVerdict::runtime_failure(info.message.clone()),
+                        Some(outcome.usage),
+                        Some(outcome.terminal_status),
+                        outcome.model_attempts,
+                        Some(info),
+                    ));
+                    continue;
+                }
+                let outcome = recorder.outcome();
+                let mut verdict = evaluate_outcome(&outcome, &case.gates)
+                    .map_err(|error| CliError::Input(error.to_string()))?;
+                if let Some(info) = &stream_error {
+                    if is_eval_infrastructure_error(info.code) {
+                        infrastructure_failures = infrastructure_failures.saturating_add(1);
+                        verdict = EvalVerdict::runtime_failure(info.message.clone());
+                    }
+                }
+                reports.push(EvalCaseReport::new(
+                    case.name.clone(),
+                    model,
+                    verdict,
+                    Some(outcome.usage),
+                    Some(outcome.terminal_status),
+                    outcome.model_attempts,
+                    stream_error,
+                ));
+            }
+            Err(error) => {
+                infrastructure_failures = infrastructure_failures.saturating_add(1);
+                let info = error.info();
+                reports.push(EvalCaseReport::new(
+                    case.name.clone(),
+                    model,
+                    EvalVerdict::runtime_failure(info.message.clone()),
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(info),
+                ));
+            }
+        }
+    }
+
+    let report = EvalReport::new(&dataset, loaded.sha256, reports);
+    print_eval_report(&report, format)?;
+    if infrastructure_failures > 0 {
+        Err(CliError::Runtime(format!(
+            "evaluation infrastructure failed for {infrastructure_failures} case(s)"
+        )))
+    } else if report.passed {
+        Ok(())
+    } else {
+        Err(CliError::EvalFailed {
+            failed_cases: report.total_cases - report.passed_cases,
+            total_cases: report.total_cases,
+        })
+    }
+}
+
+struct LoadedEvalDataset {
+    dataset: EvalDataset,
+    sha256: String,
+}
+
+fn is_live_model(model: &str) -> bool {
+    !model.to_ascii_lowercase().starts_with("mock")
+}
+
+fn is_eval_infrastructure_error(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::ProviderAuth
+            | ErrorCode::ProviderRateLimit
+            | ErrorCode::ProviderTimeout
+            | ErrorCode::ProviderTransport
+            | ErrorCode::ProviderServer
+            | ErrorCode::ProviderInvalidRequest
+            | ErrorCode::ProviderProtocol
+            | ErrorCode::Configuration
+            | ErrorCode::Session
+            | ErrorCode::Conflict
+            | ErrorCode::Audit
+            | ErrorCode::Hook
+            | ErrorCode::Unknown
+    )
+}
+
+fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(CliError::Input(
+            "eval dataset must be a regular file, not a symlink or special file".into(),
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(CliError::Input(
+            "eval dataset must remain a regular file while it is read".into(),
+        ));
+    }
+    if metadata.len() > MAX_EVAL_DATASET_BYTES as u64 {
+        return Err(CliError::Input(format!(
+            "eval dataset exceeds the {} byte limit",
+            MAX_EVAL_DATASET_BYTES
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_EVAL_DATASET_BYTES)
+            .min(MAX_EVAL_DATASET_BYTES),
+    );
+    file.take((MAX_EVAL_DATASET_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_EVAL_DATASET_BYTES {
+        return Err(CliError::Input(format!(
+            "eval dataset exceeds the {} byte limit",
+            MAX_EVAL_DATASET_BYTES
+        )));
+    }
+    let dataset = serde_json::from_slice(&bytes)
+        .map_err(|error| CliError::Input(format!("invalid eval dataset JSON: {error}")))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    Ok(LoadedEvalDataset { dataset, sha256 })
+}
+
+fn print_eval_report(report: &EvalReport, format: OutputFormat) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Text => {
+            println!(
+                "{}  {}  {}/{} cases",
+                if report.passed { "PASS" } else { "FAIL" },
+                report.dataset,
+                report.passed_cases,
+                report.total_cases
+            );
+            for case in &report.cases {
+                println!(
+                    "{}  {} ({}/{})",
+                    if case.passed() { "PASS" } else { "FAIL" },
+                    case.name,
+                    case.verdict.passed_checks,
+                    case.verdict.total_checks
+                );
+                for check in &case.verdict.checks {
+                    println!(
+                        "  {}  {}: {}",
+                        if check.passed { "PASS" } else { "FAIL" },
+                        check.gate,
+                        check.message
+                    );
+                }
+            }
+            Ok(())
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => print_value(report, format),
+    }
+}
+
 fn process_agent() -> Agent {
-    Agent::from_env(env::vars().filter(|(_, value)| !value.trim().is_empty()))
+    Agent::from_process_env()
 }
 
 async fn run_once(agent: &Agent, args: RunArgs, format: OutputFormat) -> Result<(), CliError> {
@@ -417,6 +747,7 @@ fn exit_code(error: &CliError) -> u8 {
         CliError::Input(_) => 2,
         CliError::Runtime(_) => 3,
         CliError::Io(_) | CliError::Json(_) => 1,
+        CliError::EvalFailed { .. } => 4,
     }
 }
 
@@ -450,5 +781,21 @@ mod tests {
     fn exit_codes_are_stable() {
         assert_eq!(exit_code(&CliError::Input("x".into())), 2);
         assert_eq!(exit_code(&CliError::Runtime("x".into())), 3);
+        assert_eq!(
+            exit_code(&CliError::EvalFailed {
+                failed_cases: 1,
+                total_cases: 1,
+            }),
+            4
+        );
+    }
+
+    #[test]
+    fn eval_separates_provider_outages_from_expected_runtime_outcomes() {
+        assert!(is_eval_infrastructure_error(ErrorCode::ProviderAuth));
+        assert!(is_eval_infrastructure_error(ErrorCode::ProviderTimeout));
+        assert!(!is_eval_infrastructure_error(ErrorCode::ProviderSafety));
+        assert!(!is_eval_infrastructure_error(ErrorCode::BudgetExceeded));
+        assert!(!is_eval_infrastructure_error(ErrorCode::Cancelled));
     }
 }

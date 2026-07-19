@@ -184,20 +184,22 @@ impl Sandbox {
     pub(crate) fn walk_files<F>(
         &self,
         base: Option<&Path>,
+        max_entries: usize,
         mut visit: F,
     ) -> Result<(), SandboxError>
     where
-        F: for<'a> FnMut(SandboxedWalkFile<'a>),
+        F: for<'a> FnMut(SandboxedWalkFile<'a>) -> bool,
     {
+        let mut remaining = max_entries;
         if self.unrestricted {
             let base = base.ok_or_else(|| SandboxError::Io("no sandbox root".into()))?;
-            walk_ambient(base, &mut visit);
+            let _ = walk_ambient(base, &mut remaining, &mut visit);
             return Ok(());
         }
 
         #[cfg(not(unix))]
         {
-            let _ = (base, &mut visit);
+            let _ = (base, &mut remaining, &mut visit);
             return Err(unsupported_platform());
         }
 
@@ -226,7 +228,7 @@ impl Sandbox {
                     )
                 }
             };
-            walk_capability(&dir, &display, &mut visit);
+            let _ = walk_capability(&dir, &display, &mut remaining, &mut visit);
             Ok(())
         }
     }
@@ -624,14 +626,18 @@ fn capability_error(operation: &str, display: &Path, error: std::io::Error) -> S
 }
 
 #[cfg(unix)]
-fn walk_capability<F>(dir: &Dir, display: &Path, visit: &mut F)
+fn walk_capability<F>(dir: &Dir, display: &Path, remaining: &mut usize, visit: &mut F) -> bool
 where
-    F: for<'a> FnMut(SandboxedWalkFile<'a>),
+    F: for<'a> FnMut(SandboxedWalkFile<'a>) -> bool,
 {
     let Ok(entries) = dir.entries() else {
-        return;
+        return true;
     };
     for entry in entries.flatten() {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -642,38 +648,52 @@ where
         let child_display = display.join(&name);
         if file_type.is_dir() {
             if let Ok(child) = open_dir_at(dir, &name, &child_display) {
-                walk_capability(&child, &child_display, visit);
+                if !walk_capability(&child, &child_display, remaining, visit) {
+                    return false;
+                }
             }
-        } else if file_type.is_file() {
-            visit(SandboxedWalkFile {
+        } else if file_type.is_file()
+            && !visit(SandboxedWalkFile {
                 display: child_display,
                 source: WalkSource::Capability { parent: dir, name },
-            });
+            })
+        {
+            return false;
         }
     }
+    true
 }
 
-fn walk_ambient<F>(dir: &Path, visit: &mut F)
+fn walk_ambient<F>(dir: &Path, remaining: &mut usize, visit: &mut F) -> bool
 where
-    F: for<'a> FnMut(SandboxedWalkFile<'a>),
+    F: for<'a> FnMut(SandboxedWalkFile<'a>) -> bool,
 {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for entry in entries.flatten() {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         let path = entry.path();
         if file_type.is_dir() {
-            walk_ambient(&path, visit);
-        } else if file_type.is_file() {
-            visit(SandboxedWalkFile {
+            if !walk_ambient(&path, remaining, visit) {
+                return false;
+            }
+        } else if file_type.is_file()
+            && !visit(SandboxedWalkFile {
                 display: path.clone(),
                 source: WalkSource::Ambient(&path),
-            });
+            })
+        {
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -816,6 +836,24 @@ mod tests {
         file.write_all(b"ambient").unwrap();
         drop(file);
         assert_eq!(read(sb.open_read(&path).unwrap()), "ambient");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_walk_stops_immediately_when_the_visitor_reaches_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(dir.path().join(format!("{index}.txt")), "value").unwrap();
+        }
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        let mut visits = 0usize;
+        sandbox
+            .walk_files(None, 100, |_| {
+                visits += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(visits, 1);
     }
 
     #[cfg(unix)]

@@ -21,13 +21,54 @@ use crate::capabilities::FidelityGrade;
 use crate::error::{AikitError, Result};
 use crate::providers::{Provider, ProviderRequest};
 use crate::types::{Message, StreamDelta, ToolSpec};
+use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+
+const MAX_SEMANTIC_VALIDATION_REASON_BYTES: usize = 1_024;
+const MAX_STRUCTURED_OUTPUT_RETRIES: u32 = 32;
+
+/// A host semantic validator's decision after JSON parsing and JSON-Schema validation succeed.
+///
+/// [`Retry`](Self::Retry) consumes the same bounded repair budget as a schema failure, while
+/// [`Reject`](Self::Reject) terminates immediately with a typed structured-output error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticValidation {
+    Accept,
+    Retry(String),
+    Reject(String),
+}
+
+/// Async application-level validation for a schema-valid structured object.
+///
+/// Implementations must be pure and idempotent: cancellation or a caller retry may invoke the
+/// validator again with the same owned value. The value is never copied into aikit's error or
+/// audit payloads automatically. A `Retry` reason is provider-facing and audit-recorded, so the
+/// callback must return a safe summary rather than the raw value. Callback failures and panics
+/// fail closed.
+#[async_trait]
+pub trait SemanticValidator: Send + Sync {
+    async fn validate(&self, value: Value) -> std::result::Result<SemanticValidation, String>;
+}
+
+#[async_trait]
+impl<F, Fut> SemanticValidator for F
+where
+    F: Fn(Value) -> Fut + Send + Sync,
+    Fut: Future<Output = std::result::Result<SemanticValidation, String>> + Send,
+{
+    async fn validate(&self, value: Value) -> std::result::Result<SemanticValidation, String> {
+        (self)(value).await
+    }
+}
 
 /// The outcome of [`generate_object`]: the parsed value, plus the honest grade and attempt count.
 #[derive(Debug, Clone, Serialize)]
@@ -70,7 +111,8 @@ pub struct TypedGeneratedObject<T> {
 }
 
 /// One observable step of [`stream_object`]. Provider deltas are forwarded as they arrive; the
-/// final object is emitted only after complete JSON parsing and JSON-Schema validation.
+/// final object is emitted only after complete JSON parsing, JSON-Schema validation, and any
+/// configured semantic validator accepts it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObjectStreamEvent {
@@ -83,13 +125,14 @@ pub enum ObjectStreamEvent {
     },
     /// An unmodified canonical provider delta, delivered before the full object is available.
     Delta { attempt: u32, delta: StreamDelta },
-    /// The completed candidate could not be parsed or did not satisfy the schema.
+    /// The completed candidate could not be parsed, did not satisfy the schema, or requested a
+    /// semantic repair.
     ValidationFailed {
         attempt: u32,
         error: String,
         will_retry: bool,
     },
-    /// The first fully parsed and schema-validated result.
+    /// The first fully parsed, schema-valid, and semantically accepted result.
     Completed { object: GeneratedObject },
 }
 
@@ -99,9 +142,9 @@ pub enum ObjectStreamEvent {
 pub type ObjectStream = BoxStream<'static, Result<ObjectStreamEvent>>;
 
 /// Tunables for [`generate_object`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectOptions {
-    /// Extra validation-repair round-trips after the first attempt.
+    /// Extra validation-repair round-trips after the first attempt (maximum 32).
     pub max_retries: u32,
     /// Output-token ceiling per attempt.
     pub max_tokens: u64,
@@ -111,6 +154,25 @@ pub struct ObjectOptions {
     /// are applied after these options, so a caller cannot accidentally override the schema or
     /// weaken the reported fidelity grade.
     pub provider_options: crate::types::ProviderOptions,
+    /// Optional application-level validator, run only after JSON Schema succeeds. The callback
+    /// must be pure/idempotent and may accept, request a bounded repair, or reject immediately.
+    pub semantic_validator: Option<Arc<dyn SemanticValidator>>,
+}
+
+impl fmt::Debug for ObjectOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectOptions")
+            .field("max_retries", &self.max_retries)
+            .field("max_tokens", &self.max_tokens)
+            .field("name", &self.name)
+            .field("provider_options", &self.provider_options)
+            .field(
+                "semantic_validator",
+                &self.semantic_validator.as_ref().map(|_| "<registered>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for ObjectOptions {
@@ -120,7 +182,76 @@ impl Default for ObjectOptions {
             max_tokens: 1024,
             name: "respond".into(),
             provider_options: crate::types::ProviderOptions::new(),
+            semantic_validator: None,
         }
+    }
+}
+
+fn bounded_semantic_reason(reason: String, fallback: &str) -> String {
+    const ELLIPSIS: &str = "...";
+    let mut normalized = String::with_capacity(MAX_SEMANTIC_VALIDATION_REASON_BYTES);
+    let mut truncated = false;
+    for character in reason.trim().chars() {
+        let character = if is_unsafe_display_character(character) {
+            ' '
+        } else {
+            character
+        };
+        if normalized.len().saturating_add(character.len_utf8())
+            > MAX_SEMANTIC_VALIDATION_REASON_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        normalized.push(character);
+    }
+    if normalized.trim().is_empty() {
+        return fallback.to_string();
+    }
+    if truncated {
+        while normalized.len().saturating_add(ELLIPSIS.len()) > MAX_SEMANTIC_VALIDATION_REASON_BYTES
+        {
+            normalized.pop();
+        }
+        normalized.push_str(ELLIPSIS);
+    }
+    normalized
+}
+
+fn is_unsafe_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{206f}'
+        )
+}
+
+async fn validate_semantics(
+    validator: Arc<dyn SemanticValidator>,
+    value: Value,
+) -> Result<SemanticValidation> {
+    match AssertUnwindSafe(validator.validate(value))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(SemanticValidation::Accept)) => Ok(SemanticValidation::Accept),
+        Ok(Ok(SemanticValidation::Retry(reason))) => Ok(SemanticValidation::Retry(
+            bounded_semantic_reason(reason, "semantic validator requested repair"),
+        )),
+        Ok(Ok(SemanticValidation::Reject(reason))) => Ok(SemanticValidation::Reject(
+            bounded_semantic_reason(reason, "semantic validator rejected object"),
+        )),
+        Ok(Err(reason)) => Err(AikitError::StructuredOutput(format!(
+            "semantic validator failed closed: {}",
+            bounded_semantic_reason(reason, "callback returned an error")
+        ))),
+        Err(_) => Err(AikitError::StructuredOutput(
+            "semantic validator panicked; object rejected".into(),
+        )),
     }
 }
 
@@ -538,8 +669,16 @@ pub fn stream_object_messages_observed(
     let schema = schema.clone();
     let options = options.clone();
     let audit = audit.cloned();
-    let total_attempts = options.max_retries + 1;
+    let total_attempts = options
+        .max_retries
+        .checked_add(1)
+        .filter(|_| options.max_retries <= MAX_STRUCTURED_OUTPUT_RETRIES);
     Box::pin(async_stream::try_stream! {
+        let total_attempts = total_attempts.ok_or_else(|| {
+            AikitError::Configuration(format!(
+                "structured output max_retries cannot exceed {MAX_STRUCTURED_OUTPUT_RETRIES}"
+            ))
+        })?;
         let base_messages = base_messages?;
         let mut last_error = String::new();
         let mut provider_metadata = crate::types::ProviderMetadata::new();
@@ -622,12 +761,58 @@ pub fn stream_object_messages_observed(
                     .map_err(|error| format!("response was not valid JSON: {error}")),
             };
 
-            let validated = candidate.and_then(|value| {
+            let schema_validated = candidate.and_then(|value| {
                 validate(&schema, &value)?;
                 Ok(value)
             });
-            match validated {
+            match schema_validated {
                 Ok(value) => {
+                    if let Some(validator) = options.semantic_validator.clone() {
+                        match validate_semantics(validator, value.clone()).await {
+                            Ok(SemanticValidation::Accept) => {}
+                            Ok(SemanticValidation::Retry(reason)) => {
+                                last_error = format!("semantic validation requested repair: {reason}");
+                                if let Some(audit) = &audit {
+                                    audit.emit(crate::observability::AuditEvent::StructuredOutputValidationFailed {
+                                        attempt,
+                                        error: last_error.clone(),
+                                    })?;
+                                }
+                                let will_retry = attempt < total_attempts;
+                                yield ObjectStreamEvent::ValidationFailed {
+                                    attempt,
+                                    error: last_error.clone(),
+                                    will_retry,
+                                };
+                                if !will_retry {
+                                    Err(AikitError::StructuredOutput(format!(
+                                        "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
+                                    )))?;
+                                }
+                                continue;
+                            }
+                            Ok(SemanticValidation::Reject(reason)) => {
+                                last_error =
+                                    format!("semantic validator rejected object: {reason}");
+                                if let Some(audit) = &audit {
+                                    audit.emit(crate::observability::AuditEvent::StructuredOutputValidationFailed {
+                                        attempt,
+                                        error: "semantic validator rejected object".into(),
+                                    })?;
+                                }
+                                Err(AikitError::StructuredOutput(last_error))?;
+                            }
+                            Err(error) => {
+                                if let Some(audit) = &audit {
+                                    audit.emit(crate::observability::AuditEvent::StructuredOutputValidationFailed {
+                                        attempt,
+                                        error: "semantic validator failed closed".into(),
+                                    })?;
+                                }
+                                Err(error)?;
+                            }
+                        }
+                    }
                     let object = GeneratedObject {
                         value,
                         fidelity: grade,
@@ -664,6 +849,9 @@ pub fn stream_object_messages_observed(
                 )))?;
             }
         }
+        Err(AikitError::StructuredOutput(format!(
+            "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
+        )))?;
     })
 }
 
@@ -799,6 +987,22 @@ mod tests {
                 },
             ];
             Ok(Box::pin(futures::stream::iter(deltas)))
+        }
+    }
+
+    struct NeverCalledMock;
+
+    #[async_trait]
+    impl Provider for NeverCalledMock {
+        fn name(&self) -> &str {
+            "never-called"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> AikitResult<BoxStream<'static, StreamDelta>> {
+            panic!("invalid structured-output options reached the provider")
         }
     }
 
@@ -1199,6 +1403,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_validator_runs_only_after_schema_validation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = calls.clone();
+        let options = ObjectOptions {
+            semantic_validator: Some(Arc::new(move |_value: Value| {
+                let validator_calls = validator_calls.clone();
+                async move {
+                    validator_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(SemanticValidation::Accept)
+                }
+            })),
+            ..ObjectOptions::default()
+        };
+        let result = generate_object(
+            Arc::new(FlakyMock {
+                calls: AtomicUsize::new(0),
+            }),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.attempts, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_retry_uses_the_bounded_repair_stream() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = calls.clone();
+        let options = ObjectOptions {
+            max_retries: 1,
+            semantic_validator: Some(Arc::new(move |_value: Value| {
+                let call = validator_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(SemanticValidation::Retry("currency policy mismatch".into()))
+                    } else {
+                        Ok(SemanticValidation::Accept)
+                    }
+                }
+            })),
+            ..ObjectOptions::default()
+        };
+        let mut stream = stream_object(
+            Arc::new(TextMock(r#"{"total": 9.99, "currency": "EUR"}"#.into())),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+        );
+        let mut saw_semantic_retry = false;
+        let mut completed = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ObjectStreamEvent::ValidationFailed {
+                    attempt: 1,
+                    will_retry: true,
+                    error,
+                } => {
+                    assert!(error.contains("currency policy mismatch"));
+                    saw_semantic_retry = true;
+                }
+                ObjectStreamEvent::Completed { object } => completed = Some(object),
+                _ => {}
+            }
+        }
+
+        assert!(saw_semantic_retry);
+        assert_eq!(completed.unwrap().attempts, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn semantic_reject_is_immediate_bounded_and_does_not_echo_the_object() {
+        use crate::observability::{AuditEvent, AuditTrail, InMemoryAuditSink};
+
+        let secret = "RAW_OBJECT_SECRET_MUST_NOT_LEAK";
+        let sink = Arc::new(InMemoryAuditSink::default());
+        let audit = AuditTrail::new().with_sink(sink.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = calls.clone();
+        let options = ObjectOptions {
+            max_retries: 4,
+            semantic_validator: Some(Arc::new(move |_value: Value| {
+                validator_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Ok(SemanticValidation::Reject(format!(
+                        "visible\u{061c}\u{202e}spoof{}",
+                        "x".repeat(10_000)
+                    )))
+                }
+            })),
+            ..ObjectOptions::default()
+        };
+        let error = generate_object_observed(
+            Arc::new(TextMock(format!(
+                r#"{{"total": 9.99, "currency": "EUR", "secret": "{secret}"}}"#
+            ))),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+            Some(&audit),
+        )
+        .await
+        .unwrap_err();
+
+        match error {
+            AikitError::StructuredOutput(message) => {
+                assert!(message.starts_with("semantic validator rejected object:"));
+                let reason = message
+                    .strip_prefix("semantic validator rejected object: ")
+                    .unwrap();
+                assert!(reason.len() <= MAX_SEMANTIC_VALIDATION_REASON_BYTES);
+                assert!(!reason.contains('\u{061c}'));
+                assert!(!reason.contains('\u{202e}'));
+                assert!(!message.contains(secret));
+            }
+            other => panic!("expected structured-output rejection, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(sink.records().iter().any(|record| matches!(
+            record.event,
+            AuditEvent::StructuredOutputValidationFailed { .. }
+        )));
+        let audit_json = serde_json::to_string(&sink.records()).unwrap();
+        assert!(!audit_json.contains(secret));
+        assert!(!audit_json.contains("visible"));
+    }
+
+    #[tokio::test]
+    async fn semantic_retry_audit_records_only_the_bounded_reason() {
+        use crate::observability::{AuditTrail, InMemoryAuditSink};
+
+        let secret = "RAW_SEMANTIC_OBJECT_AUDIT_SECRET";
+        let sink = Arc::new(InMemoryAuditSink::default());
+        let audit = AuditTrail::new().with_sink(sink.clone());
+        let options = ObjectOptions {
+            max_retries: 0,
+            semantic_validator: Some(Arc::new(|_value: Value| async move {
+                Ok(SemanticValidation::Retry(
+                    "business invariant failed".into(),
+                ))
+            })),
+            ..ObjectOptions::default()
+        };
+        let error = generate_object_observed(
+            Arc::new(TextMock(format!(
+                r#"{{"total": 9.99, "currency": "EUR", "secret": "{secret}"}}"#
+            ))),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+            Some(&audit),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!error.to_string().contains(secret));
+        let audit_json = serde_json::to_string(&sink.records()).unwrap();
+        assert!(audit_json.contains("business invariant failed"));
+        assert!(!audit_json.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn semantic_validator_errors_and_panics_fail_closed() {
+        use crate::observability::{AuditEvent, AuditTrail, InMemoryAuditSink};
+
+        let secret = "RAW_TERMINAL_SEMANTIC_AUDIT_SECRET";
+        let error_sink = Arc::new(InMemoryAuditSink::default());
+        let error_audit = AuditTrail::new().with_sink(error_sink.clone());
+        let error_options = ObjectOptions {
+            semantic_validator: Some(Arc::new(|_value: Value| async move {
+                Err("host callback exception".to_string())
+            })),
+            ..ObjectOptions::default()
+        };
+        let error = generate_object_observed(
+            Arc::new(TextMock(format!(
+                r#"{{"total":9.99,"currency":"EUR","secret":"{secret}"}}"#
+            ))),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &error_options,
+            Some(&error_audit),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AikitError::StructuredOutput(message) if message.contains("failed closed")
+        ));
+        assert!(error_sink.records().iter().any(|record| matches!(
+            record.event,
+            AuditEvent::StructuredOutputValidationFailed { .. }
+        )));
+        let error_audit_json = serde_json::to_string(&error_sink.records()).unwrap();
+        assert!(!error_audit_json.contains(secret));
+        assert!(!error_audit_json.contains("host callback exception"));
+
+        let panic_sink = Arc::new(InMemoryAuditSink::default());
+        let panic_audit = AuditTrail::new().with_sink(panic_sink.clone());
+        let panic_options = ObjectOptions {
+            semantic_validator: Some(Arc::new(|_value: Value| async move {
+                panic!("validator panic payload");
+                #[allow(unreachable_code)]
+                Ok(SemanticValidation::Accept)
+            })),
+            ..ObjectOptions::default()
+        };
+        let error = generate_object_observed(
+            Arc::new(TextMock(r#"{"total": 9.99, "currency": "EUR"}"#.into())),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &panic_options,
+            Some(&panic_audit),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AikitError::StructuredOutput(message) if message.contains("panicked")
+        ));
+        assert!(panic_sink.records().iter().any(|record| matches!(
+            record.event,
+            AuditEvent::StructuredOutputValidationFailed { .. }
+        )));
+    }
+
+    #[tokio::test]
     async fn stream_object_reports_terminal_validation_failure_then_errors() {
         let options = ObjectOptions {
             max_retries: 0,
@@ -1252,6 +1705,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AikitError::StructuredOutput(m) if m.contains("currency")));
+    }
+
+    #[tokio::test]
+    async fn excessive_retry_counts_fail_before_calling_the_provider() {
+        for max_retries in [MAX_STRUCTURED_OUTPUT_RETRIES + 1, u32::MAX] {
+            let options = ObjectOptions {
+                max_retries,
+                ..ObjectOptions::default()
+            };
+            let error = generate_object(
+                Arc::new(NeverCalledMock),
+                "openai",
+                FidelityGrade::NativeConstrained,
+                "gpt-x",
+                "x",
+                &invoice_schema(),
+                &options,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                AikitError::Configuration(message) if message.contains("max_retries")
+            ));
+        }
     }
 
     #[tokio::test]

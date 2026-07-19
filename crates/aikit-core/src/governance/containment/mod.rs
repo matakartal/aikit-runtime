@@ -172,7 +172,9 @@ impl ContainmentGuarantees {
     const fn linux_namespace() -> Self {
         ContainmentGuarantees {
             filesystem_write_boundary: true,
-            sensitive_home_read_boundary: true,
+            // The current bwrap profile makes the host root read-only, but it does not mask the
+            // user's home. Read-only is a write boundary, not a sensitive-data read boundary.
+            sensitive_home_read_boundary: false,
             network_boundary: true,
             descendant_inheritance: true,
             syscall_filter: true,
@@ -466,6 +468,13 @@ mod tests {
             ContainmentPolicy::default().requirement,
             ContainmentRequirement::Required(BackendSelector::Auto)
         );
+    }
+
+    #[test]
+    fn linux_namespace_does_not_overstate_sensitive_home_isolation() {
+        let guarantees = ContainmentGuarantees::linux_namespace();
+        assert!(guarantees.filesystem_write_boundary);
+        assert!(!guarantees.sensitive_home_read_boundary);
     }
 
     #[tokio::test]

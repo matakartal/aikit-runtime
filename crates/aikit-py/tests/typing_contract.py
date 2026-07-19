@@ -14,12 +14,15 @@ from aikit import (
     ContainmentCapabilityReport,
     ErrorInfo,
     ErrorCode,
+    EvalGate,
+    EvalVerdict,
     FailureContext,
     GeneratedText,
     HookResponse,
     JsonValue,
     Message,
     McpServer,
+    McpToolFilter,
     ModelProfile,
     ModelRouteRequirements,
     ObjectStream,
@@ -27,12 +30,14 @@ from aikit import (
     QueryStream,
     RunOutcome,
     RunOptions,
+    SemanticValidationDecision,
     StreamDelta,
     SubagentResult,
     SubagentSpec,
     Tool,
     connect_mcp_http,
     connect_mcp_stdio,
+    evaluate_outcome,
     query,
     tool,
 )
@@ -63,6 +68,33 @@ messages: list[Message] = [
 ]
 prompt_input: PromptInput = messages
 
+eval_outcome: RunOutcome = {
+    "messages": messages,
+    "usage": {
+        "input_tokens": 8,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "reasoning_tokens": 0,
+    },
+    "terminal_status": "completed",
+    "stop_reason": "stop",
+    "model_attempts": ["mock-1"],
+    "invocation_start_message_index": 0,
+}
+eval_gates: list[EvalGate] = [
+    {"type": "output_contains", "value": "chart"},
+    {"type": "terminal_status", "status": "completed"},
+    {"type": "tool_sequence", "names": ["search"], "exact": False},
+    {"type": "no_tool_errors"},
+    {"type": "max_total_tokens", "value": 32},
+]
+assert_type(evaluate_outcome(eval_outcome, eval_gates), EvalVerdict)
+
+
+async def semantic_validator(_value: JsonValue) -> SemanticValidationDecision:
+    return {"action": "retry", "reason": "business invariant not met"}
+
 
 @tool(
     "typed_tool",
@@ -85,12 +117,24 @@ agent.use_memory_file("/tmp/aikit-memory.json", namespace="tenant-a")
 agent.use_session_file("/tmp/aikit-sessions.json")
 agent.use_sqlite_memory("/tmp/aikit-state.db", namespace="tenant-a")
 agent.use_sqlite_sessions("/tmp/aikit-state.db")
+assert_type(
+    agent.recover_expired_session(
+        "typed-session", side_effects_reconciled=True
+    ),
+    int,
+)
 agent.register_web_tools(["example.com"], "https://example.com/search?q={query}")
-agent.register_browser_tools("http://127.0.0.1:4444", "session", ["example.com"])
+agent.register_browser_tools(
+    "http://127.0.0.1:4444",
+    "session",
+    ["example.com"],
+    external_egress_enforced=True,
+)
 stream = agent.stream_object(
     "stream an invoice",
     Invoice,
     provider_options={"openai": {"temperature": 0}},
+    validator=semantic_validator,
 )
 assert_type(stream, ObjectStream[Invoice])
 
@@ -111,7 +155,9 @@ async def consume_canonical_messages() -> None:
         if delta["type"] == "error":
             assert_type(delta["info"], ErrorInfo)
 
-    object_result = await agent.generate_object(messages, Invoice)
+    object_result = await agent.generate_object(
+        messages, Invoice, validator=semantic_validator
+    )
     assert_type(object_result["value"], Invoice)
     object_stream = agent.stream_object(messages, Invoice)
     assert_type(object_stream, ObjectStream[Invoice])
@@ -164,8 +210,13 @@ agent.enable_capability_requests(["Bash"])
 agent.enable_default_guardrails([r"ignore previous instructions"])
 
 async def configure_mcp() -> None:
-    http_server: McpServer = await connect_mcp_http("https://mcp.example.com", "remote")
-    stdio_server: McpServer = await connect_mcp_stdio("server", [], "local", env={}, inherit_env=False)
+    tool_filter: McpToolFilter = {"allow": ["read_file", "search"], "deny": ["write_file"]}
+    http_server: McpServer = await connect_mcp_http(
+        "https://mcp.example.com", "remote", tool_filter=tool_filter
+    )
+    stdio_server: McpServer = await connect_mcp_stdio(
+        "server", [], "local", env={}, inherit_env=False, tool_filter={"deny": ["Bash"]}
+    )
     agent.register_mcp(http_server)
     await http_server.list_resources()
     await http_server.list_prompts()

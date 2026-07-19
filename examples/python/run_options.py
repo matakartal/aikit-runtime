@@ -38,6 +38,38 @@ async def main() -> None:
         agent.run("budget parity", {"budget": {"max_total_tokens": 0}}),
         "budget_exceeded",
     )
+    for options, field in (
+        ({"budegt": {"max_total_tokens": 0}}, "budegt"),
+        ({"budget": {"max_total_tokenz": 0}}, "max_total_tokenz"),
+        ({"retry": {"max_attempts_per_modal": 1}}, "max_attempts_per_modal"),
+        (
+            {
+                "compaction": {
+                    "max_context_tokens": 100,
+                    "keep_recent_messagez": 2,
+                }
+            },
+            "keep_recent_messagez",
+        ),
+    ):
+        try:
+            agent.run("invalid options must fail closed", options)
+        except ValueError as error:
+            if field not in str(error):
+                raise RuntimeError(f"unexpected invalid-option error: {error}") from error
+        else:
+            raise RuntimeError(f"Python silently ignored invalid option {field}")
+    for rule, field in (
+        ({"effect": "allow", "tool": "lookup", "pattrn": "AAPL"}, "pattrn"),
+        ({"effect": "allow", "tool": "lookup", "field": "symbol"}, "requires pattern"),
+    ):
+        try:
+            agent.set_permissions([rule])
+        except ValueError as error:
+            if field not in str(error):
+                raise RuntimeError(f"unexpected permission-rule error: {error}") from error
+        else:
+            raise RuntimeError(f"Python accepted unsafe permission rule {field}")
     try:
         agent.run("typed error parity", {"model": "not-a-real-model"})
     except RuntimeError as error:

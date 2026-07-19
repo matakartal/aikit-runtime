@@ -18,6 +18,7 @@ pub mod compaction;
 pub mod credentials;
 pub mod dx;
 pub mod error;
+pub mod eval;
 pub mod governance;
 pub mod mcp;
 pub mod memory;
@@ -51,9 +52,14 @@ pub use dx::{
     generate_object, generate_object_messages, generate_object_messages_observed,
     generate_object_observed, generate_object_typed, generate_object_typed_messages, stream_object,
     stream_object_messages, stream_object_messages_observed, stream_object_observed,
-    GeneratedObject, ObjectOptions, ObjectStream, ObjectStreamEvent, TypedGeneratedObject,
+    GeneratedObject, ObjectOptions, ObjectStream, ObjectStreamEvent, SemanticValidation,
+    SemanticValidator, TypedGeneratedObject,
 };
 pub use error::{AikitError, ErrorCode, ErrorInfo, ProviderError, ProviderErrorKind, Result};
+pub use eval::{
+    evaluate_outcome, EvalCase, EvalCaseReport, EvalCheck, EvalDataset, EvalGate, EvalReport,
+    EvalVerdict, EVAL_SCHEMA_VERSION,
+};
 pub use governance::capability::{
     request_capability_tool, CapabilityBroker, CapabilityDecision, CapabilityGate,
     REQUEST_CAPABILITY_TOOL,
@@ -91,8 +97,9 @@ pub use governance::{
     Governance, PermissionUpdate, ToolApprover,
 };
 pub use mcp::{
-    McpClient, McpPrompt, McpResource, McpToolExecutor, McpTransport, StdioTransport,
-    StreamableHttpTransport, MCP_PROTOCOL_VERSION,
+    McpClient, McpPrompt, McpResource, McpToolExecutor, McpToolFilter, McpTransport,
+    StdioTransport, StreamableHttpTransport, MAX_MCP_TOOL_FILTER_NAMES, MAX_MCP_TOOL_NAME_CHARS,
+    MCP_PROTOCOL_VERSION,
 };
 pub use memory::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryEntry, MemoryQuery, MemoryStore};
 #[cfg(feature = "opentelemetry")]
@@ -125,11 +132,11 @@ pub use runtime::{run_agent, RunConfig};
 pub use schemars::JsonSchema;
 pub use session::{
     InMemorySessionStore, JsonFileSessionStore, RunOutcome, RunRecorder, RunTerminalStatus,
-    Session, SessionStore, SessionStoreError, SessionStoreResult,
+    Session, SessionExecutionLease, SessionStore, SessionStoreError, SessionStoreResult,
 };
 pub use sqlite::{SqliteMemoryStore, SqliteSessionStore};
 pub use tools::builtin::BuiltinTools;
-pub use tools::web::{BrowserTools, WebTools};
+pub use tools::web::{BrowserEgressPolicy, BrowserTools, WebTools};
 pub use tools::{tool, NoTools, ToolExecutor, ToolRouter};
 pub use types::{
     ContentBlock, MediaSource, Message, ProviderMetadata, ProviderOptions, Role, StreamDelta,

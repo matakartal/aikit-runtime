@@ -34,6 +34,122 @@ async function main() {
     agent.run("budget parity", { budget: { maxTotalTokens: 0 } }),
     "budget_exceeded",
   );
+  for (const [options, field] of [
+    [{ budegt: { maxTotalTokens: 0 } }, "budegt"],
+    [{ budget: { maxTotalTokenz: 0 } }, "maxTotalTokenz"],
+    [{ retry: { maxAttemptsPerModal: 1 } }, "maxAttemptsPerModal"],
+    [
+      { compaction: { maxContextTokens: 100, keepRecentMessagez: 2 } },
+      "keepRecentMessagez",
+    ],
+    [{ signal: {} }, "AbortSignal"],
+  ]) {
+    let rejected = false;
+    try {
+      agent.run("invalid options must fail closed", options);
+    } catch (error) {
+      rejected = error.message.includes(field);
+    }
+    if (!rejected) throw new Error(`Node silently ignored invalid option ${field}`);
+  }
+  for (const [options, snake, camel] of [
+    [
+      { budget: { max_total_tokens: 100, maxTotalTokens: 100 } },
+      "max_total_tokens",
+      "maxTotalTokens",
+    ],
+    [
+      {
+        budget: {
+          pricing: {
+            input_per_million_usd: 1,
+            inputPerMillionUsd: 1,
+            outputPerMillionUsd: 2,
+          },
+        },
+      },
+      "input_per_million_usd",
+      "inputPerMillionUsd",
+    ],
+    [
+      { retry: { max_attempts_per_model: 1, maxAttemptsPerModel: 1 } },
+      "max_attempts_per_model",
+      "maxAttemptsPerModel",
+    ],
+    [
+      { compaction: { max_context_tokens: 100, maxContextTokens: 100 } },
+      "max_context_tokens",
+      "maxContextTokens",
+    ],
+  ]) {
+    let rejected = false;
+    try {
+      agent.run("duplicate aliases must fail closed", options);
+    } catch (error) {
+      rejected =
+        error.message.includes("duplicate aliases") &&
+        error.message.includes(snake) &&
+        error.message.includes(camel);
+    }
+    if (!rejected) {
+      throw new Error(`Node accepted duplicate aliases ${snake}/${camel}`);
+    }
+  }
+  for (const [options, field] of [
+    [{ budegt: { max_model_calls: 0 } }, "budegt"],
+    [{ budget: { max_model_callz: 0 } }, "max_model_callz"],
+  ]) {
+    let rejected = false;
+    try {
+      agent.fanOut([], [], options);
+    } catch (error) {
+      rejected = error.message.includes(field);
+    }
+    if (!rejected) {
+      throw new Error(`Node silently ignored invalid orchestration option ${field}`);
+    }
+  }
+  let subtaskRejected = false;
+  try {
+    agent.subtask("invalid", "prompt", "mock-1", { maxTurnz: 1 });
+  } catch (error) {
+    subtaskRejected = error.message.includes("maxTurnz");
+  }
+  if (!subtaskRejected) throw new Error("Node silently ignored invalid subtask option");
+  for (const [rule, field] of [
+    [{ effect: "allow", tool: "lookup", pattrn: "AAPL" }, "pattrn"],
+    [{ effect: "allow", tool: "lookup", field: "symbol" }, "requires pattern"],
+  ]) {
+    let rejected = false;
+    try {
+      agent.setPermissions([rule]);
+    } catch (error) {
+      rejected = error.message.includes(field);
+    }
+    if (!rejected) throw new Error(`Node accepted unsafe permission rule ${field}`);
+  }
+  for (const [operation, field] of [
+    [() => agent.streamText("invalid options", { maxTokenz: 1 }), "maxTokenz"],
+    [
+      () => agent.enableBashWithRequiredContainment({ image: "invalid", pidsLmit: 1 }),
+      "pidsLmit",
+    ],
+  ]) {
+    let rejected = false;
+    try {
+      operation();
+    } catch (error) {
+      rejected = error.message.includes(field);
+    }
+    if (!rejected) throw new Error(`Node silently ignored invalid ${field}`);
+  }
+  let textOptionsRejected = false;
+  try {
+    await agent.generateText("invalid options", { maxTokenz: 1 });
+  } catch (error) {
+    textOptionsRejected = error.message.includes("maxTokenz");
+  }
+  if (!textOptionsRejected) throw new Error("Node ignored invalid generateText options");
   let errorCode;
   try {
     agent.run("typed error parity", { model: "not-a-real-model" });
@@ -51,6 +167,37 @@ async function main() {
     signal: beforeController.signal,
   });
   const cancelBeforeOutcome = await before.close();
+
+  // A pre-aborted signal used to start native close() and the iterator's first next() in parallel,
+  // intermittently tripping QueryStream's intentional single-consumer guard. Exercise the race
+  // repeatedly so cancellation remains deterministic for both direct and for-await consumers.
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    const controller = new AbortController();
+    controller.abort();
+    const preAborted = agent.run("pre-aborted iteration", {
+      signal: controller.signal,
+    });
+    for await (const _delta of preAborted) {
+      throw new Error("pre-aborted iteration unexpectedly emitted a delta");
+    }
+    if (preAborted.outcome().terminal_status !== "cancelled") {
+      throw new Error("pre-aborted iteration did not finalize as cancelled");
+    }
+  }
+
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const controller = new AbortController();
+    controller.abort();
+    const preAborted = agent.run("pre-aborted direct pull", {
+      signal: controller.signal,
+    });
+    if ((await preAborted.next()) !== null) {
+      throw new Error("pre-aborted direct next unexpectedly emitted a delta");
+    }
+    if (preAborted.outcome().terminal_status !== "cancelled") {
+      throw new Error("pre-aborted direct next did not finalize as cancelled");
+    }
+  }
 
   const blocked = Agent.fromEnv({});
   let enteredResolve;
@@ -84,6 +231,33 @@ async function main() {
   controller.abort();
   await pending;
   const cancelDuringOutcome = await during.close();
+
+  const directBlocked = Agent.fromEnv({});
+  let directEnteredResolve;
+  const directEntered = new Promise((resolve) => {
+    directEnteredResolve = resolve;
+  });
+  directBlocked.onUserPrompt(async () => {
+    directEnteredResolve();
+    await new Promise(() => {});
+  });
+  const directClose = directBlocked.run("close while next is blocked");
+  const directPending = directClose.next();
+  await directEntered;
+  let closeTimer;
+  const directCloseOutcome = await Promise.race([
+    directClose.close(),
+    new Promise((_, reject) => {
+      closeTimer = setTimeout(
+        () => reject(new Error("direct close did not cancel the pending next")),
+        1_000,
+      );
+    }),
+  ]).finally(() => clearTimeout(closeTimer));
+  await directPending;
+  if (directCloseOutcome.terminal_status !== "cancelled") {
+    throw new Error("direct close did not finalize as cancelled");
+  }
 
   // `for await ... break` must invoke iterator.return(), which awaits native close().
   const breakStream = Agent.fromEnv({}).run("break finalization");

@@ -54,7 +54,24 @@ pub fn build_request(
     messages: &[Message],
     tools: &[ToolSpec],
     provider_options: Option<&serde_json::Map<String, Value>>,
-) -> Value {
+) -> crate::error::Result<Value> {
+    super::reject_protected_options(
+        "google",
+        model,
+        provider_options,
+        &[
+            "model",
+            "contents",
+            "systemInstruction",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "generationConfig.maxOutputTokens",
+            "tools",
+            "stream",
+            "stream_options",
+        ],
+    )?;
     // `functionResponse.name` must echo the called function's name; ContentBlock::ToolResult only
     // carries the opaque tool_use_id, so build an id→name lookup from prior ToolUse blocks.
     let mut tool_names: HashMap<&str, &str> = HashMap::new();
@@ -243,7 +260,7 @@ pub fn build_request(
             }
         }
     }
-    req
+    Ok(req)
 }
 
 /// Stateful translator for Gemini `streamGenerateContent` SSE chunks → canonical [`StreamDelta`]s.
@@ -265,6 +282,9 @@ pub struct GeminiStreamParser {
     usage: Usage,
     seen_citations: BTreeSet<String>,
     metadata: Map<String, Value>,
+    terminal: bool,
+    failed: bool,
+    retention: super::StreamRetentionBudget,
 }
 
 impl GeminiStreamParser {
@@ -286,14 +306,26 @@ impl GeminiStreamParser {
             usage: Usage::default(),
             seen_citations: BTreeSet::new(),
             metadata: Map::new(),
+            terminal: false,
+            failed: false,
+            retention: super::StreamRetentionBudget::default(),
         }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     /// Translate one decoded Gemini SSE chunk into zero or more canonical deltas.
     pub fn push_chunk(&mut self, chunk: &Value) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
         let mut out = Vec::new();
 
-        self.capture_response_metadata(chunk);
+        if !self.capture_response_metadata(chunk) {
+            return self.retained_state_failure();
+        }
 
         if !self.started {
             self.started = true;
@@ -303,7 +335,9 @@ impl GeminiStreamParser {
         }
 
         if let Some(u) = chunk.get("usageMetadata").filter(|u| u.is_object()) {
-            self.absorb_usage(u);
+            if !self.absorb_usage(u) {
+                return self.retained_state_failure();
+            }
         }
 
         // Gemini nests output under candidates[0].content.parts[].
@@ -314,7 +348,9 @@ impl GeminiStreamParser {
         let Some(candidate) = candidate else {
             return out;
         };
-        self.capture_candidate_metadata(candidate);
+        if !self.capture_candidate_metadata(candidate) {
+            return self.retained_state_failure();
+        }
 
         if let Some(parts) = candidate
             .get("content")
@@ -330,11 +366,17 @@ impl GeminiStreamParser {
                     // A thinking part: `text` holds the reasoning; `thoughtSignature` (when present)
                     // must be captured so it can be replayed verbatim next turn.
                     if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                        if !self.retention.retain(sig.len(), 0) {
+                            return self.retained_state_failure();
+                        }
                         self.reasoning_signature = Some(sig.to_string());
                     }
                     self.saw_reasoning = true;
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
+                            if !self.retention.retain(text.len(), 0) {
+                                return self.retained_state_failure();
+                            }
                             self.reasoning_text.push_str(text);
                             out.push(StreamDelta::ReasoningDelta { text: text.into() });
                         }
@@ -348,6 +390,10 @@ impl GeminiStreamParser {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    if name.is_empty() {
+                        return self
+                            .terminal_protocol_failure("Gemini functionCall is missing its name");
+                    }
                     let input = fc
                         .get("args")
                         .cloned()
@@ -358,6 +404,12 @@ impl GeminiStreamParser {
                     if let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) {
                         // Keep the signature associated with this exact canonical call id. Gemini
                         // 3 rejects a replay when it is moved onto a synthetic thought part.
+                        if !self.retention.retain(
+                            id.len().saturating_add(signature.len()),
+                            usize::from(!self.function_call_signatures.contains_key(&id)),
+                        ) {
+                            return self.retained_state_failure();
+                        }
                         self.function_call_signatures
                             .insert(id.clone(), signature.to_string());
                         self.saw_reasoning = true;
@@ -372,6 +424,9 @@ impl GeminiStreamParser {
                     // A plain-text part can also carry the turn's `thoughtSignature`; capture it so
                     // PreserveThoughtSignature works even when no `thought:true` part was streamed.
                     if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                        if !self.retention.retain(sig.len(), 0) {
+                            return self.retained_state_failure();
+                        }
                         self.reasoning_signature = Some(sig.to_string());
                         self.saw_reasoning = true;
                     }
@@ -383,6 +438,13 @@ impl GeminiStreamParser {
         }
 
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
+            if fr.is_empty() {
+                return self.terminal_protocol_failure("Gemini finishReason must not be empty");
+            }
+            if !self.retention.retain(fr.len(), 0) {
+                return self.retained_state_failure();
+            }
+            self.terminal = true;
             self.stop_reason = map_finish_reason(fr);
         }
 
@@ -402,6 +464,10 @@ impl GeminiStreamParser {
                     .unwrap_or_default()
                     .to_string();
                 let key = serde_json::to_string(chunk).unwrap_or_default();
+                let is_new = !self.seen_citations.contains(&key);
+                if is_new && !self.retention.retain(key.len(), 1) {
+                    return self.retained_state_failure();
+                }
                 if self.seen_citations.insert(key) {
                     out.push(StreamDelta::Citation {
                         text,
@@ -418,6 +484,15 @@ impl GeminiStreamParser {
     /// Call at end-of-stream: complete any reasoning block (with its signature), then Usage +
     /// MessageStop. A `functionCall` seen anywhere forces `tool_use` regardless of `finishReason`.
     pub fn finish(&mut self) -> Vec<StreamDelta> {
+        if self.failed {
+            return Vec::new();
+        }
+        if !self.terminal {
+            return vec![super::protocol_failure(
+                "google",
+                "Gemini stream ended before finishReason",
+            )];
+        }
         let mut out = Vec::new();
         if self.saw_reasoning {
             let function_call_signatures = std::mem::take(&mut self.function_call_signatures);
@@ -452,8 +527,11 @@ impl GeminiStreamParser {
         out
     }
 
-    fn absorb_usage(&mut self, u: &Value) {
+    fn absorb_usage(&mut self, u: &Value) -> bool {
         if let Some(raw) = u.as_object().filter(|raw| !raw.is_empty()) {
+            if !self.retention.retain_json(u, 1) {
+                return false;
+            }
             self.metadata
                 .entry("usageMetadata")
                 .or_insert_with(|| Value::Array(Vec::new()))
@@ -473,17 +551,22 @@ impl GeminiStreamParser {
         if let Some(n) = u.get("cachedContentTokenCount").and_then(Value::as_u64) {
             self.usage.cache_read_input_tokens = n;
         }
+        true
     }
 
-    fn capture_response_metadata(&mut self, chunk: &Value) {
+    fn capture_response_metadata(&mut self, chunk: &Value) -> bool {
         for field in ["responseId", "modelVersion", "promptFeedback"] {
             if let Some(value) = chunk.get(field) {
+                if !self.retain_metadata_value(field, value) {
+                    return false;
+                }
                 self.metadata.insert(field.into(), value.clone());
             }
         }
+        true
     }
 
-    fn capture_candidate_metadata(&mut self, candidate: &Value) {
+    fn capture_candidate_metadata(&mut self, candidate: &Value) -> bool {
         let mut metadata = Map::new();
         for field in [
             "index",
@@ -501,13 +584,49 @@ impl GeminiStreamParser {
             }
         }
         if !metadata.is_empty() {
+            let value = Value::Object(metadata);
+            if !self.retention.retain_json(&value, 1) {
+                return false;
+            }
             self.metadata
                 .entry("candidates")
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
                 .expect("candidate metadata is initialized as an array")
-                .push(Value::Object(metadata));
+                .push(value);
         }
+        true
+    }
+
+    fn retain_metadata_value(&mut self, key: &str, value: &Value) -> bool {
+        self.retention.retain(
+            key.len().saturating_add(super::json_retained_bytes(value)),
+            usize::from(!self.metadata.contains_key(key)),
+        )
+    }
+
+    fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.failed = true;
+        self.reasoning_text.clear();
+        self.reasoning_signature = None;
+        self.function_call_signatures.clear();
+        self.stop_reason.clear();
+        self.seen_citations.clear();
+        self.metadata.clear();
+        vec![super::retained_state_failure("google")]
+    }
+
+    fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.failed = true;
+        self.reasoning_text.clear();
+        self.reasoning_signature = None;
+        self.function_call_signatures.clear();
+        self.stop_reason.clear();
+        self.seen_citations.clear();
+        self.metadata.clear();
+        vec![super::protocol_failure("google", message)]
     }
 }
 
@@ -539,7 +658,7 @@ impl GeminiProvider {
         GeminiProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 }
@@ -561,7 +680,15 @@ impl Provider for GeminiProvider {
             &req.messages,
             &req.tools,
             Some(&options),
-        );
+        )
+        .map_err(|error| {
+            crate::error::ProviderError::new(
+                "google",
+                &req.model,
+                crate::error::ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         // The model name lives in the URL path for Gemini; `?alt=sse` selects SSE framing.
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -581,7 +708,7 @@ impl Provider for GeminiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
-            let text = resp.text().await.unwrap_or_default();
+            let text = super::read_error_body(resp).await;
             return Err(super::http_failure(
                 "google",
                 &req.model,
@@ -599,7 +726,15 @@ impl Provider for GeminiProvider {
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        buf.extend_from_slice(&bytes);
+                        if !super::append_sse_chunk(&mut buf, &bytes) {
+                            yield super::stream_failure(
+                                "google",
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                "Gemini SSE event exceeded the size limit",
+                            );
+                            return;
+                        }
                         // Dispatch each complete SSE `data:` line to the parser.
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
@@ -615,6 +750,12 @@ impl Provider for GeminiProvider {
                                         for d in parser.push_chunk(&json) {
                                             yield super::with_stream_context(d, "google", &model);
                                         }
+                                        if parser.is_terminal() {
+                                            for d in parser.finish() {
+                                                yield super::with_stream_context(d, "google", &model);
+                                            }
+                                            return;
+                                        }
                                     }
                                     Err(_) => {
                                         yield super::stream_failure(
@@ -629,14 +770,14 @@ impl Provider for GeminiProvider {
                             }
                         }
                     }
-                    Err(_) => {
-                        yield super::stream_failure(
+                    Err(error) => {
+                        yield super::response_stream_failure(
                             "google",
                             &model,
-                            crate::error::ProviderErrorKind::Transport,
-                            "Gemini response stream transport failed",
+                            error,
+                            "Gemini",
                         );
-                        break;
+                        return;
                     }
                 }
             }
@@ -674,7 +815,7 @@ mod tests {
                 },
             ],
         }];
-        let request = build_request("gemini-test", 100, &messages, &[], None);
+        let request = build_request("gemini-test", 100, &messages, &[], None).unwrap();
         let parts = request["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[1]["fileData"]["fileUri"], "gs://bucket/image.png");
         assert_eq!(parts[2]["inlineData"]["mimeType"], "image/jpeg");
@@ -746,7 +887,7 @@ mod tests {
             input_schema: json!({ "type": "object" }),
         }];
 
-        let req = build_request("gemini-2.5-pro", 2048, &messages, &tools, None);
+        let req = build_request("gemini-2.5-pro", 2048, &messages, &tools, None).unwrap();
 
         // System extracted to the top-level systemInstruction (not a content entry).
         assert_eq!(
@@ -889,6 +1030,48 @@ mod tests {
         assert!(metadata["candidates"][0].get("content").is_none());
     }
 
+    #[test]
+    fn many_small_thought_fragments_fail_terminally() {
+        let mut parser = GeminiStreamParser::new("gemini-test");
+        parser.retention = crate::providers::StreamRetentionBudget::with_limits(8, 8);
+        let fragment = json!({
+            "candidates": [{"content": {"parts": [{"thought": true, "text": "x"}]}}]
+        });
+        let failure = (0..16)
+            .find_map(|_| {
+                parser
+                    .push_chunk(&fragment)
+                    .into_iter()
+                    .find(|delta| matches!(delta, StreamDelta::Error { .. }))
+            })
+            .expect("many small thought fragments must exceed retained state");
+        assert!(
+            matches!(failure, StreamDelta::Error { message, .. } if message.contains("retained parser-state"))
+        );
+        assert!(parser.terminal);
+        assert!(parser.failed);
+        assert!(parser.reasoning_text.is_empty());
+        assert!(parser.push_chunk(&fragment).is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn function_call_without_name_is_a_terminal_protocol_failure() {
+        let mut parser = GeminiStreamParser::new("gemini-test");
+        let out = parser.push_chunk(&json!({
+            "candidates": [{"content": {"parts": [{"functionCall": {"args": {}}}]}}]
+        }));
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("missing its name")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::ToolCallStart { .. })));
+        assert!(parser.terminal);
+        assert!(parser.failed);
+    }
+
     #[tokio::test]
     async fn provider_streams_gemini_sse_over_real_http() {
         use futures::StreamExt;
@@ -930,6 +1113,49 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn clean_eof_before_finish_reason_is_a_protocol_failure() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::with_base_url("google-test-key", server.uri());
+        let out: Vec<_> = provider
+            .stream(ProviderRequest {
+                model: "gemini-2.5-flash".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: serde_json::Map::new(),
+                provider_options: crate::types::ProviderOptions::new(),
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
+    }
+
     #[test]
     fn function_call_signature_is_replayed_on_the_exact_original_part() {
         // Gemini can attach thoughtSignature to a functionCall part (not just a thought:true part)
@@ -940,7 +1166,7 @@ mod tests {
             "candidates": [{ "content": { "role": "model", "parts": [
                 { "functionCall": { "name": "search", "args": { "q": "merhaba" } },
                   "thoughtSignature": "sig_on_fc" }
-            ]}}]
+            ]}, "finishReason": "STOP" }]
         })));
         out.extend(p.finish());
 
@@ -979,7 +1205,7 @@ mod tests {
                 },
             ],
         };
-        let request = build_request("gemini-3-flash", 128, &[replay], &[], None);
+        let request = build_request("gemini-3-flash", 128, &[replay], &[], None).unwrap();
         let parts = request["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1, "must not synthesize an extra thought part");
         assert_eq!(parts[0]["functionCall"]["name"], "search");
@@ -1020,10 +1246,79 @@ mod tests {
             &[Message::user("hi")],
             &[],
             Some(&opts),
-        );
+        )
+        .unwrap();
         // Deep merge: built maxOutputTokens survives AND the caller's temperature is applied.
         assert_eq!(req["generationConfig"]["maxOutputTokens"], 2048);
         assert_eq!(req["generationConfig"]["temperature"], 0.5);
+    }
+
+    #[test]
+    fn provider_options_cannot_replace_gemini_contract_fields() {
+        for (key, value, expected_path) in [
+            ("model", json!("other-model"), "model"),
+            ("contents", json!([]), "contents"),
+            (
+                "systemInstruction",
+                json!({ "parts": [] }),
+                "systemInstruction",
+            ),
+            ("max_tokens", json!(1), "max_tokens"),
+            ("max_output_tokens", json!(1), "max_output_tokens"),
+            ("max_completion_tokens", json!(1), "max_completion_tokens"),
+            (
+                "generationConfig",
+                json!({ "maxOutputTokens": 1 }),
+                "generationConfig.maxOutputTokens",
+            ),
+            (
+                "generationConfig",
+                Value::Null,
+                "generationConfig.maxOutputTokens",
+            ),
+            ("tools", json!([]), "tools"),
+            ("stream", json!(false), "stream"),
+            ("stream_options", json!({}), "stream_options"),
+        ] {
+            let options = serde_json::Map::from_iter([(key.to_string(), value)]);
+            let error = build_request(
+                "gemini-2.5-pro",
+                100,
+                &[Message::user("hello")],
+                &[],
+                Some(&options),
+            )
+            .unwrap_err();
+            let error = error.provider_error().expect("typed provider error");
+            assert_eq!(error.kind, crate::error::ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains(expected_path));
+        }
+
+        let options =
+            serde_json::Map::from_iter([("labels".into(), json!({ "environment": "test" }))]);
+        let request = build_request(
+            "gemini-2.5-pro",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["labels"], options["labels"]);
+
+        let options = serde_json::Map::from_iter([(
+            "toolConfig".into(),
+            json!({ "functionCallingConfig": { "mode": "ANY" } }),
+        )]);
+        let request = build_request(
+            "gemini-2.5-pro",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["toolConfig"], options["toolConfig"]);
     }
 
     #[test]
@@ -1046,7 +1341,7 @@ mod tests {
                 }],
             },
         ];
-        let req = build_request("gemini-2.5-pro", 128, &messages, &[], None);
+        let req = build_request("gemini-2.5-pro", 128, &messages, &[], None).unwrap();
         let contents = req["contents"].as_array().unwrap();
         let tool_turn = contents.last().unwrap();
         let response = &tool_turn["parts"][0]["functionResponse"]["response"];

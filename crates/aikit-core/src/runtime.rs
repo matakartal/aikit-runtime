@@ -152,6 +152,169 @@ struct PendingToolCall {
     input: Option<serde_json::Value>,
 }
 
+// Provider `max_tokens` is a request hint, not a trustworthy memory boundary. Keep enough room
+// for unusually byte-heavy tokens and native metadata while imposing an absolute per-response
+// ceiling against buggy, compromised, or custom providers that stream forever.
+const MIN_RETAINED_RUN_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_RUN_BYTES: usize = 64 * 1024 * 1024;
+const RETAINED_BYTES_PER_REQUESTED_TOKEN: usize = 256;
+const MAX_RETAINED_RUN_ITEMS: usize = 16_384;
+const MAX_RUN_DELTAS: usize = 100_000;
+const MAX_SINGLE_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_JSON_DEPTH: usize = 128;
+const MAX_RETAINED_JSON_NODES: usize = 65_536;
+const RETAINED_JSON_NODE_OVERHEAD: usize = 16;
+
+#[derive(Debug)]
+struct RetainedRunBudget {
+    bytes: usize,
+    items: usize,
+    deltas: usize,
+    byte_limit: usize,
+}
+
+impl RetainedRunBudget {
+    fn new(max_tokens: u64) -> Self {
+        let requested_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
+        let byte_limit = requested_tokens
+            .saturating_mul(RETAINED_BYTES_PER_REQUESTED_TOKEN)
+            .clamp(MIN_RETAINED_RUN_BYTES, MAX_RETAINED_RUN_BYTES);
+        Self {
+            bytes: 0,
+            items: 0,
+            deltas: 0,
+            byte_limit,
+        }
+    }
+
+    fn charge_delta(&mut self, delta: &StreamDelta) -> std::result::Result<(), String> {
+        let (bytes, items) = match delta {
+            StreamDelta::MessageStart { model } => (model.len(), 1),
+            StreamDelta::TextDelta { text } => (text.len(), 0),
+            // Count forwarded reasoning too. Native parsers also emit a completed block, so this
+            // is deliberately conservative rather than trusting a provider's token hint.
+            StreamDelta::ReasoningDelta { text } => (text.len(), 0),
+            StreamDelta::Usage(_) => (0, 0),
+            StreamDelta::ReasoningComplete {
+                text,
+                signature,
+                opaque,
+            } => (
+                text.len()
+                    .saturating_add(signature.as_ref().map_or(0, String::len))
+                    .saturating_add(opaque.as_ref().map_or(0, retained_json_bytes)),
+                1,
+            ),
+            StreamDelta::ToolCallStart { id, name } => {
+                (id.len().saturating_mul(2).saturating_add(name.len()), 1)
+            }
+            StreamDelta::ToolCallInput { input, .. } => (retained_json_bytes(input), 0),
+            StreamDelta::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => (tool_use_id.len().saturating_add(content.len()), 1),
+            StreamDelta::Citation {
+                text,
+                source,
+                metadata,
+            } => (
+                text.len()
+                    .saturating_add(source.as_ref().map_or(0, String::len))
+                    .saturating_add(metadata.as_ref().map_or(0, retained_json_bytes)),
+                1,
+            ),
+            StreamDelta::ProviderMetadata { provider, metadata } => (
+                provider.len().saturating_add(retained_json_bytes(metadata)),
+                1,
+            ),
+            StreamDelta::MessageStop { stop_reason } => (stop_reason.len(), 0),
+            StreamDelta::Error { message, info } => (
+                message
+                    .len()
+                    .saturating_add(info.message.len())
+                    .saturating_add(info.provider.as_ref().map_or(0, String::len))
+                    .saturating_add(info.model.as_ref().map_or(0, String::len)),
+                0,
+            ),
+        };
+
+        self.charge(bytes, items, 1, "provider stream")
+    }
+
+    fn charge_tool_result(&mut self, tool_use_id: &str, content: &str) -> Result<(), String> {
+        self.charge(
+            tool_use_id.len().saturating_add(content.len()),
+            1,
+            1,
+            "tool output",
+        )
+    }
+
+    fn charge(
+        &mut self,
+        bytes: usize,
+        items: usize,
+        deltas: usize,
+        source: &str,
+    ) -> Result<(), String> {
+        let next_deltas = self.deltas.saturating_add(deltas);
+        let next_bytes = self.bytes.saturating_add(bytes);
+        let next_items = self.items.saturating_add(items);
+        if next_deltas > MAX_RUN_DELTAS
+            || next_bytes > self.byte_limit
+            || next_items > MAX_RETAINED_RUN_ITEMS
+        {
+            return Err(format!(
+                "{source} exceeded the retained-output safety limit ({} bytes, {} items, {} deltas)",
+                self.byte_limit, MAX_RETAINED_RUN_ITEMS, MAX_RUN_DELTAS,
+            ));
+        }
+        self.deltas = next_deltas;
+        self.bytes = next_bytes;
+        self.items = next_items;
+        Ok(())
+    }
+}
+
+fn retained_json_bytes(value: &serde_json::Value) -> usize {
+    fn visit(value: &serde_json::Value, depth: usize, nodes: &mut usize, bytes: &mut usize) {
+        if depth > MAX_RETAINED_JSON_DEPTH || *nodes >= MAX_RETAINED_JSON_NODES {
+            *bytes = usize::MAX;
+            return;
+        }
+        *nodes = nodes.saturating_add(1);
+        *bytes = bytes.saturating_add(RETAINED_JSON_NODE_OVERHEAD);
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) => {}
+            serde_json::Value::Number(_) => *bytes = bytes.saturating_add(24),
+            serde_json::Value::String(value) => *bytes = bytes.saturating_add(value.len()),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, depth.saturating_add(1), nodes, bytes);
+                    if *bytes == usize::MAX {
+                        break;
+                    }
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    *bytes = bytes.saturating_add(key.len());
+                    visit(value, depth.saturating_add(1), nodes, bytes);
+                    if *bytes == usize::MAX {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut nodes = 0;
+    let mut bytes = 0;
+    visit(value, 0, &mut nodes, &mut bytes);
+    bytes
+}
+
 fn compile_tool_validators(
     tools: &[crate::types::ToolSpec],
 ) -> crate::error::Result<HashMap<String, jsonschema::Validator>> {
@@ -337,6 +500,10 @@ pub fn run_agent(
         let mut budget = None;
         let mut can_run = true;
         let mut budget_error_emitted = false;
+        let retained_token_hint = cfg.max_tokens.saturating_mul(
+            u64::try_from(cfg.max_turns.max(1)).unwrap_or(u64::MAX),
+        );
+        let mut retained_output = RetainedRunBudget::new(retained_token_hint);
 
         if let Err(error) = cfg.audit.emit(AuditEvent::RunStarted {
             model: cfg.model.clone(),
@@ -417,6 +584,11 @@ pub fn run_agent(
                         PromptHookOutcome::Continue => {}
                         PromptHookOutcome::Rewrite(replacement) => {
                             rewrite_latest_user_prompt(&mut cfg.messages, replacement);
+                            // `begin` captures input before hooks so early failures remain
+                            // inspectable. Once a hook sanitizes the prompt, replace that initial
+                            // copy immediately so RunOutcome/session persistence cannot retain the
+                            // raw pre-hook text.
+                            cfg.recorder.replace_messages(cfg.messages.clone());
                         }
                         PromptHookOutcome::Block(reason) => {
                             let failure = run_failure_hooks(
@@ -580,7 +752,6 @@ pub fn run_agent(
             // state, redacted_thinking). Dropping them breaks extended-thinking + tool-use loops.
             let mut reasoning: Vec<(String, Option<String>, Option<serde_json::Value>)> = Vec::new();
             let mut citations: Vec<(String, Option<String>, Option<serde_json::Value>)> = Vec::new();
-
             loop {
                 let next_delta = tokio::select! {
                     biased;
@@ -596,6 +767,20 @@ pub fn run_agent(
                 let Some(delta) = next_delta else {
                     break;
                 };
+                if let Err(message) = retained_output.charge_delta(&delta) {
+                    let info = crate::error::ErrorInfo::new(
+                        crate::error::ErrorCode::ProviderProtocol,
+                    )
+                    .with_provider(provider.name(), &cfg.model);
+                    stream_error = Some((message.clone(), info.clone()));
+                    text.clear();
+                    tool_calls.clear();
+                    index_by_id.clear();
+                    reasoning.clear();
+                    citations.clear();
+                    yield StreamDelta::error_with_info(message, info);
+                    break;
+                }
                 match &delta {
                     StreamDelta::MessageStart { model } if !recorded_model_attempt => {
                         cfg.recorder.record_model_attempt(model.clone());
@@ -859,7 +1044,24 @@ pub fn run_agent(
                         yield StreamDelta::from_error(&error);
                         break 'agent;
                     }
-                    let reason = failure.message;
+                    let reason = if failure.message.len() > MAX_SINGLE_TOOL_RESULT_BYTES {
+                        format!(
+                            "tool '{}' denial output exceeded {} bytes and was discarded",
+                            call.name, MAX_SINGLE_TOOL_RESULT_BYTES
+                        )
+                    } else {
+                        failure.message
+                    };
+                    if let Err(message) = retained_output.charge_tool_result(&call.id, &reason) {
+                        terminal_reason = "retained_output_limit".into();
+                        yield StreamDelta::error_with_info(
+                            message,
+                            crate::error::ErrorInfo::new(
+                                crate::error::ErrorCode::ToolExecution,
+                            ),
+                        );
+                        break 'agent;
+                    }
                     if let Err(error) = cfg.audit.emit(AuditEvent::PermissionDecision {
                         turn,
                         tool_use_id: call.id.clone(),
@@ -910,6 +1112,24 @@ pub fn run_agent(
                             break 'agent;
                         }
                     };
+                    let reason = if reason.len() > MAX_SINGLE_TOOL_RESULT_BYTES {
+                        format!(
+                            "tool '{}' validation output exceeded {} bytes and was discarded",
+                            call.name, MAX_SINGLE_TOOL_RESULT_BYTES
+                        )
+                    } else {
+                        reason
+                    };
+                    if let Err(message) = retained_output.charge_tool_result(&call.id, &reason) {
+                        terminal_reason = "retained_output_limit".into();
+                        yield StreamDelta::error_with_info(
+                            message,
+                            crate::error::ErrorInfo::new(
+                                crate::error::ErrorCode::ToolExecution,
+                            ),
+                        );
+                        break 'agent;
+                    }
                     yield StreamDelta::ToolResult {
                         tool_use_id: call.id.clone(),
                         content: reason.clone(),
@@ -1010,7 +1230,7 @@ pub fn run_agent(
                     break 'agent;
                 }
 
-                let (content, is_error, effective_input) = match report.authorization {
+                let (mut content, mut is_error, effective_input) = match report.authorization {
                     Authorization::Denied {
                         message: reason,
                         interrupt: false,
@@ -1126,6 +1346,16 @@ pub fn run_agent(
                             };
                             match execution {
                                 Ok(raw_output) => {
+                                    let output_was_oversized =
+                                        raw_output.len() > MAX_SINGLE_TOOL_RESULT_BYTES;
+                                    let raw_output = if output_was_oversized {
+                                        format!(
+                                            "tool '{}' output exceeded {} bytes and was discarded",
+                                            call.name, MAX_SINGLE_TOOL_RESULT_BYTES
+                                        )
+                                    } else {
+                                        raw_output
+                                    };
                                     let duration_ms = started.elapsed().as_millis();
                                     let post = tokio::select! {
                                         biased;
@@ -1163,7 +1393,9 @@ pub fn run_agent(
                                         break 'agent;
                                     }
                                     match post {
-                                        PostToolOutcome::Continue => (raw_output, false, Some(effective)),
+                                        PostToolOutcome::Continue => {
+                                            (raw_output, output_was_oversized, Some(effective))
+                                        }
                                         PostToolOutcome::RewriteOutput(output) => {
                                             (output, false, Some(effective))
                                         }
@@ -1215,6 +1447,24 @@ pub fn run_agent(
                         }
                     }
                 };
+
+                if content.len() > MAX_SINGLE_TOOL_RESULT_BYTES {
+                    content = format!(
+                        "tool '{}' post-hook output exceeded {} bytes and was discarded",
+                        call.name, MAX_SINGLE_TOOL_RESULT_BYTES
+                    );
+                    is_error = true;
+                }
+                if let Err(message) = retained_output.charge_tool_result(&call.id, &content) {
+                    terminal_reason = "retained_output_limit".into();
+                    yield StreamDelta::error_with_info(
+                        message,
+                        crate::error::ErrorInfo::new(
+                            crate::error::ErrorCode::ToolExecution,
+                        ),
+                    );
+                    break 'agent;
+                }
 
                 if effective_input.is_some() {
                     if let Err(error) = cfg.audit.emit(AuditEvent::ToolCompleted {
@@ -1569,6 +1819,85 @@ mod tests {
         assert_eq!(metadata[1]["usage"]["prompt_cache_hit_tokens"], 11);
     }
 
+    struct OversizedStreamProvider;
+
+    #[async_trait]
+    impl Provider for OversizedStreamProvider {
+        fn name(&self) -> &str {
+            "oversized-stream"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
+            let deltas = std::iter::repeat_with(|| StreamDelta::TextDelta {
+                text: "x".repeat(64 * 1024),
+            })
+            .take(18)
+            .chain(std::iter::once(StreamDelta::MessageStop {
+                stop_reason: "end_turn".into(),
+            }));
+            Ok(Box::pin(futures::stream::iter(deltas)))
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_stream_output_is_bounded_even_when_provider_ignores_max_tokens() {
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("hostile-model", vec![Message::user("hi")]);
+        cfg.max_tokens = 1;
+        cfg.recorder = recorder.clone();
+        let stream = run_agent(Arc::new(OversizedStreamProvider), Arc::new(EchoTool), cfg);
+        futures::pin_mut!(stream);
+
+        let mut text_deltas = 0;
+        let mut protocol_error = None;
+        while let Some(delta) = stream.next().await {
+            match delta {
+                StreamDelta::TextDelta { .. } => text_deltas += 1,
+                StreamDelta::Error { message, info } => {
+                    protocol_error = Some((message, info));
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            text_deltas, 16,
+            "the over-limit delta must not be forwarded"
+        );
+        let (message, info) = protocol_error.expect("limit emits a typed terminal error");
+        assert!(message.contains("retained-output safety limit"));
+        assert_eq!(info.code, crate::error::ErrorCode::ProviderProtocol);
+        assert_eq!(info.provider.as_deref(), Some("oversized-stream"));
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Failed
+        );
+        assert!(outcome.final_text.is_none());
+    }
+
+    #[test]
+    fn retained_json_accounting_bounds_empty_nodes_and_depth() {
+        let empty = serde_json::json!([]);
+        assert!(retained_json_bytes(&empty) >= RETAINED_JSON_NODE_OVERHEAD);
+
+        let many_empty = serde_json::Value::Array(
+            (0..=MAX_RETAINED_JSON_NODES)
+                .map(|_| serde_json::Value::Array(Vec::new()))
+                .collect(),
+        );
+        assert_eq!(retained_json_bytes(&many_empty), usize::MAX);
+
+        let mut deeply_nested = serde_json::Value::Null;
+        for _ in 0..=MAX_RETAINED_JSON_DEPTH {
+            deeply_nested = serde_json::Value::Array(vec![deeply_nested]);
+        }
+        assert_eq!(retained_json_bytes(&deeply_nested), usize::MAX);
+    }
+
     /// Turn 1 asks for one tool call; turn 2 (once a tool result exists) finishes.
     struct SingleToolProvider {
         tool: String,
@@ -1664,6 +1993,19 @@ mod tests {
         last_input: Arc<std::sync::Mutex<serde_json::Value>>,
     }
 
+    struct OversizedOutputTool;
+
+    #[async_trait]
+    impl ToolExecutor for OversizedOutputTool {
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+        ) -> crate::error::Result<String> {
+            Ok("x".repeat(MAX_SINGLE_TOOL_RESULT_BYTES + 1))
+        }
+    }
+
     #[async_trait]
     impl ToolExecutor for RecordingExecutor {
         async fn execute(
@@ -1683,6 +2025,36 @@ mod tests {
             description: "test tool".into(),
             input_schema: serde_json::json!({ "type": "object" }),
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_custom_tool_output_is_discarded_before_hooks_or_history_clone_it() {
+        let mut cfg = RunConfig::new("m", vec![Message::user("hi")]);
+        cfg.tools = vec![advertised("huge")];
+        let stream = run_agent(
+            Arc::new(SingleToolProvider {
+                tool: "huge".into(),
+                input: serde_json::json!({}),
+            }),
+            Arc::new(OversizedOutputTool),
+            cfg,
+        );
+        futures::pin_mut!(stream);
+
+        let mut tool_result = None;
+        while let Some(delta) = stream.next().await {
+            if let StreamDelta::ToolResult {
+                content, is_error, ..
+            } = delta
+            {
+                tool_result = Some((content, is_error));
+            }
+        }
+
+        let (content, is_error) = tool_result.expect("tool result is surfaced");
+        assert!(is_error);
+        assert!(content.contains("output exceeded"));
+        assert!(content.len() < 256);
     }
 
     fn strict_path_tool(name: &str) -> ToolSpec {

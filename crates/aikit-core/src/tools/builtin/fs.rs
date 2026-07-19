@@ -7,6 +7,14 @@ use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+const MAX_READ_BYTES: u64 = 1_000_000;
+const MAX_WRITE_BYTES: usize = 1_000_000;
+const MAX_SEARCH_FILE_BYTES: u64 = 1_000_000;
+const MAX_SEARCHED_FILES: usize = 10_000;
+const MAX_GREP_HITS: usize = 200;
+const MAX_GREP_LINE_CHARS: usize = 4_096;
+const MAX_GLOB_MATCHES: usize = 200;
+
 fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
     input
         .get(key)
@@ -22,15 +30,17 @@ fn denied(e: SandboxError) -> AikitError {
 pub fn read(sb: &Sandbox, input: &Value) -> Result<String> {
     let path = str_arg(input, "path")?;
     let mut file = sb.open_read(path).map_err(denied)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|error| AikitError::ToolExecution(format!("read {path}: {error}")))?;
-    Ok(content)
+    read_bounded(&mut file, path, MAX_READ_BYTES)
 }
 
 pub fn write(sb: &Sandbox, input: &Value) -> Result<String> {
     let path = str_arg(input, "path")?;
     let content = str_arg(input, "content")?;
+    if content.len() > MAX_WRITE_BYTES {
+        return Err(AikitError::ToolExecution(format!(
+            "write {path}: content exceeds {MAX_WRITE_BYTES} bytes"
+        )));
+    }
     let mut file = sb.open_write(path).map_err(denied)?;
     file.write_all(content.as_bytes())
         .map_err(|error| AikitError::ToolExecution(format!("write {path}: {error}")))?;
@@ -44,15 +54,18 @@ pub fn edit(sb: &Sandbox, input: &Value) -> Result<String> {
     // Read and write through one open descriptor. A concurrent rename can change the name, but it
     // cannot redirect the write to a different file after the content check.
     let mut file = sb.open_edit(path).map_err(denied)?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .map_err(|error| AikitError::ToolExecution(format!("read {path}: {error}")))?;
+    let content = read_bounded(&mut file, path, MAX_READ_BYTES)?;
     match content.matches(old).count() {
         0 => Err(AikitError::ToolExecution(format!(
             "old_string not found in {path}"
         ))),
         1 => {
             let updated = content.replacen(old, new, 1);
+            if updated.len() as u64 > MAX_READ_BYTES {
+                return Err(AikitError::ToolExecution(format!(
+                    "edited content for {path} exceeds {MAX_READ_BYTES} bytes"
+                )));
+            }
             file.seek(SeekFrom::Start(0))
                 .and_then(|_| file.set_len(0))
                 .and_then(|_| file.write_all(updated.as_bytes()))
@@ -65,6 +78,19 @@ pub fn edit(sb: &Sandbox, input: &Value) -> Result<String> {
     }
 }
 
+fn read_bounded(file: &mut std::fs::File, path: &str, max_bytes: u64) -> Result<String> {
+    let mut content = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut content)
+        .map_err(|error| AikitError::ToolExecution(format!("read {path}: {error}")))?;
+    if content.len() as u64 > max_bytes {
+        return Err(AikitError::ToolExecution(format!(
+            "read {path}: file exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(content)
+}
+
 pub fn grep(sb: &Sandbox, input: &Value) -> Result<String> {
     let pattern = str_arg(input, "pattern")?;
     let re = regex::Regex::new(pattern)
@@ -74,31 +100,49 @@ pub fn grep(sb: &Sandbox, input: &Value) -> Result<String> {
         return Err(AikitError::ToolExecution("no search root".into()));
     }
     let mut hits = Vec::new();
-    sb.walk_files(requested_base.map(Path::new), |entry| {
-        if let Ok(mut file) = entry.open() {
+    let mut searched_files = 0usize;
+    sb.walk_files(requested_base.map(Path::new), MAX_SEARCHED_FILES, |entry| {
+        if searched_files >= MAX_SEARCHED_FILES || hits.len() >= MAX_GREP_HITS {
+            return false;
+        }
+        searched_files += 1;
+        if let Ok(file) = entry.open() {
             let mut text = String::new();
-            if file.read_to_string(&mut text).is_err() {
-                return;
+            if file
+                .take(MAX_SEARCH_FILE_BYTES.saturating_add(1))
+                .read_to_string(&mut text)
+                .is_err()
+                || text.len() as u64 > MAX_SEARCH_FILE_BYTES
+            {
+                return true;
             }
             for (i, line) in text.lines().enumerate() {
                 if re.is_match(line) {
-                    hits.push(format!(
-                        "{}:{}: {}",
-                        entry.path().display(),
-                        i + 1,
-                        line.trim()
-                    ));
+                    let line = bounded_line(line.trim(), MAX_GREP_LINE_CHARS);
+                    hits.push(format!("{}:{}: {}", entry.path().display(), i + 1, line));
+                    if hits.len() >= MAX_GREP_HITS {
+                        break;
+                    }
                 }
             }
         }
+        searched_files < MAX_SEARCHED_FILES && hits.len() < MAX_GREP_HITS
     })
     .map_err(denied)?;
     if hits.is_empty() {
         Ok("no matches".into())
     } else {
-        hits.truncate(200);
         Ok(hits.join("\n"))
     }
+}
+
+fn bounded_line(line: &str, max_chars: usize) -> String {
+    let mut chars = line.chars();
+    let mut output: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    output
 }
 
 pub fn glob(sb: &Sandbox, input: &Value) -> Result<String> {
@@ -107,7 +151,12 @@ pub fn glob(sb: &Sandbox, input: &Value) -> Result<String> {
         return Err(AikitError::ToolExecution("no root".into()));
     }
     let mut matches = Vec::new();
-    sb.walk_files(None, |entry| {
+    let mut searched_files = 0usize;
+    sb.walk_files(None, MAX_SEARCHED_FILES, |entry| {
+        if searched_files >= MAX_SEARCHED_FILES || matches.len() >= MAX_GLOB_MATCHES {
+            return false;
+        }
+        searched_files += 1;
         let name = entry
             .path()
             .file_name()
@@ -116,6 +165,7 @@ pub fn glob(sb: &Sandbox, input: &Value) -> Result<String> {
         if glob_match(pattern, name) {
             matches.push(entry.path().display().to_string());
         }
+        searched_files < MAX_SEARCHED_FILES && matches.len() < MAX_GLOB_MATCHES
     })
     .map_err(denied)?;
     if matches.is_empty() {
@@ -248,5 +298,72 @@ mod tests {
 
         let output = grep(&sandbox, &json!({"pattern": "MATCH"})).unwrap();
         assert_eq!(output.lines().count(), 200);
+    }
+
+    #[test]
+    fn read_rejects_files_over_the_memory_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("oversized.txt"),
+            vec![b'x'; MAX_READ_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let error = read(&sandbox, &json!({"path": "oversized.txt"})).unwrap_err();
+        assert!(error.to_string().contains("file exceeds 1000000 bytes"));
+    }
+
+    #[test]
+    fn oversized_write_is_rejected_before_the_existing_file_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        std::fs::write(dir.path().join("existing.txt"), "preserve me").unwrap();
+
+        let error = write(
+            &sandbox,
+            &json!({
+                "path": "existing.txt",
+                "content": "x".repeat(MAX_WRITE_BYTES + 1)
+            }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content exceeds 1000000 bytes"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
+            "preserve me"
+        );
+    }
+
+    #[test]
+    fn grep_skips_oversized_files_and_bounds_each_rendered_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        let mut oversized = b"MATCH ".to_vec();
+        oversized.resize(MAX_SEARCH_FILE_BYTES as usize + 1, b'x');
+        std::fs::write(dir.path().join("oversized.txt"), oversized).unwrap();
+        std::fs::write(
+            dir.path().join("long-line.txt"),
+            format!("MATCH {}", "y".repeat(MAX_GREP_LINE_CHARS + 100)),
+        )
+        .unwrap();
+
+        let output = grep(&sandbox, &json!({"pattern": "MATCH"})).unwrap();
+        assert!(!output.contains("oversized.txt"));
+        assert!(output.contains("long-line.txt"));
+        assert!(output.ends_with('…'));
+        assert!(output.len() < MAX_GREP_LINE_CHARS + 500);
+    }
+
+    #[test]
+    fn glob_caps_the_number_of_retained_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        for index in 0..250 {
+            std::fs::write(dir.path().join(format!("match-{index}.txt")), "x").unwrap();
+        }
+
+        let output = glob(&sandbox, &json!({"pattern": "*.txt"})).unwrap();
+        assert_eq!(output.lines().count(), MAX_GLOB_MATCHES);
     }
 }

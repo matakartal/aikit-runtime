@@ -24,19 +24,21 @@ use std::sync::{Arc, RwLock};
 
 use aikit_core::orchestration::{ExecutionContext, Orchestrator, SubagentSpec};
 use aikit_core::{
-    request_capability_tool, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions,
-    AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
-    AuditTrail, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
-    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, Client as CoreClient,
-    CompactionPolicy, ContainmentPolicy, DockerConfig, FailureContext, FailureHookOutcome,
-    GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher,
-    HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink,
-    McpClient, McpToolExecutor, Message, ModelCatalog, ModelPricing, ModelProfile, NoTools,
+    evaluate_outcome as core_evaluate_outcome, request_capability_tool, Agent as CoreAgent,
+    AgentError, AgentOptions as CoreAgentOptions, AikitError, ApprovalDecision, ApprovalRequest,
+    AuditFailureMode, AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools,
+    BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle,
+    CapabilityBroker, CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy,
+    DockerConfig, EvalGate, FailureContext, FailureHookOutcome, GeneratedText, Governance,
+    GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
+    InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
+    McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile, NoTools,
     ObjectOptions, ObjectStream as CoreObjectStream, PermissionEngine, PermissionMode,
     PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext, PreToolUseContext,
     PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
-    RoutingOptions as CoreRoutingOptions, Rule, RunConfig, RunRecorder, RunTerminalStatus, Sandbox,
-    SecretRedactor, SessionStore, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
+    RoutingOptions as CoreRoutingOptions, Rule, RunConfig, RunOutcome, RunRecorder,
+    RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
+    SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
     StopContext, StreamDelta, StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter,
     ToolSpec, WebTools,
 };
@@ -79,6 +81,13 @@ pub struct DockerContainmentOptions {
     pub memory_mib: Option<u32>,
     pub cpus: Option<u32>,
     pub tmpfs_mib: Option<u32>,
+}
+
+/// Required caller assertion for browser registration. Setting this to true does not install an
+/// egress boundary; it asserts that the caller already configured one outside aikit.
+#[napi(object)]
+pub struct BrowserToolsOptions {
+    pub external_egress_enforced: bool,
 }
 
 fn required_auto_containment(docker: Option<DockerContainmentOptions>) -> ContainmentPolicy {
@@ -187,6 +196,50 @@ fn action(value: &Value) -> Option<&str> {
         .as_str()
         .or_else(|| value.get("action").and_then(Value::as_str))
         .or_else(|| value.get("decision").and_then(Value::as_str))
+}
+
+fn parse_semantic_validation(value: Value) -> std::result::Result<SemanticValidation, String> {
+    match value {
+        Value::String(action) if action == "accept" => Ok(SemanticValidation::Accept),
+        Value::Object(object) => match object.get("action").and_then(Value::as_str) {
+            Some("accept") if object.len() == 1 => Ok(SemanticValidation::Accept),
+            Some("retry") if object.len() == 2 => object
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| SemanticValidation::Retry(reason.to_string()))
+                .ok_or_else(|| {
+                    "semantic validator retry decision requires exactly action and string reason"
+                        .into()
+                }),
+            Some("reject") if object.len() == 2 => object
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| SemanticValidation::Reject(reason.to_string()))
+                .ok_or_else(|| {
+                    "semantic validator reject decision requires exactly action and string reason"
+                        .into()
+                }),
+            _ => Err(
+                "semantic validator must resolve to 'accept' or an exact action object with retry/reject and reason"
+                    .into(),
+            ),
+        },
+        _ => Err(
+            "semantic validator must resolve to 'accept' or an exact action object with retry/reject and reason"
+                .into(),
+        ),
+    }
+}
+
+struct NodeSemanticValidator {
+    callback: HostCallback,
+}
+
+#[async_trait]
+impl SemanticValidator for NodeSemanticValidator {
+    async fn validate(&self, value: Value) -> std::result::Result<SemanticValidation, String> {
+        parse_semantic_validation(call_node(self.callback.clone(), value).await?)
+    }
 }
 
 fn parse_approval(value: Value) -> std::result::Result<ApprovalDecision, String> {
@@ -507,6 +560,170 @@ pub struct McpServer {
     client: Arc<McpClient>,
 }
 
+fn node_mcp_tool_filter(value: Option<Value>) -> Result<McpToolFilter> {
+    let Some(value) = value else {
+        return Ok(McpToolFilter::default());
+    };
+    McpToolFilter::from_value(value).map_err(|error| Error::from_reason(error.to_string()))
+}
+
+/// Public evaluation input is stricter than backward-compatible persisted session decoding.
+/// Check closed canonical shapes first, then let the shared core serde types perform all actual
+/// type and enum decoding.
+fn validate_eval_outcome_shape(value: &Value) -> std::result::Result<(), String> {
+    fn reject_unknown(
+        value: &Value,
+        allowed: &[&str],
+        context: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        if object
+            .keys()
+            .any(|key| !allowed.iter().any(|allowed| key == allowed))
+        {
+            return Err(format!("{context} contains an unknown field"));
+        }
+        Ok(())
+    }
+
+    reject_unknown(
+        value,
+        &[
+            "messages",
+            "usage",
+            "provider_metadata",
+            "terminal_status",
+            "stop_reason",
+            "model_attempts",
+            "final_text",
+            "invocation_start_message_index",
+        ],
+        "RunOutcome",
+    )?;
+
+    let Some(outcome) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(usage) = outcome.get("usage") {
+        reject_unknown(
+            usage,
+            &[
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "reasoning_tokens",
+            ],
+            "RunOutcome.usage",
+        )?;
+    }
+
+    let Some(messages) = outcome.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (message_index, message) in messages.iter().enumerate() {
+        reject_unknown(
+            message,
+            &["role", "content"],
+            &format!("RunOutcome.messages[{message_index}]"),
+        )?;
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            let context = format!("RunOutcome.messages[{message_index}].content[{block_index}]");
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => reject_unknown(block, &["type", "text"], &context)?,
+                Some("reasoning") => reject_unknown(
+                    block,
+                    &["type", "text", "signature", "provider", "opaque"],
+                    &context,
+                )?,
+                Some("tool_use") => {
+                    reject_unknown(block, &["type", "id", "name", "input"], &context)?
+                }
+                Some("tool_result") => reject_unknown(
+                    block,
+                    &["type", "tool_use_id", "content", "is_error"],
+                    &context,
+                )?,
+                Some("media") => {
+                    reject_unknown(block, &["type", "media_type", "source"], &context)?;
+                    if let Some(source) = block.get("source") {
+                        let source_context = format!("{context}.source");
+                        match source.get("kind").and_then(Value::as_str) {
+                            Some("url") => {
+                                reject_unknown(source, &["kind", "url"], &source_context)?
+                            }
+                            Some("base64") => {
+                                reject_unknown(source, &["kind", "data"], &source_context)?
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some("citation") => {
+                    reject_unknown(block, &["type", "text", "source", "metadata"], &context)?
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_eval_outcome(value: Value) -> Result<RunOutcome> {
+    validate_eval_outcome_shape(&value).map_err(Error::from_reason)?;
+    serde_json::from_value(value)
+        .map_err(|_| Error::from_reason("invalid canonical RunOutcome structure"))
+}
+
+fn validate_eval_gate_shapes(value: &Value) -> Result<()> {
+    let gates = value
+        .as_array()
+        .ok_or_else(|| Error::from_reason("eval gates must be an array"))?;
+    for (index, gate) in gates.iter().enumerate() {
+        let Some(object) = gate.as_object() else {
+            continue;
+        };
+        let allowed: &[&str] = match object.get("type").and_then(Value::as_str) {
+            Some("output_exact" | "output_contains" | "output_not_contains") => &["type", "value"],
+            Some("terminal_status") => &["type", "status"],
+            Some("called_tool" | "did_not_call_tool") => &["type", "name"],
+            Some("tool_sequence") => &["type", "names", "exact"],
+            Some("no_tool_errors") => &["type"],
+            Some(
+                "max_turns" | "max_input_tokens" | "max_output_tokens" | "max_total_tokens"
+                | "max_model_attempts",
+            ) => &["type", "value"],
+            _ => continue,
+        };
+        if object
+            .keys()
+            .any(|key| !allowed.iter().any(|allowed| key == allowed))
+        {
+            return Err(Error::from_reason(format!(
+                "eval gates[{index}] contains an unknown field"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Pure deterministic evaluation over a previously recorded canonical outcome.
+#[napi]
+pub fn evaluate_outcome(outcome: Value, gates: Value) -> Result<Value> {
+    let outcome = parse_eval_outcome(outcome)?;
+    validate_eval_gate_shapes(&gates)?;
+    let gates: Vec<EvalGate> = serde_json::from_value(gates)
+        .map_err(|_| Error::from_reason("invalid eval gate sequence"))?;
+    let verdict = core_evaluate_outcome(&outcome, &gates)
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    serde_json::to_value(verdict).map_err(|_| Error::from_reason("failed to encode EvalVerdict"))
+}
+
 #[napi]
 impl McpServer {
     #[napi(factory)]
@@ -514,12 +731,14 @@ impl McpServer {
         endpoint: String,
         name: String,
         bearer_token: Option<String>,
+        tool_filter: Option<Value>,
     ) -> Result<Self> {
+        let tool_filter = node_mcp_tool_filter(tool_filter)?;
         let transport = Arc::new(
             StreamableHttpTransport::new(&endpoint, bearer_token)
                 .map_err(|error| Error::from_reason(error.to_string()))?,
         );
-        let mut client = McpClient::new(transport, name);
+        let mut client = McpClient::new_with_tool_filter(transport, name, tool_filter);
         client
             .initialize()
             .await
@@ -543,14 +762,16 @@ impl McpServer {
         name: String,
         env: Option<HashMap<String, String>>,
         inherit_env: Option<bool>,
+        tool_filter: Option<Value>,
     ) -> Result<Self> {
+        let tool_filter = node_mcp_tool_filter(tool_filter)?;
         let env = env.unwrap_or_default().into_iter().collect();
         let transport = Arc::new(
             StdioTransport::spawn_with_env(&program, &args, &env, inherit_env.unwrap_or(false))
                 .await
                 .map_err(|error| Error::from_reason(error.to_string()))?,
         );
-        let mut client = McpClient::new(transport, name);
+        let mut client = McpClient::new_with_tool_filter(transport, name, tool_filter);
         client
             .initialize()
             .await
@@ -862,6 +1083,31 @@ impl Agent {
         Ok(())
     }
 
+    /// Clear one expired execution lease after the caller has reconciled every possibly completed
+    /// external side effect. This never runs a provider or tool; retry/resume remains a separate
+    /// explicit call.
+    #[napi]
+    pub fn recover_expired_session(
+        &self,
+        session_id: String,
+        side_effects_reconciled: bool,
+    ) -> Result<u64> {
+        if !side_effects_reconciled {
+            return Err(Error::from_reason(
+                "expired session recovery requires sideEffectsReconciled=true",
+            ));
+        }
+        let base = match self.session_store.load_session(&session_id) {
+            Ok(session) => session,
+            Err(SessionStoreError::NotFound { .. }) => Session::new(session_id, Vec::new()),
+            Err(error) => return Err(Error::from_reason(error.to_string())),
+        };
+        self.session_store
+            .clear_expired_execution_lease(base)
+            .map(|session| session.revision)
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
     #[napi]
     pub fn register_web_tools(
         &mut self,
@@ -889,8 +1135,14 @@ impl Agent {
         webdriver_endpoint: String,
         session_id: String,
         allowed_hosts: Vec<String>,
+        options: BrowserToolsOptions,
     ) -> Result<()> {
-        let tools = BrowserTools::new(&webdriver_endpoint, &session_id, allowed_hosts)
+        let policy = if options.external_egress_enforced {
+            BrowserEgressPolicy::ExternallyEnforced
+        } else {
+            BrowserEgressPolicy::Deny
+        };
+        let tools = BrowserTools::new(&webdriver_endpoint, &session_id, allowed_hosts, policy)
             .map_err(|error| Error::from_reason(error.to_string()))?;
         let specs = tools.specs();
         self.install_external_tools(specs, Arc::new(tools))
@@ -1400,12 +1652,17 @@ impl Agent {
     /// Generate a schema-validated object. Defaults to the deterministic keyless
     /// `mock-structured` model; use a live model after activating its provider with `addKey`.
     #[napi(ts_return_type = "Promise<any>")]
-    pub async fn generate_object(
+    pub fn generate_object(
         &self,
+        env: Env,
         input: Value,
         schema: Value,
         options: Option<GenerateObjectOptions>,
-    ) -> Result<Value> {
+        validator: Option<HostFunction<'_>>,
+    ) -> Result<AsyncBlock<Value>> {
+        let semantic_validator = validator.map(host_callback).transpose()?.map(|callback| {
+            Arc::new(NodeSemanticValidator { callback }) as Arc<dyn SemanticValidator>
+        });
         let options = options.unwrap_or(GenerateObjectOptions {
             model: None,
             max_retries: None,
@@ -1425,22 +1682,28 @@ impl Agent {
         let messages = model_input_messages(input)
             .map_err(|error| encoded_agent_error(AgentError::Core(error)))?;
         let audit = self.audit.fresh_run();
-        let result = agent
-            .generate_object_messages_with_audit(
-                messages,
-                schema,
-                options.model.as_deref().unwrap_or("mock-structured"),
-                ObjectOptions {
-                    max_retries: options.max_retries.unwrap_or(2),
-                    max_tokens: u64::from(options.max_tokens.unwrap_or(1024)),
-                    name: options.name.unwrap_or_else(|| "respond".into()),
-                    provider_options,
-                },
-                Some(&audit),
-            )
-            .await
-            .map_err(encoded_agent_error)?;
-        serde_json::to_value(result).map_err(|e| Error::from_reason(e.to_string()))
+        let model = options.model.unwrap_or_else(|| "mock-structured".into());
+        let object_options = ObjectOptions {
+            max_retries: options.max_retries.unwrap_or(2),
+            max_tokens: u64::from(options.max_tokens.unwrap_or(1024)),
+            name: options.name.unwrap_or_else(|| "respond".into()),
+            provider_options,
+            semantic_validator,
+        };
+        AsyncBlockBuilder::new(async move {
+            let result = agent
+                .generate_object_messages_with_audit(
+                    messages,
+                    schema,
+                    &model,
+                    object_options,
+                    Some(&audit),
+                )
+                .await
+                .map_err(encoded_agent_error)?;
+            serde_json::to_value(result).map_err(|error| Error::from_reason(error.to_string()))
+        })
+        .build(&env)
     }
 
     /// Stream every structured-output attempt and provider delta as it occurs. Validation failures
@@ -1452,7 +1715,11 @@ impl Agent {
         input: Value,
         schema: Value,
         options: Option<GenerateObjectOptions>,
+        validator: Option<HostFunction<'_>>,
     ) -> Result<ObjectStream> {
+        let semantic_validator = validator.map(host_callback).transpose()?.map(|callback| {
+            Arc::new(NodeSemanticValidator { callback }) as Arc<dyn SemanticValidator>
+        });
         let options = options.unwrap_or(GenerateObjectOptions {
             model: None,
             max_retries: None,
@@ -1481,6 +1748,7 @@ impl Agent {
                     max_tokens: u64::from(options.max_tokens.unwrap_or(1024)),
                     name: options.name.unwrap_or_else(|| "respond".into()),
                     provider_options,
+                    semantic_validator,
                 },
                 Some(&audit),
             )
@@ -1598,38 +1866,62 @@ fn parse_routing_options(value: Option<Value>) -> Result<Option<CoreRoutingOptio
 
 fn field<'a>(
     object: &'a serde_json::Map<String, Value>,
+    context: &str,
     snake: &str,
     camel: &str,
-) -> Option<&'a Value> {
-    object.get(snake).or_else(|| object.get(camel))
+) -> Result<Option<&'a Value>> {
+    if snake != camel && object.contains_key(snake) && object.contains_key(camel) {
+        return Err(Error::from_reason(format!(
+            "{context} contains duplicate aliases '{snake}' and '{camel}'"
+        )));
+    }
+    Ok(object.get(snake).or_else(|| object.get(camel)))
 }
 
 fn optional_u64(
     object: &serde_json::Map<String, Value>,
+    context: &str,
     snake: &str,
     camel: &str,
 ) -> Result<Option<u64>> {
-    match field(object, snake, camel) {
+    match field(object, context, snake, camel)? {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-            Error::from_reason(format!("RunOptions.{camel} must be a non-negative integer"))
+            Error::from_reason(format!("{context}.{camel} must be a non-negative integer"))
         }),
     }
 }
 
 fn optional_f64(
     object: &serde_json::Map<String, Value>,
+    context: &str,
     snake: &str,
     camel: &str,
 ) -> Result<Option<f64>> {
-    match field(object, snake, camel) {
+    match field(object, context, snake, camel)? {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_f64()
             .filter(|value| value.is_finite())
             .map(Some)
-            .ok_or_else(|| Error::from_reason(format!("RunOptions.{camel} must be finite"))),
+            .ok_or_else(|| Error::from_reason(format!("{context}.{camel} must be finite"))),
     }
+}
+
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+    allowed: &[&str],
+) -> Result<()> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(Error::from_reason(format!(
+            "{context} contains unknown field '{field}'"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
@@ -1639,15 +1931,41 @@ fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
     let object = value
         .as_object()
         .ok_or_else(|| Error::from_reason("RunOptions.budget must be an object"))?;
-    let pricing = match field(object, "pricing", "pricing").filter(|value| !value.is_null()) {
+    reject_unknown_fields(
+        object,
+        "RunOptions.budget",
+        &[
+            "max_total_tokens",
+            "maxTotalTokens",
+            "max_cost_usd",
+            "maxCostUsd",
+            "pricing",
+        ],
+    )?;
+    let pricing = match object.get("pricing").filter(|value| !value.is_null()) {
         None => None,
         Some(pricing) => {
             let pricing = pricing
                 .as_object()
                 .ok_or_else(|| Error::from_reason("RunOptions.budget.pricing must be an object"))?;
+            reject_unknown_fields(
+                pricing,
+                "RunOptions.budget.pricing",
+                &[
+                    "input_per_million_usd",
+                    "inputPerMillionUsd",
+                    "output_per_million_usd",
+                    "outputPerMillionUsd",
+                    "cache_read_per_million_usd",
+                    "cacheReadPerMillionUsd",
+                    "cache_write_per_million_usd",
+                    "cacheWritePerMillionUsd",
+                ],
+            )?;
             Some(ModelPricing {
                 input_per_million_usd: optional_f64(
                     pricing,
+                    "RunOptions.budget.pricing",
                     "input_per_million_usd",
                     "inputPerMillionUsd",
                 )?
@@ -1656,6 +1974,7 @@ fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
                 })?,
                 output_per_million_usd: optional_f64(
                     pricing,
+                    "RunOptions.budget.pricing",
                     "output_per_million_usd",
                     "outputPerMillionUsd",
                 )?
@@ -1664,11 +1983,13 @@ fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
                 })?,
                 cache_read_per_million_usd: optional_f64(
                     pricing,
+                    "RunOptions.budget.pricing",
                     "cache_read_per_million_usd",
                     "cacheReadPerMillionUsd",
                 )?,
                 cache_write_per_million_usd: optional_f64(
                     pricing,
+                    "RunOptions.budget.pricing",
                     "cache_write_per_million_usd",
                     "cacheWritePerMillionUsd",
                 )?,
@@ -1676,8 +1997,13 @@ fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
         }
     };
     let policy = BudgetPolicy {
-        max_total_tokens: optional_u64(object, "max_total_tokens", "maxTotalTokens")?,
-        max_cost_usd: optional_f64(object, "max_cost_usd", "maxCostUsd")?,
+        max_total_tokens: optional_u64(
+            object,
+            "RunOptions.budget",
+            "max_total_tokens",
+            "maxTotalTokens",
+        )?,
+        max_cost_usd: optional_f64(object, "RunOptions.budget", "max_cost_usd", "maxCostUsd")?,
         pricing,
     };
     policy
@@ -1693,18 +2019,42 @@ fn parse_retry_policy(value: Option<Value>) -> Result<RetryPolicy> {
     let object = value
         .as_object()
         .ok_or_else(|| Error::from_reason("RunOptions.retry must be an object"))?;
+    reject_unknown_fields(
+        object,
+        "RunOptions.retry",
+        &[
+            "max_attempts_per_model",
+            "maxAttemptsPerModel",
+            "base_delay_ms",
+            "baseDelayMs",
+            "max_delay_ms",
+            "maxDelayMs",
+            "per_attempt_timeout_ms",
+            "perAttemptTimeoutMs",
+        ],
+    )?;
     let mut retry = RetryPolicy::default();
-    if let Some(value) = optional_u64(object, "max_attempts_per_model", "maxAttemptsPerModel")? {
+    if let Some(value) = optional_u64(
+        object,
+        "RunOptions.retry",
+        "max_attempts_per_model",
+        "maxAttemptsPerModel",
+    )? {
         retry.max_attempts_per_model = u32::try_from(value)
             .map_err(|_| Error::from_reason("RunOptions.retry.maxAttemptsPerModel exceeds u32"))?;
     }
-    if let Some(value) = optional_u64(object, "base_delay_ms", "baseDelayMs")? {
+    if let Some(value) = optional_u64(object, "RunOptions.retry", "base_delay_ms", "baseDelayMs")? {
         retry.base_delay_ms = value;
     }
-    if let Some(value) = optional_u64(object, "max_delay_ms", "maxDelayMs")? {
+    if let Some(value) = optional_u64(object, "RunOptions.retry", "max_delay_ms", "maxDelayMs")? {
         retry.max_delay_ms = value;
     }
-    if let Some(value) = optional_u64(object, "per_attempt_timeout_ms", "perAttemptTimeoutMs")? {
+    if let Some(value) = optional_u64(
+        object,
+        "RunOptions.retry",
+        "per_attempt_timeout_ms",
+        "perAttemptTimeoutMs",
+    )? {
         retry.per_attempt_timeout_ms = value;
     }
     Ok(retry)
@@ -1741,12 +2091,30 @@ fn build_agent_options(
         let object = compaction
             .as_object()
             .ok_or_else(|| Error::from_reason("RunOptions.compaction must be an object"))?;
-        let max_context_tokens = optional_u64(object, "max_context_tokens", "maxContextTokens")?
-            .ok_or_else(|| {
-                Error::from_reason("RunOptions.compaction.maxContextTokens is required")
-            })?;
-        let keep_recent_messages =
-            optional_u64(object, "keep_recent_messages", "keepRecentMessages")?.unwrap_or(8);
+        reject_unknown_fields(
+            object,
+            "RunOptions.compaction",
+            &[
+                "max_context_tokens",
+                "maxContextTokens",
+                "keep_recent_messages",
+                "keepRecentMessages",
+            ],
+        )?;
+        let max_context_tokens = optional_u64(
+            object,
+            "RunOptions.compaction",
+            "max_context_tokens",
+            "maxContextTokens",
+        )?
+        .ok_or_else(|| Error::from_reason("RunOptions.compaction.maxContextTokens is required"))?;
+        let keep_recent_messages = optional_u64(
+            object,
+            "RunOptions.compaction",
+            "keep_recent_messages",
+            "keepRecentMessages",
+        )?
+        .unwrap_or(8);
         mapped.compaction = CompactionPolicy::new(
             max_context_tokens,
             usize::try_from(keep_recent_messages).map_err(|_| {
@@ -1847,6 +2215,9 @@ fn build_permissions(
                 (None, Some(p)) => base
                     .matching(&p)
                     .map_err(|e| Error::from_reason(e.to_string()))?,
+                (Some(_), None) => {
+                    return Err(Error::from_reason("permission rule field requires pattern"))
+                }
                 _ => base,
             };
             parsed.push(rule);
@@ -2064,6 +2435,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn mcp_tool_filter_options_fail_closed_and_share_core_validation() {
+        let filter = node_mcp_tool_filter(Some(serde_json::json!({
+            "allow": ["read_file", "write_file"],
+            "deny": ["write_file"]
+        })))
+        .unwrap();
+        assert!(filter.allows("read_file"));
+        assert!(!filter.allows("write_file"));
+
+        assert!(node_mcp_tool_filter(Some(serde_json::json!({
+            "deny": ["duplicate", "duplicate"]
+        })))
+        .is_err());
+        assert!(node_mcp_tool_filter(Some(serde_json::json!({
+            "allow": ["read_file"],
+            "unexpected": []
+        })))
+        .is_err());
+    }
+
     struct ParsedApprover {
         decision: ApprovalDecision,
         calls: Arc<AtomicUsize>,
@@ -2219,6 +2611,217 @@ mod tests {
         assert_eq!(options.compaction.max_context_tokens, 2_000);
         assert_eq!(options.compaction.keep_recent_messages, 6);
         assert!(options.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn run_options_reject_unknown_nested_cost_and_reliability_fields() {
+        for (budget, retry, compaction, field) in [
+            (
+                Some(serde_json::json!({"maxTotalTokenz": 0})),
+                None,
+                None,
+                "maxTotalTokenz",
+            ),
+            (
+                Some(serde_json::json!({"pricing": {
+                    "inputPerMillionUsd": 1.0,
+                    "outputPerMillionUsd": 2.0,
+                    "cacheReadPerMillion": 0.5
+                }})),
+                None,
+                None,
+                "cacheReadPerMillion",
+            ),
+            (
+                None,
+                Some(serde_json::json!({"maxAttemptsPerModal": 1})),
+                None,
+                "maxAttemptsPerModal",
+            ),
+            (
+                None,
+                None,
+                Some(serde_json::json!({
+                    "maxContextTokens": 100,
+                    "keepRecentMessagez": 2
+                })),
+                "keepRecentMessagez",
+            ),
+        ] {
+            let error = build_agent_options(
+                Some(RunOptions {
+                    budget,
+                    retry,
+                    compaction,
+                    ..RunOptions::default()
+                }),
+                Governance::default(),
+            )
+            .err()
+            .expect("invalid options must fail closed");
+            assert!(
+                error.to_string().contains(field),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_options_reject_every_duplicate_nested_alias_even_when_values_match() {
+        let cases = vec![
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({
+                        "max_total_tokens": 100,
+                        "maxTotalTokens": 100
+                    })),
+                    ..RunOptions::default()
+                },
+                "max_total_tokens",
+                "maxTotalTokens",
+            ),
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({
+                        "max_cost_usd": 1.0,
+                        "maxCostUsd": 1.0
+                    })),
+                    ..RunOptions::default()
+                },
+                "max_cost_usd",
+                "maxCostUsd",
+            ),
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({"pricing": {
+                        "input_per_million_usd": 1.0,
+                        "inputPerMillionUsd": 1.0,
+                        "outputPerMillionUsd": 2.0
+                    }})),
+                    ..RunOptions::default()
+                },
+                "input_per_million_usd",
+                "inputPerMillionUsd",
+            ),
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({"pricing": {
+                        "inputPerMillionUsd": 1.0,
+                        "output_per_million_usd": 2.0,
+                        "outputPerMillionUsd": 2.0
+                    }})),
+                    ..RunOptions::default()
+                },
+                "output_per_million_usd",
+                "outputPerMillionUsd",
+            ),
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({"pricing": {
+                        "inputPerMillionUsd": 1.0,
+                        "outputPerMillionUsd": 2.0,
+                        "cache_read_per_million_usd": 0.5,
+                        "cacheReadPerMillionUsd": 0.5
+                    }})),
+                    ..RunOptions::default()
+                },
+                "cache_read_per_million_usd",
+                "cacheReadPerMillionUsd",
+            ),
+            (
+                RunOptions {
+                    budget: Some(serde_json::json!({"pricing": {
+                        "inputPerMillionUsd": 1.0,
+                        "outputPerMillionUsd": 2.0,
+                        "cache_write_per_million_usd": 0.5,
+                        "cacheWritePerMillionUsd": 0.5
+                    }})),
+                    ..RunOptions::default()
+                },
+                "cache_write_per_million_usd",
+                "cacheWritePerMillionUsd",
+            ),
+            (
+                RunOptions {
+                    retry: Some(serde_json::json!({
+                        "max_attempts_per_model": 2,
+                        "maxAttemptsPerModel": 2
+                    })),
+                    ..RunOptions::default()
+                },
+                "max_attempts_per_model",
+                "maxAttemptsPerModel",
+            ),
+            (
+                RunOptions {
+                    retry: Some(serde_json::json!({
+                        "base_delay_ms": 250,
+                        "baseDelayMs": 250
+                    })),
+                    ..RunOptions::default()
+                },
+                "base_delay_ms",
+                "baseDelayMs",
+            ),
+            (
+                RunOptions {
+                    retry: Some(serde_json::json!({
+                        "max_delay_ms": 4_000,
+                        "maxDelayMs": 4_000
+                    })),
+                    ..RunOptions::default()
+                },
+                "max_delay_ms",
+                "maxDelayMs",
+            ),
+            (
+                RunOptions {
+                    retry: Some(serde_json::json!({
+                        "per_attempt_timeout_ms": 30_000,
+                        "perAttemptTimeoutMs": 30_000
+                    })),
+                    ..RunOptions::default()
+                },
+                "per_attempt_timeout_ms",
+                "perAttemptTimeoutMs",
+            ),
+            (
+                RunOptions {
+                    compaction: Some(serde_json::json!({
+                        "max_context_tokens": 4_096,
+                        "maxContextTokens": 4_096
+                    })),
+                    ..RunOptions::default()
+                },
+                "max_context_tokens",
+                "maxContextTokens",
+            ),
+            (
+                RunOptions {
+                    compaction: Some(serde_json::json!({
+                        "maxContextTokens": 4_096,
+                        "keep_recent_messages": 8,
+                        "keepRecentMessages": 8
+                    })),
+                    ..RunOptions::default()
+                },
+                "keep_recent_messages",
+                "keepRecentMessages",
+            ),
+        ];
+
+        for (options, snake, camel) in cases {
+            let error = build_agent_options(Some(options), Governance::default())
+                .err()
+                .expect("duplicate aliases must fail closed");
+            let message = error.to_string();
+            assert!(
+                message.contains("duplicate aliases")
+                    && message.contains(snake)
+                    && message.contains(camel),
+                "unexpected error for {snake}/{camel}: {message}"
+            );
+        }
     }
 
     #[cfg(unix)]

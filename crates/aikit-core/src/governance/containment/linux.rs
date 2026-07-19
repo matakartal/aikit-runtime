@@ -51,7 +51,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
             Ok(Ok(output)) if output.status.success() => BackendCapability::available(
                 ActiveContainmentBackend::LinuxNamespace,
                 ContainmentGuarantees::linux_namespace(),
-                "user/mount/pid/network namespaces and seccomp enforcement probe succeeded",
+                "user/mount/pid/network namespaces and seccomp probe succeeded; the host home is read-only but not hidden",
             ),
             Ok(Ok(output)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::LinuxNamespace,

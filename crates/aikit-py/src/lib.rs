@@ -19,21 +19,22 @@ use aikit_core::orchestration::{
     ExecutionContext, ModelRouteRequirements, Orchestrator, SubagentSpec,
 };
 use aikit_core::{
-    request_capability_tool, tools::ToolExecutor, Agent, AgentError,
-    AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
-    AuditPayloadPolicy, AuditTrail, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
-    BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
-    Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig, FailureContext,
-    FailureHookOutcome, GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher,
-    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
-    JsonlAuditSink, McpClient, McpToolExecutor, Message, ModelCatalog, ModelPricing, ModelProfile,
+    evaluate_outcome as core_evaluate_outcome, request_capability_tool, tools::ToolExecutor, Agent,
+    AgentError, AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest,
+    AuditFailureMode, AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools,
+    BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle,
+    CapabilityBroker, CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy,
+    DockerConfig, EvalGate, FailureContext, FailureHookOutcome, GeneratedText, Governance,
+    GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
+    InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
+    McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile,
     ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent, PermissionEngine,
     PermissionMode, PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext,
     PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist,
-    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunRecorder, RunTerminalStatus, Sandbox,
-    SecretRedactor, SessionStore, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
-    StopContext, StreamDelta, StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec,
-    WebTools,
+    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunOutcome, RunRecorder, RunTerminalStatus,
+    Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session, SessionStore,
+    SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport, StopContext,
+    StreamDelta, StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -47,6 +48,179 @@ use tokio::sync::Mutex as TokioMutex;
 pyo3::create_exception!(aikit, AikitError, PyRuntimeError);
 
 type CallbackLocals = Arc<RwLock<Option<Arc<pyo3_async_runtimes::TaskLocals>>>>;
+
+fn python_mcp_tool_filter(value: Option<Bound<'_, PyAny>>) -> PyResult<McpToolFilter> {
+    let Some(value) = value else {
+        return Ok(McpToolFilter::default());
+    };
+    let value: Value =
+        pythonize::depythonize(&value).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    McpToolFilter::from_value(value).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// The canonical core types intentionally remain backward-compatible for persisted sessions, so
+/// their serde implementations accept some future fields. A public evaluation boundary must be
+/// stricter: reject unknown host input before deserializing through those same core types.
+fn validate_eval_outcome_shape(value: &Value) -> Result<(), String> {
+    fn reject_unknown(value: &Value, allowed: &[&str], context: &str) -> Result<(), String> {
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        if object
+            .keys()
+            .any(|key| !allowed.iter().any(|allowed| key == allowed))
+        {
+            return Err(format!("{context} contains an unknown field"));
+        }
+        Ok(())
+    }
+
+    reject_unknown(
+        value,
+        &[
+            "messages",
+            "usage",
+            "provider_metadata",
+            "terminal_status",
+            "stop_reason",
+            "model_attempts",
+            "final_text",
+            "invocation_start_message_index",
+        ],
+        "RunOutcome",
+    )?;
+
+    let Some(outcome) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(usage) = outcome.get("usage") {
+        reject_unknown(
+            usage,
+            &[
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "reasoning_tokens",
+            ],
+            "RunOutcome.usage",
+        )?;
+    }
+
+    let Some(messages) = outcome.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (message_index, message) in messages.iter().enumerate() {
+        reject_unknown(
+            message,
+            &["role", "content"],
+            &format!("RunOutcome.messages[{message_index}]"),
+        )?;
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            let context = format!("RunOutcome.messages[{message_index}].content[{block_index}]");
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => reject_unknown(block, &["type", "text"], &context)?,
+                Some("reasoning") => reject_unknown(
+                    block,
+                    &["type", "text", "signature", "provider", "opaque"],
+                    &context,
+                )?,
+                Some("tool_use") => {
+                    reject_unknown(block, &["type", "id", "name", "input"], &context)?
+                }
+                Some("tool_result") => reject_unknown(
+                    block,
+                    &["type", "tool_use_id", "content", "is_error"],
+                    &context,
+                )?,
+                Some("media") => {
+                    reject_unknown(block, &["type", "media_type", "source"], &context)?;
+                    if let Some(source) = block.get("source") {
+                        let source_context = format!("{context}.source");
+                        match source.get("kind").and_then(Value::as_str) {
+                            Some("url") => {
+                                reject_unknown(source, &["kind", "url"], &source_context)?
+                            }
+                            Some("base64") => {
+                                reject_unknown(source, &["kind", "data"], &source_context)?
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some("citation") => {
+                    reject_unknown(block, &["type", "text", "source", "metadata"], &context)?
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_eval_outcome(value: Value) -> PyResult<RunOutcome> {
+    validate_eval_outcome_shape(&value).map_err(PyValueError::new_err)?;
+    serde_json::from_value(value)
+        .map_err(|_| PyValueError::new_err("invalid canonical RunOutcome structure"))
+}
+
+fn validate_eval_gate_shapes(value: &Value) -> PyResult<()> {
+    let gates = value
+        .as_array()
+        .ok_or_else(|| PyValueError::new_err("eval gates must be a sequence"))?;
+    for (index, gate) in gates.iter().enumerate() {
+        let Some(object) = gate.as_object() else {
+            continue;
+        };
+        let allowed: &[&str] = match object.get("type").and_then(Value::as_str) {
+            Some("output_exact" | "output_contains" | "output_not_contains") => &["type", "value"],
+            Some("terminal_status") => &["type", "status"],
+            Some("called_tool" | "did_not_call_tool") => &["type", "name"],
+            Some("tool_sequence") => &["type", "names", "exact"],
+            Some("no_tool_errors") => &["type"],
+            Some(
+                "max_turns" | "max_input_tokens" | "max_output_tokens" | "max_total_tokens"
+                | "max_model_attempts",
+            ) => &["type", "value"],
+            _ => continue,
+        };
+        if object
+            .keys()
+            .any(|key| !allowed.iter().any(|allowed| key == allowed))
+        {
+            return Err(PyValueError::new_err(format!(
+                "eval gates[{index}] contains an unknown field"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a canonical recorded outcome with deterministic gates. This function performs no
+/// provider, tool, filesystem, or network work.
+#[pyfunction]
+fn evaluate_outcome<'py>(
+    py: Python<'py>,
+    outcome: Bound<'_, PyAny>,
+    gates: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let outcome: Value = pythonize::depythonize(&outcome)
+        .map_err(|_| PyValueError::new_err("invalid canonical RunOutcome structure"))?;
+    let gates: Value = pythonize::depythonize(&gates)
+        .map_err(|_| PyValueError::new_err("invalid eval gate sequence"))?;
+    let outcome = parse_eval_outcome(outcome)?;
+    validate_eval_gate_shapes(&gates)?;
+    let gates: Vec<EvalGate> = serde_json::from_value(gates)
+        .map_err(|_| PyValueError::new_err("invalid eval gate sequence"))?;
+    let verdict = core_evaluate_outcome(&outcome, &gates)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    pythonize::pythonize(py, &verdict)
+        .map(Bound::unbind)
+        .map_err(|_| PyRuntimeError::new_err("failed to encode EvalVerdict"))
+}
 
 #[pyclass(name = "McpServer")]
 struct PyMcpServer {
@@ -134,19 +308,21 @@ impl PyMcpServer {
 }
 
 #[pyfunction]
-#[pyo3(signature = (endpoint, name, bearer_token=None))]
+#[pyo3(signature = (endpoint, name, bearer_token=None, tool_filter=None))]
 fn connect_mcp_http<'py>(
     py: Python<'py>,
     endpoint: String,
     name: String,
     bearer_token: Option<String>,
+    tool_filter: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let tool_filter = python_mcp_tool_filter(tool_filter)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let transport = Arc::new(
             StreamableHttpTransport::new(&endpoint, bearer_token)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
         );
-        let mut client = McpClient::new(transport, name);
+        let mut client = McpClient::new_with_tool_filter(transport, name, tool_filter);
         client
             .initialize()
             .await
@@ -170,7 +346,7 @@ fn connect_mcp_http<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (program, args, name, env=None, inherit_env=false))]
+#[pyo3(signature = (program, args, name, env=None, inherit_env=false, tool_filter=None))]
 fn connect_mcp_stdio<'py>(
     py: Python<'py>,
     program: String,
@@ -178,7 +354,9 @@ fn connect_mcp_stdio<'py>(
     name: String,
     env: Option<HashMap<String, String>>,
     inherit_env: bool,
+    tool_filter: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let tool_filter = python_mcp_tool_filter(tool_filter)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let env = env.unwrap_or_default().into_iter().collect();
         let transport = Arc::new(
@@ -186,7 +364,7 @@ fn connect_mcp_stdio<'py>(
                 .await
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
         );
-        let mut client = McpClient::new(transport, name);
+        let mut client = McpClient::new_with_tool_filter(transport, name, tool_filter);
         client
             .initialize()
             .await
@@ -225,6 +403,16 @@ struct PyDockerContainmentOptions {
 struct PyRoutingOptions {
     profiles: Vec<ModelProfile>,
     request: RouteRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PyPermissionRuleSpec {
+    id: Option<String>,
+    effect: String,
+    tool: String,
+    pattern: Option<String>,
+    field: Option<String>,
 }
 
 fn required_auto_containment(docker: Option<PyDockerContainmentOptions>) -> ContainmentPolicy {
@@ -418,6 +606,50 @@ fn action(value: &Value) -> Option<&str> {
         .as_str()
         .or_else(|| value.get("action").and_then(Value::as_str))
         .or_else(|| value.get("decision").and_then(Value::as_str))
+}
+
+fn parse_semantic_validation(value: Value) -> Result<SemanticValidation, String> {
+    match value {
+        Value::String(action) if action == "accept" => Ok(SemanticValidation::Accept),
+        Value::Object(object) => match object.get("action").and_then(Value::as_str) {
+            Some("accept") if object.len() == 1 => Ok(SemanticValidation::Accept),
+            Some("retry") if object.len() == 2 => object
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| SemanticValidation::Retry(reason.to_string()))
+                .ok_or_else(|| {
+                    "semantic validator retry decision requires exactly action and string reason"
+                        .into()
+                }),
+            Some("reject") if object.len() == 2 => object
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|reason| SemanticValidation::Reject(reason.to_string()))
+                .ok_or_else(|| {
+                    "semantic validator reject decision requires exactly action and string reason"
+                        .into()
+                }),
+            _ => Err(
+                "semantic validator must return 'accept' or an exact action object with retry/reject and reason"
+                    .into(),
+            ),
+        },
+        _ => Err(
+            "semantic validator must return 'accept' or an exact action object with retry/reject and reason"
+                .into(),
+        ),
+    }
+}
+
+struct PySemanticValidator {
+    callback: Arc<PyHostCallback>,
+}
+
+#[async_trait]
+impl SemanticValidator for PySemanticValidator {
+    async fn validate(&self, value: Value) -> std::result::Result<SemanticValidation, String> {
+        parse_semantic_validation(call_python(self.callback.clone(), value).await?)
+    }
 }
 
 fn parse_approval(value: Value) -> Result<ApprovalDecision, String> {
@@ -801,6 +1033,20 @@ fn optional_f64(
     }
 }
 
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("{context} contains unknown field '{field}'"));
+    }
+    Ok(())
+}
+
 fn parse_budget_policy(value: Option<&Value>) -> Result<BudgetPolicy, String> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(BudgetPolicy::default());
@@ -808,12 +1054,27 @@ fn parse_budget_policy(value: Option<&Value>) -> Result<BudgetPolicy, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "RunOptions.budget must be a mapping".to_string())?;
+    reject_unknown_fields(
+        object,
+        "RunOptions.budget",
+        &["max_total_tokens", "max_cost_usd", "pricing"],
+    )?;
     let pricing = match object.get("pricing").filter(|value| !value.is_null()) {
         None => None,
         Some(pricing) => {
             let pricing = pricing
                 .as_object()
                 .ok_or_else(|| "RunOptions.budget.pricing must be a mapping".to_string())?;
+            reject_unknown_fields(
+                pricing,
+                "RunOptions.budget.pricing",
+                &[
+                    "input_per_million_usd",
+                    "output_per_million_usd",
+                    "cache_read_per_million_usd",
+                    "cache_write_per_million_usd",
+                ],
+            )?;
             Some(ModelPricing {
                 input_per_million_usd: optional_f64(pricing, "input_per_million_usd")?.ok_or_else(
                     || "RunOptions.budget.pricing.input_per_million_usd is required".to_string(),
@@ -843,6 +1104,16 @@ fn parse_retry_policy(value: Option<&Value>) -> Result<RetryPolicy, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "RunOptions.retry must be a mapping".to_string())?;
+    reject_unknown_fields(
+        object,
+        "RunOptions.retry",
+        &[
+            "max_attempts_per_model",
+            "base_delay_ms",
+            "max_delay_ms",
+            "per_attempt_timeout_ms",
+        ],
+    )?;
     let mut retry = RetryPolicy::default();
     if let Some(value) = optional_u64(object, "max_attempts_per_model")? {
         retry.max_attempts_per_model = u32::try_from(value)
@@ -885,6 +1156,21 @@ fn build_agent_options(
     let object = value
         .as_object()
         .ok_or_else(|| "RunOptions must be a mapping".to_string())?;
+    reject_unknown_fields(
+        object,
+        "RunOptions",
+        &[
+            "model",
+            "fallback_models",
+            "max_tokens",
+            "max_turns",
+            "provider_options",
+            "budget",
+            "retry",
+            "routing",
+            "compaction",
+        ],
+    )?;
     if let Some(model) = object.get("model") {
         options.model = model
             .as_str()
@@ -915,6 +1201,11 @@ fn build_agent_options(
         let compaction = compaction
             .as_object()
             .ok_or_else(|| "RunOptions.compaction must be a mapping".to_string())?;
+        reject_unknown_fields(
+            compaction,
+            "RunOptions.compaction",
+            &["max_context_tokens", "keep_recent_messages"],
+        )?;
         let max_context_tokens = optional_u64(compaction, "max_context_tokens")?
             .ok_or_else(|| "RunOptions.compaction.max_context_tokens is required".to_string())?;
         let keep_recent_messages = optional_u64(compaction, "keep_recent_messages")?.unwrap_or(8);
@@ -1044,31 +1335,34 @@ fn build_permissions(
     let mut parsed: Vec<Rule> = Vec::new();
     if let Some(rules) = rules {
         for r in rules {
-            let effect: String = r.get_item("effect")?.extract()?;
-            let tool: String = r.get_item("tool")?.extract()?;
-            let id: Option<String> = r.get_item("id").ok().and_then(|v| v.extract().ok());
-            let pattern: Option<String> = r.get_item("pattern").ok().and_then(|v| v.extract().ok());
-            let field: Option<String> = r.get_item("field").ok().and_then(|v| v.extract().ok());
-            let mut base = match effect.as_str() {
-                "allow" => Rule::allow(tool),
-                "deny" => Rule::deny(tool),
-                "ask" => Rule::ask(tool),
+            let spec: PyPermissionRuleSpec = pythonize::depythonize(&r).map_err(|error| {
+                PyValueError::new_err(format!("invalid permission rule: {error}"))
+            })?;
+            let mut base = match spec.effect.as_str() {
+                "allow" => Rule::allow(spec.tool),
+                "deny" => Rule::deny(spec.tool),
+                "ask" => Rule::ask(spec.tool),
                 other => {
                     return Err(PyValueError::new_err(format!(
                         "unknown permission effect '{other}' (expected allow/deny/ask)"
                     )))
                 }
             };
-            if let Some(id) = id {
+            if let Some(id) = spec.id {
                 base = base.named(id);
             }
-            let rule = match (field, pattern) {
+            let rule = match (spec.field, spec.pattern) {
                 (Some(f), Some(p)) => base
                     .matching_field(f, &p)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?,
                 (None, Some(p)) => base
                     .matching(&p)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                (Some(_), None) => {
+                    return Err(PyValueError::new_err(
+                        "permission rule field requires pattern",
+                    ))
+                }
                 _ => base,
             };
             parsed.push(rule);
@@ -1529,6 +1823,31 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Clear one expired execution lease after the caller has reconciled every possibly completed
+    /// external side effect. This never runs a provider or tool; retry/resume remains a separate
+    /// explicit call.
+    #[pyo3(signature = (session_id, *, side_effects_reconciled))]
+    fn recover_expired_session(
+        &self,
+        session_id: &str,
+        side_effects_reconciled: bool,
+    ) -> PyResult<u64> {
+        if !side_effects_reconciled {
+            return Err(PyValueError::new_err(
+                "expired session recovery requires side_effects_reconciled=True",
+            ));
+        }
+        let base = match self.session_store.load_session(session_id) {
+            Ok(session) => session,
+            Err(SessionStoreError::NotFound { .. }) => Session::new(session_id, Vec::new()),
+            Err(error) => return Err(py_core_error(error.into())),
+        };
+        self.session_store
+            .clear_expired_execution_lease(base)
+            .map(|session| session.revision)
+            .map_err(|error| py_core_error(error.into()))
+    }
+
     #[pyo3(signature = (allowed_hosts, search_endpoint=None, max_response_bytes=None))]
     fn register_web_tools(
         &mut self,
@@ -1550,13 +1869,20 @@ impl PyAgent {
         self.install_external_tools(specs, Arc::new(tools))
     }
 
+    #[pyo3(signature = (webdriver_endpoint, session_id, allowed_hosts, *, external_egress_enforced))]
     fn register_browser_tools(
         &mut self,
         webdriver_endpoint: &str,
         session_id: &str,
         allowed_hosts: Vec<String>,
+        external_egress_enforced: bool,
     ) -> PyResult<()> {
-        let tools = BrowserTools::new(webdriver_endpoint, session_id, allowed_hosts)
+        let policy = if external_egress_enforced {
+            BrowserEgressPolicy::ExternallyEnforced
+        } else {
+            BrowserEgressPolicy::Deny
+        };
+        let tools = BrowserTools::new(webdriver_endpoint, session_id, allowed_hosts, policy)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let specs = tools.specs();
         self.install_external_tools(specs, Arc::new(tools))
@@ -2210,7 +2536,7 @@ impl PyAgent {
     /// Generate a schema-validated object. Defaults to the deterministic keyless
     /// `mock-structured` model; pass a live model after activating its provider with `add_key`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None))]
+    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, validator=None))]
     fn generate_object<'py>(
         &self,
         py: Python<'py>,
@@ -2221,16 +2547,27 @@ impl PyAgent {
         max_tokens: u64,
         name: Option<String>,
         provider_options: Option<Bound<'_, PyAny>>,
+        validator: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = python_messages(&prompt)?;
         let (schema, model_class) = structured_schema(schema)?;
         let provider_options = structured_provider_options(provider_options)?;
+        let semantic_validator = validator
+            .map(|callback| {
+                capture_callback_locals(py, &self.callback_locals)?;
+                Ok::<Arc<dyn SemanticValidator>, PyErr>(Arc::new(PySemanticValidator {
+                    callback: host_callback(callback, self.callback_locals.clone())?,
+                })
+                    as Arc<dyn SemanticValidator>)
+            })
+            .transpose()?;
         let agent = self.inner.clone();
         let options = ObjectOptions {
             max_retries,
             max_tokens,
             name: name.unwrap_or_else(|| "respond".into()),
             provider_options,
+            semantic_validator,
         };
         let model = model.unwrap_or_else(|| "mock-structured".into());
         let audit = self.audit.fresh_run();
@@ -2278,9 +2615,10 @@ impl PyAgent {
     /// failures/repairs, and finally one schema-validated `completed` event. Pydantic v2 classes
     /// materialize only the final `completed.object.value`; no intermediate event is hidden.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None))]
+    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, validator=None))]
     fn stream_object(
         &self,
+        py: Python<'_>,
         prompt: Bound<'_, PyAny>,
         schema: Bound<'_, PyAny>,
         model: Option<String>,
@@ -2288,10 +2626,20 @@ impl PyAgent {
         max_tokens: u64,
         name: Option<String>,
         provider_options: Option<Bound<'_, PyAny>>,
+        validator: Option<Bound<'_, PyAny>>,
     ) -> PyResult<ObjectStream> {
         let messages = python_messages(&prompt)?;
         let (schema, model_class) = structured_schema(schema)?;
         let provider_options = structured_provider_options(provider_options)?;
+        let semantic_validator = validator
+            .map(|callback| {
+                capture_callback_locals(py, &self.callback_locals)?;
+                Ok::<Arc<dyn SemanticValidator>, PyErr>(Arc::new(PySemanticValidator {
+                    callback: host_callback(callback, self.callback_locals.clone())?,
+                })
+                    as Arc<dyn SemanticValidator>)
+            })
+            .transpose()?;
         let audit = self.audit.fresh_run();
         let stream = self
             .inner
@@ -2304,6 +2652,7 @@ impl PyAgent {
                     max_tokens,
                     name: name.unwrap_or_else(|| "respond".into()),
                     provider_options,
+                    semantic_validator,
                 },
                 Some(&audit),
             )
@@ -2384,6 +2733,7 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AikitError", m.py().get_type::<AikitError>())?;
     m.add_function(wrap_pyfunction!(tool, m)?)?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_outcome, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_http, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_stdio, m)?)?;
     m.add_class::<PyToolDecorator>()?;
@@ -2400,6 +2750,27 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn mcp_tool_filter_options_reject_unknown_fields_and_invalid_names() {
+        let filter = McpToolFilter::from_value(serde_json::json!({
+            "allow": ["read_file"],
+            "deny": ["write_file"]
+        }))
+        .unwrap();
+        assert!(filter.allows("read_file"));
+        assert!(!filter.allows("write_file"));
+
+        assert!(McpToolFilter::from_value(serde_json::json!({
+            "deny": ["write_file", "write_file"]
+        }))
+        .is_err());
+        assert!(McpToolFilter::from_value(serde_json::json!({
+            "allow": ["read_file"],
+            "unexpected": []
+        }))
+        .is_err());
+    }
 
     struct ParsedApprover {
         decision: ApprovalDecision,
@@ -2545,6 +2916,44 @@ mod tests {
         assert_eq!(options.budget.pricing.unwrap().output_per_million_usd, 4.0);
         assert_eq!(options.retry.max_attempts_per_model, 3);
         assert_eq!(options.retry.per_attempt_timeout_ms, 30);
+    }
+
+    #[test]
+    fn run_options_reject_unknown_fields_in_cost_and_reliability_controls() {
+        for (value, field) in [
+            (
+                serde_json::json!({"budegt": {"max_total_tokens": 0}}),
+                "budegt",
+            ),
+            (
+                serde_json::json!({"budget": {"max_total_tokenz": 0}}),
+                "max_total_tokenz",
+            ),
+            (
+                serde_json::json!({"budget": {"pricing": {
+                    "input_per_million_usd": 1.0,
+                    "output_per_million_usd": 2.0,
+                    "cache_read_per_million": 0.5
+                }}}),
+                "cache_read_per_million",
+            ),
+            (
+                serde_json::json!({"retry": {"max_attempts_per_modal": 1}}),
+                "max_attempts_per_modal",
+            ),
+            (
+                serde_json::json!({"compaction": {
+                    "max_context_tokens": 100,
+                    "keep_recent_messagez": 2
+                }}),
+                "keep_recent_messagez",
+            ),
+        ] {
+            let error = build_agent_options(Some(value), Governance::default())
+                .err()
+                .expect("invalid options must fail closed");
+            assert!(error.contains(field), "unexpected error: {error}");
+        }
     }
 
     #[cfg(unix)]

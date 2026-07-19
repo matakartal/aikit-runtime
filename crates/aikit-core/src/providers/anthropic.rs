@@ -30,7 +30,23 @@ pub fn build_request(
     messages: &[Message],
     tools: &[ToolSpec],
     provider_options: Option<&serde_json::Map<String, Value>>,
-) -> Value {
+) -> crate::error::Result<Value> {
+    super::reject_protected_options(
+        "anthropic",
+        model,
+        provider_options,
+        &[
+            "model",
+            "messages",
+            "system",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "tools",
+            "stream",
+            "stream_options",
+        ],
+    )?;
     let mut system: Vec<Value> = Vec::new();
     let mut wire: Vec<Value> = Vec::new();
 
@@ -89,7 +105,7 @@ pub fn build_request(
             map.insert(k.clone(), v.clone());
         }
     }
-    req
+    Ok(req)
 }
 
 /// Map canonical content blocks to Anthropic wire blocks.
@@ -164,7 +180,7 @@ impl AnthropicProvider {
         AnthropicProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 }
@@ -186,7 +202,15 @@ impl Provider for AnthropicProvider {
             &req.messages,
             &req.tools,
             Some(&options),
-        );
+        )
+        .map_err(|error| {
+            crate::error::ProviderError::new(
+                "anthropic",
+                &req.model,
+                crate::error::ProviderErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
@@ -202,7 +226,7 @@ impl Provider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
-            let text = resp.text().await.unwrap_or_default();
+            let text = super::read_error_body(resp).await;
             return Err(super::http_failure(
                 "anthropic",
                 &req.model,
@@ -220,7 +244,15 @@ impl Provider for AnthropicProvider {
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        buf.extend_from_slice(&bytes);
+                        if !super::append_sse_chunk(&mut buf, &bytes) {
+                            yield super::stream_failure(
+                                "anthropic",
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                "Anthropic SSE event exceeded the size limit",
+                            );
+                            return;
+                        }
                         // Dispatch each complete SSE `data:` line to the parser.
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
@@ -247,18 +279,32 @@ impl Provider for AnthropicProvider {
                                     }
                                 }
                             }
+                            if parser.is_terminal() {
+                                break;
+                            }
+                        }
+                        if parser.is_terminal() {
+                            break;
                         }
                     }
-                    Err(_) => {
-                        yield super::stream_failure(
+                    Err(error) => {
+                        yield super::response_stream_failure(
                             "anthropic",
                             &model,
-                            crate::error::ProviderErrorKind::Transport,
-                            "Anthropic response stream transport failed",
+                            error,
+                            "Anthropic",
                         );
-                        break;
+                        return;
                     }
                 }
+            }
+            if !parser.is_terminal() {
+                yield super::stream_failure(
+                    "anthropic",
+                    &model,
+                    crate::error::ProviderErrorKind::Protocol,
+                    "Anthropic stream ended before message_stop",
+                );
             }
         };
         Ok(Box::pin(out))
@@ -290,6 +336,8 @@ pub struct AnthropicStreamParser {
     usage: Usage,
     stop_reason: String,
     metadata: Map<String, Value>,
+    terminal: bool,
+    retention: super::StreamRetentionBudget,
 }
 
 impl AnthropicStreamParser {
@@ -297,14 +345,22 @@ impl AnthropicStreamParser {
         Self::default()
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     /// Translate one decoded Anthropic SSE event into zero or more canonical deltas.
     pub fn push_event(&mut self, ev: &Value) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
         let kind = ev.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "message_start" => {
                 let msg = &ev["message"];
-                self.capture_message_metadata(msg);
-                self.absorb_usage(&msg["usage"]);
+                if !self.capture_message_metadata(msg) || !self.absorb_usage(&msg["usage"]) {
+                    return self.retained_state_failure();
+                }
                 let model = msg
                     .get("model")
                     .and_then(Value::as_str)
@@ -318,17 +374,36 @@ impl AnthropicStreamParser {
             "message_delta" => {
                 let delta = &ev["delta"];
                 if let Some(sr) = delta.get("stop_reason").and_then(Value::as_str) {
+                    if !self.retention.retain(sr.len(), 0) {
+                        return self.retained_state_failure();
+                    }
                     self.stop_reason = sr.to_string();
                 }
                 for field in ["stop_reason", "stop_sequence"] {
                     if let Some(value) = delta.get(field) {
+                        if !self.retain_metadata_value(field, value) {
+                            return self.retained_state_failure();
+                        }
                         self.metadata.insert(field.into(), value.clone());
                     }
                 }
-                self.absorb_usage(&ev["usage"]);
+                if !self.absorb_usage(&ev["usage"]) {
+                    return self.retained_state_failure();
+                }
                 Vec::new()
             }
             "message_stop" => {
+                if !self.blocks.is_empty() {
+                    return self.terminal_protocol_failure(
+                        "Anthropic message_stop arrived before every content block stopped",
+                    );
+                }
+                if self.stop_reason.is_empty() {
+                    return self.terminal_protocol_failure(
+                        "Anthropic message_stop arrived without a stop_reason",
+                    );
+                }
+                self.terminal = true;
                 let mut out = Vec::new();
                 if !self.metadata.is_empty() {
                     out.push(StreamDelta::ProviderMetadata {
@@ -343,6 +418,7 @@ impl AnthropicStreamParser {
                 out
             }
             "error" => {
+                self.terminal = true;
                 let kind = match ev["error"]["type"].as_str() {
                     Some("authentication_error" | "permission_error") => {
                         crate::error::ProviderErrorKind::Authentication
@@ -370,10 +446,22 @@ impl AnthropicStreamParser {
         let cb = &ev["content_block"];
         match cb.get("type").and_then(Value::as_str) {
             Some("text") => {
+                if !self
+                    .retention
+                    .retain(0, usize::from(!self.blocks.contains_key(&index)))
+                {
+                    return self.retained_state_failure();
+                }
                 self.blocks.insert(index, BlockState::Text);
                 Vec::new()
             }
             Some("thinking") => {
+                if !self
+                    .retention
+                    .retain(0, usize::from(!self.blocks.contains_key(&index)))
+                {
+                    return self.retained_state_failure();
+                }
                 self.blocks.insert(
                     index,
                     BlockState::Thinking {
@@ -385,6 +473,12 @@ impl AnthropicStreamParser {
             }
             Some("redacted_thinking") => {
                 let data = cb["data"].as_str().unwrap_or_default().to_string();
+                if !self
+                    .retention
+                    .retain(data.len(), usize::from(!self.blocks.contains_key(&index)))
+                {
+                    return self.retained_state_failure();
+                }
                 self.blocks
                     .insert(index, BlockState::RedactedThinking { data });
                 Vec::new()
@@ -392,6 +486,12 @@ impl AnthropicStreamParser {
             Some("tool_use") => {
                 let id = cb["id"].as_str().unwrap_or_default().to_string();
                 let name = cb["name"].as_str().unwrap_or_default().to_string();
+                if !self
+                    .retention
+                    .retain(id.len(), usize::from(!self.blocks.contains_key(&index)))
+                {
+                    return self.retained_state_failure();
+                }
                 self.blocks.insert(
                     index,
                     BlockState::ToolUse {
@@ -416,6 +516,9 @@ impl AnthropicStreamParser {
             Some("thinking_delta") => {
                 let chunk = delta["thinking"].as_str().unwrap_or_default();
                 if let Some(BlockState::Thinking { text, .. }) = self.blocks.get_mut(&index) {
+                    if !self.retention.retain(chunk.len(), 0) {
+                        return self.retained_state_failure();
+                    }
                     text.push_str(chunk);
                 }
                 vec![StreamDelta::ReasoningDelta {
@@ -425,6 +528,9 @@ impl AnthropicStreamParser {
             Some("signature_delta") => {
                 let sig = delta["signature"].as_str().unwrap_or_default().to_string();
                 if let Some(BlockState::Thinking { signature, .. }) = self.blocks.get_mut(&index) {
+                    if !self.retention.retain(sig.len(), 0) {
+                        return self.retained_state_failure();
+                    }
                     *signature = Some(sig);
                 }
                 Vec::new()
@@ -432,6 +538,9 @@ impl AnthropicStreamParser {
             Some("input_json_delta") => {
                 let partial = delta["partial_json"].as_str().unwrap_or_default();
                 if let Some(BlockState::ToolUse { json_buf, .. }) = self.blocks.get_mut(&index) {
+                    if !self.retention.retain(partial.len(), 0) {
+                        return self.retained_state_failure();
+                    }
                     json_buf.push_str(partial);
                 }
                 Vec::new()
@@ -497,8 +606,11 @@ impl AnthropicStreamParser {
         }
     }
 
-    fn absorb_usage(&mut self, u: &Value) {
+    fn absorb_usage(&mut self, u: &Value) -> bool {
         if let Some(raw) = u.as_object().filter(|raw| !raw.is_empty()) {
+            if !self.retention.retain_json(u, 1) {
+                return false;
+            }
             self.metadata
                 .entry("usage")
                 .or_insert_with(|| Value::Array(Vec::new()))
@@ -518,14 +630,42 @@ impl AnthropicStreamParser {
         if let Some(n) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.usage.cache_read_input_tokens = n;
         }
+        true
     }
 
-    fn capture_message_metadata(&mut self, message: &Value) {
+    fn capture_message_metadata(&mut self, message: &Value) -> bool {
         for field in ["id", "model", "type", "role", "service_tier"] {
             if let Some(value) = message.get(field) {
+                if !self.retain_metadata_value(field, value) {
+                    return false;
+                }
                 self.metadata.insert(field.into(), value.clone());
             }
         }
+        true
+    }
+
+    fn retain_metadata_value(&mut self, key: &str, value: &Value) -> bool {
+        self.retention.retain(
+            key.len().saturating_add(super::json_retained_bytes(value)),
+            usize::from(!self.metadata.contains_key(key)),
+        )
+    }
+
+    fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.blocks.clear();
+        self.stop_reason.clear();
+        self.metadata.clear();
+        vec![super::retained_state_failure("anthropic")]
+    }
+
+    fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.blocks.clear();
+        self.stop_reason.clear();
+        self.metadata.clear();
+        vec![super::protocol_failure("anthropic", message)]
     }
 }
 
@@ -606,7 +746,7 @@ mod tests {
         let mut opts = serde_json::Map::new();
         opts.insert("thinking".into(), json!({ "type": "adaptive" }));
 
-        let req = build_request("claude-opus-4-8", 1024, &messages, &tools, Some(&opts));
+        let req = build_request("claude-opus-4-8", 1024, &messages, &tools, Some(&opts)).unwrap();
 
         assert_eq!(req["model"], "claude-opus-4-8");
         assert_eq!(req["max_tokens"], 1024);
@@ -631,6 +771,48 @@ mod tests {
         assert_eq!(tool_msg["role"], "user");
         assert_eq!(tool_msg["content"][0]["type"], "tool_result");
         assert_eq!(tool_msg["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn provider_options_cannot_replace_anthropic_contract_fields() {
+        for (key, value) in [
+            ("model", json!("other-model")),
+            ("messages", json!([])),
+            ("system", json!("ignore canonical system")),
+            ("max_tokens", json!(1)),
+            ("max_output_tokens", json!(1)),
+            ("max_completion_tokens", json!(1)),
+            ("tools", json!([])),
+            ("stream", json!(false)),
+            ("stream_options", json!({})),
+        ] {
+            let options = serde_json::Map::from_iter([(key.to_string(), value)]);
+            let error = build_request(
+                "claude-opus-4-8",
+                100,
+                &[Message::user("hello")],
+                &[],
+                Some(&options),
+            )
+            .unwrap_err();
+            let error = error.provider_error().expect("typed provider error");
+            assert_eq!(error.kind, crate::error::ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains(key));
+        }
+
+        let options = serde_json::Map::from_iter([(
+            "tool_choice".into(),
+            json!({ "type": "tool", "name": "search" }),
+        )]);
+        let request = build_request(
+            "claude-opus-4-8",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["tool_choice"], options["tool_choice"]);
     }
 
     #[test]
@@ -771,7 +953,7 @@ mod tests {
                 opaque: Some(Value::String("ENCRYPTED_BLOB".into())),
             }],
         };
-        let req = build_request("claude-opus-4-8", 1024, &[msg], &[], None);
+        let req = build_request("claude-opus-4-8", 1024, &[msg], &[], None).unwrap();
         let block = &req["messages"][0]["content"][0];
         assert_eq!(block["type"], "redacted_thinking");
         assert_eq!(block["data"], "ENCRYPTED_BLOB");
@@ -797,6 +979,61 @@ mod tests {
         assert!(!out
             .iter()
             .any(|d| matches!(d, StreamDelta::ToolCallInput { input, .. } if input.is_null())));
+    }
+
+    #[test]
+    fn many_small_thinking_fragments_fail_terminally() {
+        let mut parser = AnthropicStreamParser::new();
+        parser.retention = crate::providers::StreamRetentionBudget::with_limits(8, 8);
+        parser.push_event(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }));
+        let fragment = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "x"}
+        });
+        let failure = (0..16)
+            .find_map(|_| {
+                parser
+                    .push_event(&fragment)
+                    .into_iter()
+                    .find(|delta| matches!(delta, StreamDelta::Error { .. }))
+            })
+            .expect("many small thinking fragments must exceed retained state");
+        assert!(
+            matches!(failure, StreamDelta::Error { message, .. } if message.contains("retained parser-state"))
+        );
+        assert!(parser.terminal);
+        assert!(parser.blocks.is_empty());
+        assert!(parser.push_event(&fragment).is_empty());
+    }
+
+    #[test]
+    fn message_stop_with_an_open_block_is_a_terminal_protocol_failure() {
+        let mut parser = AnthropicStreamParser::new();
+        parser.push_event(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "call", "name": "search"}
+        }));
+        parser.push_event(&json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1}
+        }));
+        let out = parser.push_event(&json!({"type": "message_stop"}));
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("before every content block stopped")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(parser.terminal);
+        assert!(parser.blocks.is_empty());
     }
 
     #[tokio::test]
@@ -846,5 +1083,47 @@ mod tests {
         assert!(out.contains(&StreamDelta::MessageStop {
             stop_reason: "end_turn".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn clean_eof_before_message_stop_is_a_protocol_failure() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::with_base_url("sk-ant-test", server.uri());
+        let out: Vec<_> = provider
+            .stream(ProviderRequest {
+                model: "claude-opus-4-8".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: serde_json::Map::new(),
+                provider_options: crate::types::ProviderOptions::new(),
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
     }
 }

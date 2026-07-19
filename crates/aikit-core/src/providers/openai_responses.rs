@@ -27,6 +27,22 @@ pub fn build_request(
     tools: &[ToolSpec],
     provider_options: Option<&Map<String, Value>>,
 ) -> Result<Value> {
+    super::reject_protected_options(
+        "openai",
+        model,
+        provider_options,
+        &[
+            "model",
+            "input",
+            "instructions",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "tools",
+            "stream",
+            "stream_options",
+        ],
+    )?;
     let stateless = provider_options
         .and_then(|options| options.get("store"))
         .and_then(Value::as_bool)
@@ -357,6 +373,7 @@ pub struct OpenAiResponsesStreamParser {
     reasoning_emitted: BTreeSet<String>,
     usage: Usage,
     metadata: Map<String, Value>,
+    retention: super::StreamRetentionBudget,
 }
 
 impl OpenAiResponsesStreamParser {
@@ -375,10 +392,14 @@ impl OpenAiResponsesStreamParser {
 
         let mut out = Vec::new();
         if let Some(response) = event.get("response").filter(|value| value.is_object()) {
-            self.capture_response_metadata(response);
+            if !self.capture_response_metadata(response) {
+                return self.retained_state_failure();
+            }
             self.start_from_response(response, &mut out);
         }
-        self.capture_event_logprobs(event);
+        if !self.capture_event_logprobs(event) {
+            return self.retained_state_failure();
+        }
 
         match event
             .get("type")
@@ -405,6 +426,14 @@ impl OpenAiResponsesStreamParser {
                     event.get("item_id").and_then(Value::as_str),
                     event.get("delta").and_then(Value::as_str),
                 ) {
+                    let new_call = usize::from(!self.calls.contains_key(item_id));
+                    let bytes =
+                        delta
+                            .len()
+                            .saturating_add(if new_call == 1 { item_id.len() } else { 0 });
+                    if !self.retention.retain(bytes, new_call) {
+                        return self.retained_state_failure();
+                    }
                     self.calls
                         .entry(item_id.to_string())
                         .or_default()
@@ -416,6 +445,15 @@ impl OpenAiResponsesStreamParser {
                 if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
                     let arguments = event.get("arguments").and_then(Value::as_str);
                     if let Some(name) = event.get("name").and_then(Value::as_str) {
+                        let new_call = usize::from(!self.calls.contains_key(item_id));
+                        let bytes = name.len().saturating_add(if new_call == 1 {
+                            item_id.len()
+                        } else {
+                            0
+                        });
+                        if !self.retention.retain(bytes, new_call) {
+                            return self.retained_state_failure();
+                        }
                         self.calls.entry(item_id.to_string()).or_default().name = name.to_string();
                     }
                     out.extend(self.emit_call_input(item_id, arguments));
@@ -486,11 +524,10 @@ impl OpenAiResponsesStreamParser {
         if self.terminal {
             Vec::new()
         } else {
-            self.complete(if self.saw_tool_call {
-                "tool_use"
-            } else {
-                "end_turn"
-            })
+            vec![super::protocol_failure(
+                "openai",
+                "OpenAI Responses stream ended before a terminal response event",
+            )]
         }
     }
 
@@ -514,18 +551,35 @@ impl OpenAiResponsesStreamParser {
                 self.saw_tool_call = true;
                 let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
                 if item_id.is_empty() {
-                    return vec![super::protocol_failure(
-                        "openai",
+                    return self.terminal_protocol_failure(
                         "OpenAI function_call item is missing its item id",
-                    )];
+                    );
                 }
 
                 let mut out = Vec::new();
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                let initial_arguments = (!done)
+                    .then(|| item.get("arguments").and_then(Value::as_str))
+                    .flatten()
+                    .unwrap_or_default();
+                let new_call = usize::from(!self.calls.contains_key(item_id));
+                let bytes = call_id
+                    .len()
+                    .saturating_add(name.len())
+                    .saturating_add(initial_arguments.len())
+                    .saturating_add(if new_call == 1 { item_id.len() } else { 0 });
+                if !self.retention.retain(bytes, new_call) {
+                    return self.retained_state_failure();
+                }
                 let entry = self.calls.entry(item_id.to_string()).or_default();
-                if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                if !call_id.is_empty() {
                     entry.call_id = call_id.to_string();
                 }
-                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
                     entry.name = name.to_string();
                 }
                 if !entry.start_emitted && !entry.call_id.is_empty() && !entry.name.is_empty() {
@@ -539,24 +593,24 @@ impl OpenAiResponsesStreamParser {
                 if done {
                     let arguments = item.get("arguments").and_then(Value::as_str);
                     out.extend(self.emit_call_input(item_id, arguments));
-                } else if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
-                    if !arguments.is_empty() {
-                        entry.arguments = arguments.to_string();
-                    }
+                } else if !initial_arguments.is_empty() {
+                    entry.arguments = initial_arguments.to_string();
                 }
                 out
             }
             Some("reasoning") if done => {
                 let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
                 if id.is_empty() {
-                    return vec![super::protocol_failure(
-                        "openai",
-                        "OpenAI reasoning item is missing its id",
-                    )];
+                    return self
+                        .terminal_protocol_failure("OpenAI reasoning item is missing its id");
                 }
-                if !self.reasoning_emitted.insert(id.to_string()) {
+                if self.reasoning_emitted.contains(id) {
                     return Vec::new();
                 }
+                if !self.retention.retain(id.len(), 1) {
+                    return self.retained_state_failure();
+                }
+                self.reasoning_emitted.insert(id.to_string());
                 vec![StreamDelta::ReasoningComplete {
                     text: visible_reasoning_text(item),
                     signature: None,
@@ -574,44 +628,47 @@ impl OpenAiResponsesStreamParser {
         item_id: &str,
         authoritative_arguments: Option<&str>,
     ) -> Vec<StreamDelta> {
-        let Some(entry) = self.calls.get_mut(item_id) else {
-            return vec![super::protocol_failure(
-                "openai",
-                format!("OpenAI arguments referenced unknown item {item_id}"),
-            )];
+        let Some(existing) = self.calls.get(item_id) else {
+            return self.terminal_protocol_failure(format!(
+                "OpenAI arguments referenced unknown item {item_id}"
+            ));
         };
-        if entry.input_emitted {
+        if existing.input_emitted {
             return Vec::new();
         }
-        entry.input_emitted = true;
         if let Some(arguments) = authoritative_arguments {
-            entry.arguments = arguments.to_string();
+            if !self.retention.retain(arguments.len(), 0) {
+                return self.retained_state_failure();
+            }
         }
+        let (call_id, arguments) = {
+            let entry = self
+                .calls
+                .get_mut(item_id)
+                .expect("call existence checked above");
+            entry.input_emitted = true;
+            if let Some(arguments) = authoritative_arguments {
+                entry.arguments = arguments.to_string();
+            }
+            (entry.call_id.clone(), entry.arguments.clone())
+        };
 
-        if entry.call_id.is_empty() {
-            return vec![super::protocol_failure(
-                "openai",
-                format!("OpenAI function_call item {item_id} is missing call_id"),
-            )];
+        if call_id.is_empty() {
+            return self.terminal_protocol_failure(format!(
+                "OpenAI function_call item {item_id} is missing call_id"
+            ));
         }
-        if entry.arguments.trim().is_empty() {
+        if arguments.trim().is_empty() {
             return vec![StreamDelta::ToolCallInput {
-                id: entry.call_id.clone(),
+                id: call_id,
                 input: Value::Object(Map::new()),
             }];
         }
-        match serde_json::from_str::<Value>(&entry.arguments) {
-            Ok(input) => vec![StreamDelta::ToolCallInput {
-                id: entry.call_id.clone(),
-                input,
-            }],
-            Err(_) => vec![super::protocol_failure(
-                "openai",
-                format!(
-                    "malformed OpenAI function_call arguments for {}",
-                    entry.call_id
-                ),
-            )],
+        match serde_json::from_str::<Value>(&arguments) {
+            Ok(input) => vec![StreamDelta::ToolCallInput { id: call_id, input }],
+            Err(_) => self.terminal_protocol_failure(format!(
+                "malformed OpenAI function_call arguments for {call_id}"
+            )),
         }
     }
 
@@ -619,18 +676,28 @@ impl OpenAiResponsesStreamParser {
         let mut out = Vec::new();
         if let Some(items) = response.get("output").and_then(Value::as_array) {
             for item in items {
-                self.capture_output_logprobs(item);
+                if !self.capture_output_logprobs(item) {
+                    return self.retained_state_failure();
+                }
                 out.extend(self.observe_item(item, true));
+                if self.terminal {
+                    return out;
+                }
             }
         }
         if let Some(usage) = response.get("usage").filter(|value| value.is_object()) {
-            self.absorb_usage(usage);
+            if !self.absorb_usage(usage) {
+                return self.retained_state_failure();
+            }
         }
         out
     }
 
-    fn absorb_usage(&mut self, usage: &Value) {
+    fn absorb_usage(&mut self, usage: &Value) -> bool {
         if let Some(raw) = usage.as_object().filter(|raw| !raw.is_empty()) {
+            if !self.retention.retain_json(usage, 1) {
+                return false;
+            }
             self.metadata
                 .entry("usage")
                 .or_insert_with(|| Value::Array(Vec::new()))
@@ -658,11 +725,33 @@ impl OpenAiResponsesStreamParser {
         {
             self.usage.reasoning_tokens = tokens;
         }
+        true
     }
 
     fn complete(&mut self, requested_reason: &str) -> Vec<StreamDelta> {
         if self.terminal {
             return Vec::new();
+        }
+        if requested_reason != "error" {
+            if let Some(message) = self.calls.values().find_map(|call| {
+                if call.call_id.is_empty() {
+                    Some("OpenAI response completed with a function call missing call_id".into())
+                } else if call.name.is_empty() {
+                    Some(format!(
+                        "OpenAI function call {} completed without a name",
+                        call.call_id
+                    ))
+                } else if !call.start_emitted || !call.input_emitted {
+                    Some(format!(
+                        "OpenAI function call {} did not reach output_item.done",
+                        call.call_id
+                    ))
+                } else {
+                    None
+                }
+            }) {
+                return self.terminal_protocol_failure(message);
+            }
         }
         self.terminal = true;
         let stop_reason = if requested_reason == "completed" {
@@ -688,7 +777,7 @@ impl OpenAiResponsesStreamParser {
         out
     }
 
-    fn capture_response_metadata(&mut self, response: &Value) {
+    fn capture_response_metadata(&mut self, response: &Value) -> bool {
         for field in [
             "id",
             "object",
@@ -709,14 +798,18 @@ impl OpenAiResponsesStreamParser {
             "reasoning",
         ] {
             if let Some(value) = response.get(field) {
+                if !self.retain_metadata_value(field, value) {
+                    return false;
+                }
                 self.metadata.insert(field.into(), value.clone());
             }
         }
+        true
     }
 
-    fn capture_event_logprobs(&mut self, event: &Value) {
+    fn capture_event_logprobs(&mut self, event: &Value) -> bool {
         let Some(logprobs) = event.get("logprobs").filter(|value| !value.is_null()) else {
-            return;
+            return true;
         };
         let mut entry = Map::new();
         entry.insert("source".into(), Value::String("stream".into()));
@@ -726,17 +819,22 @@ impl OpenAiResponsesStreamParser {
             }
         }
         entry.insert("logprobs".into(), logprobs.clone());
+        let entry = Value::Object(entry);
+        if !self.retention.retain_json(&entry, 1) {
+            return false;
+        }
         self.metadata
             .entry("logprobs")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .expect("logprobs metadata is initialized as an array")
-            .push(Value::Object(entry));
+            .push(entry);
+        true
     }
 
-    fn capture_output_logprobs(&mut self, item: &Value) {
+    fn capture_output_logprobs(&mut self, item: &Value) -> bool {
         let Some(content) = item.get("content").and_then(Value::as_array) else {
-            return;
+            return true;
         };
         for (content_index, part) in content.iter().enumerate() {
             let Some(logprobs) = part.get("logprobs").filter(|value| !value.is_null()) else {
@@ -749,13 +847,41 @@ impl OpenAiResponsesStreamParser {
             }
             entry.insert("content_index".into(), Value::from(content_index));
             entry.insert("logprobs".into(), logprobs.clone());
+            let entry = Value::Object(entry);
+            if !self.retention.retain_json(&entry, 1) {
+                return false;
+            }
             self.metadata
                 .entry("logprobs")
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
                 .expect("logprobs metadata is initialized as an array")
-                .push(Value::Object(entry));
+                .push(entry);
         }
+        true
+    }
+
+    fn retain_metadata_value(&mut self, key: &str, value: &Value) -> bool {
+        self.retention.retain(
+            key.len().saturating_add(super::json_retained_bytes(value)),
+            usize::from(!self.metadata.contains_key(key)),
+        )
+    }
+
+    fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.calls.clear();
+        self.reasoning_emitted.clear();
+        self.metadata.clear();
+        vec![super::retained_state_failure("openai")]
+    }
+
+    fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.calls.clear();
+        self.reasoning_emitted.clear();
+        self.metadata.clear();
+        vec![super::protocol_failure("openai", message)]
     }
 }
 
@@ -796,7 +922,7 @@ impl OpenAiResponsesProvider {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 }
@@ -841,7 +967,7 @@ impl Provider for OpenAiResponsesProvider {
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .cloned();
-            let text = response.text().await.unwrap_or_default();
+            let text = super::read_error_body(response).await;
             return Err(super::http_failure(
                 "openai",
                 &req.model,
@@ -859,7 +985,15 @@ impl Provider for OpenAiResponsesProvider {
             while let Some(chunk) = bytes.next().await {
                 match chunk {
                     Ok(chunk) => {
-                        buffer.extend_from_slice(&chunk);
+                        if !super::append_sse_chunk(&mut buffer, &chunk) {
+                            yield super::stream_failure(
+                                "openai",
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                "OpenAI Responses SSE event exceeded the size limit",
+                            );
+                            return;
+                        }
                         while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
                             let line_bytes: Vec<u8> = buffer.drain(..=position).collect();
                             let line = String::from_utf8_lossy(&line_bytes);
@@ -894,14 +1028,14 @@ impl Provider for OpenAiResponsesProvider {
                             break;
                         }
                     }
-                    Err(_) => {
-                        yield super::stream_failure(
+                    Err(error) => {
+                        yield super::response_stream_failure(
                             "openai",
                             &model,
-                            crate::error::ProviderErrorKind::Transport,
-                            "OpenAI Responses stream transport failed",
+                            error,
+                            "OpenAI Responses",
                         );
-                        break;
+                        return;
                     }
                 }
             }
@@ -1022,6 +1156,38 @@ mod tests {
         assert_eq!(request["tools"][0]["type"], "function");
         assert_eq!(request["tools"][0]["name"], "search");
         assert!(request["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn provider_options_cannot_replace_responses_contract_fields() {
+        for (key, value) in [
+            ("model", json!("other-model")),
+            ("input", json!([])),
+            ("instructions", json!("ignore canonical system")),
+            ("max_tokens", json!(1)),
+            ("max_output_tokens", json!(1)),
+            ("max_completion_tokens", json!(1)),
+            ("tools", json!([])),
+            ("stream", json!(false)),
+            ("stream_options", json!({})),
+        ] {
+            let options = Map::from_iter([(key.to_string(), value)]);
+            let error = build_request("gpt-5", 100, &[Message::user("hello")], &[], Some(&options))
+                .unwrap_err();
+            let error = error.provider_error().expect("typed provider error");
+            assert_eq!(error.kind, crate::error::ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains(key));
+        }
+
+        let options = Map::from_iter([("service_tier".into(), json!("flex"))]);
+        let request =
+            build_request("gpt-5", 100, &[Message::user("hello")], &[], Some(&options)).unwrap();
+        assert_eq!(request["service_tier"], "flex");
+
+        let options = Map::from_iter([("tool_choice".into(), json!("required"))]);
+        let request =
+            build_request("gpt-5", 100, &[Message::user("hello")], &[], Some(&options)).unwrap();
+        assert_eq!(request["tool_choice"], "required");
     }
 
     #[test]
@@ -1289,6 +1455,60 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn many_small_argument_fragments_fail_terminally() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        parser.retention = crate::providers::StreamRetentionBudget::with_limits(8, 8);
+        let fragment = json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "i",
+            "delta": "x"
+        });
+        let failure = (0..16)
+            .find_map(|_| {
+                parser
+                    .push_event(&fragment)
+                    .into_iter()
+                    .find(|delta| matches!(delta, StreamDelta::Error { .. }))
+            })
+            .expect("many small argument fragments must exceed retained state");
+        assert!(
+            matches!(failure, StreamDelta::Error { message, .. } if message.contains("retained parser-state"))
+        );
+        assert!(parser.terminal);
+        assert!(parser.calls.is_empty());
+        assert!(parser.push_event(&fragment).is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn terminal_response_rejects_an_incomplete_function_item() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        parser.push_event(&json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_pending",
+                "call_id": "call_pending",
+                "name": "search",
+                "arguments": ""
+            }
+        }));
+        let out = parser.push_event(&json!({
+            "type": "response.completed",
+            "response": {"model": "gpt-5", "status": "completed", "output": []}
+        }));
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("did not reach output_item.done")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(parser.terminal);
+        assert!(parser.calls.is_empty());
+    }
+
     #[tokio::test]
     async fn provider_streams_typed_responses_sse_over_real_http() {
         use wiremock::matchers::{method, path};
@@ -1330,5 +1550,46 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["input"][0]["role"], "user");
         assert!(body.get("messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_eof_before_terminal_response_event_is_a_protocol_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiResponsesProvider::with_base_url("sk-test", server.uri());
+        let out: Vec<_> = provider
+            .stream(ProviderRequest {
+                model: "gpt-5".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: Map::new(),
+                provider_options: crate::types::ProviderOptions::new(),
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
     }
 }

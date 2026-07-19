@@ -10,9 +10,10 @@ pub use aikit_core::*;
 pub mod prelude {
     pub use aikit_core::{
         tool, Agent, AgentOptions, CancellableRun, CancellationHandle, CancellationToken, Client,
-        ContentBlock, GeneratedObject, GeneratedText, JsonSchema, MediaSource, Message,
-        ObjectOptions, ObjectStream, ObjectStreamEvent, RoutingOptions, StreamDelta, ToolExecutor,
-        ToolSpec, TypedGeneratedObject,
+        ContentBlock, EvalCase, EvalDataset, EvalGate, EvalReport, EvalVerdict, GeneratedObject,
+        GeneratedText, JsonSchema, MediaSource, Message, ObjectOptions, ObjectStream,
+        ObjectStreamEvent, RoutingOptions, SemanticValidation, SemanticValidator, StreamDelta,
+        ToolExecutor, ToolSpec, TypedGeneratedObject,
     };
 }
 

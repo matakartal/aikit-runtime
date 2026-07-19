@@ -55,29 +55,49 @@ impl Agent {
         Agent::default()
     }
 
-    /// Self-configure from environment pairs (name, value). Every var that maps to a known
-    /// provider activates it — the "key gir → güçlen" flow. Unknown vars are ignored. The
-    /// binding passes real `std::env::vars()`; the core stays pure by taking them as input.
+    /// Self-configure from environment pairs (name, value). Every non-empty var that maps to a
+    /// known provider activates it — the "key gir → güçlen" flow. Unknown vars and blank
+    /// credentials are ignored. If both Google aliases are present, `GOOGLE_API_KEY` follows the
+    /// official client-library precedence regardless of iterator order. The core stays pure by
+    /// taking the pairs as input.
     pub fn from_env<I, S>(vars: I) -> Self
     where
         I: IntoIterator<Item = (S, S)>,
         S: AsRef<str>,
     {
         let mut agent = Agent::new();
+        let mut discovered = BTreeMap::<String, (u8, String)>::new();
         for (name, value) in vars {
-            if let Some(provider) = provider_from_env_var(name.as_ref()) {
-                agent
-                    .credentials
-                    .insert(provider.to_string(), value.as_ref().to_string());
+            let name = name.as_ref();
+            let value = value.as_ref().trim();
+            let Some(provider) = provider_from_env_var(name) else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+
+            let priority = u8::from(name == "GOOGLE_API_KEY");
+            let entry = discovered
+                .entry(provider.to_string())
+                .or_insert_with(|| (priority, value.to_string()));
+            if priority >= entry.0 {
+                *entry = (priority, value.to_string());
             }
         }
+        agent.credentials = discovered
+            .into_iter()
+            .map(|(provider, (_, credential))| (provider, credential))
+            .collect();
         agent
     }
 
     /// Convenience for native Rust applications. Bindings call [`Agent::from_env`] at their host
     /// boundary so tests can still inject a deterministic empty environment.
     pub fn from_process_env() -> Self {
-        Agent::from_env(std::env::vars())
+        Agent::from_env(std::env::vars_os().filter_map(|(name, value)| {
+            Some((name.into_string().ok()?, value.into_string().ok()?))
+        }))
     }
 
     /// Add a credential at runtime, activating its provider. `explicit`/`env_var` disambiguate
@@ -89,6 +109,7 @@ impl Agent {
         explicit: Option<&str>,
         env_var: Option<&str>,
     ) -> Result<&'static str, ResolveError> {
+        let key = key.trim();
         let provider = resolve_provider(key, explicit, env_var)?;
         self.credentials
             .insert(provider.to_string(), key.to_string());
@@ -1022,6 +1043,53 @@ mod tests {
             ("IRRELEVANT_VAR", "ignore-me"),
         ]);
         assert_eq!(agent.active_providers(), vec!["anthropic", "deepseek"]);
+    }
+
+    #[test]
+    fn from_env_ignores_blank_credentials_and_trims_real_ones() {
+        let agent = Agent::from_env([
+            ("OPENAI_API_KEY", "   "),
+            ("ANTHROPIC_API_KEY", "  sk-ant-xxx  "),
+        ]);
+        assert_eq!(agent.active_providers(), vec!["anthropic"]);
+        assert_eq!(
+            agent.credentials.get("anthropic").map(String::as_str),
+            Some("sk-ant-xxx")
+        );
+    }
+
+    #[test]
+    fn google_env_alias_precedence_is_independent_of_iterator_order() {
+        for vars in [
+            [
+                ("GOOGLE_API_KEY", "preferred"),
+                ("GEMINI_API_KEY", "fallback"),
+            ],
+            [
+                ("GEMINI_API_KEY", "fallback"),
+                ("GOOGLE_API_KEY", "preferred"),
+            ],
+        ] {
+            let agent = Agent::from_env(vars);
+            assert_eq!(
+                agent.credentials.get("google").map(String::as_str),
+                Some("preferred")
+            );
+        }
+    }
+
+    #[test]
+    fn add_key_rejects_blank_values_and_stores_trimmed_credentials() {
+        let mut agent = Agent::new();
+        assert_eq!(
+            agent.add_key("   ", Some("openai"), None),
+            Err(ResolveError::Empty)
+        );
+        assert_eq!(agent.add_key("  sk-ant-xxx  ", None, None), Ok("anthropic"));
+        assert_eq!(
+            agent.credentials.get("anthropic").map(String::as_str),
+            Some("sk-ant-xxx")
+        );
     }
 
     #[test]

@@ -152,6 +152,26 @@ class GeneratedObject(TypedDict, Generic[T]):
     provider_metadata: Dict[str, List[JsonValue]]
 
 
+class SemanticAccept(TypedDict):
+    action: Literal["accept"]
+
+
+class SemanticRetry(TypedDict):
+    action: Literal["retry"]
+    reason: str
+
+
+class SemanticReject(TypedDict):
+    action: Literal["reject"]
+    reason: str
+
+
+SemanticValidationDecision = Union[
+    Literal["accept"], SemanticAccept, SemanticRetry, SemanticReject
+]
+SemanticValidator = Callable[[JsonValue], Awaitable[SemanticValidationDecision]]
+
+
 class ObjectAttemptStarted(TypedDict):
     type: Literal["attempt_started"]
     attempt: int
@@ -479,6 +499,111 @@ class _RunOutcomeRequired(TypedDict):
 class RunOutcome(_RunOutcomeRequired, total=False):
     final_text: str
     provider_metadata: Dict[str, List[JsonValue]]
+    invocation_start_message_index: int
+
+
+EvalTerminalStatus = Literal[
+    "completed", "failed", "budget_exceeded", "max_turns", "cancelled"
+]
+
+
+class EvalOutputExactGate(TypedDict):
+    type: Literal["output_exact"]
+    value: str
+
+
+class EvalOutputContainsGate(TypedDict):
+    type: Literal["output_contains"]
+    value: str
+
+
+class EvalOutputNotContainsGate(TypedDict):
+    type: Literal["output_not_contains"]
+    value: str
+
+
+class EvalTerminalStatusGate(TypedDict):
+    type: Literal["terminal_status"]
+    status: EvalTerminalStatus
+
+
+class EvalCalledToolGate(TypedDict):
+    type: Literal["called_tool"]
+    name: str
+
+
+class EvalDidNotCallToolGate(TypedDict):
+    type: Literal["did_not_call_tool"]
+    name: str
+
+
+class _EvalToolSequenceGateRequired(TypedDict):
+    type: Literal["tool_sequence"]
+    names: List[str]
+
+
+class EvalToolSequenceGate(_EvalToolSequenceGateRequired, total=False):
+    exact: bool
+
+
+class EvalNoToolErrorsGate(TypedDict):
+    type: Literal["no_tool_errors"]
+
+
+class EvalMaxTurnsGate(TypedDict):
+    type: Literal["max_turns"]
+    value: int
+
+
+class EvalMaxInputTokensGate(TypedDict):
+    type: Literal["max_input_tokens"]
+    value: int
+
+
+class EvalMaxOutputTokensGate(TypedDict):
+    type: Literal["max_output_tokens"]
+    value: int
+
+
+class EvalMaxTotalTokensGate(TypedDict):
+    type: Literal["max_total_tokens"]
+    value: int
+
+
+class EvalMaxModelAttemptsGate(TypedDict):
+    type: Literal["max_model_attempts"]
+    value: int
+
+
+EvalGate = Union[
+    EvalOutputExactGate,
+    EvalOutputContainsGate,
+    EvalOutputNotContainsGate,
+    EvalTerminalStatusGate,
+    EvalCalledToolGate,
+    EvalDidNotCallToolGate,
+    EvalToolSequenceGate,
+    EvalNoToolErrorsGate,
+    EvalMaxTurnsGate,
+    EvalMaxInputTokensGate,
+    EvalMaxOutputTokensGate,
+    EvalMaxTotalTokensGate,
+    EvalMaxModelAttemptsGate,
+]
+
+
+class EvalCheck(TypedDict):
+    gate: str
+    passed: bool
+    message: str
+
+
+class EvalVerdict(TypedDict):
+    passed: bool
+    passed_checks: int
+    total_checks: int
+    score: float
+    checks: List[EvalCheck]
 
 
 class _SubagentResultRequired(TypedDict):
@@ -628,14 +753,19 @@ class Tool(Protocol):
 
 ToolCallback = Callable[[Dict[str, JsonValue]], Awaitable[str]]
 
+class McpToolFilter(TypedDict, total=False):
+    """Exact, case-sensitive MCP tool visibility policy; deny always wins."""
+    allow: Sequence[str]
+    deny: Sequence[str]
+
 class McpServer:
     async def list_resources(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
     async def read_resource(self, uri: str) -> JsonValue: ...
     async def list_prompts(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
     async def get_prompt(self, name: str, arguments: JsonValue) -> JsonValue: ...
 
-async def connect_mcp_http(endpoint: str, name: str, bearer_token: Optional[str] = ...) -> McpServer: ...
-async def connect_mcp_stdio(program: str, args: Sequence[str], name: str, env: Optional[Mapping[str, str]] = ..., inherit_env: bool = ...) -> McpServer: ...
+async def connect_mcp_http(endpoint: str, name: str, bearer_token: Optional[str] = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpServer: ...
+async def connect_mcp_stdio(program: str, args: Sequence[str], name: str, env: Optional[Mapping[str, str]] = ..., inherit_env: bool = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpServer: ...
 
 
 @overload
@@ -672,8 +802,25 @@ class Agent:
     def use_session_file(self, path: str) -> None: ...
     def use_sqlite_memory(self, path: str, namespace: str = ...) -> None: ...
     def use_sqlite_sessions(self, path: str) -> None: ...
+    def recover_expired_session(
+        self,
+        session_id: str,
+        *,
+        side_effects_reconciled: Literal[True],
+    ) -> int:
+        """Clear an expired lease after reconciliation; does not execute or resume work."""
+        ...
     def register_web_tools(self, allowed_hosts: Sequence[str], search_endpoint: Optional[str] = ..., max_response_bytes: Optional[int] = ...) -> None: ...
-    def register_browser_tools(self, webdriver_endpoint: str, session_id: str, allowed_hosts: Sequence[str]) -> None: ...
+    def register_browser_tools(
+        self,
+        webdriver_endpoint: str,
+        session_id: str,
+        allowed_hosts: Sequence[str],
+        *,
+        external_egress_enforced: Literal[True],
+    ) -> None:
+        """Register browser tools after asserting an exact external host/public-IP boundary."""
+        ...
     def register_mcp(self, server: McpServer) -> None: ...
     def enable_capability_requests(self, gated_tools: Sequence[str]) -> None: ...
     def enable_default_guardrails(self, blocked_input_patterns: Sequence[str] = ...) -> None: ...
@@ -764,6 +911,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        validator: Optional[SemanticValidator] = ...,
     ) -> GeneratedObject[T]: ...
 
     @overload
@@ -776,6 +924,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        validator: Optional[SemanticValidator] = ...,
     ) -> GeneratedObject[JsonValue]: ...
 
     @overload
@@ -788,6 +937,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        validator: Optional[SemanticValidator] = ...,
     ) -> ObjectStream[T]: ...
 
     @overload
@@ -800,6 +950,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        validator: Optional[SemanticValidator] = ...,
     ) -> ObjectStream[JsonValue]: ...
 
     def remember(self, key: str, value: JsonValue) -> None: ...
@@ -878,6 +1029,9 @@ def query(
     permissions: Optional[Sequence[PermissionRule]] = ...,
     options: Optional[RunOptions] = ...,
 ) -> QueryStream: ...
+
+
+def evaluate_outcome(outcome: RunOutcome, gates: Sequence[EvalGate]) -> EvalVerdict: ...
 
 
 __version__: str

@@ -79,6 +79,9 @@ pub fn resolve_provider(
     explicit: Option<&str>,
     env_var: Option<&str>,
 ) -> Result<&'static str, ResolveError> {
+    if key.trim().is_empty() {
+        return Err(ResolveError::Empty);
+    }
     if let Some(p) = explicit {
         return KNOWN_PROVIDERS
             .iter()
@@ -98,6 +101,8 @@ pub fn resolve_provider(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
+    /// An empty or whitespace-only value can never authenticate an inference request.
+    Empty,
     /// `sk-...` key with no env-var or explicit hint — could be OpenAI or DeepSeek.
     Ambiguous,
     /// No recognizable signature and no hint.
@@ -109,6 +114,7 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ResolveError::Empty => write!(f, "credential cannot be empty"),
             ResolveError::Ambiguous => write!(
                 f,
                 "sk- key is ambiguous (OpenAI or DeepSeek); pass an explicit provider or use the env-var name"
@@ -173,6 +179,14 @@ mod tests {
         assert_eq!(
             resolve_provider("sk-xxxx", None, None),
             Err(ResolveError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn empty_key_is_rejected_even_with_an_explicit_provider() {
+        assert_eq!(
+            resolve_provider("   ", Some("openai"), None),
+            Err(ResolveError::Empty)
         );
     }
 

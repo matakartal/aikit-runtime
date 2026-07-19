@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "keyless-smoke",
+  "model": "mock-1",
+  "max_tokens": 64,
+  "cases": [
+    {
+      "name": "mock-completes",
+      "prompt": "Explain that the task is complete.",
+      "gates": [
+        {
+          "type": "output_contains",
+          "value": "tamamladım"
+        },
+        {
+          "type": "terminal_status",
+          "status": "completed"
+        },
+        {
+          "type": "max_output_tokens",
+          "value": 64
+        },
+        {
+          "type": "no_tool_errors"
+        }
+      ]
+    }
+  ]
+}

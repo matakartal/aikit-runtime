@@ -28,9 +28,20 @@ function nativePackageName() {
   }
   if (process.platform === "linux") {
     const header = process.report?.getReport?.().header;
-    if (header?.glibcVersionRuntime == null) {
+    const glibc = header?.glibcVersionRuntime;
+    if (glibc == null) {
       throw new Error(
-        "aikit-runtime currently publishes glibc Linux addons only; musl is not yet supported",
+        "aikit-runtime packaged Linux addons require glibc; musl is not yet supported",
+      );
+    }
+    const match = /^(\d+)\.(\d+)/.exec(glibc);
+    if (
+      match == null ||
+      Number(match[1]) < 2 ||
+      (Number(match[1]) === 2 && Number(match[2]) < 28)
+    ) {
+      throw new Error(
+        `aikit-runtime packaged Linux addons require glibc 2.28 or newer; found ${glibc}`,
       );
     }
   }
@@ -39,7 +50,7 @@ function nativePackageName() {
 
 function loadNative() {
   // Local builds intentionally remain simple: scripts/build-node.sh stages the addon beside this
-  // wrapper. Published installs omit that file and resolve the exact optional platform package.
+  // wrapper. Packaged installs omit that file and resolve the exact optional platform package.
   const local = path.join(__dirname, "aikit_node.node");
   if (fs.existsSync(local)) return require(local);
 
@@ -78,19 +89,12 @@ function normalizeNativeError(error) {
 
 /** Make a native pull stream (`next()` → value | null) consumable via `for await`. */
 function asyncIterable(stream, transform, signal) {
-  if (typeof transform === "function") {
-    const nativeNext = stream.next.bind(stream);
-    stream.next = async function () {
-      try {
-        const value = await nativeNext();
-        return value == null ? null : transform(value);
-      } catch (error) {
-        throw normalizeNativeError(error);
-      }
-    };
-  }
+  const nativeNext = stream.next.bind(stream);
+  const nativeCancel =
+    typeof stream.cancel === "function" ? stream.cancel.bind(stream) : null;
   const nativeClose =
     typeof stream.close === "function" ? stream.close.bind(stream) : null;
+  let inFlightNext;
   let closePromise;
   let abortListener;
   const removeAbortListener = () => {
@@ -99,9 +103,42 @@ function asyncIterable(stream, transform, signal) {
   };
   const close = () => {
     if (closePromise == null) {
-      closePromise = Promise.resolve(nativeClose?.()).finally(removeAbortListener);
+      // Cancellation must happen before waiting for an outstanding pull: that pull may be blocked
+      // inside a host hook and native close is otherwise the only operation that wakes it.
+      nativeCancel?.();
+      // Native QueryStream is deliberately single-consumer. If cancellation or an explicit
+      // close races a pending next(), let that pull observe cancellation before taking the native
+      // stream for finalization.
+      const pending = inFlightNext;
+      closePromise = Promise.resolve(pending)
+        .catch(() => {})
+        .then(() => nativeClose?.())
+        .catch((error) => {
+          throw normalizeNativeError(error);
+        })
+        .finally(removeAbortListener);
     }
     return closePromise;
+  };
+  stream.next = function () {
+    if (closePromise != null) {
+      return closePromise.then(() => null);
+    }
+    if (signal?.aborted) {
+      return close().then(() => null);
+    }
+    const operation = (async () => {
+      try {
+        const value = await nativeNext();
+        return value == null || typeof transform !== "function" ? value : transform(value);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    })();
+    inFlightNext = operation;
+    return operation.finally(() => {
+      if (inFlightNext === operation) inFlightNext = undefined;
+    });
   };
   if (nativeClose != null) stream.close = close;
   if (signal != null) {
@@ -109,7 +146,6 @@ function asyncIterable(stream, transform, signal) {
       throw new TypeError("options.signal must be an AbortSignal");
     }
     abortListener = () => {
-      stream.cancel?.();
       void close().catch(() => {});
     };
     if (signal.aborted) abortListener();
@@ -141,9 +177,76 @@ function asyncIterable(stream, transform, signal) {
   return stream;
 }
 
-function nativeOptions(options) {
-  if (options == null || !("signal" in options)) return [options, undefined];
+const RUN_OPTION_KEYS = new Set([
+  "model",
+  "fallbackModels",
+  "maxTokens",
+  "maxTurns",
+  "providerOptions",
+  "budget",
+  "retry",
+  "routing",
+  "compaction",
+  "signal",
+]);
+const QUERY_OPTION_KEYS = new Set([
+  ...RUN_OPTION_KEYS,
+  "permissions",
+  "defaultMode",
+]);
+const PERMISSION_RULE_KEYS = new Set([
+  "id",
+  "effect",
+  "tool",
+  "pattern",
+  "field",
+]);
+
+function checkedPermissionRules(rules) {
+  if (rules == null) return rules;
+  if (!Array.isArray(rules)) {
+    throw new TypeError("permissions must be an array");
+  }
+  for (const [index, rule] of rules.entries()) {
+    if (rule == null || typeof rule !== "object" || Array.isArray(rule)) {
+      throw new TypeError(`permissions[${index}] must be an object`);
+    }
+    const unknown = Object.keys(rule).find((key) => !PERMISSION_RULE_KEYS.has(key));
+    if (unknown != null) {
+      throw new TypeError(`permissions[${index}] contains unknown field '${unknown}'`);
+    }
+    if (rule.field != null && rule.pattern == null) {
+      throw new TypeError(`permissions[${index}].field requires pattern`);
+    }
+  }
+  return rules;
+}
+
+function checkedOptionObject(options, context, allowedKeys) {
+  if (options == null) return options;
+  if (typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError(`${context} must be an object`);
+  }
+  const unknown = Object.keys(options).find((key) => !allowedKeys.has(key));
+  if (unknown != null) {
+    throw new TypeError(`${context} contains unknown field '${unknown}'`);
+  }
+  return options;
+}
+
+function nativeOptions(options, allowedKeys = RUN_OPTION_KEYS) {
+  checkedOptionObject(options, "RunOptions", allowedKeys);
+  if (options == null) return [options, undefined];
+  if ("permissions" in options) checkedPermissionRules(options.permissions);
+  if (!("signal" in options)) return [options, undefined];
   const { signal, ...rest } = options;
+  if (
+    signal != null &&
+    (typeof signal.addEventListener !== "function" ||
+      typeof signal.removeEventListener !== "function")
+  ) {
+    throw new TypeError("RunOptions.signal must be an AbortSignal");
+  }
   // Carry a pre-aborted signal into the Rust CancellationToken before the core driver is spawned.
   // Calling stream.cancel() only after nativeRun() returns races an ultra-fast mock/provider run.
   return [{ ...rest, cancelBeforeStart: signal?.aborted === true }, signal];
@@ -178,10 +281,63 @@ native.Agent.prototype.addToolDefinition = function (definition) {
   );
 };
 
+const nativeSetPermissions = native.Agent.prototype.setPermissions;
+native.Agent.prototype.setPermissions = function (rules, defaultMode) {
+  return nativeSetPermissions.call(this, checkedPermissionRules(rules), defaultMode);
+};
+
+const DOCKER_OPTION_KEYS = new Set([
+  "image",
+  "executable",
+  "pidsLimit",
+  "memoryMiB",
+  "cpus",
+  "tmpfsMiB",
+]);
+const nativeEnableBash = native.Agent.prototype.enableBashWithRequiredContainment;
+native.Agent.prototype.enableBashWithRequiredContainment = function (docker) {
+  return nativeEnableBash.call(
+    this,
+    checkedOptionObject(docker, "DockerContainmentOptions", DOCKER_OPTION_KEYS),
+  );
+};
+
+// napi represents Rust u64 values as BigInt. Session revisions are part of the public Node
+// surface as ordinary numbers, so convert only while the value remains exactly representable.
+const nativeRecoverExpiredSession = native.Agent.prototype.recoverExpiredSession;
+native.Agent.prototype.recoverExpiredSession = function (
+  sessionId,
+  sideEffectsReconciled,
+) {
+  const revision = nativeRecoverExpiredSession.call(
+    this,
+    sessionId,
+    sideEffectsReconciled,
+  );
+  if (
+    typeof revision === "bigint" &&
+    revision > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new RangeError("session revision exceeds JavaScript's safe integer range");
+  }
+  return Number(revision);
+};
+
 // Thin Node ergonomics over the canonical SubagentSpec and existing fanOut implementation.
 native.Agent.prototype.subtask = function (id, prompt, route, options = {}) {
   if (options == null || typeof options !== "object") {
     throw new TypeError("subtask options must be an object");
+  }
+  const allowed = new Set([
+    "system",
+    "allowedTools",
+    "maxTurns",
+    "maxTokens",
+    "estimatedInputTokens",
+  ]);
+  const unknown = Object.keys(options).find((key) => !allowed.has(key));
+  if (unknown != null) {
+    throw new TypeError(`subtask options contain unknown field '${unknown}'`);
   }
   return {
     id,
@@ -195,6 +351,53 @@ native.Agent.prototype.subtask = function (id, prompt, route, options = {}) {
   };
 };
 
+const ORCHESTRATION_OPTION_KEYS = new Set(["maxParallelism", "budget"]);
+const ORCHESTRATION_BUDGET_KEYS = new Set([
+  "max_model_calls",
+  "max_input_tokens",
+  "max_output_tokens",
+  "max_cost_micro_usd",
+  "wall_time_ms",
+]);
+
+function checkedOrchestrationOptions(options) {
+  if (options == null) return options;
+  if (typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("OrchestrationOptions must be an object");
+  }
+  const unknown = Object.keys(options).find(
+    (key) => !ORCHESTRATION_OPTION_KEYS.has(key),
+  );
+  if (unknown != null) {
+    throw new TypeError(`OrchestrationOptions contains unknown field '${unknown}'`);
+  }
+  if (options.budget != null) {
+    if (typeof options.budget !== "object" || Array.isArray(options.budget)) {
+      throw new TypeError("OrchestrationOptions.budget must be an object");
+    }
+    const unknownBudget = Object.keys(options.budget).find(
+      (key) => !ORCHESTRATION_BUDGET_KEYS.has(key),
+    );
+    if (unknownBudget != null) {
+      throw new TypeError(
+        `OrchestrationOptions.budget contains unknown field '${unknownBudget}'`,
+      );
+    }
+  }
+  return options;
+}
+
+for (const method of ["runSubagent", "fanOut", "council", "resumeSubagent"]) {
+  const nativeMethod = native.Agent.prototype[method];
+  native.Agent.prototype[method] = function (...args) {
+    const optionsIndex = method === "council" ? 4 : method === "resumeSubagent" ? 3 : 2;
+    if (args.length > optionsIndex) {
+      args[optionsIndex] = checkedOrchestrationOptions(args[optionsIndex]);
+    }
+    return nativeMethod.apply(this, args);
+  };
+}
+
 native.Agent.prototype.parallel = function (specs, profiles, options) {
   return this.fanOut(specs, profiles, options);
 };
@@ -202,17 +405,28 @@ native.Agent.prototype.parallel = function (specs, profiles, options) {
 // Native methods return the same QueryStream used by the top-level `query` compatibility
 // helper. Make Agent streaming equally idiomatic without adding another implementation layer.
 const nativeGenerateText = native.Agent.prototype.generateText;
-native.Agent.prototype.generateText = async function (...args) {
+const GENERATE_TEXT_OPTION_KEYS = new Set(["model", "maxTokens"]);
+native.Agent.prototype.generateText = async function (prompt, options) {
   try {
-    return await nativeGenerateText.apply(this, args);
+    return await nativeGenerateText.call(
+      this,
+      prompt,
+      checkedOptionObject(options, "GenerateTextOptions", GENERATE_TEXT_OPTION_KEYS),
+    );
   } catch (error) {
     throw normalizeNativeError(error);
   }
 };
 
 const nativeStreamText = native.Agent.prototype.streamText;
-native.Agent.prototype.streamText = function (...args) {
-  return asyncIterable(nativeStreamText.apply(this, args));
+native.Agent.prototype.streamText = function (prompt, options) {
+  return asyncIterable(
+    nativeStreamText.call(
+      this,
+      prompt,
+      checkedOptionObject(options, "GenerateTextOptions", GENERATE_TEXT_OPTION_KEYS),
+    ),
+  );
 };
 
 const nativeRun = native.Agent.prototype.run;
@@ -263,17 +477,40 @@ function zodAdapter(schema) {
 // optional peer: raw JSON Schema callers never load it, while Zod callers get the same core JSON
 // Schema validation plus a final `parse` that materializes their inferred runtime type.
 const nativeGenerateObject = native.Agent.prototype.generateObject;
+const GENERATE_OBJECT_OPTION_KEYS = new Set([
+  "model",
+  "maxRetries",
+  "maxTokens",
+  "name",
+  "providerOptions",
+  "validator",
+]);
+function structuredOptions(options) {
+  const checked = checkedOptionObject(
+    options,
+    "GenerateObjectOptions",
+    GENERATE_OBJECT_OPTION_KEYS,
+  );
+  if (checked == null) return [checked, undefined];
+  const { validator, ...nativeOptions } = checked;
+  if (validator != null && typeof validator !== "function") {
+    throw new TypeError("GenerateObjectOptions.validator must be an async function");
+  }
+  return [nativeOptions, validator];
+}
 native.Agent.prototype.generateObject = async function (prompt, schema, options) {
   const adapter = zodAdapter(schema);
+  const [checkedOptions, validator] = structuredOptions(options);
   try {
     if (adapter == null) {
-      return await nativeGenerateObject.call(this, prompt, schema, options);
+      return await nativeGenerateObject.call(this, prompt, schema, checkedOptions, validator);
     }
     const result = await nativeGenerateObject.call(
       this,
       prompt,
       adapter.jsonSchema,
-      options,
+      checkedOptions,
+      validator,
     );
     return { ...result, value: adapter.parse(result.value) };
   } catch (error) {
@@ -287,11 +524,13 @@ native.Agent.prototype.generateObject = async function (prompt, schema, options)
 const nativeStreamObject = native.Agent.prototype.streamObject;
 native.Agent.prototype.streamObject = function (prompt, schema, options) {
   const adapter = zodAdapter(schema);
+  const [checkedOptions, validator] = structuredOptions(options);
   const stream = nativeStreamObject.call(
     this,
     prompt,
     adapter?.jsonSchema ?? schema,
-    options,
+    checkedOptions,
+    validator,
   );
   return asyncIterable(stream, (event) => {
     if (adapter == null || event?.type !== "completed") return event;
@@ -308,10 +547,12 @@ native.Agent.prototype.streamObject = function (prompt, schema, options) {
 module.exports = {
   Agent: native.Agent,
   Client: native.Client,
+  McpServer: native.McpServer,
+  evaluateOutcome: native.evaluateOutcome,
   tool,
   // query(prompt, tools?, options?) — `tools` maps a name to a JS `async (input) => string`.
   query: (prompt, tools, options) => {
-    const [runOptions, signal] = nativeOptions(options);
+    const [runOptions, signal] = nativeOptions(options, QUERY_OPTION_KEYS);
     return asyncIterable(native.query(prompt, tools, runOptions), undefined, signal);
   },
 };

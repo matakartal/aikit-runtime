@@ -1,9 +1,14 @@
 //! Transactional, cross-process local persistence for memory and resumable sessions.
 
 use crate::memory::{MemoryEntry, MemoryQuery, MemoryStore};
-use crate::session::{Session, SessionStore, SessionStoreError, SessionStoreResult};
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
-use std::path::Path;
+use crate::session::{
+    validate_execution_lease_claim, validate_stored_execution_lease, Session,
+    SessionExecutionLease, SessionExecutionLeaseRecord, SessionStore, SessionStoreError,
+    SessionStoreResult,
+};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,20 +28,182 @@ CREATE TABLE IF NOT EXISTS aikit_sessions (
   revision INTEGER NOT NULL,
   session_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS aikit_session_execution_leases (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expires_at_unix_ms INTEGER NOT NULL
+);
 "#;
 
 fn open(path: impl AsRef<Path>) -> std::result::Result<Connection, String> {
-    if let Some(parent) = path.as_ref().parent() {
+    let path = path.as_ref();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let connection = Connection::open(path).map_err(|e| e.to_string())?;
+    // Pre-create/open with O_NOFOLLOW on Unix, then make SQLite open only that existing path. A
+    // second descriptor check catches ordinary target replacement between the secure open and
+    // SQLite's open. Schema writes happen only after this verification.
+    let database_file = open_database_file(path, true)?;
+    // Resolve benign parent aliases (notably macOS `/var` -> `/private/var`) without resolving the
+    // final component. A final-path swap to a symlink therefore still reaches SQLite as a symlink
+    // and is rejected by SQLITE_OPEN_NOFOLLOW.
+    let sqlite_path = sqlite_nofollow_path(path)?;
+    let connection = Connection::open_with_flags(&sqlite_path, database_open_flags())
+        .map_err(|e| e.to_string())?;
+    let verified_file = open_database_file(path, false)?;
+    if !same_open_file(&database_file, &verified_file)? {
+        return Err(format!(
+            "SQLite database {} changed while it was being opened",
+            path.display()
+        ));
+    }
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
     connection
         .execute_batch(SCHEMA)
         .map_err(|e| e.to_string())?;
+    ensure_execution_lease_token_column(&connection)?;
+    tighten_owner_only_permissions(&database_file)?;
     Ok(connection)
+}
+
+fn ensure_execution_lease_token_column(connection: &Connection) -> std::result::Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(aikit_session_execution_leases)")
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    if !columns.iter().any(|column| column == "token") {
+        // Existing in-flight rows remain NULL and therefore fail closed as indeterminate. Only
+        // newly acquired/recovered leases receive a valid store-generated token.
+        connection
+            .execute(
+                "ALTER TABLE aikit_session_execution_leases ADD COLUMN token TEXT",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn database_open_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
+
+fn sqlite_nofollow_path(path: &Path) -> std::result::Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "SQLite database path must have a final file name".to_string())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn open_database_file(path: &Path, create: bool) -> std::result::Result<File, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing to open SQLite database {} through a symlink",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err(format!(
+            "SQLite database {} is not a regular file",
+            path.display()
+        ));
+    }
+    tighten_owner_only_permissions(&file)?;
+    Ok(file)
+}
+
+fn tighten_owner_only_permissions(file: &File) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_open_file(left: &File, right: &File) -> std::result::Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.metadata().map_err(|error| error.to_string())?;
+    let right = right.metadata().map_err(|error| error.to_string())?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_open_file(left: &File, right: &File) -> std::result::Result<bool, String> {
+    Ok(windows_file_identity(left)? == windows_file_identity(right)?)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> std::result::Result<(u32, u64), String> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a valid handle for the duration of this call and Windows initializes the
+    // complete output structure when the function reports success.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(format!(
+            "cannot prove Windows SQLite file identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful call above initialized `information`.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_open_file(_left: &File, _right: &File) -> std::result::Result<bool, String> {
+    Err("cannot prove SQLite file identity on this platform".into())
 }
 
 pub struct SqliteMemoryStore {
@@ -273,6 +440,343 @@ impl SessionStore for SqliteSessionStore {
         }
         Ok(replacement)
     }
+
+    fn acquire_execution_lease(
+        &self,
+        base: Session,
+        owner: &str,
+    ) -> SessionStoreResult<SessionExecutionLease> {
+        validate_id(&base.id)?;
+        validate_lease_owner(owner)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io_error(error.to_string()))?;
+        let existing_lease: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM aikit_session_execution_leases WHERE id=?1",
+                params![base.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| io_error(error.to_string()))?;
+        if existing_lease.is_some() {
+            return Err(sqlite_lease_conflict(&base));
+        }
+        let actual_revision = current_revision(&transaction, &base.id)?;
+        if base.revision == 0 {
+            if let Some(actual_revision) = actual_revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: 0,
+                    actual_revision,
+                });
+            }
+        } else {
+            let actual_revision = actual_revision.ok_or_else(|| SessionStoreError::NotFound {
+                id: base.id.clone(),
+            })?;
+            if actual_revision != base.revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: base.revision,
+                    actual_revision,
+                });
+            }
+        }
+        let lease = SessionExecutionLeaseRecord::new(owner)?;
+        transaction
+            .execute(
+                "INSERT INTO aikit_session_execution_leases(id,owner,token,expires_at_unix_ms) VALUES(?1,?2,?3,?4)",
+                params![
+                    base.id,
+                    lease.owner,
+                    lease.token,
+                    revision_to_sql(lease.expires_at_unix_ms)?
+                ],
+            )
+            .map_err(|error| io_error(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| io_error(error.to_string()))?;
+        Ok(SessionExecutionLease::from_record(base, &lease))
+    }
+
+    fn recover_expired_execution_lease(
+        &self,
+        base: Session,
+        recovery_owner: &str,
+    ) -> SessionStoreResult<SessionExecutionLease> {
+        validate_id(&base.id)?;
+        validate_lease_owner(recovery_owner)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io_error(error.to_string()))?;
+        let existing_lease = sqlite_execution_lease_record(&transaction, &base.id)?
+            .ok_or_else(|| sqlite_lease_conflict(&base))?;
+        if !existing_lease.is_expired()? {
+            return Err(sqlite_lease_conflict(&base));
+        }
+
+        let actual_revision = current_revision(&transaction, &base.id)?;
+        if base.revision == 0 {
+            if let Some(actual_revision) = actual_revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: 0,
+                    actual_revision,
+                });
+            }
+        } else {
+            let actual_revision = actual_revision.ok_or_else(|| SessionStoreError::NotFound {
+                id: base.id.clone(),
+            })?;
+            if actual_revision != base.revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: base.revision,
+                    actual_revision,
+                });
+            }
+        }
+
+        let recovered_lease = SessionExecutionLeaseRecord::new(recovery_owner)?;
+        transaction
+            .execute(
+                "UPDATE aikit_session_execution_leases SET owner=?1, token=?2, expires_at_unix_ms=?3 WHERE id=?4",
+                params![
+                    recovered_lease.owner,
+                    recovered_lease.token,
+                    revision_to_sql(recovered_lease.expires_at_unix_ms)?,
+                    base.id
+                ],
+            )
+            .map_err(|error| io_error(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| io_error(error.to_string()))?;
+        Ok(SessionExecutionLease::from_record(base, &recovered_lease))
+    }
+
+    fn clear_expired_execution_lease(&self, base: Session) -> SessionStoreResult<Session> {
+        validate_id(&base.id)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io_error(error.to_string()))?;
+        let existing = sqlite_execution_lease_record(&transaction, &base.id)?
+            .ok_or_else(|| sqlite_lease_conflict(&base))?;
+        if !existing.is_expired()? {
+            return Err(sqlite_lease_conflict(&base));
+        }
+        let actual_revision = current_revision(&transaction, &base.id)?;
+        if base.revision == 0 {
+            if let Some(actual_revision) = actual_revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: 0,
+                    actual_revision,
+                });
+            }
+        } else {
+            let actual_revision = actual_revision.ok_or_else(|| SessionStoreError::NotFound {
+                id: base.id.clone(),
+            })?;
+            if actual_revision != base.revision {
+                return Err(SessionStoreError::Conflict {
+                    id: base.id,
+                    expected_revision: base.revision,
+                    actual_revision,
+                });
+            }
+        }
+        let removed = transaction
+            .execute(
+                "DELETE FROM aikit_session_execution_leases WHERE id=?1 AND token=?2",
+                params![base.id, existing.token],
+            )
+            .map_err(|error| io_error(error.to_string()))?;
+        if removed != 1 {
+            return Err(sqlite_lease_conflict(&base));
+        }
+        transaction
+            .commit()
+            .map_err(|error| io_error(error.to_string()))?;
+        Ok(base)
+    }
+
+    fn commit_execution_lease(
+        &self,
+        mut lease: SessionExecutionLease,
+    ) -> SessionStoreResult<Session> {
+        validate_id(&lease.session.id)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io_error(error.to_string()))?;
+        let actual = sqlite_execution_lease_record(&transaction, &lease.session.id)?;
+        validate_execution_lease_claim(actual.as_ref(), &lease)?;
+
+        let session_id = lease.session.id.clone();
+        let lease_token = lease.token.clone();
+        let result = (|| -> SessionStoreResult<Session> {
+            if lease.session.revision == 0 {
+                if let Some(actual_revision) = current_revision(&transaction, &lease.session.id)? {
+                    return Err(SessionStoreError::Conflict {
+                        id: lease.session.id.clone(),
+                        expected_revision: 0,
+                        actual_revision,
+                    });
+                }
+                let now = now_ms();
+                lease.session.revision = 1;
+                lease.session.created_at_unix_ms = now;
+                lease.session.updated_at_unix_ms = now;
+                let json = serde_json::to_string(&lease.session)?;
+                transaction
+                    .execute(
+                        "INSERT INTO aikit_sessions(id,revision,session_json) VALUES(?1,?2,?3)",
+                        params![lease.session.id, 1_i64, json],
+                    )
+                    .map_err(|error| io_error(error.to_string()))?;
+            } else {
+                let current_json: Option<String> = transaction
+                    .query_row(
+                        "SELECT session_json FROM aikit_sessions WHERE id=?1",
+                        params![lease.session.id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| io_error(error.to_string()))?;
+                let current: Session = current_json
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?
+                    .ok_or_else(|| SessionStoreError::NotFound {
+                        id: lease.session.id.clone(),
+                    })?;
+                if current.revision != lease.session.revision {
+                    return Err(SessionStoreError::Conflict {
+                        id: lease.session.id.clone(),
+                        expected_revision: lease.session.revision,
+                        actual_revision: current.revision,
+                    });
+                }
+                lease.session.revision = current
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| io_error("session revision overflow"))?;
+                lease.session.created_at_unix_ms = current.created_at_unix_ms;
+                lease.session.updated_at_unix_ms = now_ms().max(current.updated_at_unix_ms);
+                let json = serde_json::to_string(&lease.session)?;
+                let changed = transaction
+                    .execute(
+                        "UPDATE aikit_sessions SET revision=?1,session_json=?2 WHERE id=?3 AND revision=?4",
+                        params![
+                            revision_to_sql(lease.session.revision)?,
+                            json,
+                            lease.session.id,
+                            revision_to_sql(current.revision)?
+                        ],
+                    )
+                    .map_err(|error| io_error(error.to_string()))?;
+                if changed == 0 {
+                    return Err(SessionStoreError::Conflict {
+                        id: lease.session.id.clone(),
+                        expected_revision: current.revision,
+                        actual_revision: current_revision(&transaction, &current.id)?.unwrap_or(0),
+                    });
+                }
+            }
+            Ok(lease.session)
+        })();
+        if matches!(
+            &result,
+            Ok(_) | Err(SessionStoreError::Conflict { .. } | SessionStoreError::NotFound { .. })
+        ) {
+            transaction
+                .execute(
+                    "DELETE FROM aikit_session_execution_leases WHERE id=?1 AND token=?2",
+                    params![session_id, lease_token],
+                )
+                .map_err(|error| io_error(error.to_string()))?;
+            transaction
+                .commit()
+                .map_err(|error| io_error(error.to_string()))?;
+        }
+        result
+    }
+
+    fn release_execution_lease(&self, lease: SessionExecutionLease) -> SessionStoreResult<Session> {
+        validate_id(&lease.session.id)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| io_error(error.to_string()))?;
+        let actual = sqlite_execution_lease_record(&transaction, &lease.session.id)?;
+        validate_execution_lease_claim(actual.as_ref(), &lease)?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM aikit_session_execution_leases WHERE id=?1 AND token=?2",
+                params![lease.session.id, lease.token],
+            )
+            .map_err(|error| io_error(error.to_string()))?;
+        if removed != 1 {
+            return Err(sqlite_lease_conflict(&lease.session));
+        }
+        transaction
+            .commit()
+            .map_err(|error| io_error(error.to_string()))?;
+        Ok(lease.session)
+    }
+}
+
+fn sqlite_execution_lease_record(
+    connection: &Connection,
+    id: &str,
+) -> SessionStoreResult<Option<SessionExecutionLeaseRecord>> {
+    let stored: Option<(String, Option<String>, i64)> = connection
+        .query_row(
+            "SELECT owner,token,expires_at_unix_ms FROM aikit_session_execution_leases WHERE id=?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| io_error(error.to_string()))?;
+    stored
+        .map(|(owner, token, expires_at_unix_ms)| {
+            let token = token.ok_or_else(|| SessionStoreError::Serialization {
+                message: "stored SQLite execution lease has no fencing token".into(),
+            })?;
+            let expires_at_unix_ms = u64::try_from(expires_at_unix_ms).map_err(|_| {
+                SessionStoreError::Serialization {
+                    message: "stored SQLite execution lease has an invalid expiration".into(),
+                }
+            })?;
+            let record = SessionExecutionLeaseRecord {
+                owner,
+                token,
+                expires_at_unix_ms,
+            };
+            validate_stored_execution_lease(&record)?;
+            Ok(record)
+        })
+        .transpose()
 }
 
 fn current_revision(connection: &Connection, id: &str) -> SessionStoreResult<Option<u64>> {
@@ -302,6 +806,25 @@ fn validate_id(id: &str) -> SessionStoreResult<()> {
         })
     } else {
         Ok(())
+    }
+}
+
+fn validate_lease_owner(owner: &str) -> SessionStoreResult<()> {
+    if owner.trim().is_empty() || owner.chars().any(char::is_control) {
+        Err(SessionStoreError::InvalidId {
+            reason: "execution lease owner must be non-empty and contain no control characters"
+                .into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn sqlite_lease_conflict(session: &Session) -> SessionStoreError {
+    SessionStoreError::Conflict {
+        id: session.id.clone(),
+        expected_revision: session.revision,
+        actual_revision: session.revision.saturating_add(1),
     }
 }
 
@@ -377,5 +900,228 @@ mod tests {
             )
             .unwrap();
         assert!(current_revision(&connection, "bad").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_rejects_a_final_path_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.db");
+        let alias = dir.path().join("alias.db");
+        fs::write(&target, b"must remain untouched").unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let memory_error = SqliteMemoryStore::open(&alias).err().unwrap();
+        assert!(memory_error.contains("symlink"), "{memory_error}");
+        let session_error = SqliteSessionStore::open(&alias).err().unwrap();
+        assert!(session_error.to_string().contains("symlink"));
+        assert_eq!(fs::read(&target).unwrap(), b"must remain untouched");
+        assert!(database_open_flags().contains(OpenFlags::SQLITE_OPEN_NOFOLLOW));
+        let sqlite_path = sqlite_nofollow_path(&alias).unwrap();
+        assert_eq!(sqlite_path.file_name(), alias.file_name());
+        assert!(fs::symlink_metadata(sqlite_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_tightens_existing_database_permissions_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.db");
+        fs::write(&path, []).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let _store = SqliteSessionStore::open(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn sqlite_expired_execution_lease_can_be_recovered_without_revision_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease-recovery.db");
+        let first = SqliteSessionStore::open(&path).unwrap();
+        let base = Session::new("recoverable", Vec::new());
+        let mut stale = first
+            .acquire_execution_lease(base.clone(), "crashed-owner")
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE aikit_session_execution_leases SET expires_at_unix_ms=0 WHERE id=?1",
+                params![base.id],
+            )
+            .unwrap();
+
+        let second = SqliteSessionStore::open(&path).unwrap();
+        assert!(matches!(
+            second.acquire_execution_lease(base.clone(), "automatic-retry"),
+            Err(SessionStoreError::Conflict { .. })
+        ));
+        let mut recovered = second
+            .recover_expired_execution_lease(base, "crashed-owner")
+            .unwrap();
+        assert_ne!(stale.token, recovered.token);
+        assert_eq!(recovered.session().revision, 0);
+        stale
+            .session_mut()
+            .messages
+            .push(Message::user("unsafe stale retry"));
+        recovered
+            .session_mut()
+            .messages
+            .push(Message::user("safe retry"));
+
+        assert!(matches!(
+            first.commit_execution_lease(stale),
+            Err(SessionStoreError::Conflict { .. })
+        ));
+        let saved = second.commit_execution_lease(recovered).unwrap();
+        assert_eq!(saved.revision, 1);
+        assert_eq!(second.load_session("recoverable").unwrap(), saved);
+    }
+
+    #[test]
+    fn sqlite_malformed_expiration_blocks_normal_and_explicit_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-lease.db");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let base = Session::new("malformed-lease", Vec::new());
+        store
+            .acquire_execution_lease(base.clone(), "crashed-owner")
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE aikit_session_execution_leases SET expires_at_unix_ms=-1 WHERE id=?1",
+                params![base.id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.acquire_execution_lease(base.clone(), "automatic-retry"),
+            Err(SessionStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            store.recover_expired_execution_lease(base, "manual-recovery"),
+            Err(SessionStoreError::Serialization { .. })
+        ));
+    }
+
+    #[test]
+    fn sqlite_legacy_lease_without_fencing_token_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-lease.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE aikit_session_execution_leases (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    expires_at_unix_ms INTEGER NOT NULL
+                );
+                INSERT INTO aikit_session_execution_leases(id,owner,expires_at_unix_ms)
+                VALUES('legacy','old-worker',0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let base = Session::new("legacy", Vec::new());
+        assert!(matches!(
+            store.acquire_execution_lease(base.clone(), "automatic-retry"),
+            Err(SessionStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            store.recover_expired_execution_lease(base.clone(), "manual-recovery"),
+            Err(SessionStoreError::Serialization { .. })
+        ));
+        assert!(matches!(
+            store.clear_expired_execution_lease(base),
+            Err(SessionStoreError::Serialization { .. })
+        ));
+    }
+
+    #[test]
+    fn sqlite_atomic_clear_removes_only_an_expired_lease_without_revision_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("atomic-clear.db");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let base = Session::new("atomic-clear", Vec::new());
+        store
+            .acquire_execution_lease(base.clone(), "crashed-owner")
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE aikit_session_execution_leases SET expires_at_unix_ms=0 WHERE id=?1",
+                params![base.id],
+            )
+            .unwrap();
+
+        let cleared = store.clear_expired_execution_lease(base.clone()).unwrap();
+        assert_eq!(cleared.revision, 0);
+        assert!(
+            current_revision(&store.connection.lock().unwrap(), &base.id)
+                .unwrap()
+                .is_none()
+        );
+        let reacquired = store.acquire_execution_lease(base, "new-worker").unwrap();
+        assert_eq!(reacquired.session().revision, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sqlite_file_identity_distinguishes_open_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.db");
+        let second_path = directory.path().join("second.db");
+        fs::write(&first_path, b"one").unwrap();
+        fs::write(&second_path, b"two").unwrap();
+        let first = File::open(&first_path).unwrap();
+        let first_again = File::open(&first_path).unwrap();
+        let second = File::open(&second_path).unwrap();
+
+        assert!(same_open_file(&first, &first_again).unwrap());
+        assert!(!same_open_file(&first, &second).unwrap());
+    }
+
+    #[test]
+    fn sqlite_terminal_revision_conflict_releases_matching_execution_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease-conflict.db");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let created = store
+            .create_session(Session::new("conflicted", vec![Message::user("one")]))
+            .unwrap();
+        let mut leased = store
+            .acquire_execution_lease(created.clone(), "first-owner")
+            .unwrap();
+        leased
+            .session_mut()
+            .messages
+            .push(Message::user("first result"));
+
+        let mut external = created.clone();
+        external.messages.push(Message::user("external winner"));
+        let external = store.compare_and_swap(created.revision, external).unwrap();
+        assert!(matches!(
+            store.commit_execution_lease(leased),
+            Err(SessionStoreError::Conflict { .. })
+        ));
+
+        let recovered = store
+            .acquire_execution_lease(external, "second-owner")
+            .expect("known terminal conflict must release the matching owner lease");
+        assert_eq!(recovered.session().revision, 2);
     }
 }

@@ -204,7 +204,8 @@ fn configured_targets(full: bool) -> Vec<ConfiguredTarget<'static>> {
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
 }
 
 async fn assert_text(agent: &Agent, target: &SmokeTarget, model: &str) {

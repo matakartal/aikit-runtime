@@ -193,8 +193,20 @@ async function main() {
     networkTools.registerWebTools(
       ["example.com"], "https://example.com/search?q={query}",
     );
+    const browserDenied = Agent.fromEnv({});
+    assert.throws(
+      () => browserDenied.registerBrowserTools(
+        "http://127.0.0.1:4444",
+        "session",
+        ["example.com"],
+        { externalEgressEnforced: false },
+      ),
+      /BrowserEgressPolicy::ExternallyEnforced/,
+    );
+    assert(!browserDenied.capabilities().tools.includes("BrowserNavigate"));
     networkTools.registerBrowserTools(
       "http://127.0.0.1:4444", "session", ["example.com"],
+      { externalEgressEnforced: true },
     );
     const networkNames = new Set(networkTools.capabilities().tools);
     for (const name of ["WebFetch", "WebSearch", "BrowserNavigate", "BrowserSnapshot"]) {
@@ -204,15 +216,67 @@ async function main() {
     const created = await agent.runSubagent(childSpec("persist-session"), profiles);
     assert.equal(created.status, "succeeded");
 
+    const crashedDatabase = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    const persistedBeforeRecovery = crashedDatabase.sessions["persist-session"];
+    crashedDatabase.execution_leases ??= {};
+    crashedDatabase.execution_leases["persist-session"] = {
+      owner: "crashed-worker",
+      token: `lease-${"00".repeat(16)}`,
+      expires_at_unix_ms: 0,
+    };
+    fs.writeFileSync(sessionPath, JSON.stringify(crashedDatabase));
+
     const reopened = Agent.fromEnv({});
     reopened.configureJsonlAudit(metadataPath);
     reopened.useSessionFile(sessionPath);
+    const beforeDeniedRecovery = fs.readFileSync(sessionPath, "utf8");
+    assert.throws(
+      () => reopened.recoverExpiredSession("persist-session", false),
+      /sideEffectsReconciled=true/,
+    );
+    assert.equal(fs.readFileSync(sessionPath, "utf8"), beforeDeniedRecovery);
+
+    const blockedResume = await reopened.resumeSubagent(
+      "persist-session",
+      childSpec("blocked-expired-resume"),
+      profiles,
+    );
+    assert.equal(blockedResume.status, "session_conflict");
+    const stillBlocked = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    assert.deepEqual(stillBlocked.sessions["persist-session"], persistedBeforeRecovery);
+    assert(Object.hasOwn(stillBlocked.execution_leases, "persist-session"));
+
+    const recoveredRevision = reopened.recoverExpiredSession("persist-session", true);
+    assert.equal(recoveredRevision, 1);
+    const recoveredDatabase = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    assert.deepEqual(recoveredDatabase.sessions["persist-session"], persistedBeforeRecovery);
+    assert(!Object.hasOwn(recoveredDatabase.execution_leases ?? {}, "persist-session"));
+
     const resumed = await reopened.resumeSubagent(
       "persist-session",
       childSpec("persist-session-resumed"),
       profiles,
     );
     assert.equal(resumed.status, "succeeded");
+
+    const freshDatabase = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    freshDatabase.execution_leases ??= {};
+    freshDatabase.execution_leases["fresh-crash"] = {
+      owner: "crashed-worker",
+      token: `lease-${"11".repeat(16)}`,
+      expires_at_unix_ms: 0,
+    };
+    fs.writeFileSync(sessionPath, JSON.stringify(freshDatabase));
+    assert.equal(reopened.recoverExpiredSession("fresh-crash", true), 0);
+    const clearedFresh = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    assert(!Object.hasOwn(clearedFresh.execution_leases ?? {}, "fresh-crash"));
+    assert(!Object.hasOwn(clearedFresh.sessions, "fresh-crash"));
+    const freshAfterRecovery = await reopened.runSubagent(
+      childSpec("fresh-crash"),
+      profiles,
+    );
+    assert.equal(freshAfterRecovery.status, "succeeded");
+    assert.equal(freshAfterRecovery.session_revision, 1);
 
     const fan = await agent.fanOut(
       [childSpec("fan-a"), childSpec("fan-b")],

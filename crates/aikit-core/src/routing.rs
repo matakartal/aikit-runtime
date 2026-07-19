@@ -34,6 +34,7 @@ pub enum ModelCapability {
 /// not ship a possibly stale global ranking or price table. Pricing is similarly an explicit
 /// snapshot supplied by the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
     pub provider: String,
     pub model: String,
@@ -170,7 +171,7 @@ pub enum RouteObjective {
 
 /// Select one named model, or let the router optimize across the eligible catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoutePolicy {
     Explicit { model: String },
     Automatic { objective: RouteObjective },
@@ -178,6 +179,7 @@ pub enum RoutePolicy {
 
 /// Non-secret runtime facts and hard requirements for one route.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteRequest {
     pub policy: RoutePolicy,
     /// Providers for which the host currently has a usable credential/capability activation.
@@ -545,6 +547,29 @@ mod tests {
             .unwrap();
         assert_eq!(decision.profile.model, "deepseek-r1");
         assert_eq!(decision.eligible_models, 1);
+    }
+
+    #[test]
+    fn routing_inputs_reject_unknown_fields() {
+        let profile = serde_json::to_value(model("openai", "strict", 80, Some(1.0))).unwrap();
+        let mut profile = profile.as_object().unwrap().clone();
+        profile.insert("context_window_tokenz".into(), serde_json::json!(100_000));
+        assert!(serde_json::from_value::<ModelProfile>(profile.into()).is_err());
+
+        let route = serde_json::to_value(request(RoutePolicy::Automatic {
+            objective: RouteObjective::Quality,
+        }))
+        .unwrap();
+        let mut route = route.as_object().unwrap().clone();
+        route.insert("max_cost_uzd".into(), serde_json::json!(0.01));
+        assert!(serde_json::from_value::<RouteRequest>(route.into()).is_err());
+
+        assert!(serde_json::from_value::<RoutePolicy>(serde_json::json!({
+            "kind": "explicit",
+            "model": "strict",
+            "modle": "typo"
+        }))
+        .is_err());
     }
 
     #[test]

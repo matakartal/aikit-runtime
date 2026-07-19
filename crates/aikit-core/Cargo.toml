@@ -36,6 +36,7 @@ url = "2"
 jsonschema = { version = "0.47", default-features = false }
 schemars = "1"
 tempfile = "3"
+getrandom = "0.3"
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 
 # Bash process hardening (rlimits via pre_exec) is Unix-only; elsewhere the policy still scrubs the
@@ -43,6 +44,9 @@ opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 [target.'cfg(unix)'.dependencies]
 cap-std = "=4.0.2"
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }

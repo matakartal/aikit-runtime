@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPricing {
     pub input_per_million_usd: f64,
     pub output_per_million_usd: f64,
@@ -20,7 +21,33 @@ pub struct ModelPricing {
     pub cache_write_per_million_usd: Option<f64>,
 }
 
+impl ModelPricing {
+    /// Reject values that could make a budget comparison fail open or produce nonsensical cost.
+    pub fn validate(&self) -> Result<()> {
+        for (name, rate) in [
+            ("input_per_million_usd", Some(self.input_per_million_usd)),
+            ("output_per_million_usd", Some(self.output_per_million_usd)),
+            (
+                "cache_read_per_million_usd",
+                self.cache_read_per_million_usd,
+            ),
+            (
+                "cache_write_per_million_usd",
+                self.cache_write_per_million_usd,
+            ),
+        ] {
+            if rate.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(AikitError::Other(format!(
+                    "{name} must be finite and non-negative"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetPolicy {
     pub max_total_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
@@ -44,9 +71,6 @@ impl BudgetPolicy {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.max_cost_usd.is_some() && self.pricing.is_none() {
-            return Err(AikitError::BudgetExceeded);
-        }
         if self
             .max_cost_usd
             .is_some_and(|limit| !limit.is_finite() || limit < 0.0)
@@ -54,6 +78,12 @@ impl BudgetPolicy {
             return Err(AikitError::Other(
                 "max_cost_usd must be finite and non-negative".into(),
             ));
+        }
+        if self.max_cost_usd.is_some() && self.pricing.is_none() {
+            return Err(AikitError::BudgetExceeded);
+        }
+        if let Some(pricing) = self.pricing {
+            pricing.validate()?;
         }
         Ok(())
     }
@@ -150,6 +180,7 @@ fn add_usage(total: &mut Usage, part: Usage) {
 /// ledger reserves worst-case capacity *before* a call starts, so sibling agents cannot each see
 /// the same remaining budget and overspend it concurrently.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetLimits {
     pub max_model_calls: Option<u64>,
     pub max_input_tokens: Option<u64>,
@@ -577,21 +608,9 @@ fn check_limit(
 }
 
 fn cost_micro_usd(pricing: ModelPricing, usage: Usage) -> BudgetLedgerResult<u64> {
-    for rate in [
-        Some(pricing.input_per_million_usd),
-        Some(pricing.output_per_million_usd),
-        pricing.cache_read_per_million_usd,
-        pricing.cache_write_per_million_usd,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !rate.is_finite() || rate < 0.0 {
-            return Err(BudgetLedgerError::Invalid(
-                "pricing rates must be finite and non-negative".into(),
-            ));
-        }
-    }
+    pricing
+        .validate()
+        .map_err(|error| BudgetLedgerError::Invalid(error.to_string()))?;
     let uncached_input = usage
         .input_tokens
         .saturating_sub(usage.cache_read_input_tokens);
@@ -670,6 +689,81 @@ mod tests {
             BudgetTracker::new(policy),
             Err(AikitError::BudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn budget_policy_rejects_non_finite_and_negative_cost_limits() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+            let policy = BudgetPolicy {
+                max_cost_usd: Some(invalid),
+                pricing: Some(ModelPricing {
+                    input_per_million_usd: 1.0,
+                    output_per_million_usd: 1.0,
+                    cache_read_per_million_usd: None,
+                    cache_write_per_million_usd: None,
+                }),
+                ..BudgetPolicy::default()
+            };
+            assert!(BudgetTracker::new(policy).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn model_pricing_rejects_every_invalid_rate() {
+        let valid = ModelPricing {
+            input_per_million_usd: 1.0,
+            output_per_million_usd: 2.0,
+            cache_read_per_million_usd: Some(0.5),
+            cache_write_per_million_usd: Some(1.5),
+        };
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01] {
+            let candidates = [
+                ModelPricing {
+                    input_per_million_usd: invalid,
+                    ..valid
+                },
+                ModelPricing {
+                    output_per_million_usd: invalid,
+                    ..valid
+                },
+                ModelPricing {
+                    cache_read_per_million_usd: Some(invalid),
+                    ..valid
+                },
+                ModelPricing {
+                    cache_write_per_million_usd: Some(invalid),
+                    ..valid
+                },
+            ];
+            for pricing in candidates {
+                assert!(pricing.validate().is_err(), "accepted {pricing:?}");
+                assert!(BudgetTracker::new(BudgetPolicy {
+                    pricing: Some(pricing),
+                    ..BudgetPolicy::default()
+                })
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn budget_configuration_deserialization_rejects_unknown_fields() {
+        let limits = serde_json::from_value::<BudgetLimits>(serde_json::json!({
+            "max_model_callz": 2
+        }));
+        assert!(limits.is_err());
+
+        let policy = serde_json::from_value::<BudgetPolicy>(serde_json::json!({
+            "max_cost_usd": 1.0,
+            "pricing": {
+                "input_per_million_usd": 1.0,
+                "output_per_million_usd": 2.0,
+                "cache_read_per_million_usd": null,
+                "cache_write_per_million_usd": null,
+                "output_per_milion_usd": 0.0
+            }
+        }));
+        assert!(policy.is_err());
     }
 
     #[test]

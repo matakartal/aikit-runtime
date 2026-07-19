@@ -25,6 +25,21 @@ pub fn build_request(
     tools: &[ToolSpec],
     provider_options: Option<&serde_json::Map<String, Value>>,
 ) -> crate::error::Result<Value> {
+    super::reject_protected_options(
+        "deepseek",
+        model,
+        provider_options,
+        &[
+            "model",
+            "messages",
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "tools",
+            "stream",
+            "stream_options",
+        ],
+    )?;
     if messages.iter().any(|message| {
         message
             .content
@@ -107,6 +122,8 @@ pub fn build_request(
         "max_tokens": max_tokens,
         "messages": wire,
         "stream": true,
+        // DeepSeek only emits the terminal usage-only chunk when this is explicitly enabled.
+        "stream_options": { "include_usage": true },
     });
     if !tools.is_empty() {
         req["tools"] = Value::Array(
@@ -178,6 +195,7 @@ struct ToolCallAccum {
 #[derive(Default)]
 pub struct DeepSeekStreamParser {
     started: bool,
+    terminal: bool,
     reasoning_content: String,
     reasoning_emitted: bool,
     tool_calls: BTreeMap<u64, ToolCallAccum>,
@@ -185,6 +203,7 @@ pub struct DeepSeekStreamParser {
     stop_reason: String,
     usage: Usage,
     metadata: Map<String, Value>,
+    retention: super::StreamRetentionBudget,
 }
 
 impl DeepSeekStreamParser {
@@ -192,10 +211,19 @@ impl DeepSeekStreamParser {
         Self::default()
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     pub fn push_chunk(&mut self, chunk: &Value) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
         let mut out = Vec::new();
 
-        self.capture_response_metadata(chunk);
+        if !self.capture_response_metadata(chunk) {
+            return self.retained_state_failure();
+        }
 
         if !self.started {
             self.started = true;
@@ -208,16 +236,24 @@ impl DeepSeekStreamParser {
         }
 
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
-            self.absorb_usage(u);
+            if !self.absorb_usage(u) {
+                return self.retained_state_failure();
+            }
         }
 
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
 
         if let Some(index) = choice.get("index") {
+            if !self.retain_metadata_value("choice_index", index) {
+                return self.retained_state_failure();
+            }
             self.metadata.insert("choice_index".into(), index.clone());
         }
         if let Some(logprobs) = choice.get("logprobs").filter(|value| !value.is_null()) {
+            if !self.retention.retain_json(logprobs, 1) {
+                return self.retained_state_failure();
+            }
             self.metadata
                 .entry("logprobs")
                 .or_insert_with(|| Value::Array(Vec::new()))
@@ -233,6 +269,9 @@ impl DeepSeekStreamParser {
         }
         if let Some(rc) = delta.get("reasoning_content").and_then(Value::as_str) {
             if !rc.is_empty() {
+                if !self.retention.retain(rc.len(), 0) {
+                    return self.retained_state_failure();
+                }
                 self.reasoning_content.push_str(rc);
                 out.push(StreamDelta::ReasoningDelta { text: rc.into() });
             }
@@ -240,24 +279,43 @@ impl DeepSeekStreamParser {
         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
             for tc in tcs {
                 let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = tc["function"]
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let args = tc["function"]
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let new_call = usize::from(!self.tool_calls.contains_key(&index));
+                if !self.retention.retain(
+                    id.len()
+                        .saturating_add(name.len())
+                        .saturating_add(args.len()),
+                    new_call,
+                ) {
+                    return self.retained_state_failure();
+                }
                 let entry = self.tool_calls.entry(index).or_default();
-                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        entry.id = id.to_string();
-                    }
+                if !id.is_empty() {
+                    entry.id = id.to_string();
                 }
-                if let Some(name) = tc["function"].get("name").and_then(Value::as_str) {
-                    if !name.is_empty() {
-                        entry.name = name.to_string();
-                    }
+                if !name.is_empty() {
+                    entry.name = name.to_string();
                 }
-                if let Some(args) = tc["function"].get("arguments").and_then(Value::as_str) {
+                if !args.is_empty() {
                     entry.args.push_str(args);
                 }
             }
         }
 
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+            let bytes = fr.len().saturating_mul(2);
+            let items = usize::from(!self.metadata.contains_key("finish_reason"));
+            if !self.retention.retain(bytes, items) {
+                return self.retained_state_failure();
+            }
             self.metadata
                 .insert("finish_reason".into(), Value::String(fr.into()));
             self.stop_reason = map_finish_reason(fr);
@@ -276,7 +334,7 @@ impl DeepSeekStreamParser {
         }
         self.reasoning_emitted = true;
         vec![StreamDelta::ReasoningComplete {
-            text: self.reasoning_content.clone(),
+            text: std::mem::take(&mut self.reasoning_content),
             signature: None,
             opaque: None,
         }]
@@ -286,6 +344,24 @@ impl DeepSeekStreamParser {
     fn emit_tool_calls(&mut self) -> Vec<StreamDelta> {
         if self.tool_calls_emitted || self.tool_calls.is_empty() {
             return Vec::new();
+        }
+        if let Some(message) = self.tool_calls.values().find_map(|call| {
+            if call.id.is_empty() {
+                Some("DeepSeek tool call is missing its id".to_string())
+            } else if call.name.is_empty() {
+                Some(format!(
+                    "DeepSeek tool call {} is missing its name",
+                    call.id
+                ))
+            } else if !call.args.trim().is_empty()
+                && serde_json::from_str::<Value>(&call.args).is_err()
+            {
+                Some(format!("malformed tool_call arguments for {}", call.id))
+            } else {
+                None
+            }
+        }) {
+            return self.terminal_protocol_failure(message);
         }
         self.tool_calls_emitted = true;
         let mut out = Vec::new();
@@ -300,28 +376,31 @@ impl DeepSeekStreamParser {
                     id: accum.id.clone(),
                     input: Value::Object(Default::default()),
                 });
-            } else {
-                // Never coerce malformed arguments to null and run the tool with it; surface
-                // the parse failure as an Error delta so the loop can reject the tool call.
-                match serde_json::from_str::<Value>(&accum.args) {
-                    Ok(input) => out.push(StreamDelta::ToolCallInput {
-                        id: accum.id.clone(),
-                        input,
-                    }),
-                    Err(_) => out.push(super::protocol_failure(
-                        "deepseek",
-                        format!("malformed tool_call arguments for {}", accum.id),
-                    )),
-                }
+            } else if let Ok(input) = serde_json::from_str::<Value>(&accum.args) {
+                out.push(StreamDelta::ToolCallInput {
+                    id: accum.id.clone(),
+                    input,
+                });
             }
         }
+        self.tool_calls.clear();
         out
     }
 
     /// Call on `[DONE]` / stream end: flush any un-emitted tool calls, then Usage + MessageStop.
     pub fn finish(&mut self) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if self.stop_reason.is_empty() {
+            return self.terminal_protocol_failure("DeepSeek [DONE] arrived before finish_reason");
+        }
         let mut out = self.emit_reasoning_complete();
         out.extend(self.emit_tool_calls());
+        if self.terminal {
+            return out;
+        }
+        self.terminal = true;
         if !self.metadata.is_empty() {
             out.push(StreamDelta::ProviderMetadata {
                 provider: "deepseek".into(),
@@ -338,8 +417,11 @@ impl DeepSeekStreamParser {
         out
     }
 
-    fn absorb_usage(&mut self, u: &Value) {
+    fn absorb_usage(&mut self, u: &Value) -> bool {
         if let Some(raw) = u.as_object().filter(|raw| !raw.is_empty()) {
+            if !self.retention.retain_json(u, 1) {
+                return false;
+            }
             self.metadata
                 .entry("usage")
                 .or_insert_with(|| Value::Array(Vec::new()))
@@ -364,9 +446,10 @@ impl DeepSeekStreamParser {
         if let Some(n) = u.get("prompt_cache_hit_tokens").and_then(Value::as_u64) {
             self.usage.cache_read_input_tokens = n;
         }
+        true
     }
 
-    fn capture_response_metadata(&mut self, chunk: &Value) {
+    fn capture_response_metadata(&mut self, chunk: &Value) -> bool {
         for field in [
             "id",
             "object",
@@ -376,9 +459,38 @@ impl DeepSeekStreamParser {
             "service_tier",
         ] {
             if let Some(value) = chunk.get(field) {
+                if !self.retain_metadata_value(field, value) {
+                    return false;
+                }
                 self.metadata.insert(field.into(), value.clone());
             }
         }
+        true
+    }
+
+    fn retain_metadata_value(&mut self, key: &str, value: &Value) -> bool {
+        self.retention.retain(
+            key.len().saturating_add(super::json_retained_bytes(value)),
+            usize::from(!self.metadata.contains_key(key)),
+        )
+    }
+
+    fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.reasoning_content.clear();
+        self.tool_calls.clear();
+        self.stop_reason.clear();
+        self.metadata.clear();
+        vec![super::retained_state_failure("deepseek")]
+    }
+
+    fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal = true;
+        self.reasoning_content.clear();
+        self.tool_calls.clear();
+        self.stop_reason.clear();
+        self.metadata.clear();
+        vec![super::protocol_failure("deepseek", message)]
     }
 }
 
@@ -411,7 +523,7 @@ impl DeepSeekProvider {
         DeepSeekProvider {
             api_key: api_key.into(),
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: super::native_http_client(),
         }
     }
 }
@@ -456,7 +568,7 @@ impl Provider for DeepSeekProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
-            let text = resp.text().await.unwrap_or_default();
+            let text = super::read_error_body(resp).await;
             return Err(super::http_failure(
                 "deepseek",
                 &req.model,
@@ -475,7 +587,15 @@ impl Provider for DeepSeekProvider {
             while let Some(chunk) = byte_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        buf.extend_from_slice(&bytes);
+                        if !super::append_sse_chunk(&mut buf, &bytes) {
+                            yield super::stream_failure(
+                                "deepseek",
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                "DeepSeek SSE event exceeded the size limit",
+                            );
+                            return;
+                        }
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
                             let line = String::from_utf8_lossy(&line_bytes);
@@ -496,6 +616,9 @@ impl Provider for DeepSeekProvider {
                                         for d in parser.push_chunk(&json) {
                                             yield super::with_stream_context(d, "deepseek", &model);
                                         }
+                                        if parser.is_terminal() {
+                                            return;
+                                        }
                                     }
                                     Err(_) => {
                                         yield super::stream_failure(
@@ -513,22 +636,25 @@ impl Provider for DeepSeekProvider {
                             break;
                         }
                     }
-                    Err(_) => {
-                        yield super::stream_failure(
+                    Err(error) => {
+                        yield super::response_stream_failure(
                             "deepseek",
                             &model,
-                            crate::error::ProviderErrorKind::Transport,
-                            "DeepSeek response stream transport failed",
+                            error,
+                            "DeepSeek",
                         );
-                        break;
+                        return;
                     }
                 }
             }
-            // Flush a terminal Usage + MessageStop even if the server closed without `[DONE]`.
+            // `[DONE]` is the protocol commit marker; a clean EOF before it is still truncated.
             if !done {
-                for d in parser.finish() {
-                    yield super::with_stream_context(d, "deepseek", &model);
-                }
+                yield super::stream_failure(
+                    "deepseek",
+                    &model,
+                    crate::error::ProviderErrorKind::Protocol,
+                    "DeepSeek stream ended before [DONE]",
+                );
             }
         };
         Ok(Box::pin(out))
@@ -664,6 +790,62 @@ mod tests {
     }
 
     #[test]
+    fn request_forces_usage_streaming_and_rejects_contract_overrides() {
+        let request =
+            build_request("deepseek-chat", 100, &[Message::user("hello")], &[], None).unwrap();
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+
+        for (key, value) in [
+            ("model", json!("other-model")),
+            ("messages", json!([])),
+            ("max_tokens", json!(1)),
+            ("max_output_tokens", json!(1)),
+            ("max_completion_tokens", json!(1)),
+            ("tools", json!([])),
+            ("stream", json!(false)),
+            ("stream_options", json!({ "include_usage": false })),
+        ] {
+            let options = serde_json::Map::from_iter([(key.to_string(), value)]);
+            let error = build_request(
+                "deepseek-chat",
+                100,
+                &[Message::user("hello")],
+                &[],
+                Some(&options),
+            )
+            .unwrap_err();
+            let error = error.provider_error().expect("typed provider error");
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains(key));
+        }
+
+        let options = serde_json::Map::from_iter([("temperature".into(), json!(0.1))]);
+        let request = build_request(
+            "deepseek-chat",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["temperature"], 0.1);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+
+        let options = serde_json::Map::from_iter([("tool_choice".into(), json!("required"))]);
+        let request = build_request(
+            "deepseek-chat",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["tool_choice"], "required");
+        assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn stream_parser_handles_reasoning_content_and_fragmented_tool_calls() {
         let chunks = vec![
             json!({
@@ -754,11 +936,6 @@ mod tests {
         }
         out.extend(p.finish());
 
-        // ToolCallStart is still emitted.
-        assert!(out.contains(&StreamDelta::ToolCallStart {
-            id: "call_bad".into(),
-            name: "search".into()
-        }));
         // The malformed arguments surface as an Error delta mentioning "malformed".
         assert!(out.iter().any(|d| matches!(
             d,
@@ -769,6 +946,62 @@ mod tests {
             d,
             StreamDelta::ToolCallInput { input, .. } if input.is_null()
         )));
+    }
+
+    #[test]
+    fn many_small_reasoning_fragments_fail_terminally() {
+        let mut parser = DeepSeekStreamParser::new();
+        parser.retention = crate::providers::StreamRetentionBudget::with_limits(8, 8);
+        let fragment = json!({
+            "choices": [{"delta": {"reasoning_content": "x"}, "finish_reason": null}]
+        });
+        let failure = (0..16)
+            .find_map(|_| {
+                parser
+                    .push_chunk(&fragment)
+                    .into_iter()
+                    .find(|delta| matches!(delta, StreamDelta::Error { .. }))
+            })
+            .expect("many small reasoning fragments must exceed retained state");
+        assert!(
+            matches!(failure, StreamDelta::Error { message, .. } if message.contains("retained parser-state"))
+        );
+        assert!(parser.terminal);
+        assert!(parser.reasoning_content.is_empty());
+        assert!(parser.push_chunk(&fragment).is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn done_without_finish_reason_is_a_terminal_protocol_failure() {
+        let mut parser = DeepSeekStreamParser::new();
+        let out = parser.finish();
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("before finish_reason")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+    }
+
+    #[test]
+    fn tool_call_without_id_fails_before_emission() {
+        let mut parser = DeepSeekStreamParser::new();
+        let out = parser.push_chunk(&json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "function": {"name": "search", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        }));
+        assert!(out.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("missing its id")
+        )));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::ToolCallStart { .. })));
+        assert!(parser.terminal);
     }
 
     #[tokio::test]
@@ -809,5 +1042,82 @@ mod tests {
         assert!(out.contains(&StreamDelta::MessageStop {
             stop_reason: "end_turn".into()
         }));
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_attempt_to_disable_usage_streaming() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let provider = DeepSeekProvider::with_base_url("sk-ds-test", server.uri());
+        let mut options = crate::types::ProviderOptions::new();
+        options.insert(
+            "deepseek".into(),
+            serde_json::Map::from_iter([(
+                "stream_options".into(),
+                json!({ "include_usage": false }),
+            )]),
+        );
+        let error = provider
+            .stream(ProviderRequest {
+                model: "deepseek-chat".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: serde_json::Map::new(),
+                provider_options: options,
+            })
+            .await
+            .err()
+            .expect("invalid request");
+        let error = error.provider_error().expect("typed provider error");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clean_eof_before_done_is_a_protocol_failure() {
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = DeepSeekProvider::with_base_url("sk-ds-test", server.uri());
+        let out: Vec<_> = provider
+            .stream(ProviderRequest {
+                model: "deepseek-chat".into(),
+                messages: vec![Message::user("hello")],
+                tools: vec![],
+                max_tokens: 100,
+                options: serde_json::Map::new(),
+                provider_options: crate::types::ProviderOptions::new(),
+            })
+            .await
+            .unwrap()
+            .collect()
+            .await;
+
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
     }
 }

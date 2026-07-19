@@ -17,7 +17,8 @@ use crate::providers::{Provider, ProviderRequest};
 use crate::routing::{ModelCapability, ModelCatalog, RouteObjective, RoutePolicy, RouteRequest};
 use crate::runtime::{run_agent, RunConfig};
 use crate::session::{
-    RunOutcome, RunRecorder, RunTerminalStatus, Session, SessionStore, SessionStoreError,
+    RunOutcome, RunRecorder, RunTerminalStatus, Session, SessionExecutionLease, SessionStore,
+    SessionStoreError,
 };
 use crate::tools::ToolExecutor;
 use crate::types::{Message, StreamDelta, Usage};
@@ -110,6 +111,7 @@ impl ExecutionContext {
 /// Hard model requirements for one subagent. Runtime facts (credentials and token estimates) are
 /// filled by the orchestrator, so a child cannot claim credentials the parent does not have.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRouteRequirements {
     pub policy: RoutePolicy,
     pub max_cost_usd: Option<f64>,
@@ -156,6 +158,7 @@ impl ModelRouteRequirements {
 
 /// One bounded child-agent job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubagentSpec {
     pub id: String,
     pub prompt: String,
@@ -368,7 +371,7 @@ impl Orchestrator {
     /// Execute and persist a fresh subagent session under `spec.id`.
     pub async fn execute(&self, spec: SubagentSpec, parent: &ExecutionContext) -> SubagentResult {
         let messages = fresh_messages(&spec);
-        self.execute_messages(spec, parent, messages, SaveMode::Create)
+        self.execute_messages(spec, parent, messages, LeaseMode::Create)
             .await
     }
 
@@ -475,7 +478,7 @@ impl Orchestrator {
         };
         let mut messages = current.messages.clone();
         messages.push(Message::user(spec.prompt.clone()));
-        self.execute_messages(spec, parent, messages, SaveMode::Resume(Box::new(current)))
+        self.execute_messages(spec, parent, messages, LeaseMode::Resume(Box::new(current)))
             .await
     }
 
@@ -484,7 +487,7 @@ impl Orchestrator {
         spec: SubagentSpec,
         parent: &ExecutionContext,
         messages: Vec<Message>,
-        save_mode: SaveMode,
+        lease_mode: LeaseMode,
     ) -> SubagentResult {
         if let Some(message) = validate_spec(&spec) {
             return SubagentResult::failure(
@@ -605,6 +608,28 @@ impl Orchestrator {
         config.recorder = recorder.clone();
         config.enforce_shared_wall_time(&child.budget);
 
+        // Claim the session immediately before the first provider/tool side effect. Fresh runs
+        // persist an empty placeholder, never the raw pre-hook prompt. Resumes CAS the existing
+        // record. Therefore only one concurrent caller can enter `run_agent` for a session.
+        let leased_session = match acquire_execution_lease(
+            &*self.session_store,
+            lease_mode,
+            &spec.id,
+            child.audit.run_id(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                let mut result = SubagentResult::failure(
+                    spec.id,
+                    SubagentStatus::SessionRejected,
+                    session_failure(error.clone()),
+                );
+                apply_session_error(&mut result, error);
+                finish_audit(&child.audit, &mut result);
+                return result;
+            }
+        };
+
         let mut last_error = None;
         let mut last_error_info = None;
         let output = run_agent(provider, executor, config);
@@ -645,15 +670,32 @@ impl Orchestrator {
             session_revision: None,
         };
 
-        persist_result(&*self.session_store, save_mode, &mut result);
+        persist_result(&*self.session_store, leased_session, &mut result);
         finish_audit(&child.audit, &mut result);
         result
     }
 }
 
-enum SaveMode {
+enum LeaseMode {
     Create,
     Resume(Box<Session>),
+}
+
+fn acquire_execution_lease(
+    store: &dyn SessionStore,
+    mode: LeaseMode,
+    fresh_session_id: &str,
+    owner: &str,
+) -> std::result::Result<SessionExecutionLease, SessionStoreError> {
+    let base = match mode {
+        LeaseMode::Create => {
+            // Do not persist fresh input before UserPromptSubmit hooks have had a chance to redact
+            // it. Built-in stores persist only a separate lease record until the final commit.
+            Session::new(fresh_session_id, Vec::new())
+        }
+        LeaseMode::Resume(current) => *current,
+    };
+    store.acquire_execution_lease(base, owner)
 }
 
 fn fresh_messages(spec: &SubagentSpec) -> Vec<Message> {
@@ -677,6 +719,13 @@ fn validate_spec(spec: &SubagentSpec) -> Option<String> {
     }
     if spec.max_tokens == 0 {
         return Some("max_tokens must be greater than zero".into());
+    }
+    if spec
+        .route
+        .max_cost_usd
+        .is_some_and(|limit| !limit.is_finite() || limit < 0.0)
+    {
+        return Some("max_cost_usd must be finite and non-negative".into());
     }
     None
 }
@@ -738,21 +787,17 @@ fn status_from_outcome(
     }
 }
 
-fn persist_result(store: &dyn SessionStore, mode: SaveMode, result: &mut SubagentResult) {
-    let saved = match mode {
-        SaveMode::Create => {
-            let mut session = Session::new(result.id.clone(), result.outcome.messages.clone());
-            session.outcome = Some(result.outcome.clone());
-            store.create_session(session)
-        }
-        SaveMode::Resume(current) => {
-            let mut current = *current;
-            let expected_revision = current.revision;
-            current.messages.clone_from(&result.outcome.messages);
-            current.outcome = Some(result.outcome.clone());
-            store.compare_and_swap(expected_revision, current)
-        }
-    };
+fn persist_result(
+    store: &dyn SessionStore,
+    mut lease: SessionExecutionLease,
+    result: &mut SubagentResult,
+) {
+    lease
+        .session_mut()
+        .messages
+        .clone_from(&result.outcome.messages);
+    lease.session_mut().outcome = Some(result.outcome.clone());
+    let saved = store.commit_execution_lease(lease);
     match saved {
         Ok(session) => result.session_revision = Some(session.revision),
         Err(error) => apply_session_error(result, error),
@@ -857,12 +902,10 @@ impl Provider for BudgetedProvider {
         let inner = match provider_call.await {
             Ok(inner) => inner,
             Err(provider_error) => {
-                if let Err(error) =
-                    self.ledger
-                        .reconcile(reservation, None, BillingDisposition::NoCharge)
-                {
-                    self.record_failure(&error);
-                }
+                // The provider future was polled after `mark_started`; without trustworthy usage
+                // it may still have incurred the full request. Dropping a started reservation is
+                // deliberately the ledger's conservative worst-case commit path.
+                drop(reservation);
                 return Err(provider_error);
             }
         };
@@ -886,29 +929,31 @@ fn accounted_stream(
 ) -> impl futures::Stream<Item = StreamDelta> + Send + 'static {
     stream! {
         let mut usage = Usage::default();
-        let mut saw_error = false;
         while let Some(delta) = inner.next().await {
-            match &delta {
-                StreamDelta::Usage(part) => add_usage(&mut usage, *part),
-                StreamDelta::Error { .. } => saw_error = true,
-                _ => {}
+            if let StreamDelta::Usage(part) = &delta {
+                add_usage(&mut usage, *part);
             }
             yield delta;
         }
         let has_usage = usage != Usage::default();
-        let disposition = if saw_error && !has_usage {
-            BillingDisposition::NoCharge
-        } else {
-            BillingDisposition::ChargeUsage
-        };
-        if let Err(error) = ledger.reconcile(reservation, Some(usage), disposition) {
-            if let Ok(mut slot) = failure.lock() {
-                *slot = Some(error.clone());
+        if has_usage {
+            if let Err(error) = ledger.reconcile(
+                reservation,
+                Some(usage),
+                BillingDisposition::ChargeUsage,
+            ) {
+                if let Ok(mut slot) = failure.lock() {
+                    *slot = Some(error.clone());
+                }
+                yield StreamDelta::Error {
+                    message: format!("shared budget reconciliation failed: {error}"),
+                    info: crate::error::ErrorInfo::new(crate::error::ErrorCode::BudgetExceeded),
+                };
             }
-            yield StreamDelta::Error {
-                message: format!("shared budget reconciliation failed: {error}"),
-                info: crate::error::ErrorInfo::new(crate::error::ErrorCode::BudgetExceeded),
-            };
+        } else {
+            // A complete-looking, errored, or truncated stream that omits usage is not evidence
+            // of a free request. Commit the reservation just like cancellation/drop does.
+            drop(reservation);
         }
     }
 }
@@ -931,7 +976,10 @@ mod tests {
     use crate::budget::BudgetLimits;
     use crate::observability::InMemoryAuditSink;
     use crate::routing::ModelProfile;
-    use crate::session::InMemorySessionStore;
+    use crate::session::{
+        InMemorySessionStore, JsonFileSessionStore, EXECUTION_LEASE_METADATA_KEY,
+    };
+    use crate::sqlite::SqliteSessionStore;
     use crate::types::{ContentBlock, ToolSpec};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Poll;
@@ -1036,6 +1084,22 @@ mod tests {
             self.polled.store(true, Ordering::SeqCst);
             futures::future::pending::<()>().await;
             unreachable!("pending provider setup must not complete")
+        }
+    }
+
+    struct SetupErrorProvider;
+
+    #[async_trait]
+    impl Provider for SetupErrorProvider {
+        fn name(&self) -> &str {
+            "setup-error"
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> AikitResult<BoxStream<'static, StreamDelta>> {
+            Err(AikitError::Other("provider setup failed".into()))
         }
     }
 
@@ -1225,6 +1289,26 @@ mod tests {
         )
     }
 
+    #[test]
+    fn subagent_configuration_deserialization_rejects_unknown_fields() {
+        let canonical = serde_json::to_value(spec("serde-spec")).unwrap();
+        for typo in ["max_turnz", "allowed_toolz"] {
+            let mut value = canonical.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(typo.into(), serde_json::json!(1));
+            assert!(
+                serde_json::from_value::<SubagentSpec>(value).is_err(),
+                "accepted unknown field {typo}"
+            );
+        }
+
+        let mut route_typo = canonical;
+        route_typo["route"]["max_cost_uds"] = serde_json::json!(1.0);
+        assert!(serde_json::from_value::<SubagentSpec>(route_typo).is_err());
+    }
+
     #[tokio::test]
     async fn scoped_executor_denies_hidden_tools_before_calling_host() {
         let inner = Arc::new(RecordingExecutor::default());
@@ -1325,6 +1409,136 @@ mod tests {
             1
         );
         assert_eq!(parent.budget.snapshot().unwrap().committed_model_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_id_execute_runs_the_tool_once() {
+        let mut agent = Agent::new();
+        agent.add_tool(tool("slow"));
+        let executor = Arc::new(RecordingExecutor::with_delay(40));
+        let store = Arc::new(InMemorySessionStore::default());
+        let orchestrator =
+            Orchestrator::new(Arc::new(agent), mock_catalog(), executor.clone(), store, 2);
+        let parent = context(BudgetLimits::default(), ["slow"]);
+        let first_spec = spec("same-session").with_allowed_tools(["slow"]);
+        let second_spec = first_spec.clone();
+
+        let (first, second) = tokio::join!(
+            orchestrator.execute(first_spec, &parent),
+            orchestrator.execute(second_spec, &parent)
+        );
+
+        assert_eq!(
+            [first.status, second.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::Succeeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first.status, second.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::SessionConflict)
+                .count(),
+            1
+        );
+        assert_eq!(executor.calls(), vec!["slow"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_cross_instance_execution_claim_runs_the_tool_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orchestration.db");
+        let mut agent = Agent::new();
+        agent.add_tool(tool("slow"));
+        let agent = Arc::new(agent);
+        let executor = Arc::new(RecordingExecutor::with_delay(40));
+        let first = Orchestrator::new(
+            agent.clone(),
+            mock_catalog(),
+            executor.clone(),
+            Arc::new(SqliteSessionStore::open(&path).unwrap()),
+            1,
+        );
+        let second = Orchestrator::new(
+            agent,
+            mock_catalog(),
+            executor.clone(),
+            Arc::new(SqliteSessionStore::open(&path).unwrap()),
+            1,
+        );
+        let parent = context(BudgetLimits::default(), ["slow"]);
+        let run = spec("durable-session").with_allowed_tools(["slow"]);
+
+        let (first_result, second_result) = tokio::join!(
+            first.execute(run.clone(), &parent),
+            second.execute(run, &parent)
+        );
+
+        assert_eq!(
+            [first_result.status, second_result.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::Succeeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first_result.status, second_result.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::SessionConflict)
+                .count(),
+            1
+        );
+        assert_eq!(executor.calls(), vec!["slow"]);
+    }
+
+    #[tokio::test]
+    async fn crashed_expired_leases_block_execute_and_resume_before_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("expired-leases.json");
+        let store = Arc::new(JsonFileSessionStore::new(&path));
+        let fresh_base = Session::new("expired-fresh", Vec::new());
+        store
+            .acquire_execution_lease(fresh_base, "crashed-fresh-owner")
+            .unwrap();
+        let resume_base = store
+            .create_session(Session::new(
+                "expired-resume",
+                vec![Message::user("already persisted")],
+            ))
+            .unwrap();
+        store
+            .acquire_execution_lease(resume_base, "crashed-resume-owner")
+            .unwrap();
+
+        let mut database: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        database["execution_leases"]["expired-fresh"]["expires_at_unix_ms"] = serde_json::json!(0);
+        database["execution_leases"]["expired-resume"]["expires_at_unix_ms"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_vec_pretty(&database).unwrap()).unwrap();
+
+        let mut agent = Agent::new();
+        agent.add_tool(tool("must-not-run"));
+        let executor = Arc::new(RecordingExecutor::default());
+        let orchestrator =
+            Orchestrator::new(Arc::new(agent), mock_catalog(), executor.clone(), store, 1);
+        let parent = context(BudgetLimits::default(), ["must-not-run"]);
+        let fresh = orchestrator
+            .execute(
+                spec("expired-fresh").with_allowed_tools(["must-not-run"]),
+                &parent,
+            )
+            .await;
+        let resumed = orchestrator
+            .resume(
+                "expired-resume",
+                spec("resume-worker").with_allowed_tools(["must-not-run"]),
+                &parent,
+            )
+            .await;
+
+        assert_eq!(fresh.status, SubagentStatus::SessionConflict);
+        assert_eq!(resumed.status, SubagentStatus::SessionConflict);
+        assert!(executor.calls().is_empty());
     }
 
     #[tokio::test]
@@ -1550,6 +1764,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_same_session_resume_runs_the_tool_once() {
+        let mut agent = Agent::new();
+        agent.add_tool(tool("slow"));
+        let executor = Arc::new(RecordingExecutor::with_delay(40));
+        let store = Arc::new(InMemorySessionStore::default());
+        let orchestrator =
+            Orchestrator::new(Arc::new(agent), mock_catalog(), executor.clone(), store, 2);
+        let parent = context(BudgetLimits::default(), ["slow"]);
+        let initial = orchestrator.execute(spec("resume-target"), &parent).await;
+        assert!(initial.is_success(), "{initial:?}");
+        let resume_spec = spec("resume-worker").with_allowed_tools(["slow"]);
+
+        let (first, second) = tokio::join!(
+            orchestrator.resume("resume-target", resume_spec.clone(), &parent),
+            orchestrator.resume("resume-target", resume_spec, &parent)
+        );
+
+        assert_eq!(
+            [first.status, second.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::Succeeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first.status, second.status]
+                .into_iter()
+                .filter(|status| *status == SubagentStatus::SessionConflict)
+                .count(),
+            1
+        );
+        assert_eq!(executor.calls(), vec!["slow"]);
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_replaces_raw_text_in_outcome_and_persisted_session() {
+        const RAW_SECRET: &str = "sk-raw-prompt-secret";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("redacted-sessions.json");
+        let store = Arc::new(JsonFileSessionStore::new(&path));
+        let orchestrator = Orchestrator::new(
+            Arc::new(Agent::new()),
+            mock_catalog(),
+            Arc::new(RecordingExecutor::default()),
+            store.clone(),
+            1,
+        );
+        let mut governance = Governance::default();
+        governance.hooks.on_user_prompt_submit(|_| {
+            crate::governance::hooks::PromptHookOutcome::Rewrite("[redacted]".into())
+        });
+        let parent = ExecutionContext::new(
+            governance,
+            AuditTrail::new(),
+            BudgetLedger::new(BudgetLimits::default()).unwrap(),
+            BTreeSet::new(),
+        );
+        let mut redacted_spec = spec("redacted-session");
+        redacted_spec.prompt = RAW_SECRET.into();
+
+        let result = orchestrator.execute(redacted_spec, &parent).await;
+
+        assert!(result.is_success(), "{result:?}");
+        let outcome_json = serde_json::to_string(&result.outcome).unwrap();
+        assert!(outcome_json.contains("[redacted]"));
+        assert!(!outcome_json.contains(RAW_SECRET));
+        let stored = store.load_session("redacted-session").unwrap();
+        let session_json = serde_json::to_string(&stored).unwrap();
+        assert!(session_json.contains("[redacted]"));
+        assert!(!session_json.contains(RAW_SECRET));
+        assert!(!stored.metadata.contains_key(EXECUTION_LEASE_METADATA_KEY));
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(on_disk.contains("[redacted]"));
+        assert!(!on_disk.contains(RAW_SECRET));
+    }
+
+    #[tokio::test]
     async fn child_audit_records_carry_parent_correlation() {
         let sink = Arc::new(InMemoryAuditSink::default());
         let audit = AuditTrail::new().with_sink(sink.clone());
@@ -1610,6 +1901,67 @@ mod tests {
         assert_eq!(snapshot.committed_model_calls, 1);
         assert_eq!(snapshot.committed_input_tokens, 11);
         assert_eq!(snapshot.committed_output_tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn provider_setup_error_without_usage_commits_worst_case() {
+        let ledger = BudgetLedger::new(BudgetLimits::default()).unwrap();
+        let provider = budgeted_provider(Arc::new(SetupErrorProvider), ledger.clone(), 59);
+
+        assert!(provider.stream(provider_request(61)).await.is_err());
+
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.committed_model_calls, 1);
+        assert_eq!(snapshot.committed_input_tokens, 59);
+        assert_eq!(snapshot.committed_output_tokens, 61);
+        assert_eq!(snapshot.reserved_model_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn errored_stream_without_usage_commits_worst_case() {
+        let ledger = BudgetLedger::new(BudgetLimits::default()).unwrap();
+        let provider = budgeted_provider(
+            delta_provider(vec![StreamDelta::from_error(&AikitError::Other(
+                "partial provider failure".into(),
+            ))]),
+            ledger.clone(),
+            67,
+        );
+        let mut output = provider.stream(provider_request(71)).await.unwrap();
+
+        while output.next().await.is_some() {}
+
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.committed_model_calls, 1);
+        assert_eq!(snapshot.committed_input_tokens, 67);
+        assert_eq!(snapshot.committed_output_tokens, 71);
+        assert_eq!(snapshot.reserved_model_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_partial_stream_without_usage_commits_worst_case() {
+        let ledger = BudgetLedger::new(BudgetLimits::default()).unwrap();
+        let provider = budgeted_provider(
+            delta_provider(vec![
+                StreamDelta::TextDelta {
+                    text: "provider omitted usage".into(),
+                },
+                StreamDelta::MessageStop {
+                    stop_reason: "end_turn".into(),
+                },
+            ]),
+            ledger.clone(),
+            73,
+        );
+        let mut output = provider.stream(provider_request(79)).await.unwrap();
+
+        while output.next().await.is_some() {}
+
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.committed_model_calls, 1);
+        assert_eq!(snapshot.committed_input_tokens, 73);
+        assert_eq!(snapshot.committed_output_tokens, 79);
+        assert_eq!(snapshot.reserved_model_calls, 0);
     }
 
     #[tokio::test]

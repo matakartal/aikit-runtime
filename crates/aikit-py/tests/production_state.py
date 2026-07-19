@@ -204,8 +204,24 @@ async def main() -> None:
         network_tools.register_web_tools(
             ["example.com"], "https://example.com/search?q={query}"
         )
+        browser_denied = Agent.from_env({})
+        try:
+            browser_denied.register_browser_tools(
+                "http://127.0.0.1:4444",
+                "session",
+                ["example.com"],
+                external_egress_enforced=False,
+            )
+        except ValueError as error:
+            assert "BrowserEgressPolicy::ExternallyEnforced" in str(error)
+        else:
+            raise AssertionError("browser registration must fail without egress enforcement")
+        assert "BrowserNavigate" not in browser_denied.capabilities()["tools"]
         network_tools.register_browser_tools(
-            "http://127.0.0.1:4444", "session", ["example.com"]
+            "http://127.0.0.1:4444",
+            "session",
+            ["example.com"],
+            external_egress_enforced=True,
         )
         network_names = set(network_tools.capabilities()["tools"])
         assert {"WebFetch", "WebSearch", "BrowserNavigate", "BrowserSnapshot"} <= network_names
@@ -213,13 +229,71 @@ async def main() -> None:
         created = await agent.run_subagent(child_spec("persist-session"), PROFILES)
         assert created["status"] == "succeeded", created
 
+        crashed_database = json.loads(session_path.read_text())
+        persisted_before_recovery = crashed_database["sessions"]["persist-session"]
+        crashed_database.setdefault("execution_leases", {})["persist-session"] = {
+            "owner": "crashed-worker",
+            "token": "lease-" + "00" * 16,
+            "expires_at_unix_ms": 0,
+        }
+        session_path.write_text(json.dumps(crashed_database))
+
         reopened = Agent.from_env({})
         reopened.configure_jsonl_audit(str(metadata_path))
         reopened.use_session_file(str(session_path))
+        before_denied_recovery = session_path.read_text()
+        try:
+            reopened.recover_expired_session(
+                "persist-session", side_effects_reconciled=False
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("recovery must require explicit side-effect reconciliation")
+        assert session_path.read_text() == before_denied_recovery
+
+        blocked_resume = await reopened.resume_subagent(
+            "persist-session", child_spec("blocked-expired-resume"), PROFILES
+        )
+        assert blocked_resume["status"] == "session_conflict", blocked_resume
+        still_blocked = json.loads(session_path.read_text())
+        assert still_blocked["sessions"]["persist-session"] == persisted_before_recovery
+        assert "persist-session" in still_blocked["execution_leases"]
+
+        recovered_revision = reopened.recover_expired_session(
+            "persist-session", side_effects_reconciled=True
+        )
+        assert recovered_revision == 1
+        recovered_database = json.loads(session_path.read_text())
+        assert recovered_database["sessions"]["persist-session"] == persisted_before_recovery
+        assert "persist-session" not in recovered_database.get("execution_leases", {})
+
         resumed = await reopened.resume_subagent(
             "persist-session", child_spec("persist-session-resumed"), PROFILES
         )
         assert resumed["status"] == "succeeded", resumed
+
+        fresh_database = json.loads(session_path.read_text())
+        fresh_database.setdefault("execution_leases", {})["fresh-crash"] = {
+            "owner": "crashed-worker",
+            "token": "lease-" + "11" * 16,
+            "expires_at_unix_ms": 0,
+        }
+        session_path.write_text(json.dumps(fresh_database))
+        assert (
+            reopened.recover_expired_session(
+                "fresh-crash", side_effects_reconciled=True
+            )
+            == 0
+        )
+        cleared_fresh = json.loads(session_path.read_text())
+        assert "fresh-crash" not in cleared_fresh.get("execution_leases", {})
+        assert "fresh-crash" not in cleared_fresh["sessions"]
+        fresh_after_recovery = await reopened.run_subagent(
+            child_spec("fresh-crash"), PROFILES
+        )
+        assert fresh_after_recovery["status"] == "succeeded", fresh_after_recovery
+        assert fresh_after_recovery["session_revision"] == 1
 
         fan = await agent.fan_out(
             [child_spec("fan-a"), child_spec("fan-b")],
