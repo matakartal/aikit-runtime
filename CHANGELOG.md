@@ -92,8 +92,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Documentation
 
-- Expanded feature reference, documentation index, binding READMEs, and GitHub community templates
-  to match the current governance surface and release-candidate status.
+- Reworked the complete documentation set for the 0.2 source preview: architecture and migration
+  guides, current status, SDK/CLI contracts, security boundaries, MCP/evaluation limits, release
+  operations, historical labels, and repository navigation now share one consistent vocabulary.
 
 ## [0.1.0] - Source preview
 

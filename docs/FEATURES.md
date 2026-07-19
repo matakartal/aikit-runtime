@@ -1,13 +1,16 @@
-# aikit v1 feature reference
+# aikit 0.2 feature reference
 
 This document describes the source-first implementation in this repository. Public registry
-packages are not distributed, and changing live provider APIs are not claimed as validated.
+packages are not distributed, and changing live provider APIs are not claimed as validated. See
+the [architecture guide](ARCHITECTURE.md) for component ownership and the
+[migration guide](MIGRATING-0.2.md) for breaking changes from the 0.1 source preview.
 
 ## Source-first CLI
 
 The `aikit-cli` workspace crate exposes the same Rust facade through an `aikit` binary. It includes
 one-shot runs, canonical multi-turn chat, secret-safe provider discovery, capability inspection,
-workspace/containment diagnostics, and shell completion generation. `mock-1` is the offline default.
+workspace/containment diagnostics, deterministic eval datasets, and shell completion generation.
+`mock-1` is the offline default.
 
 Text is the human output; JSON is the single-document automation format; JSONL is the streaming
 chat format. Input errors and runtime errors use distinct stable exit codes. The CLI never prints
@@ -71,6 +74,9 @@ candidate is not automatically included in errors or audit records. Retry reason
 provider and recorded in audit, so callbacks should return a safe summary without secrets. Reject
 and callback-failure details are returned to the host but recorded only as generic audit failures;
 their messages should still avoid secrets because host applications may log errors. The
+core rejects more than 32 structured-output retries and bounds each normalized reason to 1,024
+bytes. It does not impose a framework timeout on the host callback; applications must wrap
+validators whose latency is not already bounded. The
 host-validator pattern follows the useful separation in
 [PydanticAI output validators](https://pydantic.dev/docs/ai/core-concepts/output/), while aikit
 keeps the retry policy and redaction boundary in its shared Rust core.
@@ -315,9 +321,10 @@ See [`EVALUATIONS.md`](EVALUATIONS.md).
 
 MCP supports stdio and Streamable HTTP, lifecycle initialization, caller-owned bearer auth,
 paginated tools/resources/prompts, resource reads, prompt retrieval, and governed tool execution.
-Transport responses are capped at 4 MiB before JSON decoding. Discovery fails closed at bounded
-page, incoming-item, cumulative serialized-byte, and cursor limits; repeated cursors cannot loop
-forever. Each connection may apply an exact, case-sensitive tool filter on every page before the
+Transport responses are capped at 4 MiB before JSON decoding. One discovery operation is limited
+to 128 pages, 10,000 incoming items, 8 MiB of serialized items, 4 KiB per cursor, and 64 KiB of
+cumulative cursor data; repeated cursors cannot loop forever. Each connection may apply an exact,
+case-sensitive tool filter on every page before the
 advertised-tool cache is populated. Omitting `allow` preserves allow-all; an explicit empty
 `allow` exposes nothing; `deny` always wins. Empty, over-128-character,
 control/bidirectional-formatting-character, and duplicate filter names are rejected, with at most
@@ -369,7 +376,7 @@ the public built-in-tool and multimodal/routed-input contracts. Platform-specifi
 timestamps, run ids, and selected containment backend names are removed; their security invariants
 are asserted instead.
 
-## Deferred after v1
+## Deferred beyond the 0.2 source preview
 
 - Remote/distributed database adapters beyond transactional local SQLite.
 - Model-generated/two-pass summaries beyond deterministic extractive compaction.

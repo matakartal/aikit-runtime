@@ -1,5 +1,9 @@
 # Phase 0 retrospective — FFI risk retired
 
+> Archived milestone. It is preserved for architectural history, not as current 0.2 API or release
+> evidence. Use [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`PROJECT-STATUS.md`](PROJECT-STATUS.md)
+> for the current contract.
+
 Phase 0 answered one architectural question: can the Rust core stream deltas to a host language,
 await an async host tool callback, and resume the same multi-turn run?
 

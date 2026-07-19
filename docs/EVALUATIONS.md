@@ -46,6 +46,8 @@ larger runs must raise `--max-live-cases`, `--max-live-input-bytes`,
 fields. A case may override `model` and `max_tokens`. Names, prompts, gate counts, expected strings,
 tool sequences, and the complete dataset file are bounded before execution. The CLI accepts only a
 regular file, refuses symlinks/special files, and enforces its 4 MiB limit while reading.
+Symlink, FIFO, device, and other special-file inputs are rejected before parsing so a CI runner
+cannot be blocked or redirected by an untrusted dataset path.
 
 ## Gates
 
@@ -60,6 +62,11 @@ regular file, refuses symlinks/special files, and enforces its 4 MiB limit while
 | `max_turns` | Assistant-message count stays within the limit. |
 | `max_input_tokens`, `max_output_tokens`, `max_total_tokens` | Reported token usage stays bounded. |
 | `max_model_attempts` | Retry/fallback attempt count stays bounded. |
+
+Maximum gates require a positive value; `0` is rejected as invalid configuration. To assert that
+no tool ran, use `did_not_call_tool`; to assert a failed/cancelled terminal path, use an explicit
+`terminal_status` gate. Outcomes that did not complete require a terminal-status expectation so a
+runtime failure cannot accidentally look like a quality pass.
 
 The reusable Rust function is `evaluate_outcome(&RunOutcome, &[EvalGate])`. It evaluates recorded
 tool trajectories as well as text, so host applications can test governed tool runs even though
@@ -83,6 +90,29 @@ the observed run rather than a promise that a later network call will return ide
 - `4`: the dataset ran but one or more cases failed.
 
 Local I/O/serialization and normal runtime commands retain their existing exit codes.
+
+## CI usage
+
+Keep keyless datasets under `evals/` and run them as an ordinary required check:
+
+```yaml
+- name: Deterministic agent evaluations
+  run: cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json
+```
+
+Do not add `--allow-live` to normal pull-request CI. Live evaluation is non-deterministic,
+network-dependent, potentially billable, and should use a separately approved workflow with
+dedicated low-limit credentials. Store reports as provenance only after reviewing whether case
+names, model ids, and usage are safe to retain.
+
+## Choosing stable gates
+
+- Prefer terminal, tool-trajectory, error, and usage invariants over exact prose.
+- Use `output_contains` for a small durable contract string; avoid pinning an entire model answer.
+- Keep tool names and expected fragments non-sensitive because they can appear in reports.
+- Treat a changed dataset hash as a changed test definition, even when all cases still pass.
+- Use the reusable `evaluate_outcome` / `evaluateOutcome` bindings when the run is produced by an
+  application rather than the CLI.
 
 ## Design references
 

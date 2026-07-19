@@ -18,17 +18,17 @@ Security vulnerabilities must **not** be filed as public issues — follow [`SEC
 
 | Requirement | Version |
 |---|---|
-| Rust | 1.88+ (MSRV declared in workspace) |
+| Rust | 1.97.1 for primary CI; 1.88 is the declared MSRV |
 | Python | 3.9+ |
 | Node.js | 18.17+ |
 | C/C++ toolchain | Required for native bindings |
 
 ```bash
 # Pure-Rust default members (fast)
-cargo test --workspace --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo fmt --all --check
-rustup run 1.88.0 cargo check --workspace --all-targets --all-features --locked
+cargo +1.97.1 test --workspace --all-features --locked
+cargo +1.97.1 clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo +1.97.1 fmt --all --check
+cargo +1.88.0 check --workspace --all-targets --all-features --locked
 ```
 
 To build and verify the language bindings:
@@ -39,6 +39,7 @@ python3 -m venv .venv
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ./scripts/build-node.sh
 ./scripts/parity-check.sh
+cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json
 ```
 
 Optional end-to-end release-candidate invariants (still keyless):
@@ -74,6 +75,10 @@ node examples/node/agent_governance.cjs
 - Add public behavior to Rust first, then keep Python and Node.js projections aligned.
 - Ship cross-language surface changes with a parity/conformance update in the same change when possible.
 - Document capability limits honestly (especially containment guarantees and fidelity grades).
+- Treat remote MCP servers, semantic validators, and host tool callbacks as explicit trust
+  boundaries; none inherit built-in Bash containment automatically.
+- Keep current behavior in `README.md`, `docs/FEATURES.md`, the binding README files, and
+  `CHANGELOG.md` synchronized in the same change.
 
 ## Where code lives
 
@@ -106,11 +111,13 @@ Suggested local checklist before request:
 - [ ] strict Clippy (`-D warnings`)
 - [ ] relevant Rust tests
 - [ ] binding/parity checks when a public schema or binding surface changed
+- [ ] deterministic eval smoke when outcomes, transcripts, usage, or terminal status changed
 - [ ] no credentials, private prompts, or generated native artifacts committed
 - [ ] docs updated when behavior or limits change
 
-Documentation-only changes should still pass formatting and link review. By contributing, you agree
-that your contribution is licensed under MIT OR Apache-2.0, at the recipient's option.
+Documentation-only changes should still pass `git diff --check`, local-link validation, command
+review, and a scan for stale version/support claims. By contributing, you agree that your
+contribution is licensed under MIT OR Apache-2.0, at the recipient's option.
 
 ## Issue triage
 
@@ -121,7 +128,7 @@ that your contribution is licensed under MIT OR Apache-2.0, at the recipient's o
 | Documentation | Docs-only corrections and expansions |
 
 Feature proposals should describe the safety and fidelity boundary, not only the happy path.
-Deferred post-v1 items are listed in [`docs/FEATURES.md`](docs/FEATURES.md) and the
+Deferred work beyond the 0.2 source preview is listed in [`docs/FEATURES.md`](docs/FEATURES.md) and the
 [competitive roadmap](docs/COMPETITIVE-ROADMAP.md).
 
 ## Code of conduct

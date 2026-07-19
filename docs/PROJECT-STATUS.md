@@ -1,46 +1,67 @@
 # Project status
 
-**Snapshot date:** 2026-07-19
+**Snapshot date:** 2026-07-20
 
-**Release state:** source-first `v0.2.0` development preview
+**Release state:** source-first `v0.2.0` development preview on `main`
 
-This page records what can be demonstrated from source today.
+This page separates what the repository proves locally and in keyless CI from evidence that still
+requires external credentials, registries, or deployment authority. The live workflow badges and
+GitHub Actions pages remain the authoritative source for the newest remote run result.
 
-## Ready today
+## Implemented and keylessly verifiable
 
-- The Rust core and Rust, Python, and TypeScript/Node surfaces are implemented.
-- Native Anthropic, OpenAI, Google, and DeepSeek adapters are covered by keyless wire-contract
-  tests; OpenRouter, Groq, Mistral, and xAI use isolated compatible endpoints.
-- Governance, tools, routing, budgets, sessions, memory, containment, audit, and orchestration are
-  exercised without API keys through the deterministic mock provider.
-- The last pushed main-branch revision passed CI and CodeQL. This uncommitted candidate passes the
-  local keyless gates; remote GitHub Actions have not run against it yet.
-- The repository is suitable to share publicly as an open-source implementation preview.
-- The source-first CLI provides keyless runs, interactive chat, provider/capability discovery,
-  containment diagnostics, automation output, and shell completions.
+- One canonical Rust core drives the Rust facade, Python/PyO3 binding, Node/napi binding, and CLI.
+- Anthropic, OpenAI, Google, and DeepSeek use native adapters with provider-specific reasoning
+  replay; OpenRouter, Groq, Mistral, and xAI use isolated compatible endpoints.
+- Governance, tools, routing, budgets, sessions, memory, audit, containment, orchestration,
+  structured output, and deterministic evaluations run without API keys through `mock-1`.
+- Structured output supports async semantic `accept` / `retry` / `reject` validation after JSON
+  Schema, with bounded repair and fail-closed callback handling.
+- MCP stdio and Streamable HTTP clients support bounded tool/resource/prompt discovery, exact
+  allow/deny tool visibility, governed execution, and call-boundary revalidation.
+- Eval datasets produce deterministic text/tool/status/usage verdicts over the current invocation,
+  with redacted reports and distinct input, infrastructure, and gate-failure exit codes.
+- JSON and transactional SQLite session stores use revision checks and execution leases; expired
+  leases require explicit side-effect reconciliation before recovery.
+- Configured source-artifact targets are Linux x64/ARM64 with glibc 2.28+, macOS x64/ARM64, and
+  Windows x64. A specific 0.2 assembly is proven only by its workflow/evidence record. The Windows
+  file-tool jail remains intentionally unavailable and fails closed.
+
+## Proof available in the repository
+
+| Proof | Command or location | What it establishes |
+|---|---|---|
+| Rust workspace | `cargo +1.97.1 test --workspace --all-features --locked` | Core, facade, CLI, and binding-crate behavior. |
+| MSRV | `cargo +1.88.0 check --workspace --all-targets --all-features --locked` | Declared Rust 1.88 compatibility. |
+| Cross-language parity | `./scripts/parity-check.sh` | Seven canonical modules and transcripts agree across Rust/Python/Node. |
+| Deterministic eval | `cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json` | Keyless dataset parsing, execution, gates, and reporting. |
+| Source candidate | `./scripts/release-check.sh --candidate` | Version alignment, immutable CI inputs, history/tag collision checks, and artifact policy. |
+| Security automation | CodeQL, `cargo audit`, and Gitleaks | Static, dependency, and committed-secret review; not a formal security proof. |
 
 ## Distribution boundaries
 
-- Public registry packages are intentionally not distributed. GitHub source is the official path.
-- No paid live-provider acceptance result is claimed for the current candidate.
-- The existing `v0.1.0` evidence is a historical artifact snapshot, not a registry-release record.
-- The Python FFI stack uses patched PyO3 0.29 and the repository lockfile passes `cargo audit`.
+- GitHub source is the official usage path. No npm, PyPI, or crates.io publication is claimed.
+- The manual release workflow assembles temporary GitHub Actions artifacts; it does not publish to
+  a registry and does not grant release authority.
+- The current source version is `0.2.0`, but there is no committed `v0.2.0` evidence record or tag.
+- [`releases/v0.1.0.md`](releases/v0.1.0.md) is a historical draft artifact snapshot for a different
+  commit and must not be reused as proof for current `main`.
+- No paid live-provider acceptance result is claimed for `v0.2.0`. Local real-socket wire tests do
+  not prove that a changing provider currently accepts the same request.
 
-## Release decision
+## Intentionally deferred
 
-```mermaid
-flowchart LR
-    SRC[Current v0.2 candidate] --> LOCAL[Local keyless gates<br/>passing]
-    LOCAL -. commit and push .-> CI[GitHub CI + CodeQL<br/>pending]
-    CI --> SHARE[Public repository preview<br/>shareable]
-    SHARE --> USE[Clone and build<br/>from source]
-    SHARE --> ASM[Optional manual artifact<br/>assembly]
-    SHARE -. optional .-> LIVE[Billable live-provider<br/>acceptance]
-```
+- public registry publication and registry ownership/namespace work;
+- MCP server mode, ACP/A2A, skills/plugin loading, and WASM packaging;
+- durable checkpoint/time-travel replay, which requires an explicit external-side-effect model;
+- model-generated compaction and distributed session/memory services;
+- microVM containment, a caller-transparent browser egress proxy, and a Windows descriptor-relative
+  file jail.
 
-The candidate can be used from source locally. Before announcing this v0.2 source snapshot, commit
-and push it, then require its GitHub CI and CodeQL runs to pass. It should not be described as
-available through npm, PyPI, or crates.io.
+The current tree is suitable for source evaluation and integration with the documented boundaries.
+It must not be described as a published package, a completed live-provider certification, or a
+general sandbox for arbitrary host callbacks.
 
-See the [release guide](RELEASE.md), [completion matrix](V1-COMPLETION-MATRIX.md), and
-[live-provider contract](LIVE-SMOKE.md) for the detailed checks.
+See the [architecture](ARCHITECTURE.md), [feature reference](FEATURES.md),
+[implementation matrix](V1-COMPLETION-MATRIX.md), [release guide](RELEASE.md), and
+[live-provider contract](LIVE-SMOKE.md).

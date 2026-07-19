@@ -6,6 +6,8 @@ accepted the request.
 
 **Status:** no live-provider run is claimed for the current draft `v0.2.0` candidate. The
 [`v0.1.0` evidence](releases/v0.1.0.md) is a historical snapshot, not proof for this candidate.
+The deterministic `aikit eval` suite is a different proof layer: it validates outcome gates and
+may optionally use live models, but it does not replace this four-native-provider replay contract.
 
 Every live mode requires `AIKIT_LIVE_SMOKE=1` as an explicit acknowledgement of network and
 billable calls. The wrapper exits before the test when that flag is absent.
@@ -58,3 +60,7 @@ The harness never prints credential values. A maintainer should separately recor
 commit SHA, provider/model ids, and pass/fail result when using a successful full run as release
 evidence. Do not commit keys, raw sensitive prompts, or private response payloads. A keyless CI
 skip is not a live pass.
+
+Build the test binary before injecting provider secrets when running in CI. The maintained
+workflow follows this pattern and passes the executable through `AIKIT_LIVE_SMOKE_BIN`, reducing
+the time secrets are present in a build-capable step.

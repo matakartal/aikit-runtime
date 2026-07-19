@@ -41,6 +41,8 @@ async function main() {
 main();
 ```
 
+## Canonical input and structured output
+
 Every text and structured surface keeps the string convenience form and also accepts canonical
 `Message[]` history without flattening media:
 
@@ -71,11 +73,16 @@ schema-valid JSON value before Zod parsing and resolves to `"accept"`,
 `{ action: "retry", reason }`, or `{ action: "reject", reason }`. Retry uses `maxRetries`; thrown
 errors fail closed as typed structured-output errors. Decision objects are exact: aliases,
 unknown fields, conflicting keys, and a reason on `accept` are rejected.
+The core rejects more than 32 repair retries and truncates normalized reasons to 1,024 bytes. It
+does not add a timeout around the JavaScript callback; wrap slow or remote validation in an
+application-owned timeout and keep the callback pure/idempotent.
+
+## Deterministic outcome evaluation
 
 Evaluate a recorded `RunOutcome` deterministically without another model or any tool/network work:
 
 ```js
-const { evaluateOutcome } = require("aikit-runtime");
+const { evaluateOutcome } = require("./crates/aikit-node");
 const verdict = evaluateOutcome(stream.outcome(), [
   { type: "terminal_status", status: "completed" },
   { type: "no_tool_errors" },
@@ -90,6 +97,8 @@ Text, tool, and turn gates require the runtime-recorded `invocation_start_messag
 conversation history cannot satisfy the current run; legacy outcomes can still use status/usage
 gates.
 
+## Runs, streams, and typed errors
+
 `Agent.run()` and reusable `Client.query()` accept the same `RunOptions` (model fallbacks,
 provider options, turn/token limits, budget, retry policy, and optional caller-owned
 `routing: { profiles, request }`). Their `QueryStream` has
@@ -101,10 +110,12 @@ whose stable `code` and full redacted `info` envelope are safe to branch on.
 Unknown top-level or nested option fields are rejected instead of silently falling back to a
 default, so misspelled budget and retry controls cannot weaken a run unnoticed.
 
+## MCP tool visibility
+
 MCP connections can expose only exact approved tool names before registration:
 
 ```js
-const { McpServer } = require("aikit-runtime");
+const { McpServer } = require("./crates/aikit-node");
 const server = await McpServer.connectHttp(
   "https://mcp.example.com",
   "work",
@@ -118,7 +129,11 @@ Matching is case-sensitive and `deny` always wins. Omitted `allow` keeps the bac
 allow-all default; `allow: []` exposes nothing. Unknown fields, duplicate/empty names, and names
 over 128 characters fail closed; each filter accepts at most 1,024 entries. Hidden tools are
 neither advertised nor executable. Discovery and transport also fail closed on bounded page,
-item, byte, cursor, and response limits instead of retaining unbounded server data.
+item, byte, cursor, and response limits instead of retaining unbounded server data: 128 pages,
+10,000 incoming items, 8 MiB of serialized items, 4 KiB per cursor, 64 KiB cumulative cursors,
+and 4 MiB per transport response/stdio line.
+
+## Orchestration and production state
 
 `agent.subtask(id, prompt, route, options)` builds the canonical child spec, and
 `agent.parallel(specs, profiles, options)` is the ergonomic alias for the existing ordered
@@ -151,6 +166,8 @@ the default `"fail_closed"`. Memory is written only by `remember()`. File-backed
 memory can be reopened by another Agent, including in a later process, but concurrent coordination
 is process-local: these are not distributed stores or cross-process locking primitives.
 
+## Built-in tools and containment
+
 Built-in tools are opt-in and jailed to every root you register. The first root is used for
 relative paths; absolute paths may address any registered root. The initial suite contains only
 `Read`, `Write`, `Edit`, `Glob`, and `Grep`:
@@ -181,11 +198,15 @@ enabling a built-in whose name already belongs to a callback, throws a determini
 error. Registered built-ins use the same canonical schemas and executor in normal runs, clients,
 fan-out, councils, and resumed subagents.
 
+## Native distribution contract
+
 The generated `aikit_node.node` binary is platform-specific and is never relabeled as portable.
 The root `aikit-runtime` package contains the JavaScript/TypeScript surface and exact-version
 optional dependencies on `aikit-runtime-{platform}` packages. CI builds, stages, packs, installs,
 and loads each supported target independently. Local checkout builds still use the adjacent addon
-created by `scripts/build-node.sh`.
+created by `scripts/build-node.sh`; examples in this guide therefore import
+`./crates/aikit-node`. Use `require("aikit-runtime")` only inside a locally assembled/installed
+package-layout test or a future explicitly published package.
 Linux artifacts target glibc 2.28 or newer; musl is not yet supported.
 Normal examples use the deterministic mock provider and make no billable API call.
 
@@ -197,8 +218,11 @@ containment. Apply separate process isolation when callback code is untrusted.
 | Guide | Purpose |
 |---|---|
 | [Root README](../../README.md) | Project overview and multi-language quick start |
+| [Architecture](../../docs/ARCHITECTURE.md) | Core ownership, run lifecycle, state, and trust boundaries |
 | [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
 | [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |
+| [0.2 migration](../../docs/MIGRATING-0.2.md) | Breaking source-preview changes and upgrade checklist |
+| [Evaluation guide](../../docs/EVALUATIONS.md) | Dataset, gate, report, and CI contracts |
 | [Conformance](../../examples/node/conformance.cjs) | Cross-language parity driver |
 
 Cross-language parity:

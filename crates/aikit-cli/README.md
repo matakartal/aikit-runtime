@@ -6,10 +6,21 @@ Python, and TypeScript SDKs. It does not reimplement provider routing or agent b
 ## Run from the repository
 
 ```bash
-cargo run -p aikit-cli -- run "Explain this repository in one sentence"
+cargo +1.97.1 run -p aikit-cli --locked -- run "Explain this repository in one sentence"
 ```
 
 `mock-1` is the default model, so the first run is deterministic, keyless, offline, and free.
+Use `cargo +1.88.0` when explicitly checking the declared MSRV; normal development and CI use the
+pinned 1.97.1 toolchain.
+
+Global syntax:
+
+```text
+aikit [--format text|json|jsonl] [--quiet] <command>
+```
+
+`--quiet` suppresses non-result informational output. `--version` reports the workspace package
+version; this source preview is `0.2.0`.
 
 ## Commands
 
@@ -81,6 +92,17 @@ runs also have default aggregate case, input-byte, requested output-token, and w
 raising any cap requires an explicit CLI option. See the
 [evaluation guide](../../docs/EVALUATIONS.md).
 
+| Live-eval limit | Default | Override |
+|---|---:|---|
+| Cases | 8 | `--max-live-cases` |
+| Prompt/system bytes | 524,288 | `--max-live-input-bytes` |
+| Requested output tokens | 32,768 | `--max-live-output-tokens` |
+| Total wall time | 600 seconds | `--max-live-wall-seconds` |
+
+The dataset must be a regular file no larger than 4 MiB. Symlinks and special files are rejected.
+JSON reports include the runtime/schema version, exact dataset SHA-256, cases, usage, attempts, and
+redacted errors; they do not copy model output or provider metadata.
+
 ### Shell completions
 
 ```bash
@@ -96,6 +118,10 @@ Global output modes:
 - `--format text` — human-readable default;
 - `--format json` — one pretty JSON document;
 - `--format jsonl` — one compact JSON event per line, required for automated chat streams.
+
+For scripts, select the format explicitly and branch on the process code rather than parsing human
+text. JSONL is mandatory for automated chat because one session produces multiple events; JSON is
+appropriate for one-shot commands and eval reports.
 
 Stable process codes:
 

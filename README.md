@@ -204,7 +204,6 @@ main();
 | Compaction | Opt-in transcript bounding: keep the task anchor and recent tail within a token budget, preserving tool pairing. |
 | Web and browser | HTTPS allowlisted fetch/search plus an existing-session WebDriver executor; browser registration requires an explicit assertion of caller-owned pre-request egress enforcement. |
 | Observability | Typed audit lifecycle, metadata-only redaction by default, JSONL sinks, and an optional Rust OpenTelemetry bridge. |
-| Evaluation | Strict JSON datasets and deterministic text/tool/status/usage gates with keyless CI verdicts. |
 
 ## Governed tool execution
 
@@ -436,7 +435,7 @@ cargo test --workspace --all-features --locked
 
 Normal GitHub CI verifies:
 
-- Rust stable, Rust 1.88 MSRV, rustdoc, and doctests
+- Rust 1.97.1 as the pinned primary toolchain, Rust 1.88 MSRV, rustdoc, and doctests
 - Rust / Python / Node canonical parity
 - Node native packages on five target combinations
 - package dry-runs and native-addon loading
@@ -473,11 +472,13 @@ inheriting the GitHub runner's newer glibc requirement.
 | Guide | Purpose |
 |---|---|
 | [Documentation index](docs/README.md) | Full map of guides, policies, and historical notes. |
+| [Architecture](docs/ARCHITECTURE.md) | Ownership boundaries, run lifecycle, state model, and trust boundaries. |
 | [Feature reference](docs/FEATURES.md) | Runtime capabilities, governance depth, fidelity, routing, state, and limits. |
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
 | [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
-| [Completion matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed v1 implementation coverage. |
+| [0.2 migration guide](docs/MIGRATING-0.2.md) | Breaking API and operational changes from the 0.1 source preview. |
+| [Implementation matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed 0.2 implementation coverage and external proof boundaries. |
 | [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and intentionally source-only. |
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |

@@ -1,13 +1,20 @@
 # aikit — "Take Everything" Roadmap (competitor-intelligence-driven)
 
 *Synthesized 2026-07-16 from a GitHub scan of ~50 competitors across multi-provider SDKs, agent
-frameworks, coding-agent harnesses, and governance/sandbox tooling. This is what to **take** from
-the field, phase by phase — disciplined by what actually defends aikit's moat.*
+frameworks, coding-agent harnesses, and governance/sandbox tooling; reconciled with the source tree
+on 2026-07-20. This is what to **take** from the field, phase by phase — disciplined by what
+actually defends aikit's moat.*
 
 > **Status note (docs refresh):** Phase 1's core is landed and every Phase 2 row (declarative
 > policy, plan mode, heuristic SmartApprove, reliability rules, off-prompt output) ships in
 > `aikit-runtime-core`. Treat unchecked residual items and Phases 3–4 as forward planning. For
 > current public capabilities, prefer [`FEATURES.md`](FEATURES.md) and the root README.
+
+> **2026-07-20 addendum:** three cross-cutting capabilities have also landed since the original
+> roadmap: deterministic keyless evaluation gates inspired by Pydantic Evals/Mastra, async semantic
+> structured-output validation, and exact MCP visibility filters plus bounded discovery/transport.
+> All three have Rust, Python, and Node contract tests. Durable checkpoint/time-travel remains
+> deferred because replaying external side effects safely needs a deeper execution model.
 
 ## What the research changed (read this first)
 
@@ -83,9 +90,17 @@ capability broker as the base.*
 |---|------|------|-----|--------|
 | 3.1 | **microVM containment backend** — add **microsandbox** (Rust, libkrun, local-first, embeddable) as an isolation backend; keep Docker + Seatbelt/Landlock as tiers. | microsandbox (Rust, closest to our shape), E2B, Daytona (OSS retiring), Letta | VM-grade isolation for untrusted code, *local-first* (not cloud). microsandbox's Rust+embeddable shape fits our core. | L |
 | 3.2 | **Durable / resumable runs** — checkpoint run state; resume/rewind after crash or interrupt. We have sessions + run recording; add durable checkpoints. | LangGraph `interrupt()`+checkpointer (best-in-class), Julep/Temporal, Inngest, Dapr, Cloudflare DO | Long-running production agents must survive crashes and pause/resume. LangGraph's is the bar. | L |
-| 3.3 | **Model-summarizer compaction + memory-flush** — upgrade our extractive compaction to a cheap-model summary at ~85% context, flushing key facts to memory first. | grok-build compaction (`two_pass`, memory-flush) | Our v1 compaction drops-with-a-note; summarizing preserves information. Memory already exists. | M |
+| 3.3 | **Model-summarizer compaction + memory-flush** — upgrade our extractive compaction to a cheap-model summary at ~85% context, flushing key facts to memory first. | grok-build compaction (`two_pass`, memory-flush) | Our current 0.2 compaction drops-with-a-note; summarizing preserves information. Memory already exists. | M |
 | 3.4 | **Worktree-isolated parallel subagents** — git-worktree isolation for fan-out so parallel agents don't collide. We have orchestration/subagents; add worktree isolation. | grok-build worktree subagents | Safe parallel edits; matches how we already run multi-agent work. | M |
 | 3.5 | **Broaden the compatible adapter** — OpenRouter, Groq, xAI, and Mistral already ship as isolated lower-fidelity endpoints; add configurable Ollama, Together, and llama.cpp support without weakening the four native adapters. | Rig (20+), LiteLLM (100+), Cline, opencode (75+) | Provider *breadth* without diluting native fidelity. Local models (Ollama/llama.cpp) strengthen the local-first story. | S–M |
+
+### Cross-cutting work already landed after the original scan
+
+| Capability | Borrowed pattern | Aikit-specific boundary |
+|---|---|---|
+| Deterministic eval datasets and gates | Pydantic Evals; Mastra gates/verdicts | No implicit LLM judge; current-invocation transcript boundary; redacted reports; explicit live budgets. |
+| Semantic structured-output validation | PydanticAI output validators | Schema first, semantic callback second; shared bounded repair; fail-closed callback errors; three-language projection. |
+| MCP tool visibility and transport limits | OpenAI Agents SDK per-server filtering; MCP protocol | Filter before cache and again before execution; deny wins; bounded pages/items/bytes/cursors/responses. |
 
 ---
 
@@ -138,7 +153,7 @@ P1  Complete the conjunction     ──►  guardrails + real OS sandbox   [larg
 P2  Governance depth ≥ Claude    ──►  policy, plan mode, SmartApprove, reliability, off-prompt  [landed in core]
 P3  Depth / isolation / scale    ──►  microVM, durable resume, model-compaction, worktrees, generic adapter
 P4  Ecosystem / interop          ──►  ACP, A2A+identity, plugins, Cedar/OPA, MCP-server, observability
-P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat) — project new P2 APIs to Py/TS next
+P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat) — project remaining Rust-only P2 helpers to Py/TS next
 ```
 
 - **P1 core is in tree** (guardrails, required containment, honest capability report). Residual work is
@@ -148,7 +163,6 @@ P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actu
 - **P3/P4 widen the wedge**; sequence by demand.
 - **P5 is the moat and runs through all of it.** A feature that ships to Rust only is half-done.
 
-**Highest-leverage single move:** 1.1 + 1.2 together — they complete the *governance* pillar exactly where
-incumbents are weak, and every bit ships across three languages (5.1), which is the thing none of them can
-copy. That intersection — deep local governance × provider-neutral × one-core-three-bindings — is the only
-ground aikit can hold.
+**Highest-leverage direction:** close the remaining containment/egress gaps while keeping every new
+public contract in the one-core/three-SDK conformance loop. The defensible intersection is deep
+local governance × provider-native fidelity × deterministic proof, not any one checklist feature.

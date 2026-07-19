@@ -1,5 +1,9 @@
 # Phase 1 retrospective — provider and reasoning spine
 
+> Archived milestone. It records why provider replay rules exist; it is not a current feature or
+> release dashboard. Use [`FEATURES.md`](FEATURES.md) and
+> [`PROJECT-STATUS.md`](PROJECT-STATUS.md) for the 0.2 source tree.
+
 This is an archived milestone note. Phase 1 established the canonical schema, four provider
 adapters, provider-specific reasoning replay, capability grades, and credential activation. Those
 pieces are now integrated with governance, containment, audit, routing, sessions, memory, and the

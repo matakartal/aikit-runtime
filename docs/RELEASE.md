@@ -24,11 +24,22 @@ Run the keyless candidate gates locally:
 Normal CI verifies Rust, Python, Node, parity, local package layouts, and supported native targets.
 These checks do not contact a model provider or upload a package.
 
+The candidate script also requires complete Git history and fetched tags, rejects reuse of an
+existing tag/evidence version for different source bytes, checks that Cargo/Python/Node versions
+and exact Node platform dependencies agree, requires immutable GitHub Action SHAs and digest-pinned
+manylinux images, and verifies that the checksum manifest is self-contained. Run it from a clean,
+non-shallow checkout before recording evidence.
+
 ## Manual artifact assembly
 
 The `release.yml` workflow is `workflow_dispatch` only. It builds local `.crate`, `.whl`, and
 `.tgz` artifacts for the supported matrix, verifies that they load, writes `SHA256SUMS`, and
 attests the resulting GitHub Actions artifact bundle.
+
+The matrix covers Python ABI3 and Node native outputs for Linux x64/ARM64, macOS x64/ARM64, and
+Windows x64. Each artifact is checked against the runner/native architecture or wheel platform
+tag before bundling; the wrapper package is checked independently to ensure it does not embed a
+host-specific addon.
 
 Linux Python wheels and Node addons are built in digest-pinned `manylinux_2_28` containers. Their
 documented compatibility floor is glibc 2.28; musl is not currently supported. After downloading
@@ -40,6 +51,17 @@ sha256sum -c SHA256SUMS
 
 The workflow contains no tag trigger, registry credential, `npm publish`, PyPI upload action, or
 `cargo publish` command. Its output is a temporary GitHub Actions artifact, not a public package.
+
+## Evidence record
+
+Artifact assembly is not complete release evidence by itself. After choosing an exact source
+commit, copy [`RELEASE-EVIDENCE-TEMPLATE.md`](RELEASE-EVIDENCE-TEMPLATE.md) to
+`docs/releases/vX.Y.Z.md` in a follow-up evidence commit, then record the source SHA, workflow URLs,
+toolchain results, artifact hashes, and authority review without secrets. Never rewrite a
+historical record to describe a newer commit.
+
+An evidence record does not create a tag, publish a package, prove registry ownership, or certify
+live-provider behavior. Those are separate explicit decisions.
 
 ## Live-provider boundary
 

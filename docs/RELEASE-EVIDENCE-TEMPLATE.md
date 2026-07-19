@@ -25,14 +25,16 @@ record API keys, access tokens, private prompts, or raw provider responses here.
 
 | Gate | Version or result | Evidence |
 |---|---|---|
-| Rust stable |  |  |
+| Rust primary toolchain 1.97.1 |  |  |
 | Rust MSRV 1.88 |  |  |
 | Python ABI3 wheel matrix |  |  |
 | Node.js native matrix |  |  |
 | Rust/Python/Node conformance |  |  |
+| Deterministic eval dataset(s) |  |  |
 | Containment capability review |  |  |
 | CodeQL review |  |  |
 | Dependency advisory review |  |  |
+| Committed-secret review |  |  |
 
 ## Optional live-provider matrix
 
@@ -54,9 +56,14 @@ Record model ids and outcomes, never secrets.
 | Python Linux/macOS/Windows |  |  |  |
 | Node Linux/macOS/Windows |  |  |  |
 
+Confirm that `SHA256SUMS` verifies from the extracted bundle root and that GitHub provenance
+attestations match the exact source repository and workflow run.
+
 ## Safety sign-off
 
 - Private security-reporting route verified by:
 - Threat model and known limitations reviewed by:
+- Registry publication intentionally absent or separately authorized by:
+- Live-provider result correctly marked optional/pending by:
 - Unresolved high/critical security findings:
 - Final source-distribution approval:

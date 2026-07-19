@@ -54,10 +54,17 @@ High-value areas include:
 - budget bypass and audit tampering;
 - unsafe deserialization;
 - session/memory tenant isolation failures.
+- MCP discovery/call-filter bypasses, unbounded pagination, or transport framing attacks;
+- structured-output validator decisions that fail open, leak candidate values, or create
+  uncontrolled retry loops;
+- expired-session lease replay that can duplicate an external side effect.
 
 The documented security boundary matters when assessing a report. Built-in Bash can use Seatbelt,
 Linux namespaces+seccomp, Windows Job Objects, or hardened Docker containment; arbitrary Rust
 executors and Python/Node callbacks run in their host process unless the application isolates them.
+Remote MCP servers are untrusted inputs: discovery, cursors, JSON-RPC responses, names, and tool
+results must remain bounded and governed. Semantic validators also execute as host callbacks; they
+must be pure/idempotent and use a caller-owned timeout when their latency is not inherently bounded.
 See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md).
 
 Never send a real provider key as part of a report. Revoke any credential that may have been

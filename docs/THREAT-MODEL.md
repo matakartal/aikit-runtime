@@ -9,9 +9,11 @@ Related: [Security policy](../SECURITY.md) Â· [Feature reference](FEATURES.md) Â
 ## Protected assets and attacker
 
 The protected assets are host credentials and user files outside the selected workspace, host
-network access, and host availability. The attacker may control a model-produced Bash command,
-command arguments, filenames, and repository contents. The host application, aikit configuration,
-selected workspace, Docker daemon, and aikit binary are trusted.
+network access, host availability, stored prompts/tool results/provider metadata, and the integrity
+of permission/evaluation decisions. The attacker may control a model-produced Bash command,
+command arguments, filenames, repository contents, MCP discovery/results/cursors, provider stream
+frames, and structured-output candidates. The host application, aikit configuration, selected
+workspace, Docker daemon, and aikit binary are trusted.
 
 This stack reduces the impact of an untrusted command. It does not claim to stop a kernel exploit,
 a compromised Docker daemon, a malicious host callback, or a privileged actor on the host.
@@ -170,6 +172,33 @@ same exact hostname allowlist and denies private/local/non-routable IPs before e
 assertion does not configure or verify that boundary; a false assertion restores the SSRF risk.
 Postcondition URL checks are retained only as defense in depth. WebDriver responses and browser
 inputs are bounded, and protocol failure bodies are not reflected into tool errors.
+
+### MCP servers
+
+MCP stdio and HTTP peers are untrusted protocol endpoints. Aikit caps one response/stdio line at
+4 MiB before JSON decoding and bounds each discovery operation to 128 pages, 10,000 incoming items,
+8 MiB of serialized items, 4 KiB per cursor, and 64 KiB cumulative cursor data. Repeated cursors,
+invalid/duplicate/bidirectional-control tool names, malformed payloads, and stale refresh state fail
+closed. These limits reduce memory/loop/log-spoofing risk; they do not make the remote tool safe.
+
+Exact allow/deny filtering happens before discovery-cache retention and again immediately before
+execution. Deny wins. Every allowed MCP call still passes the normal schema/governance/tool-result
+pipeline. Applications must separately decide whether the remote server, its credentials, and its
+side effects are acceptable.
+
+### Semantic validators and evaluation
+
+Semantic structured-output validators are host callbacks outside Bash containment. The core calls
+them only after JSON-Schema validation, caps retries and reasons, catches callback errors/panics,
+and does not automatically copy candidate values into audit/error payloads. It does not impose a
+callback timeout; the host must bound validators that can block or perform I/O. Validators should
+be pure/idempotent because cancellation or a caller retry can present the same value again.
+
+Deterministic evaluation reports omit model output and provider metadata, but dataset/case names,
+model ids, usage, gate types, and bounded error categories can still be operationally sensitive.
+Dataset files must be treated as code: the CLI rejects symlinks/special files and silently billable
+models, but `--allow-live` is an explicit operator authorization for network/cost within the stated
+aggregate limits.
 
 The descriptor-relative file-tool jail supports Linux/macOS and fails closed for file operations
 on Windows. The Windows Job backend is therefore a Bash process/resource boundary, not a Windows

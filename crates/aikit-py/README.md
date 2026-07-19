@@ -14,7 +14,7 @@ the Rust core, with type information in `aikit.pyi` / `py.typed`.
 # from the repository root
 python3 -m venv .venv
 .venv/bin/pip install "maturin==1.14.1"
-.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
+.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml --locked
 ```
 
 Smoke test with the deterministic mock provider (no API key, no network):
@@ -91,7 +91,9 @@ Names match exactly and case-sensitively. Omit `allow` for the backward-compatib
 default, or pass `"allow": []` to expose no tools. Unknown fields, duplicate/empty names, and names
 over 128 characters are rejected; each filter accepts at most 1,024 entries. Filtered tools are not
 advertised or executable. Discovery and transport also fail closed on bounded page, item, byte,
-cursor, and response limits instead of retaining unbounded server data.
+cursor, and response limits instead of retaining unbounded server data: 128 pages, 10,000 incoming
+items, 8 MiB of serialized items, 4 KiB per cursor, 64 KiB cumulative cursors, and 4 MiB per
+transport response/stdio line.
 
 ## Multimodal and structured input
 
@@ -119,6 +121,9 @@ schema-valid JSON value and returns `"accept"`, `{"action": "retry", "reason": "
 `{"action": "reject", "reason": "..."}`. Retry is bounded by `max_retries`; exceptions fail
 closed before Pydantic materialization. Decision objects are exact: aliases, unknown fields,
 conflicting keys, and a reason on `accept` are rejected.
+The core rejects more than 32 repair retries and truncates normalized reasons to 1,024 bytes. It
+does not add a timeout around the Python callback; wrap slow or remote validation in an
+application-owned timeout and keep the callback pure/idempotent.
 
 Unsupported media is rejected with a typed error instead of being silently dropped.
 
@@ -199,6 +204,19 @@ Cross-language parity is enforced by:
 ```
 
 See the root [README](../../README.md), [feature reference](../../docs/FEATURES.md), and
-[threat model](../../docs/THREAT-MODEL.md).
+[threat model](../../docs/THREAT-MODEL.md). For ownership and upgrade details, see the
+[architecture](../../docs/ARCHITECTURE.md), [0.2 migration guide](../../docs/MIGRATING-0.2.md),
+and [evaluation guide](../../docs/EVALUATIONS.md).
+
+## Documentation map
+
+| Guide | Purpose |
+|---|---|
+| [Root README](../../README.md) | Project overview and multi-language quick start |
+| [Architecture](../../docs/ARCHITECTURE.md) | Core ownership, run lifecycle, state, and trust boundaries |
+| [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
+| [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |
+| [0.2 migration](../../docs/MIGRATING-0.2.md) | Breaking source-preview changes and upgrade checklist |
+| [Evaluation guide](../../docs/EVALUATIONS.md) | Dataset, gate, report, and CI contracts |
 
 Licensed under MIT OR Apache-2.0; both license texts are included in the package.
