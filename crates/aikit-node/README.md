@@ -5,8 +5,8 @@ canonical agent, streaming, structured-output, routing, memory, governance, and 
 the Rust core, with TypeScript declarations in `index.d.ts`.
 
 > The npm distribution name is **`aikit-runtime`**; the existing bare `aikit` package is unrelated.
-> Native platform packages are published as `aikit-runtime-{platform}` and selected automatically by
-> the wrapper. This package remains unpublished until the release evidence gates pass.
+> Local artifact assembly reserves `aikit-runtime-{platform}` for native packages and the wrapper
+> selects that shape automatically. No npm registry publication is currently claimed or planned.
 
 ## Build from this checkout
 
@@ -66,6 +66,30 @@ value is parsed, so typed convenience does not hide intermediate events. Ask app
 `updated_permissions: ["allow_exact_input" | "allow_tool"]`; a denial may set `interrupt: true` to
 stop before the tool callback or another model turn.
 
+`generateObject` and `streamObject` also accept an async `options.validator`. It sees the raw
+schema-valid JSON value before Zod parsing and resolves to `"accept"`,
+`{ action: "retry", reason }`, or `{ action: "reject", reason }`. Retry uses `maxRetries`; thrown
+errors fail closed as typed structured-output errors. Decision objects are exact: aliases,
+unknown fields, conflicting keys, and a reason on `accept` are rejected.
+
+Evaluate a recorded `RunOutcome` deterministically without another model or any tool/network work:
+
+```js
+const { evaluateOutcome } = require("aikit-runtime");
+const verdict = evaluateOutcome(stream.outcome(), [
+  { type: "terminal_status", status: "completed" },
+  { type: "no_tool_errors" },
+  { type: "max_total_tokens", value: 2_000 },
+]);
+if (!verdict.passed) throw new Error("evaluation gates failed");
+```
+
+This uses the same snake-case gate JSON contract as `aikit eval`. Unknown outcome or gate fields
+fail closed, and verdict messages expose only lengths, counts, and states rather than raw output.
+Text, tool, and turn gates require the runtime-recorded `invocation_start_message_index`, so old
+conversation history cannot satisfy the current run; legacy outcomes can still use status/usage
+gates.
+
 `Agent.run()` and reusable `Client.query()` accept the same `RunOptions` (model fallbacks,
 provider options, turn/token limits, budget, retry policy, and optional caller-owned
 `routing: { profiles, request }`). Their `QueryStream` has
@@ -74,6 +98,27 @@ driver shutdown. The JavaScript wrapper calls it automatically for `for await ..
 an aborted `options.signal`; direct `next()` users should call `await stream.close()` in `finally`.
 Async generation and terminal structured-stream failures reject with `AikitError`-shaped values
 whose stable `code` and full redacted `info` envelope are safe to branch on.
+Unknown top-level or nested option fields are rejected instead of silently falling back to a
+default, so misspelled budget and retry controls cannot weaken a run unnoticed.
+
+MCP connections can expose only exact approved tool names before registration:
+
+```js
+const { McpServer } = require("aikit-runtime");
+const server = await McpServer.connectHttp(
+  "https://mcp.example.com",
+  "work",
+  undefined,
+  { allow: ["search", "read_file"], deny: ["read_file"] },
+);
+agent.registerMcp(server);
+```
+
+Matching is case-sensitive and `deny` always wins. Omitted `allow` keeps the backward-compatible
+allow-all default; `allow: []` exposes nothing. Unknown fields, duplicate/empty names, and names
+over 128 characters fail closed; each filter accepts at most 1,024 entries. Hidden tools are
+neither advertised nor executable. Discovery and transport also fail closed on bounded page,
+item, byte, cursor, and response limits instead of retaining unbounded server data.
 
 `agent.subtask(id, prompt, route, options)` builds the canonical child spec, and
 `agent.parallel(specs, profiles, options)` is the ergonomic alias for the existing ordered
@@ -88,6 +133,17 @@ agent.configureJsonlAudit("./aikit-audit.jsonl"); // metadata_only + fail_closed
 agent.useMemoryFile("./aikit-memory.json", "tenant-a");
 agent.useSessionFile("./aikit-sessions.json");
 ```
+
+Normal run/resume calls fail closed when a persisted execution lease exists, even after expiry.
+After confirming the prior worker is stopped and reconciling every possibly completed external
+side effect, an operator may clear only the expired lease explicitly:
+
+```js
+const revision = agent.recoverExpiredSession("session-id", true);
+// No model or tool ran. Retry or resume separately only when it is safe to do so.
+```
+
+Passing `false`, or targeting a missing, active, or malformed lease, throws without starting work.
 
 Audit configuration opens and validates the JSONL target immediately. Payload capture becomes
 `"full"` only when explicitly requested; `"best_effort"` is likewise an explicit alternative to
@@ -130,6 +186,7 @@ The root `aikit-runtime` package contains the JavaScript/TypeScript surface and 
 optional dependencies on `aikit-runtime-{platform}` packages. CI builds, stages, packs, installs,
 and loads each supported target independently. Local checkout builds still use the adjacent addon
 created by `scripts/build-node.sh`.
+Linux artifacts target glibc 2.28 or newer; musl is not yet supported.
 Normal examples use the deterministic mock provider and make no billable API call.
 
 Python/Node host callbacks execute in the host process and are not covered by built-in Bash OS

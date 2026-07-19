@@ -35,7 +35,7 @@ To build and verify the language bindings:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "maturin>=1.5,<2"
+.venv/bin/pip install "maturin==1.14.1"
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ./scripts/build-node.sh
 ./scripts/parity-check.sh

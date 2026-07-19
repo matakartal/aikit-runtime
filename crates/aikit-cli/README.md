@@ -67,6 +67,20 @@ Doctor checks the workspace jail, reports active providers without values, and a
 fail-closed Bash containment backend. A containment warning means file tools remain available but
 Bash would be denied before launch.
 
+### Deterministic evaluations
+
+```bash
+cargo run -p aikit-cli -- eval evals/smoke.json
+cargo run -p aikit-cli -- --format json eval evals/smoke.json
+```
+
+Evaluation datasets are strict JSON and combine output, tool-trajectory, terminal-state, and usage
+gates into a CI verdict. They default to `mock-1`; a non-mock model is rejected before provider
+construction unless `--allow-live` explicitly acknowledges network use and possible cost. Live
+runs also have default aggregate case, input-byte, requested output-token, and wall-time caps;
+raising any cap requires an explicit CLI option. See the
+[evaluation guide](../../docs/EVALUATIONS.md).
+
 ### Shell completions
 
 ```bash
@@ -90,7 +104,8 @@ Stable process codes:
 | `0` | Success |
 | `1` | Local I/O or serialization failure |
 | `2` | Invalid input or incompatible CLI mode |
-| `3` | Agent/provider/runtime failure |
+| `3` | Agent/provider/runtime failure, including evaluation infrastructure |
+| `4` | Evaluation dataset ran but at least one case failed |
 
 Real-provider commands can make billable network calls. Keyless checks and CI continue to use
 `mock-1`; no live provider is contacted implicitly.

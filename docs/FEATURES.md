@@ -59,6 +59,22 @@ Native structured-output encodings follow Anthropic's
 contract and Gemini's
 [`GenerationConfig.responseJsonSchema`](https://ai.google.dev/api/generate-content) field.
 
+### Semantic structured-output validation
+
+`ObjectOptions.semantic_validator` runs an async application invariant only after parsing and full
+JSON Schema validation. It returns `Accept`, `Retry(reason)`, or `Reject(reason)`: retry consumes
+the existing bounded repair loop, while reject terminates immediately with the typed
+`structured_output` error. Python exposes `validator=` and Node exposes `options.validator` with
+the same contract before Pydantic/Zod materialization. Callbacks must be pure and idempotent;
+exceptions, invalid decisions, and Rust panics fail closed. Reasons are size-bounded and the raw
+candidate is not automatically included in errors or audit records. Retry reasons are sent to the
+provider and recorded in audit, so callbacks should return a safe summary without secrets. Reject
+and callback-failure details are returned to the host but recorded only as generic audit failures;
+their messages should still avoid secrets because host applications may log errors. The
+host-validator pattern follows the useful separation in
+[PydanticAI output validators](https://pydantic.dev/docs/ai/core-concepts/output/), while aikit
+keeps the retry policy and redaction boundary in its shared Rust core.
+
 ### Deterministic mock tool fixtures
 
 `MockProvider` remains keyless and keeps its default first-advertised-tool behavior. Tests that
@@ -163,6 +179,8 @@ next call and returns `Allow` or model-facing `Forbid(reason)`. Rules load from 
 an `OffPromptStore` and replaced with a compact reference plus preview. The agent retrieves full
 content only via the `retrieve_output` tool when needed. Small outputs pass through unchanged.
 This protects context budget and reduces replaying bulky or sensitive tool dumps every turn.
+Handles contain 128 bits from the OS CSPRNG and are scoped to one executor. The default store keeps
+at most 128 outputs / 16 MiB for one hour, evicting oldest entries; oversized outputs fail closed.
 The wrapper's canonical `retrieve_output_tool()` specification must be advertised with the wrapped
 executor; otherwise references cannot be resolved by the model.
 
@@ -238,8 +256,8 @@ their `tool` helpers pair schemas with host callbacks without moving execution p
 
 ## Sessions and memory
 
-`RunRecorder` stores canonical messages, usage, terminal status, stop reason, model attempts, raw
-provider metadata, and the optional final-text projection. `InMemorySessionStore` and
+`RunRecorder` stores canonical messages, the current invocation's start index, usage, terminal
+status, stop reason, model attempts, raw provider metadata, and the optional final-text projection. `InMemorySessionStore` and
 `JsonFileSessionStore` use explicit revisions and compare-and-swap updates so concurrent resumes
 cannot silently overwrite each other. JSON persistence uses same-directory replacement; it is a
 process-local store, not a cross-process lock or distributed transaction system. Path aliases that
@@ -253,15 +271,72 @@ deterministic keyword/tag recall. Model output is never written automatically; c
 store canonicalizes path aliases into shared process state, rejects final symlinks, uses private
 regular files and atomic same-directory replacement, but does not claim cross-process locking.
 Python and Node expose JSON and SQLite memory/session selection; their defaults remain in-memory.
-SQLite uses WAL and transactions for cross-process local persistence and optimistic CAS. It is not
-a remote or geographically distributed database.
+SQLite uses WAL, transactions, optimistic CAS, and a durable execution claim so competing local
+processes cannot both perform the same resumed model/tool work. It is not a remote or geographically
+distributed database.
+
+Execution claims deliberately fail closed after a crash: ordinary `execute` and `resume` reject
+every existing lease, including an expired one, so a tool side effect is never replayed merely
+because 24 hours passed. Rust store implementations expose
+`SessionStore::recover_expired_execution_lease` as a manual primitive. It only transfers a
+parseable, expired claim and performs no model or tool work. The recovery caller must first prove
+the old owner stopped, reconcile possibly completed external effects, and use downstream
+idempotency keys before committing or explicitly retrying. Every acquire/recovery receives a
+store-generated 128-bit fencing token; commit and release compare that token, so reusing an owner
+label cannot let an old worker affect a newer lease. Built-in stores keep the session revision
+unchanged during acquisition/recovery/release; only the final session commit advances it. The
+default third-party-store fallback embeds the claim in session metadata and therefore consumes CAS
+revisions. Custom stores that override lease methods use the doc-hidden `SessionExecutionLease`
+store-author API to issue a secure claim, persist and compare its owner/token/deadline, then consume
+its session. `clear_expired_execution_lease` atomically validates and removes an expired claim after
+reconciliation. Python `recover_expired_session(..., side_effects_reconciled=True)` and Node
+`recoverExpiredSession(..., true)` expose only that no-execution operation; retry/resume remains a
+separate call.
+
+## Deterministic evaluation gates
+
+`EvalDataset` stores strict, bounded JSON cases suitable for version control. `evaluate_outcome`
+checks canonical final text, terminal status, ordered or exact tool trajectories, failed tool
+results, turns, usage, and model-attempt limits without calling a judge model. `aikit eval` runs
+datasets sequentially with `mock-1` by default, emits text/JSON/JSONL reports without copying model
+output or provider metadata, and returns exit code `4` when a completed dataset has failed gates.
+Non-mock cases require the explicit `--allow-live` acknowledgement before any provider is built.
+Live suites additionally enforce aggregate case, input-byte, requested output-token, and wall-time
+budgets.
+Reports carry schema/runtime versions, the exact dataset SHA-256, and model-attempt provenance;
+provider/runtime failures remain distinct from gate regressions at the process exit boundary.
+Text, tool, error, and turn gates inspect only messages produced after the recorded invocation
+boundary, so resumed conversation history cannot satisfy a current-run gate. Legacy/manual
+outcomes without that boundary may still use status/usage gates, but message-derived gates fail
+closed.
+See [`EVALUATIONS.md`](EVALUATIONS.md).
 
 ## MCP, Web, Browser, and compaction
 
 MCP supports stdio and Streamable HTTP, lifecycle initialization, caller-owned bearer auth,
 paginated tools/resources/prompts, resource reads, prompt retrieval, and governed tool execution.
-Web requires an exact HTTPS host allowlist and bounded responses. Browser drives an existing W3C
-WebDriver session with the same navigation allowlist. Opt-in deterministic compaction preserves
+Transport responses are capped at 4 MiB before JSON decoding. Discovery fails closed at bounded
+page, incoming-item, cumulative serialized-byte, and cursor limits; repeated cursors cannot loop
+forever. Each connection may apply an exact, case-sensitive tool filter on every page before the
+advertised-tool cache is populated. Omitting `allow` preserves allow-all; an explicit empty
+`allow` exposes nothing; `deny` always wins. Empty, over-128-character,
+control/bidirectional-formatting-character, and duplicate filter names are rejected, with at most
+1,024 total entries per filter. Hidden tools are
+neither retained as raw discovery values, advertised, nor callable through the MCP executor, and
+Python/Node reject unknown filter fields instead of ignoring misspellings. This adopts the
+per-server filtering idea documented by
+the [OpenAI Agents SDK MCP integration](https://openai.github.io/openai-agents-python/mcp/) and
+enforces it again at execution rather than treating discovery filtering as presentation only.
+Web requires an exact HTTPS host allowlist, standard port 443, public-only DNS resolution pinned
+for each request, validated redirect hops, bounded responses, and no implicit environment proxy.
+Browser drives an existing W3C WebDriver session, but registration is denied unless the caller
+explicitly asserts that an external proxy, BiDi interceptor, or equivalent pre-request boundary
+already enforces the exact host allowlist and public-only IP policy. Rust passes
+`BrowserEgressPolicy::ExternallyEnforced`; Python passes the required keyword
+`external_egress_enforced=True`; Node passes `{ externalEgressEnforced: true }`. These values are
+assertions, not switches that install or verify enforcement. Current-URL checks remain
+defense-in-depth postconditions. Browser URL/query/selector/type/session inputs and WebDriver JSON
+responses are bounded; failure payloads are redacted. Opt-in deterministic compaction preserves
 the task anchor, recent tail, and tool pairs.
 
 ## Containment

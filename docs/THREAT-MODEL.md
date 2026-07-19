@@ -146,6 +146,31 @@ do not provide encryption, tenant authentication, backup policy, or cross-proces
 Concurrent JSONL sinks for the same canonical path serialize appends only inside one process;
 multi-process writers need external coordination.
 
+Session execution leases prevent concurrent model/tool work but cannot prove whether a crashed
+owner completed an external side effect before losing its final session commit. Expiry is therefore
+not permission to replay: normal execution rejects active, expired, and malformed lease state.
+Only the explicit store recovery primitive can transfer a parseable expired lease, and it never
+runs work itself. Operators must verify the former owner is stopped, reconcile external systems,
+and preserve provider/tool idempotency before committing or retrying. Owner strings are diagnostic,
+not fences: each lease carries a store-generated random token, and commit/release require the exact
+current token to prevent same-owner ABA. Binding recovery atomically clears an expired lease only
+after an explicit reconciliation assertion, without executing work or creating a second-write
+crash window. JSON remains process-local; SQLite provides the transactional cross-process form.
+File replacement/open checks compare stable device/inode identity on Unix and volume/file-index
+identity on Windows; an identity lookup failure is an error rather than permission to continue.
+
+Web fetches validate each HTTPS redirect target against the exact host allowlist before following
+it, reject mixed/private/non-routable DNS answers, and pin the checked public addresses into a
+proxy-free request. WebDriver revalidates the current URL after navigation, click, type, and
+snapshot, but the browser—not aikit—performs its DNS and network requests. A redirect or DNS rebind
+may therefore already have sent a request before WebDriver reports the committed URL. Browser tool
+construction and Python/Node registration consequently fail closed unless the caller explicitly
+asserts that a network proxy, BiDi request interceptor, or equivalent boundary already enforces the
+same exact hostname allowlist and denies private/local/non-routable IPs before every request. The
+assertion does not configure or verify that boundary; a false assertion restores the SSRF risk.
+Postcondition URL checks are retained only as defense in depth. WebDriver responses and browser
+inputs are bounded, and protocol failure bodies are not reflected into tool errors.
+
 The descriptor-relative file-tool jail supports Linux/macOS and fails closed for file operations
 on Windows. The Windows Job backend is therefore a Bash process/resource boundary, not a Windows
 file-tool sandbox. Docker remains the stronger documented Windows option when filesystem and

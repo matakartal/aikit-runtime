@@ -1,5 +1,5 @@
 ---
-source_version: 0.1.0
+source_version: 0.2.0
 source_status: draft
 commit_sha:
 source_remote: pending
@@ -8,7 +8,7 @@ live_matrix: optional
 native_artifacts: pending
 ---
 
-# Source-distribution evidence: v0.1.0
+# Source-distribution evidence: v0.2.0
 
 Copy this file to `docs/releases/vX.Y.Z.md` when recording a manual artifact assembly. Never
 record API keys, access tokens, private prompts, or raw provider responses here.

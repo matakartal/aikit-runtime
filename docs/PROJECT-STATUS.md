@@ -1,7 +1,8 @@
 # Project status
 
-**Snapshot date:** 2026-07-16  
-**Release state:** source-first `v0.1.0` open-source preview
+**Snapshot date:** 2026-07-19
+
+**Release state:** source-first `v0.2.0` development preview
 
 This page records what can be demonstrated from source today.
 
@@ -12,7 +13,8 @@ This page records what can be demonstrated from source today.
   tests; OpenRouter, Groq, Mistral, and xAI use isolated compatible endpoints.
 - Governance, tools, routing, budgets, sessions, memory, containment, audit, and orchestration are
   exercised without API keys through the deterministic mock provider.
-- Main-branch CI and CodeQL are green for the current source tree.
+- The last pushed main-branch revision passed CI and CodeQL. This uncommitted candidate passes the
+  local keyless gates; remote GitHub Actions have not run against it yet.
 - The repository is suitable to share publicly as an open-source implementation preview.
 - The source-first CLI provides keyless runs, interactive chat, provider/capability discovery,
   containment diagnostics, automation output, and shell completions.
@@ -28,15 +30,17 @@ This page records what can be demonstrated from source today.
 
 ```mermaid
 flowchart LR
-    SRC[Current source] --> CI[Keyless CI + CodeQL<br/>passing]
+    SRC[Current v0.2 candidate] --> LOCAL[Local keyless gates<br/>passing]
+    LOCAL -. commit and push .-> CI[GitHub CI + CodeQL<br/>pending]
     CI --> SHARE[Public repository preview<br/>shareable]
-    SHARE --> LOCAL[Clone and build<br/>from source]
+    SHARE --> USE[Clone and build<br/>from source]
     SHARE --> ASM[Optional manual artifact<br/>assembly]
     SHARE -. optional .-> LIVE[Billable live-provider<br/>acceptance]
 ```
 
-The repository can be announced and used from source now. It should not be described as available
-through npm, PyPI, or crates.io.
+The candidate can be used from source locally. Before announcing this v0.2 source snapshot, commit
+and push it, then require its GitHub CI and CodeQL runs to pass. It should not be described as
+available through npm, PyPI, or crates.io.
 
 See the [release guide](RELEASE.md), [completion matrix](V1-COMPLETION-MATRIX.md), and
 [live-provider contract](LIVE-SMOKE.md) for the detailed checks.

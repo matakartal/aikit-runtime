@@ -5,15 +5,15 @@ canonical agent, streaming, structured-output, routing, memory, governance, and 
 the Rust core, with type information in `aikit.pyi` / `py.typed`.
 
 > The PyPI distribution name is **`aikit-runtime`**; the existing bare `aikit` package on PyPI is
-> unrelated. Python imports remain `import aikit`. This package remains unpublished until the
-> release evidence gates pass.
+> unrelated. Python imports remain `import aikit`. No PyPI publication is currently claimed or
+> planned; local artifact assembly uses this name only for package-layout verification.
 
 ## Build from this checkout
 
 ```bash
 # from the repository root
 python3 -m venv .venv
-.venv/bin/pip install "maturin>=1.5,<2"
+.venv/bin/pip install "maturin==1.14.1"
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ```
 
@@ -71,6 +71,28 @@ agent.can_use_tool(approve)
 Permission decisions, hooks, and tool execution policy live in Rust. Python only supplies host
 callbacks and structured configuration.
 
+## MCP tool visibility
+
+Filter each MCP connection before registering it with an agent:
+
+```python
+server = await aikit.connect_mcp_http(
+    "https://mcp.example.com",
+    "work",
+    tool_filter={
+        "allow": ["search", "read_file"],
+        "deny": ["read_file"],  # deny is authoritative
+    },
+)
+agent.register_mcp(server)
+```
+
+Names match exactly and case-sensitively. Omit `allow` for the backward-compatible allow-all
+default, or pass `"allow": []` to expose no tools. Unknown fields, duplicate/empty names, and names
+over 128 characters are rejected; each filter accepts at most 1,024 entries. Filtered tools are not
+advertised or executable. Discovery and transport also fail closed on bounded page, item, byte,
+cursor, and response limits instead of retaining unbounded server data.
+
 ## Multimodal and structured input
 
 Every text and object surface accepts a string or canonical message history:
@@ -92,7 +114,32 @@ result = await agent.generate_text(messages, model="your-model")
 obj = await agent.generate_object(messages, schema)
 ```
 
+Add `validator=async_fn` for business rules that JSON Schema cannot express. It receives the raw
+schema-valid JSON value and returns `"accept"`, `{"action": "retry", "reason": "..."}`, or
+`{"action": "reject", "reason": "..."}`. Retry is bounded by `max_retries`; exceptions fail
+closed before Pydantic materialization. Decision objects are exact: aliases, unknown fields,
+conflicting keys, and a reason on `accept` are rejected.
+
 Unsupported media is rejected with a typed error instead of being silently dropped.
+
+## Deterministic outcome evaluation
+
+Evaluate a completed `RunOutcome` without calling a model, tool, filesystem, or network service:
+
+```python
+verdict = aikit.evaluate_outcome(stream.outcome(), [
+    {"type": "terminal_status", "status": "completed"},
+    {"type": "no_tool_errors"},
+    {"type": "max_total_tokens", "value": 2_000},
+])
+assert verdict["passed"]
+```
+
+The gate contract is the same versioned JSON contract used by `aikit eval`. Unknown outcome or
+gate fields fail closed. Verdict messages report only lengths, counts, and states; they do not
+copy raw model output. Text, tool, and turn gates require the runtime-recorded
+`invocation_start_message_index`, so earlier conversation history cannot satisfy the current run;
+legacy outcomes without that field can still use terminal-status and usage gates.
 
 ## Production state (opt-in)
 
@@ -104,6 +151,17 @@ agent.use_session_file("./aikit-sessions.json")
 
 Memory is written only by `remember()`. File-backed sessions and memory can be reopened later in
 another process; concurrent coordination is process-local unless you use the SQLite stores.
+
+An expired execution lease never replays automatically. After verifying the old worker stopped and
+reconciling/idempotently checking its external effects, clear only the expired lease explicitly:
+
+```python
+revision = agent.recover_expired_session(
+    "session-id",
+    side_effects_reconciled=True,
+)
+# A later run_subagent/resume_subagent call is a separate execution decision.
+```
 
 ## Built-in tools and containment
 
@@ -128,6 +186,9 @@ file jail, so registration fails closed there. Host callbacks run in the Python 
 Async generation and terminal structured-stream failures raise `aikit.AikitError` (or surface a
 stable `code` / redacted `info` envelope — see type stubs). Prefer branching on `code` rather than
 message text.
+
+Unknown top-level or nested run-option fields are rejected, so a misspelled budget or retry limit
+cannot be ignored silently. Assembled Linux wheels target glibc 2.28 or newer; musl is unsupported.
 
 ## Conformance
 

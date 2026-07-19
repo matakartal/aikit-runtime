@@ -6,8 +6,38 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Breaking
+
+- Rust `ObjectOptions` now includes `semantic_validator`. Struct-literal callers should add
+  `semantic_validator: None` or use `..ObjectOptions::default()` when migrating to 0.2.
+- Rust `RunOutcome` now records `invocation_start_message_index`. Struct-literal callers should
+  set the boundary explicitly or use `..RunOutcome::default()`; legacy serialized outcomes load
+  with no boundary and message-derived eval gates fail closed for them.
+- `BrowserTools` and the Python/Node browser registration helpers now require an explicit external
+  egress-enforcement assertion; post-navigation URL checks alone are no longer presented as an
+  SSRF boundary.
+- `OffPromptStore::store` is now fallible and returns `Result<String>` so OS-randomness and
+  retention-limit failures cannot be hidden.
+- Expired session execution leases are no longer acquired automatically. Recovery now requires an
+  explicit `SessionStore::recover_expired_execution_lease` call after side-effect reconciliation.
+- `SessionStore` execution-lease methods now exchange the opaque, core-exported
+  `SessionExecutionLease` claim: acquire/recovery return it, while commit/release consume it. Custom
+  stores that overrode the previous owner-string methods must update their signatures and persist
+  the store-generated fencing token. The doc-hidden store-author API
+  (`issue_for_store`, `fencing_token`, `expires_at_unix_ms`, and `into_session`) provides the
+  complete construction, persistence, validation, and ownership-transfer path needed by those
+  overrides.
+
 ### Added
 
+- Async semantic structured-output validation across Rust, Python, and Node with explicit
+  accept/retry/reject decisions, bounded repair attempts, and fail-closed callback handling.
+- Exact, case-sensitive MCP tool visibility filters across Rust, Python, and Node; optional allow
+  lists are applied before discovery caching, deny entries always win, and hidden tools cannot be
+  advertised or executed.
+- Deterministic evaluation datasets and gates over canonical outcomes, plus a keyless `aikit eval`
+  command with redacted provenance reports, bounded live runs, hardened dataset loading, and
+  distinct infrastructure/gate failure codes.
 - Declarative permission policy (`PolicySpec`): JSON `mode` / allow / ask / deny rules with
   `Tool(glob)` patterns compile into the enforcing permission engine.
 - Plan mode: agents propose a step plan; a host `PlanReviewer` approves, revises, or rejects
@@ -30,7 +60,32 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Changed
 
-- Node native bindings now target N-API 3 for the declared Node.js compatibility floor.
+- MCP discovery and transport now fail closed after bounded page, item, byte, cursor, or response
+  limits; stale discovery caches are cleared after refresh failures and repeated cursors cannot
+  loop indefinitely.
+- Development manifests advance to `0.2.0`; release checks reject reusing an evidenced/tagged
+  version for different source bytes.
+- Node native bindings use napi-rs 3 with N-API 9 for the declared Node.js 18.17+ compatibility
+  floor.
+- Linux Python and Node artifacts now build against a digest-pinned glibc 2.28 baseline; workflow
+  actions and build tools are immutable or exact-version pinned.
+- Run options reject unknown top-level and nested fields, credentials reject blank values, and
+  Node AbortSignal cancellation serializes native stream finalization.
+- Native provider streams now enforce bounded frames, retained parser state, response lifetime,
+  and complete terminal/tool-call invariants; the runtime independently caps retained run output
+  and oversized custom-tool results.
+- Session execution claims block automatic expired-lease takeover. Recovery is an explicit store
+  operation that requires external-side-effect reconciliation before any replay or commit. Random
+  per-claim fencing tokens prevent same-owner ABA, and Python/Node expose an assertion-gated atomic
+  expired-lease clear that performs no model/tool work.
+- Web fetches pin validated public DNS targets with proxy-free, per-hop redirect checks. Browser
+  and built-in file-tool inputs, traversal, responses, and outputs have fail-closed size limits.
+- SQLite and JSON session files verify descriptor identity on Unix and Windows; unsupported
+  platforms fail closed when file identity cannot be proven.
+- Browser tool registration now fails closed without an explicit caller assertion of external
+  pre-request host/public-IP enforcement. Browser inputs and WebDriver replies are bounded, and
+  WebDriver failure payloads are redacted. This changes the Rust, Python, and Node registration
+  signatures.
 - Updated Tokio, Regex, SQLite, and the Python FFI stack. PyO3, `pyo3-async-runtimes`, and
   `pythonize` now use the patched 0.29 line; SQLite revisions are converted explicitly at the
   signed storage boundary.

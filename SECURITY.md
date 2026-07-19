@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-`aikit-runtime` is currently a source-first v0.1.0 implementation preview. Security fixes land on
-the default branch; no public package-registry support line is claimed.
+`aikit-runtime` is currently a source-first v0.2.0 development preview. Security fixes land on the
+default branch; no public package-registry support line is claimed.
 
 Source-distribution checks include dependency and CodeQL review. Source users should review the
 repository's current security state before deploying a commit.

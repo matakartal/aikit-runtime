@@ -30,6 +30,14 @@ The `release.yml` workflow is `workflow_dispatch` only. It builds local `.crate`
 `.tgz` artifacts for the supported matrix, verifies that they load, writes `SHA256SUMS`, and
 attests the resulting GitHub Actions artifact bundle.
 
+Linux Python wheels and Node addons are built in digest-pinned `manylinux_2_28` containers. Their
+documented compatibility floor is glibc 2.28; musl is not currently supported. After downloading
+and extracting the bundle, verify it from the bundle root:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
 The workflow contains no tag trigger, registry credential, `npm publish`, PyPI upload action, or
 `cargo publish` command. Its output is a temporary GitHub Actions artifact, not a public package.
 

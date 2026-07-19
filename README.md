@@ -104,6 +104,7 @@ cargo run -p aikit-cli -- run "Explain aikit in one sentence"
 cargo run -p aikit-cli -- chat
 cargo run -p aikit-cli -- providers
 cargo run -p aikit-cli -- doctor
+cargo run -p aikit-cli -- eval evals/smoke.json
 ```
 
 Choose a configured provider explicitly only when you intend to make a network call:
@@ -113,8 +114,9 @@ XAI_API_KEY='...' cargo run -p aikit-cli -- run --model grok-4.5 "Say hello"
 ```
 
 The CLI supports text, JSON, and JSONL output, stable exit codes, stdin prompts, canonical
-multi-turn history, secret-safe provider discovery, containment diagnostics, and shell completion
-generation. See the [CLI guide](crates/aikit-cli/README.md) for the full contract.
+multi-turn history, secret-safe provider discovery, containment diagnostics, deterministic eval
+gates, and shell completion generation. See the [CLI guide](crates/aikit-cli/README.md) for the
+full contract.
 
 ### Rust
 
@@ -144,7 +146,7 @@ Build the native binding once, then use the same core from Python:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "maturin>=1.5,<2"
+.venv/bin/pip install "maturin==1.14.1"
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ```
 
@@ -183,7 +185,8 @@ main();
 | Capability | What aikit provides |
 |---|---|
 | Streaming | Incremental text, reasoning, tool-call, tool-result, usage, and terminal events. |
-| Structured output | JSON Schema validation, bounded repair, streaming attempts, Pydantic and Zod materialization. |
+| Structured output | JSON Schema plus async semantic validation, bounded repair, streaming attempts, Pydantic and Zod materialization. |
+| Evaluation | Deterministic text, tool-trajectory, terminal-state, usage, turn, and model-attempt gates over the current invocation. |
 | Canonical messages | Text, reasoning, tools, media, citations, usage, and provider-owned metadata without flattening. |
 | Governance | Global allow / ask / deny, declarative JSON policy, async approval, lifecycle hooks, and authoritative denial. |
 | Plan mode | Whole-approach HITL: the agent proposes a plan; a human approves, revises, or rejects before tools run. |
@@ -193,14 +196,15 @@ main();
 | Guardrails | Deterministic secret/PII redaction, regex blocking, and fail-closed MCP safety-server interop. |
 | Self-extension | Human-governed capability requests: the agent asks for a tool it lacks, a human decides, the grant is recorded — never a silent escalation. |
 | Tool runtime | Host callbacks plus opt-in Read, Write, Edit, Glob, Grep, and contained Bash. |
-| MCP | Stdio and Streamable HTTP client with tools, resources, prompts, auth/session propagation, and governed execution. |
+| MCP | Bounded stdio and Streamable HTTP client with tools, resources, prompts, auth/session propagation, exact allow/deny visibility filters, and governed execution. |
 | Routing | Explicit or automatic model selection from a caller-owned catalog with hard capability and cost gates. |
 | Resilience | Typed failures, bounded retry, pre-stream fallback, cancellation, deadlines, and terminal outcomes. |
 | Orchestration | Scoped subagents, ordered parallel fan-out, council synthesis, quorum, and shared budget accounting. |
 | State | Namespaced memory, revisioned sessions, JSON/transactional SQLite persistence, canonical recording, and resume. |
 | Compaction | Opt-in transcript bounding: keep the task anchor and recent tail within a token budget, preserving tool pairing. |
-| Web and browser | HTTPS allowlisted fetch/search plus an existing-session WebDriver executor; both use the shared governed tool boundary. |
+| Web and browser | HTTPS allowlisted fetch/search plus an existing-session WebDriver executor; browser registration requires an explicit assertion of caller-owned pre-request egress enforcement. |
 | Observability | Typed audit lifecycle, metadata-only redaction by default, JSONL sinks, and an optional Rust OpenTelemetry bridge. |
+| Evaluation | Strict JSON datasets and deterministic text/tool/status/usage gates with keyless CI verdicts. |
 
 ## Governed tool execution
 
@@ -326,6 +330,14 @@ Generated objects report their actual fidelity:
 Your application can branch on that grade instead of assuming every JSON-shaped answer has the
 same guarantee.
 
+After JSON Schema succeeds, an optional async semantic validator can return `Accept`,
+`Retry(reason)`, or `Reject(reason)`. Retry uses the existing bounded repair budget; reject and
+callback failures stop with a typed structured-output error. Validators must be pure/idempotent,
+and aikit never copies the candidate object into validator errors or audit events automatically.
+Retry reasons are provider-facing, so return a safe summary rather than the raw object. Reject and
+callback-error details are returned to the host but persist only as generic audit failure markers;
+keep those details secret-free too because an application may log exceptions.
+
 ## One runtime, three SDKs
 
 | Concept | Rust | Python | TypeScript |
@@ -334,6 +346,7 @@ same guarantee.
 | Text | `generate_text` | `generate_text` | `generateText` |
 | Streaming | `stream_text` | `stream_text` | `streamText` |
 | Structured output | `generate_object` | `generate_object` | `generateObject` |
+| Outcome evaluation | `evaluate_outcome` | `evaluate_outcome` | `evaluateOutcome` |
 | Tool registration | `tool` / executor | `add_tool` | `addTool` |
 | Permissions | `Governance` | `set_permissions` | `setPermissions` |
 | Memory | `remember` / `recall` | `remember` / `recall` | `remember` / `recall` |
@@ -397,7 +410,7 @@ of the current project plan.
 | Node wrapper | `aikit-runtime` | local checkout wrapper |
 | Node native binaries | `aikit-runtime-{platform}` | selected locally by the wrapper |
 
-The current `v0.1.0` tree is a **source-first implementation preview**. Keyless source, binding,
+The current `v0.2.0` tree is a **source-first implementation preview**. Keyless source, binding,
 and local package-layout checks run in CI. Use the checkout commands in [Quick start](#quick-start);
 no npm, PyPI, or crates.io publication is claimed or planned at this stage.
 
@@ -405,8 +418,8 @@ no npm, PyPI, or crates.io publication is claimed or planned at this stage.
 
 | Platform | Python ABI3 wheel | Node native package |
 |---|---:|---:|
-| Linux x64 glibc | Yes | Yes |
-| Linux ARM64 glibc | Yes | Yes |
+| Linux x64, glibc >= 2.28 | Yes | Yes |
+| Linux ARM64, glibc >= 2.28 | Yes | Yes |
 | macOS ARM64 | Yes | Yes |
 | macOS x64 | Yes | Yes |
 | Windows x64 | Yes | Yes |
@@ -432,6 +445,8 @@ Normal GitHub CI verifies:
 The manual source-distribution workflow builds the five Python ABI3 wheels, assembles the native
 artifacts, records SHA-256 manifests, and produces GitHub provenance attestations without uploading
 anything to a package registry.
+Linux wheels and Node addons are built in digest-pinned `manylinux_2_28` containers rather than
+inheriting the GitHub runner's newer glibc requirement.
 
 ## Repository map
 
@@ -467,6 +482,7 @@ anything to a package registry.
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |
 | [CLI guide](crates/aikit-cli/README.md) | Commands, automation contracts, diagnostics, and completions. |
+| [Evaluation guide](docs/EVALUATIONS.md) | Keyless datasets, deterministic gates, reports, and CI exit codes. |
 
 ## Contributing
 

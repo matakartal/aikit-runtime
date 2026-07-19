@@ -13,6 +13,7 @@ goes deeper: capabilities, security, release evidence, and historical design not
 | [Distribution guide](RELEASE.md) | Maintainers | Source-first policy and manual artifact assembly. |
 | [v1 completion matrix](V1-COMPLETION-MATRIX.md) | Contributors | Implementation proof vs external release blockers. |
 | [Project status](PROJECT-STATUS.md) | Everyone | Current shareability and source-distribution boundaries. |
+| [Evaluation guide](EVALUATIONS.md) | Builders and CI owners | Keyless datasets, deterministic gates, and reports. |
 
 ## Governance deep dive
 
