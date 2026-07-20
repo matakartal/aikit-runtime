@@ -604,7 +604,11 @@ impl AuditSink for OpenTelemetryAuditSink {
         match &record.event {
             AuditEvent::RunStarted { model } => {
                 let tracer = global::tracer("aikit");
-                let mut span = tracer.start("aikit.agent.run");
+                // Span name and gen_ai.* attributes follow the OpenTelemetry GenAI semantic
+                // conventions (Development status); aikit.* attributes carry runtime-specific
+                // detail the conventions do not model.
+                let mut span = tracer.start("invoke_agent");
+                span.set_attribute(KeyValue::new("gen_ai.operation.name", "invoke_agent"));
                 span.set_attribute(KeyValue::new("aikit.run_id", record.run_id.clone()));
                 span.set_attribute(KeyValue::new("gen_ai.request.model", model.clone()));
                 spans.insert(record.run_id.clone(), span);
@@ -702,6 +706,8 @@ fn otel_event(event: &AuditEvent, sequence: u64) -> (String, Vec<opentelemetry::
         }
         AuditEvent::ToolStarted { turn, tool, .. } => {
             attrs.push(KeyValue::new("aikit.turn", *turn as i64));
+            attrs.push(KeyValue::new("gen_ai.operation.name", "execute_tool"));
+            attrs.push(KeyValue::new("gen_ai.tool.name", tool.clone()));
             attrs.push(KeyValue::new("aikit.tool", tool.clone()));
             "aikit.tool_started"
         }
@@ -713,8 +719,15 @@ fn otel_event(event: &AuditEvent, sequence: u64) -> (String, Vec<opentelemetry::
             ..
         } => {
             attrs.push(KeyValue::new("aikit.turn", *turn as i64));
+            attrs.push(KeyValue::new("gen_ai.operation.name", "execute_tool"));
+            attrs.push(KeyValue::new("gen_ai.tool.name", tool.clone()));
             attrs.push(KeyValue::new("aikit.tool", tool.clone()));
-            attrs.push(KeyValue::new("error.type", *is_error));
+            attrs.push(KeyValue::new("aikit.tool.is_error", *is_error));
+            // Semconv error.type is a string set only when the operation actually failed; a
+            // boolean-on-success value would misreport every successful call as an error class.
+            if *is_error {
+                attrs.push(KeyValue::new("error.type", "tool_error"));
+            }
             attrs.push(KeyValue::new("aikit.output_bytes", *output_bytes as i64));
             "aikit.tool_completed"
         }
