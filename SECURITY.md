@@ -2,11 +2,27 @@
 
 ## Supported versions
 
-`aikit-runtime` is currently a source-first v0.2.0 development preview. Security fixes land on the
+`aikit-runtime` is currently a source-first `v0.3.0-alpha.1` development preview. Security fixes land on the
 default branch; no public package-registry support line is claimed.
 
-Source-distribution checks include dependency and CodeQL review. Source users should review the
-repository's current security state before deploying a commit.
+CI security checks include dependency advisory/license/source review (`cargo-deny`), an independent
+RustSec audit (`cargo-audit`), CodeQL static analysis for Rust, JavaScript/TypeScript, and Python,
+complete-history committed-secret scanning (Gitleaks), deterministic CycloneDX SBOM generation,
+and release-provenance contract checks. Source users should review the repository's current
+security state before deploying a commit.
+
+Run the same supply-chain checks locally with:
+
+```bash
+./scripts/security-check.sh --all
+```
+
+The local command requires `cargo-deny`, `cargo-audit`, and Gitleaks. Individual modes are available
+for dependency checks, secret scanning, SBOM generation, and provenance validation; run the script
+with an unknown argument to see the complete usage. The SBOM is written to
+`dist/security/aikit-runtime.cdx.json` and binds its evidence to the current commit and
+`Cargo.lock` digest. Release provenance uses GitHub's OIDC-backed attestation action and therefore
+does not require a repository signing secret.
 
 | Version | Supported |
 |---|---|

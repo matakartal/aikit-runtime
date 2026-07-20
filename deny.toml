@@ -52,6 +52,7 @@ skip = [
     { crate = "windows-sys@<0.61", reason = "0.52 via older transitive deps" },
     { crate = "hashbrown@<0.17", reason = "older line via transitive deps" },
     { crate = "io-lifetimes@<3", reason = "older line via transitive deps" },
+    { crate = "fallible-iterator@0.2", reason = "postgres 0.19 requires 0.2 while rusqlite 0.39 requires 0.3" },
 ]
 
 [sources]

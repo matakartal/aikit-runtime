@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Breaking
 
+- New provider/runtime entry points default to strict capability validation. An unknown or
+  unsupported required capability now returns a typed error instead of silently dropping the
+  request option or pretending a downgrade is equivalent.
+- The identified `StreamEvent` protocol supersedes `StreamDelta`. `StreamDelta` remains available
+  as a deprecated compatibility input during the v0.x migration window.
+- Python and Node use factory-created `McpConnection` handles for the MCP client; the old
+  `McpServer` name remains only as `legacy.McpServer` through the v0.6 compatibility window.
+
 - Rust `ObjectOptions` now includes `semantic_validator`. Struct-literal callers should add
   `semantic_validator: None` or use `..ObjectOptions::default()` when migrating to 0.2.
 - Rust `RunOutcome` now records `invocation_start_message_index`. Struct-literal callers should
@@ -29,6 +37,29 @@ All notable changes to this project will be documented in this file. The format 
   overrides.
 
 ### Added
+
+- Versioned offline eight-provider model catalog with canonical integrity hash, tri-state model
+  capabilities, separate caller override hashes, and no runtime network dependency.
+- First-class OpenRouter, Groq, Mistral, and xAI adapters alongside Anthropic, OpenAI, Google, and
+  DeepSeek, with strict provider identity/auth/endpoint/stream/error conformance and sanitized
+  cassette coverage.
+- Identified response/block stream events with monotonic sequence, `start/delta/end`, warning,
+  usage, error, raw-event opt-in, and Python/Node async event views.
+- Immutable scoped governance contracts, source-to-sink information-flow policy, evidence-rich
+  approvals, sandbox/egress profiles, and verified skill packages with source/artifact pinning,
+  typosquat/hidden-instruction checks, and separately authorized executable hooks.
+- Durable event-sourced runs with checkpoints, activity/idempotency/reconciliation records,
+  resume/fork/rewind/cancel, durable approvals, SQLite CAS persistence, and equivalent Python/Node
+  `DurableRun` wrappers.
+- Working, episodic, and semantic memory planes with provenance and compare-and-swap updates.
+- Provider-neutral multimodal image/audio/transcript/realtime contracts, persisted realtime
+  dedupe, cancellation, typed provider SPIs, and fallback-disabled capability-aware routing.
+- Governed MCP Tasks, A2A 1.0 and ACP v1 state mappings; protocol transport execution remains a
+  separately tracked parity gate.
+- Deterministic trace assertions and redacted agent/run/model/tool/checkpoint/activity spans,
+  exposed through Rust, Python, and Node evaluation helpers.
+- Living competitor parity matrix with exact upstream commit/license pins and evidence/status per
+  capability.
 
 - Async semantic structured-output validation across Rust, Python, and Node with explicit
   accept/retry/reject decisions, bounded repair attempts, and fail-closed callback handling.
@@ -56,14 +87,19 @@ All notable changes to this project will be documented in this file. The format 
   xAI wire-contract regression test.
 - Source-first `aikit` CLI with one-shot runs, canonical multi-turn chat, provider/capability
   discovery, containment doctor, text/JSON/JSONL output, stable exit codes, and shell completions.
-- GitHub CodeQL, Dependabot, community-health files, Discussions, and repository metadata.
+- CI security gates: cargo-deny (RustSec advisories, license policy, duplicate/wildcard bans, and
+  registry-source pinning via `deny.toml`), a full-history Gitleaks committed-secret scan, and
+  CodeQL static analysis for Rust, JavaScript/TypeScript, and Python.
+- A required deterministic-eval CI job over the keyless `mock-1` datasets, including governed
+  tool-trajectory and denied-tool cases.
+- Dependabot, community-health files, Discussions, and repository metadata.
 
 ### Changed
 
 - MCP discovery and transport now fail closed after bounded page, item, byte, cursor, or response
   limits; stale discovery caches are cleared after refresh failures and repeated cursors cannot
   loop indefinitely.
-- Development manifests advance to `0.2.0`; release checks reject reusing an evidenced/tagged
+- Development manifests advance to `0.3.0-alpha.1`; release checks reject reusing an evidenced/tagged
   version for different source bytes.
 - Node native bindings use napi-rs 3 with N-API 9 for the declared Node.js 18.17+ compatibility
   floor.
@@ -90,9 +126,28 @@ All notable changes to this project will be documented in this file. The format 
   `pythonize` now use the patched 0.29 line; SQLite revisions are converted explicitly at the
   signed storage boundary.
 
+### Fixed
+
+- MCP, A2A, and ACP ownership checks now bind both tenant and subject, closing cross-tenant access
+  when two tenants use the same subject identifier.
+- Raw durable events can no longer schedule work or replace state while a run is paused or awaiting
+  reconciliation; SQLite loads validate row identity, schema, revision, and serialized history.
+- Temporal activity invocations validate queue, timeout, retry, header, identity, and input fields
+  against deterministically regenerated state before execution.
+- Stream encoding rejects response/block deltas before start, duplicate starts, and events after a
+  terminal stop/error while retaining the legacy vector adapter.
+- Inline transcription validates the real byte length and SHA-256 under a 25 MiB cap, streams the
+  multipart body without cloning, and validates artifact integrity/provenance before commit.
+- Timed-out blocking DNS resolutions remain under a shared eight-job concurrency bound instead of
+  accumulating in Tokio's blocking pool.
+- Provider cassette fixtures now ship inside the Rust core package and the extracted `.crate`
+  executes its cassette tests in CI/release validation.
+- Python/TypeScript declarations now reflect factory-only MCP handles and optional durable resume
+  approvals instead of accepting calls that runtime rejects or rejecting valid commands.
+
 ### Documentation
 
-- Reworked the complete documentation set for the 0.2 source preview: architecture and migration
+- Reworked the documentation set for the 0.3 alpha parity candidate: architecture and migration
   guides, current status, SDK/CLI contracts, security boundaries, MCP/evaluation limits, release
   operations, historical labels, and repository navigation now share one consistent vocabulary.
 

@@ -115,8 +115,8 @@ default, so misspelled budget and retry controls cannot weaken a run unnoticed.
 MCP connections can expose only exact approved tool names before registration:
 
 ```js
-const { McpServer } = require("./crates/aikit-node");
-const server = await McpServer.connectHttp(
+const { McpConnection } = require("./crates/aikit-node");
+const server = await McpConnection.connectHttp(
   "https://mcp.example.com",
   "work",
   undefined,
@@ -221,7 +221,8 @@ containment. Apply separate process isolation when callback code is untrusted.
 | [Architecture](../../docs/ARCHITECTURE.md) | Core ownership, run lifecycle, state, and trust boundaries |
 | [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
 | [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |
-| [0.2 migration](../../docs/MIGRATING-0.2.md) | Breaking source-preview changes and upgrade checklist |
+| [Competitor parity](../../docs/PARITY-MATRIX.md) | Current evidence, gaps, and v1 gate |
+| [0.3 migration](../../docs/MIGRATING-0.3.md) | Streaming, MCP naming, capability and durability changes |
 | [Evaluation guide](../../docs/EVALUATIONS.md) | Dataset, gate, report, and CI contracts |
 | [Conformance](../../examples/node/conformance.cjs) | Cross-language parity driver |
 

@@ -1,5 +1,8 @@
 # 0.2 implementation matrix
 
+> **Historical inventory:** this file preserves the 0.2 surface audit. The current 0.3 alpha and
+> v1 eligibility source of truth is [`PARITY-MATRIX.md`](PARITY-MATRIX.md).
+
 This matrix separates implementation proof from optional live-provider proof. A keyless test can
 complete an implementation row, but it cannot prove that a changing provider accepts the wire
 request. The historical filename is retained to avoid breaking existing links; this document now
@@ -38,7 +41,7 @@ tracks the `v0.2.0` source-preview contract.
 | Evaluation | Strict versioned datasets; current-invocation text/tool/status/usage/model-attempt gates; redacted provenance; bounded live opt-in | `eval.rs`, `evals/smoke.json`, CLI and Rust/Python/Node outcome-evaluation tests | Complete keylessly |
 | Conformance | Seven canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, and multimodal/routed input | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
-| OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs and `.github` | Repository materials complete; source remote and private security reporting verified |
+| OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs, `.github`, and the `codeql.yml` / `security.yml` workflows | Repository materials complete; source remote and private security reporting verified |
 | Distribution | Source checkout plus locally assembled Cargo, Python ABI3, and Node artifacts | CI/manual assembly workflow plus `stage-node-platform.sh` and packaged-loader tests | Complete; external registry publication is intentionally out of scope |
 
 ## Deliberate boundaries beyond 0.2

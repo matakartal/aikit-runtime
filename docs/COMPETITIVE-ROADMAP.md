@@ -5,16 +5,18 @@ frameworks, coding-agent harnesses, and governance/sandbox tooling; reconciled w
 on 2026-07-20. This is what to **take** from the field, phase by phase — disciplined by what
 actually defends aikit's moat.*
 
-> **Status note (docs refresh):** Phase 1's core is landed and every Phase 2 row (declarative
-> policy, plan mode, heuristic SmartApprove, reliability rules, off-prompt output) ships in
-> `aikit-runtime-core`. Treat unchecked residual items and Phases 3–4 as forward planning. For
-> current public capabilities, prefer [`FEATURES.md`](FEATURES.md) and the root README.
+> **Status note (2026-07-20):** This is a historical strategy document, not the current completion
+> dashboard. Durable runs, PostgreSQL/Temporal reference layers, eight provider adapters,
+> multimodal contracts, governed protocol mappings, scoped governance, egress brokering, trace
+> evals, and redacted telemetry have landed since the original scan. Use
+> [`PARITY-MATRIX.md`](PARITY-MATRIX.md) for row-level current evidence and open gates.
 
 > **2026-07-20 addendum:** three cross-cutting capabilities have also landed since the original
 > roadmap: deterministic keyless evaluation gates inspired by Pydantic Evals/Mastra, async semantic
 > structured-output validation, and exact MCP visibility filters plus bounded discovery/transport.
-> All three have Rust, Python, and Node contract tests. Durable checkpoint/time-travel remains
-> deferred because replaying external side effects safely needs a deeper execution model.
+> All three have Rust, Python, and Node contract tests. Durable checkpoint/fork/rewind now uses an
+> append-only event model and explicit reconciliation for ambiguous external effects; process-level
+> chaos and real distributed-engine acceptance remain open gates.
 
 ## What the research changed (read this first)
 

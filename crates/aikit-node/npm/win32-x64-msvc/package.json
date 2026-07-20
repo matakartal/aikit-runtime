@@ -1,6 +1,6 @@
 {
   "name": "aikit-runtime-win32-x64-msvc",
-  "version": "0.2.0",
+  "version": "0.3.0-alpha.1",
   "private": true,
   "description": "Native aikit-runtime addon for Windows x64 MSVC.",
   "license": "MIT OR Apache-2.0",

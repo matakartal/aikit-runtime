@@ -18,6 +18,7 @@ name = "aikit_core"
 [features]
 default = []
 opentelemetry = ["dep:opentelemetry"]
+postgres-store = ["dep:postgres"]
 
 [dependencies]
 serde.workspace = true
@@ -38,6 +39,8 @@ schemars = "1"
 tempfile = "3"
 getrandom = "0.3"
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
+postgres = { version = "0.19", optional = true }
+yaml-rust2 = { version = "0.11", default-features = false }
 
 # Bash process hardening (rlimits via pre_exec) is Unix-only; elsewhere the policy still scrubs the
 # environment and enforces the wall-clock timeout, just without setrlimit.

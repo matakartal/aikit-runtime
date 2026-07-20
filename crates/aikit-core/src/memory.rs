@@ -16,11 +16,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPlane {
+    #[default]
+    Working,
+    Episodic,
+    Semantic,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_sequence: Option<u64>,
+    #[serde(default)]
+    pub model_generated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub namespace: String,
     pub key: String,
     pub value: Value,
+    #[serde(default)]
+    pub plane: MemoryPlane,
+    /// Optimistic concurrency revision. Zero is construction-time/unpersisted only.
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub provenance: MemoryProvenance,
     pub tags: BTreeSet<String>,
     pub importance: u8,
     pub created_unix_ms: u128,
@@ -34,6 +61,9 @@ impl MemoryEntry {
             namespace: namespace.into(),
             key: key.into(),
             value,
+            plane: MemoryPlane::Working,
+            revision: 0,
+            provenance: MemoryProvenance::default(),
             tags: BTreeSet::new(),
             importance: 50,
             created_unix_ms: now,
@@ -50,6 +80,16 @@ impl MemoryEntry {
         self.importance = importance.min(100);
         self
     }
+
+    pub fn with_plane(mut self, plane: MemoryPlane) -> Self {
+        self.plane = plane;
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: MemoryProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +98,7 @@ pub struct MemoryQuery {
     pub text: String,
     pub tags: BTreeSet<String>,
     pub limit: usize,
+    pub plane: Option<MemoryPlane>,
 }
 
 impl MemoryQuery {
@@ -67,7 +108,13 @@ impl MemoryQuery {
             text: text.into(),
             tags: BTreeSet::new(),
             limit,
+            plane: None,
         }
+    }
+
+    pub fn in_plane(mut self, plane: MemoryPlane) -> Self {
+        self.plane = Some(plane);
+        self
     }
 }
 
@@ -76,6 +123,15 @@ pub trait MemoryStore: Send + Sync {
     fn get(&self, namespace: &str, key: &str) -> std::result::Result<Option<MemoryEntry>, String>;
     fn search(&self, query: &MemoryQuery) -> std::result::Result<Vec<MemoryEntry>, String>;
     fn delete(&self, namespace: &str, key: &str) -> std::result::Result<bool, String>;
+
+    /// Atomic compare-and-swap. `expected_revision == 0` creates only when absent.
+    fn compare_and_swap(
+        &self,
+        _entry: MemoryEntry,
+        _expected_revision: u64,
+    ) -> std::result::Result<u64, String> {
+        Err("memory store does not implement compare-and-swap".into())
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +148,9 @@ impl MemoryStore for InMemoryMemoryStore {
             .map_err(|_| "memory mutex poisoned".to_string())?;
         if let Some(existing) = entries.get(&(entry.namespace.clone(), entry.key.clone())) {
             entry.created_unix_ms = existing.created_unix_ms;
+            entry.revision = existing.revision.saturating_add(1);
+        } else {
+            entry.revision = 1;
         }
         entry.updated_unix_ms = now_ms();
         entries.insert((entry.namespace.clone(), entry.key.clone()), entry);
@@ -122,6 +181,35 @@ impl MemoryStore for InMemoryMemoryStore {
             .map_err(|_| "memory mutex poisoned".to_string())?
             .remove(&(namespace.to_string(), key.to_string()))
             .is_some())
+    }
+
+    fn compare_and_swap(
+        &self,
+        mut entry: MemoryEntry,
+        expected_revision: u64,
+    ) -> std::result::Result<u64, String> {
+        validate_entry(&entry)?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "memory mutex poisoned".to_string())?;
+        let key = (entry.namespace.clone(), entry.key.clone());
+        let actual = entries.get(&key).map_or(0, |existing| existing.revision);
+        if actual != expected_revision {
+            return Err(format!(
+                "memory revision conflict: expected {expected_revision}, found {actual}"
+            ));
+        }
+        if let Some(existing) = entries.get(&key) {
+            entry.created_unix_ms = existing.created_unix_ms;
+        }
+        entry.revision = actual
+            .checked_add(1)
+            .ok_or_else(|| "memory revision overflow".to_string())?;
+        entry.updated_unix_ms = now_ms();
+        let revision = entry.revision;
+        entries.insert(key, entry);
+        Ok(revision)
     }
 }
 
@@ -173,6 +261,9 @@ impl MemoryStore for JsonFileMemoryStore {
         let mut next = entries.clone();
         if let Some(existing) = next.get(&(entry.namespace.clone(), entry.key.clone())) {
             entry.created_unix_ms = existing.created_unix_ms;
+            entry.revision = existing.revision.saturating_add(1);
+        } else {
+            entry.revision = 1;
         }
         entry.updated_unix_ms = now_ms();
         next.insert((entry.namespace.clone(), entry.key.clone()), entry);
@@ -212,6 +303,38 @@ impl MemoryStore for JsonFileMemoryStore {
             *entries = next;
         }
         Ok(removed)
+    }
+
+    fn compare_and_swap(
+        &self,
+        mut entry: MemoryEntry,
+        expected_revision: u64,
+    ) -> std::result::Result<u64, String> {
+        validate_entry(&entry)?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "memory mutex poisoned".to_string())?;
+        let mut next = entries.clone();
+        let key = (entry.namespace.clone(), entry.key.clone());
+        let actual = next.get(&key).map_or(0, |existing| existing.revision);
+        if actual != expected_revision {
+            return Err(format!(
+                "memory revision conflict: expected {expected_revision}, found {actual}"
+            ));
+        }
+        if let Some(existing) = next.get(&key) {
+            entry.created_unix_ms = existing.created_unix_ms;
+        }
+        entry.revision = actual
+            .checked_add(1)
+            .ok_or_else(|| "memory revision overflow".to_string())?;
+        entry.updated_unix_ms = now_ms();
+        let revision = entry.revision;
+        next.insert(key, entry);
+        self.persist(&next)?;
+        *entries = next;
+        Ok(revision)
     }
 }
 
@@ -445,6 +568,7 @@ fn rank_entries<'a>(
         .collect();
     let mut scored: Vec<(usize, u8, u128, String, MemoryEntry)> = entries
         .filter(|entry| entry.namespace == query.namespace)
+        .filter(|entry| query.plane.is_none_or(|plane| entry.plane == plane))
         .filter(|entry| query.tags.is_subset(&entry.tags))
         .map(|entry| {
             let haystack = format!("{} {}", entry.key, entry.value).to_ascii_lowercase();
@@ -502,6 +626,33 @@ mod tests {
         let got = store.search(&MemoryQuery::new("a", "tokio", 1)).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].namespace, "a");
+    }
+
+    #[test]
+    fn memory_planes_filter_and_cas_rejects_lost_updates() {
+        let store = InMemoryMemoryStore::default();
+        let working = MemoryEntry::new("agent", "scratch", json!("short lived"));
+        let semantic = MemoryEntry::new("agent", "rule", json!("always validate"))
+            .with_plane(MemoryPlane::Semantic)
+            .with_provenance(MemoryProvenance {
+                source_run_id: Some("run-1".into()),
+                source_event_sequence: Some(7),
+                model_generated: false,
+            });
+        store.put(working).unwrap();
+        assert_eq!(store.compare_and_swap(semantic.clone(), 0), Ok(1));
+
+        let semantic_results = store
+            .search(&MemoryQuery::new("agent", "", 10).in_plane(MemoryPlane::Semantic))
+            .unwrap();
+        assert_eq!(semantic_results.len(), 1);
+        assert_eq!(semantic_results[0].key, "rule");
+        assert_eq!(semantic_results[0].revision, 1);
+
+        let mut updated = semantic;
+        updated.value = json!("new value");
+        assert!(store.compare_and_swap(updated.clone(), 0).is_err());
+        assert_eq!(store.compare_and_swap(updated, 1), Ok(2));
     }
 
     #[test]

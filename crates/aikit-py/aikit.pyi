@@ -1,8 +1,9 @@
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Literal, Mapping, Optional, Protocol, Sequence, TypedDict, TypeVar, Union, overload
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Literal, Mapping, NoReturn, Optional, Protocol, Sequence, TypedDict, TypeVar, Union, overload
 
 JsonPrimitive = Union[str, int, float, bool, None]
 JsonValue = Union[JsonPrimitive, List["JsonValue"], Dict[str, "JsonValue"]]
 ProviderOptions = Mapping[str, Mapping[str, JsonValue]]
+ProviderMetadata = Dict[str, List[JsonValue]]
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
 
@@ -103,6 +104,128 @@ class Base64MediaSource(TypedDict):
 MediaSource = Union[UrlMediaSource, Base64MediaSource]
 
 
+class UrlMediaInputSource(TypedDict):
+    kind: Literal["url"]
+    url: str
+
+
+class Base64MediaInputSource(TypedDict):
+    kind: Literal["base64"]
+    data: str
+
+
+class BytesMediaInputSource(TypedDict):
+    kind: Literal["bytes"]
+    data: List[int]
+
+
+class ArtifactMediaInputSource(TypedDict):
+    kind: Literal["artifact"]
+    artifact_id: str
+
+
+MediaInputSource = Union[
+    UrlMediaInputSource,
+    Base64MediaInputSource,
+    BytesMediaInputSource,
+    ArtifactMediaInputSource,
+]
+
+
+class MediaInput(TypedDict):
+    media_type: str
+    source: MediaInputSource
+    sha256: str
+    size_bytes: int
+
+
+class OutputTextPart(TypedDict):
+    type: Literal["text"]
+    text: str
+
+
+class _OutputReasoningPartRequired(TypedDict):
+    type: Literal["reasoning"]
+    text: str
+
+
+class OutputReasoningPart(_OutputReasoningPartRequired, total=False):
+    signature: str
+    provider: str
+    opaque: JsonValue
+
+
+class OutputImagePart(TypedDict):
+    type: Literal["image"]
+    media: MediaInput
+
+
+class OutputAudioPart(TypedDict):
+    type: Literal["audio"]
+    media: MediaInput
+
+
+class _OutputFilePartRequired(TypedDict):
+    type: Literal["file"]
+    media: MediaInput
+
+
+class OutputFilePart(_OutputFilePartRequired, total=False):
+    filename: str
+
+
+class _OutputTranscriptPartRequired(TypedDict):
+    type: Literal["transcript"]
+    text: str
+
+
+class OutputTranscriptPart(_OutputTranscriptPartRequired, total=False):
+    language: str
+
+
+class OutputToolCallPart(TypedDict):
+    type: Literal["tool_call"]
+    id: str
+    name: str
+    input: JsonValue
+
+
+class OutputToolResultPart(TypedDict):
+    type: Literal["tool_result"]
+    tool_use_id: str
+    content: str
+    is_error: bool
+
+
+class OutputStructuredDataPart(TypedDict):
+    type: Literal["structured_data"]
+    value: JsonValue
+
+
+class _OutputCitationPartRequired(TypedDict):
+    type: Literal["citation"]
+    text: str
+
+
+class OutputCitationPart(_OutputCitationPartRequired, total=False):
+    source: str
+    metadata: JsonValue
+
+
+OutputPart = Union[
+    OutputTextPart,
+    OutputReasoningPart,
+    OutputImagePart,
+    OutputAudioPart,
+    OutputFilePart,
+    OutputTranscriptPart,
+    OutputToolCallPart,
+    OutputToolResultPart,
+    OutputStructuredDataPart,
+    OutputCitationPart,
+]
+
+
 class MediaBlock(TypedDict):
     type: Literal["media"]
     media_type: str
@@ -127,6 +250,9 @@ ContentBlock = Union[
     MediaBlock,
     CitationBlock,
 ]
+
+# Canonical v0.3 name; ContentBlock remains the v0.x compatibility spelling.
+ContentPart = ContentBlock
 
 
 class Message(TypedDict):
@@ -220,6 +346,16 @@ class ProviderCapabilityView(TypedDict):
     structured_output: Literal[
         "native_constrained", "forced_tool_call", "prompted_and_parsed"
     ]
+    structured_output_features: "StructuredOutputCapabilities"
+
+
+class StructuredOutputCapabilities(TypedDict):
+    native_schema: CapabilityState
+    forced_tool: CapabilityState
+    prompted_parse: CapabilityState
+    schema_with_tools: CapabilityState
+    streaming_schema: CapabilityState
+    parallel_tools: CapabilityState
 
 
 class AgentCapabilities(TypedDict):
@@ -353,7 +489,28 @@ class RetryPolicy(TypedDict, total=False):
     per_attempt_timeout_ms: int
 
 
-class ModelProfile(TypedDict):
+CapabilityState = Literal["supported", "unsupported", "unknown"]
+CompatibilityMode = Literal["strict", "warn", "best_effort"]
+ModelCapability = Union[
+    Literal[
+        "reasoning",
+        "prompt_cache",
+        "citations",
+        "vision",
+        "native_structured_output",
+        "tool_use",
+        "image_generation",
+        "document_input",
+        "audio_input",
+        "transcription",
+        "speech_generation",
+        "realtime_duplex",
+    ],
+    Dict[str, str],
+]
+
+
+class _ModelProfileRequired(TypedDict):
     provider: str
     model: str
     context_window_tokens: int
@@ -361,7 +518,86 @@ class ModelProfile(TypedDict):
     pricing: Optional[ModelPricing]
     quality_score: int
     skills: List[str]
-    capabilities: List[Union[str, Dict[str, str]]]
+    capabilities: List[ModelCapability]
+
+
+class ModelProfile(_ModelProfileRequired, total=False):
+    capability_states: Dict[str, CapabilityState]
+
+
+ModalityRequirement = Literal[
+    "text",
+    "reasoning",
+    "image_input",
+    "image_generation",
+    "document_input",
+    "audio_input",
+    "transcription",
+    "speech_generation",
+    "realtime_duplex",
+    "tool_use",
+    "structured_output",
+]
+
+
+class _MediaArtifactRequired(TypedDict):
+    artifact_id: str
+    media_type: str
+    sha256: str
+    size_bytes: int
+
+
+class MediaArtifact(_MediaArtifactRequired, total=False):
+    provider: str
+    model: str
+
+
+class _GeneratedImageRequired(TypedDict):
+    artifact: MediaArtifact
+
+
+class GeneratedImage(_GeneratedImageRequired, total=False):
+    revised_prompt: str
+    provider_metadata: JsonValue
+
+
+class _GeneratedAudioRequired(TypedDict):
+    artifact: MediaArtifact
+
+
+class GeneratedAudio(_GeneratedAudioRequired, total=False):
+    duration_ms: int
+    voice: str
+    provider_metadata: JsonValue
+
+
+class _TranscriptSegmentRequired(TypedDict):
+    start_ms: int
+    end_ms: int
+    text: str
+
+
+class TranscriptSegment(_TranscriptSegmentRequired, total=False):
+    speaker: str
+    confidence: float
+
+
+class _TranscriptRequired(TypedDict):
+    text: str
+    segments: List[TranscriptSegment]
+
+
+class Transcript(_TranscriptRequired, total=False):
+    language: str
+    provider_metadata: JsonValue
+
+
+class VoiceActivityPolicy(TypedDict):
+    enabled: bool
+    threshold: float
+    prefix_padding_ms: int
+    silence_duration_ms: int
+    interrupt_response: bool
 
 
 class RouteRequest(TypedDict):
@@ -371,7 +607,7 @@ class RouteRequest(TypedDict):
     required_output_tokens: int
     max_cost_usd: Optional[float]
     required_skills: List[str]
-    required_capabilities: List[Union[str, Dict[str, str]]]
+    required_capabilities: List[ModelCapability]
 
 
 class RoutingOptions(TypedDict):
@@ -407,10 +643,19 @@ class MemoryEntry(TypedDict):
     namespace: str
     key: str
     value: JsonValue
+    plane: Literal["working", "episodic", "semantic"]
+    revision: int
+    provenance: "MemoryProvenance"
     tags: List[str]
     importance: int
     created_unix_ms: int
     updated_unix_ms: int
+
+
+class MemoryProvenance(TypedDict, total=False):
+    source_run_id: str
+    source_event_sequence: int
+    model_generated: bool
 
 
 class BudgetLimits(TypedDict, total=False):
@@ -727,9 +972,127 @@ StreamDelta = Union[
 ]
 
 
+class _ProviderWarningRequired(TypedDict):
+    code: str
+    message: str
+
+
+class ProviderWarning(_ProviderWarningRequired, total=False):
+    parameter: str
+    provider: str
+    model: str
+
+
+StreamBlockKind = Literal[
+    "text",
+    "reasoning",
+    "tool_call",
+    "tool_result",
+    "citation",
+    "image",
+    "audio",
+    "transcript",
+    "structured_data",
+]
+
+
+class _StreamEventEnvelope(TypedDict):
+    event_id: str
+    sequence: int
+
+
+class ResponseStartEvent(_StreamEventEnvelope):
+    type: Literal["response_start"]
+    response_id: str
+    model: str
+
+
+class _BlockStartEventRequired(_StreamEventEnvelope):
+    type: Literal["block_start"]
+    block_id: str
+    block_kind: StreamBlockKind
+
+
+class BlockStartEvent(_BlockStartEventRequired, total=False):
+    name: str
+
+
+class BlockDeltaEvent(_StreamEventEnvelope):
+    type: Literal["block_delta"]
+    block_id: str
+    delta: JsonValue
+
+
+class _BlockEndEventRequired(_StreamEventEnvelope):
+    type: Literal["block_end"]
+    block_id: str
+
+
+class BlockEndEvent(_BlockEndEventRequired, total=False):
+    value: JsonValue
+
+
+class ProviderMetadataEvent(_StreamEventEnvelope):
+    type: Literal["provider_metadata"]
+    provider: str
+    metadata: JsonValue
+
+
+class StreamUsageEvent(_StreamEventEnvelope):
+    type: Literal["usage"]
+    usage: Usage
+
+
+class StreamWarningEvent(_StreamEventEnvelope):
+    type: Literal["warning"]
+    warning: ProviderWarning
+
+
+class ResponseEndEvent(_StreamEventEnvelope):
+    type: Literal["response_end"]
+    response_id: str
+    stop_reason: str
+
+
+class StreamErrorEvent(_StreamEventEnvelope):
+    type: Literal["error"]
+    message: str
+    info: ErrorInfo
+
+
+class RawProviderEvent(_StreamEventEnvelope):
+    type: Literal["raw_provider_event"]
+    provider: str
+    event: JsonValue
+
+
+StreamEvent = Union[
+    ResponseStartEvent,
+    BlockStartEvent,
+    BlockDeltaEvent,
+    BlockEndEvent,
+    ProviderMetadataEvent,
+    StreamUsageEvent,
+    StreamWarningEvent,
+    ResponseEndEvent,
+    StreamErrorEvent,
+    RawProviderEvent,
+]
+
+
+class QueryEventStream(AsyncIterator[StreamEvent]):
+    def __aiter__(self) -> "QueryEventStream": ...
+    async def __anext__(self) -> StreamEvent: ...
+    def cancel(self) -> None: ...
+    def is_cancelled(self) -> bool: ...
+    async def aclose(self) -> RunOutcome: ...
+    def outcome(self) -> RunOutcome: ...
+
+
 class QueryStream(AsyncIterator[StreamDelta]):
     def __aiter__(self) -> "QueryStream": ...
     async def __anext__(self) -> StreamDelta: ...
+    def events(self, response_id: str) -> QueryEventStream: ...
     async def __aenter__(self) -> "QueryStream": ...
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
     def cancel(self) -> None: ...
@@ -758,14 +1121,21 @@ class McpToolFilter(TypedDict, total=False):
     allow: Sequence[str]
     deny: Sequence[str]
 
-class McpServer:
+class McpConnection:
+    def __init__(self, _factory_only: NoReturn) -> None: ...
     async def list_resources(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
     async def read_resource(self, uri: str) -> JsonValue: ...
     async def list_prompts(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
     async def get_prompt(self, name: str, arguments: JsonValue) -> JsonValue: ...
 
-async def connect_mcp_http(endpoint: str, name: str, bearer_token: Optional[str] = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpServer: ...
-async def connect_mcp_stdio(program: str, args: Sequence[str], name: str, env: Optional[Mapping[str, str]] = ..., inherit_env: bool = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpServer: ...
+class _LegacyNamespace:
+    """Deprecated v0.x compatibility namespace."""
+    McpServer: type[McpConnection]
+
+legacy: _LegacyNamespace
+
+async def connect_mcp_http(endpoint: str, name: str, bearer_token: Optional[str] = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpConnection: ...
+async def connect_mcp_stdio(program: str, args: Sequence[str], name: str, env: Optional[Mapping[str, str]] = ..., inherit_env: bool = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpConnection: ...
 
 
 @overload
@@ -821,7 +1191,7 @@ class Agent:
     ) -> None:
         """Register browser tools after asserting an exact external host/public-IP boundary."""
         ...
-    def register_mcp(self, server: McpServer) -> None: ...
+    def register_mcp(self, server: McpConnection) -> None: ...
     def enable_capability_requests(self, gated_tools: Sequence[str]) -> None: ...
     def enable_default_guardrails(self, blocked_input_patterns: Sequence[str] = ...) -> None: ...
     def add_key(self, key: str, provider: Optional[str] = ...) -> str: ...
@@ -954,6 +1324,14 @@ class Agent:
     ) -> ObjectStream[JsonValue]: ...
 
     def remember(self, key: str, value: JsonValue) -> None: ...
+    def remember_cas(
+        self,
+        key: str,
+        value: JsonValue,
+        expected_revision: int,
+        plane: Literal["working", "episodic", "semantic"] = ...,
+        provenance: Optional[MemoryProvenance] = ...,
+    ) -> int: ...
     def recall(self, query: str, limit: int = ...) -> List[MemoryEntry]: ...
     def route(
         self, profiles: Sequence[ModelProfile], request: RouteRequest
@@ -1017,6 +1395,164 @@ class Agent:
     def __repr__(self) -> str: ...
 
 
+DurabilityMode = Literal["sync", "async", "exit"]
+DurableRunStatus = Literal[
+    "running", "paused", "reconcile_required", "completed", "failed", "cancelled"
+]
+
+
+class DurableRunState(TypedDict):
+    schema_version: int
+    session_id: str
+    run_id: str
+    durability: DurabilityMode
+    parent_run_id: Optional[str]
+    events: List[Dict[str, JsonValue]]
+    checkpoints: Dict[str, JsonValue]
+    projection: Dict[str, JsonValue]
+
+
+class Checkpoint(TypedDict):
+    checkpoint_id: str
+    run_id: str
+    event_sequence: int
+    parent_checkpoint_id: Optional[str]
+    label: Optional[str]
+    projection: Dict[str, JsonValue]
+
+
+class _ResumeCommandRequired(TypedDict):
+    command: Literal["resume"]
+    command_id: str
+
+class ResumeCommand(_ResumeCommandRequired, total=False):
+    approvals: List[Dict[str, JsonValue]]
+
+
+class ForkCommand(TypedDict):
+    command: Literal["fork"]
+    command_id: str
+    new_run_id: str
+    checkpoint_id: str
+    side_effects_reconciled: bool
+
+
+class RewindCommand(TypedDict):
+    command: Literal["rewind"]
+    command_id: str
+    checkpoint_id: str
+    side_effects_reconciled: bool
+
+
+class _CancelCommandRequired(TypedDict):
+    command: Literal["cancel"]
+    command_id: str
+
+
+class CancelCommand(_CancelCommandRequired, total=False):
+    reason: Optional[str]
+
+
+DurableCommand = Union[ResumeCommand, ForkCommand, RewindCommand, CancelCommand]
+
+
+class DurableCommandResult(TypedDict, total=False):
+    type: Literal["resumed", "forked", "rewound", "cancelled"]
+    sequence: int
+    checkpoint_id: str
+    run: DurableRunState
+
+
+class DurableRun:
+    def __init__(
+        self, session_id: str, run_id: str, durability: DurabilityMode = ...
+    ) -> None: ...
+    @staticmethod
+    def from_state(state: DurableRunState) -> "DurableRun": ...
+    @property
+    def schema_version(self) -> int: ...
+    @property
+    def session_id(self) -> str: ...
+    @property
+    def run_id(self) -> str: ...
+    @property
+    def durability(self) -> DurabilityMode: ...
+    @property
+    def status(self) -> DurableRunStatus: ...
+    def snapshot(self) -> DurableRunState: ...
+    def replace_state(
+        self, mutation_id: str, state: JsonValue
+    ) -> DurableRunState: ...
+    def checkpoint(
+        self, checkpoint_key: str, label: Optional[str] = ...
+    ) -> Checkpoint: ...
+    def pause(self, pause_id: str, reason: str) -> None: ...
+    def request_approval(
+        self,
+        logical_key: str,
+        prompt: str,
+        payload: JsonValue,
+        activity_id: Optional[str] = ...,
+    ) -> str: ...
+    def complete(self, completion_id: str) -> None: ...
+    def fail(self, failure_id: str, error: str) -> None: ...
+    def apply_command(self, command: DurableCommand) -> DurableCommandResult: ...
+
+
+class SimpleTraceAssertion(TypedDict):
+    type: Literal[
+        "stream_sequence_monotonic",
+        "stream_blocks_balanced",
+        "durable_sequence_monotonic",
+        "no_duplicate_activity_completion",
+        "all_required_reconciliations_resolved",
+    ]
+
+
+class ApprovalResolvedTraceAssertion(TypedDict):
+    type: Literal["approval_resolved"]
+    approval_id: str
+    approved: bool
+
+
+class RunStatusTraceAssertion(TypedDict):
+    type: Literal["run_status"]
+    status: DurableRunStatus
+
+
+TraceAssertion = Union[
+    SimpleTraceAssertion,
+    ApprovalResolvedTraceAssertion,
+    RunStatusTraceAssertion,
+]
+
+
+class EvalSuite(TypedDict):
+    schema_version: int
+    name: str
+    assertions: List[TraceAssertion]
+
+
+class TraceInput(TypedDict, total=False):
+    stream_events: List[StreamEvent]
+    durable_events: List[Dict[str, JsonValue]]
+    run_status: Optional[DurableRunStatus]
+
+
+class TraceCheck(TypedDict):
+    assertion: str
+    passed: bool
+    message: str
+
+
+class TraceEvalResult(TypedDict):
+    suite: str
+    passed: bool
+    passed_checks: int
+    total_checks: int
+    checks: List[TraceCheck]
+
+
 class Client:
     def __init__(self, agent: Agent) -> None: ...
     def query(self, prompt: PromptInput, options: Optional[RunOptions] = ...) -> QueryStream: ...
@@ -1032,6 +1568,9 @@ def query(
 
 
 def evaluate_outcome(outcome: RunOutcome, gates: Sequence[EvalGate]) -> EvalVerdict: ...
+
+
+def evaluate_trace(suite: EvalSuite, trace: TraceInput) -> TraceEvalResult: ...
 
 
 __version__: str

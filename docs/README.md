@@ -10,12 +10,14 @@ milestone cannot be mistaken for present behavior.
 | Document | Audience | Purpose |
 |---|---|---|
 | [Architecture](ARCHITECTURE.md) | Builders and reviewers | Component ownership, request lifecycle, state, and trust boundaries. |
+| [Competitor parity matrix](PARITY-MATRIX.md) | Everyone | Exact upstream pins, local evidence, honest gaps, and v1 release gate. |
 | [Feature reference](FEATURES.md) | Builders | Runtime capabilities, fidelity, governance, routing, state, and limits. |
 | [Threat model](THREAT-MODEL.md) | Security reviewers | Guarantees and exclusions for built-in tools and Bash containment. |
 | [Live-provider harness](LIVE-SMOKE.md) | Maintainers | Explicit, billable real-provider acceptance contract. |
 | [Distribution guide](RELEASE.md) | Maintainers | Source-first policy and manual artifact assembly. |
-| [0.2 migration guide](MIGRATING-0.2.md) | Integrators | Breaking changes from the 0.1 source preview and safe upgrade steps. |
-| [Implementation matrix](V1-COMPLETION-MATRIX.md) | Contributors | 0.2 implementation proof vs external release blockers. |
+| [0.3 migration guide](MIGRATING-0.3.md) | Integrators | Stream, MCP naming, capability and durability migration. |
+| [0.2 migration guide](MIGRATING-0.2.md) | Integrators | Historical changes from the 0.1 source preview. |
+| [Implementation matrix](V1-COMPLETION-MATRIX.md) | Contributors | Historical 0.2 inventory; parity status now lives in `PARITY-MATRIX.md`. |
 | [Project status](PROJECT-STATUS.md) | Everyone | Current shareability and source-distribution boundaries. |
 | [Evaluation guide](EVALUATIONS.md) | Builders and CI owners | Keyless datasets, deterministic gates, and reports. |
 
@@ -95,7 +97,7 @@ Use this ownership order when behavior changes:
 2. Root `README.md` stays the concise public overview and source quick start.
 3. `FEATURES.md` owns the detailed capability contract; `THREAT-MODEL.md` owns security claims.
 4. Binding/CLI README files own language-specific syntax and lifecycle details.
-5. `PROJECT-STATUS.md`, `V1-COMPLETION-MATRIX.md`, and release docs own proof boundaries; they must
+5. `PROJECT-STATUS.md`, `PARITY-MATRIX.md`, and release docs own proof boundaries; they must
    never turn a local/keyless check into a live-provider or registry-release claim.
 6. Phase and evidence files are historical. Add a current banner or new record instead of rewriting
    old facts, hashes, or workflow URLs.

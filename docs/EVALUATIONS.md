@@ -97,8 +97,19 @@ Keep keyless datasets under `evals/` and run them as an ordinary required check:
 
 ```yaml
 - name: Deterministic agent evaluations
-  run: cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json
+  run: |
+    cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json
+    cargo +1.97.1 run -p aikit-cli --locked -- eval evals/governance-allowed.json --demo-tools allowed
+    cargo +1.97.1 run -p aikit-cli --locked -- eval evals/governance-denied.json --demo-tools denied
 ```
+
+`--demo-tools` registers one deterministic, side-effect-free probe tool so governance-trajectory
+datasets can exercise a real tool call keylessly; `denied` additionally installs a deny rule so the
+call is refused before execution. The denied dataset deliberately omits `no_tool_errors` because an
+authoritative denial *is* an error tool result — the gate vocabulary cannot positively assert "an
+error occurred", so it asserts that the loop survives the denial (`called_tool` plus
+`terminal_status: completed`) instead. Executor non-execution on denial is proven directly by the
+core runtime tests.
 
 Do not add `--allow-live` to normal pull-request CI. Live evaluation is non-deterministic,
 network-dependent, potentially billable, and should use a separately approved workflow with

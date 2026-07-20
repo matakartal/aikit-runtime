@@ -13,17 +13,28 @@ pub mod agent;
 pub mod budget;
 pub mod cancellation;
 pub mod capabilities;
+pub mod catalog;
 pub mod client;
 pub mod compaction;
+pub mod contract;
 pub mod credentials;
+pub mod durability;
+pub mod durable_store;
 pub mod dx;
 pub mod error;
 pub mod eval;
 pub mod governance;
 pub mod mcp;
+pub mod media_runtime;
 pub mod memory;
+pub mod multimodal;
 pub mod observability;
 pub mod orchestration;
+#[cfg(feature = "postgres-store")]
+pub mod postgres_store;
+pub mod protocols;
+pub mod provider_media;
+pub mod provider_validation;
 pub mod providers;
 pub mod reasoning;
 pub mod resilience;
@@ -31,7 +42,10 @@ pub mod routing;
 pub mod runtime;
 pub mod session;
 pub mod sqlite;
+pub mod streaming;
+pub mod temporal_adapter;
 pub mod tools;
+pub mod trace_eval;
 pub mod types;
 
 pub use agent::{Agent, AgentCapabilities, AgentError, GeneratedText, ProviderCapabilityView};
@@ -40,14 +54,35 @@ pub use budget::{
     BudgetLimits, BudgetPolicy, BudgetReservation, BudgetSnapshot, BudgetTracker, ModelPricing,
 };
 pub use cancellation::{CancellationHandle, CancellationToken};
-pub use capabilities::{Capabilities, CapabilityRegistry, FidelityGrade};
+pub use capabilities::{
+    Capabilities, CapabilityRegistry, FidelityGrade, StructuredOutputCapabilities,
+};
+pub use catalog::{
+    CatalogSource, ModelCatalogError, ModelCatalogOverrides, ModelCatalogSnapshot,
+    ResolvedModelCatalog, MODEL_CATALOG_SCHEMA_VERSION, SHIPPED_MODEL_CATALOG_HASH,
+    SHIPPED_MODEL_CATALOG_JSON, SHIPPED_MODEL_CATALOG_VERSION,
+};
 pub use client::{
     query, query_cancellable, query_messages, query_messages_cancellable,
     query_messages_with_executor, query_with_executor, AgentOptions, CancellableRun, Client,
     DeltaStream, RoutingOptions,
 };
 pub use compaction::{compact_messages, estimate_tokens, CompactionPolicy};
+pub use contract::{
+    CapabilityState, CompatibilityMode, MediaInput, MediaInputSource, OutputPart, ProviderWarning,
+    StreamBlockKind, StreamEvent, StreamEventKind,
+};
 pub use credentials::{resolve_provider, KeyGuess, ResolveError};
+pub use durability::{
+    stable_id, stable_input_hash, ActivityAttempt, ActivityAttemptStatus, ActivityDecision,
+    ActivityDefinition, ActivityReconciliation, ActivityRecord, AppendOutcome, ApprovalResolution,
+    ArtifactMetadata, Checkpoint, CommandOutcome, DurabilityError, DurabilityMode,
+    DurabilityResult, DurableApproval, DurableApprovalStatus, DurableRunStatus, RunCommand,
+    RunEvent, RunEventKind, RunProjection, RunState, SideEffectClass, DURABILITY_SCHEMA_VERSION,
+};
+pub use durable_store::{
+    DurableStore, DurableStoreError, DurableStoreResult, InMemoryDurableStore,
+};
 pub use dx::{
     generate_object, generate_object_messages, generate_object_messages_observed,
     generate_object_observed, generate_object_typed, generate_object_typed_messages, stream_object,
@@ -69,6 +104,19 @@ pub use governance::containment::{
     ContainmentCapabilityReport, ContainmentGuarantees, ContainmentPolicy, ContainmentRequirement,
     DockerConfig,
 };
+pub use governance::contracts::{
+    AgentDefinition, ApprovalCheckContext, ApprovalDenyReason, ApprovalEvidence,
+    ApprovalEvidenceDecision, ApprovalEvidenceOutcome, ApprovalScope, DataFlowDecision,
+    DataFlowPolicy, DataLabel, DataSink, DataSinkKind, DataSourceKind, EgressDecision,
+    EgressPolicy, FilesystemProfile, FlowEffect, GovernanceContractError, PolicyDocument,
+    PolicyEffect, PolicyEvaluationContext, PolicyScope, PolicySnapshot, Provenance, SandboxProfile,
+    ScopedPolicyDecision, ScopedPolicyRule, SkillManifest, SourceToSinkRule, ToolDescriptor,
+    GOVERNANCE_CONTRACT_VERSION,
+};
+pub use governance::egress_broker::{
+    BrowserProxyAssertion, EgressBroker, EgressBrokerBuilder, EgressBrokerError, EgressDnsResolver,
+    EgressRequest, EgressResponse, EgressScheme, SystemDnsResolver,
+};
 pub use governance::guardrail::{
     GuardedExecutor, Guardrail, GuardrailChain, GuardrailVerdict, McpGuardrail, PiiRedactor,
     RegexBlocklist, SecretRedactor,
@@ -86,12 +134,18 @@ pub use governance::permissions::{
 };
 pub use governance::plan::{review_plan, Plan, PlanOutcome, PlanReview, PlanReviewer, PlanStep};
 pub use governance::policy::{PolicyMode, PolicySpec};
+pub use governance::policy_adapters::*;
 pub use governance::process::{run_bash_with_containment, BashPolicy};
 pub use governance::reliability::{
     ReliabilityPolicy, ReliabilityVerdict, RunProgress, ToolRequirement,
 };
 pub use governance::risk::{HeuristicRiskScorer, RiskLevel, RiskScorer, SmartApprover};
 pub use governance::sandbox::{Sandbox, SandboxError};
+pub use governance::skills::{
+    authorize_executable_skill, ExecutableSkillGrant, LoadedSkill, SkillExecutionMode,
+    SkillInspectionPolicy, SkillLoadError, SkillLoader, SkillPackage, SkillSourcePin,
+    MAX_SKILL_FILE_BYTES, MAX_SKILL_TOTAL_BYTES,
+};
 pub use governance::{
     ApprovalDecision, ApprovalRequest, Authorization, AuthorizationContext, AuthorizationReport,
     Governance, PermissionUpdate, ToolApprover,
@@ -101,22 +155,40 @@ pub use mcp::{
     StdioTransport, StreamableHttpTransport, MAX_MCP_TOOL_FILTER_NAMES, MAX_MCP_TOOL_NAME_CHARS,
     MCP_PROTOCOL_VERSION,
 };
-pub use memory::{InMemoryMemoryStore, JsonFileMemoryStore, MemoryEntry, MemoryQuery, MemoryStore};
+pub use media_runtime::*;
+pub use memory::{
+    InMemoryMemoryStore, JsonFileMemoryStore, MemoryEntry, MemoryPlane, MemoryProvenance,
+    MemoryQuery, MemoryStore,
+};
+pub use multimodal::{
+    GeneratedAudio, GeneratedImage, MediaArtifact, ModalityRequirement, RealtimeEvent,
+    RealtimeEventKind, RealtimeSession, RealtimeSessionState, Transcript, TranscriptSegment,
+    VoiceActivityPolicy, MAX_REALTIME_DEDUPE_EVENTS,
+};
 #[cfg(feature = "opentelemetry")]
 pub use observability::OpenTelemetryAuditSink;
 pub use observability::{
     AuditEvent, AuditFailureMode, AuditPayloadPolicy, AuditRecord, AuditSink, AuditTrail,
-    InMemoryAuditSink, JsonlAuditSink,
+    InMemoryAuditSink, JsonlAuditSink, TelemetryPolicy, TraceCollector, TraceSpan, TraceSpanKind,
+    TraceSpanStatus,
 };
 pub use orchestration::{
     CouncilResult, CouncilStatus, ExecutionContext, ModelRouteRequirements, Orchestrator,
     ScopedToolExecutor, SubagentFailure, SubagentResult, SubagentSpec, SubagentStatus,
 };
+#[cfg(feature = "postgres-store")]
+pub use postgres_store::PostgresDurableStore;
+pub use protocols::*;
+pub use provider_media::*;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::deepseek::DeepSeekProvider;
 pub use providers::google::GeminiProvider;
+pub use providers::groq::{GroqConfig, GroqProvider};
+pub use providers::mistral::{MistralConfig, MistralProvider};
 pub use providers::openai::OpenAiProvider;
 pub use providers::openai_responses::OpenAiResponsesProvider;
+pub use providers::openrouter::{OpenRouterConfig, OpenRouterProvider};
+pub use providers::xai::{XaiConfig, XaiProvider};
 pub use providers::{MockProvider, Provider, ProviderRequest};
 pub use reasoning::{
     blocks_for_provider_replay, blocks_for_replay, validate_replay, ReplayError, ReplayPolicy,
@@ -134,13 +206,22 @@ pub use session::{
     InMemorySessionStore, JsonFileSessionStore, RunOutcome, RunRecorder, RunTerminalStatus,
     Session, SessionExecutionLease, SessionStore, SessionStoreError, SessionStoreResult,
 };
-pub use sqlite::{SqliteMemoryStore, SqliteSessionStore};
+pub use sqlite::{SqliteDurableStore, SqliteMemoryStore, SqliteSessionStore};
+pub use streaming::{StreamEncodingError, StreamEncodingResult, StreamEventEncoder};
+pub use temporal_adapter::{
+    TemporalActivityInvocation, TemporalActivityOutcome, TemporalActivityPlan,
+    TemporalActivitySpec, TemporalAdapter, TemporalAdapterConfig, TemporalAdapterError,
+    TemporalAdapterResult, TemporalReconciliationPlan, TemporalRetryPolicy,
+};
 pub use tools::builtin::BuiltinTools;
 pub use tools::web::{BrowserEgressPolicy, BrowserTools, WebTools};
 pub use tools::{tool, NoTools, ToolExecutor, ToolRouter};
+pub use trace_eval::{
+    evaluate_trace, EvalResult, EvalSuite, TraceAssertion, TraceCheck, TraceInput,
+};
 pub use types::{
-    ContentBlock, MediaSource, Message, ProviderMetadata, ProviderOptions, Role, StreamDelta,
-    ToolSpec, Usage,
+    ContentBlock, ContentPart, MediaSource, Message, ProviderMetadata, ProviderOptions, Role,
+    StreamDelta, ToolSpec, Usage,
 };
 
 #[cfg(test)]

@@ -46,8 +46,33 @@ pub fn build_request(
     tools: &[ToolSpec],
     provider_options: Option<&serde_json::Map<String, Value>>,
 ) -> crate::error::Result<Value> {
-    super::reject_protected_options(
+    build_compatible_request(
         "openai",
+        "max_completion_tokens",
+        true,
+        model,
+        max_tokens,
+        messages,
+        tools,
+        provider_options,
+    )
+}
+
+/// Shared OpenAI-compatible request translation. Provider adapters select their own canonical
+/// name and output-token field while preserving the same canonical message/tool contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_compatible_request(
+    provider: &str,
+    output_token_field: &str,
+    include_usage_stream_option: bool,
+    model: &str,
+    max_tokens: u64,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    provider_options: Option<&serde_json::Map<String, Value>>,
+) -> crate::error::Result<Value> {
+    super::reject_protected_options(
+        provider,
         model,
         provider_options,
         &[
@@ -128,15 +153,17 @@ pub fn build_request(
 
     let mut req = serde_json::json!({
         "model": model,
-        // `max_completion_tokens` is accepted by BOTH reasoning (o1/o3/o4-mini/gpt-5) and current
-        // non-reasoning chat models; the legacy `max_tokens` is rejected (HTTP 400) by reasoning
-        // models. Provider options may not replace this canonical output ceiling.
-        "max_completion_tokens": max_tokens,
         "messages": wire,
         "stream": true,
-        // Ask for the terminal usage chunk (choices:[], usage:{...}) on the stream.
-        "stream_options": { "include_usage": true },
     });
+    if include_usage_stream_option {
+        // OpenAI, OpenRouter, Groq, and xAI accept this opt-in for a terminal usage chunk.
+        // Mistral's native schema has no `stream_options` request field and already reports usage.
+        req["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+    // OpenAI/Groq prefer `max_completion_tokens`; Mistral uses `max_tokens`. The adapter owns
+    // that compatibility choice and escape-hatch options may replace neither spelling.
+    req[output_token_field] = Value::from(max_tokens);
     if !tools.is_empty() {
         req["tools"] = Value::Array(
             tools
@@ -221,8 +248,9 @@ struct ToolCallAccum {
 ///
 /// Unlike [`super::deepseek::DeepSeekStreamParser`], there is no `reasoning_content` to handle:
 /// Chat Completions never streams reasoning items, so no `Reasoning*` deltas are emitted.
-#[derive(Default)]
 pub struct OpenAiStreamParser {
+    provider_name: String,
+    public_provider_name: String,
     started: bool,
     terminal: bool,
     tool_calls: BTreeMap<u64, ToolCallAccum>,
@@ -232,9 +260,29 @@ pub struct OpenAiStreamParser {
     retention: super::StreamRetentionBudget,
 }
 
+impl Default for OpenAiStreamParser {
+    fn default() -> Self {
+        Self::for_provider("openai", "OpenAI Chat")
+    }
+}
+
 impl OpenAiStreamParser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn for_provider(provider_name: &str, public_provider_name: &str) -> Self {
+        Self {
+            provider_name: provider_name.to_string(),
+            public_provider_name: public_provider_name.to_string(),
+            started: false,
+            terminal: false,
+            tool_calls: BTreeMap::new(),
+            tool_calls_emitted: false,
+            stop_reason: String::new(),
+            usage: Usage::default(),
+            retention: super::StreamRetentionBudget::default(),
+        }
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -244,6 +292,12 @@ impl OpenAiStreamParser {
     pub fn push_chunk(&mut self, chunk: &Value) -> Vec<StreamDelta> {
         if self.terminal {
             return Vec::new();
+        }
+        if let Some(error) = chunk.get("error").filter(|error| error.is_object()) {
+            return self.terminal_failure(
+                compatible_stream_error_kind(error),
+                format!("{} stream reported an error", self.public_provider_name),
+            );
         }
         let mut out = Vec::new();
 
@@ -332,9 +386,15 @@ impl OpenAiStreamParser {
         }
         if let Some(message) = self.tool_calls.values().find_map(|call| {
             if call.id.is_empty() {
-                Some("OpenAI tool call is missing its id".to_string())
+                Some(format!(
+                    "{} tool call is missing its id",
+                    self.public_provider_name
+                ))
             } else if call.name.is_empty() {
-                Some(format!("OpenAI tool call {} is missing its name", call.id))
+                Some(format!(
+                    "{} tool call {} is missing its name",
+                    self.public_provider_name, call.id
+                ))
             } else if !call.args.trim().is_empty()
                 && serde_json::from_str::<Value>(&call.args).is_err()
             {
@@ -375,8 +435,10 @@ impl OpenAiStreamParser {
             return Vec::new();
         }
         if self.stop_reason.is_empty() {
-            return self
-                .terminal_protocol_failure("OpenAI Chat [DONE] arrived before finish_reason");
+            return self.terminal_protocol_failure(format!(
+                "{} [DONE] arrived before finish_reason",
+                self.public_provider_name
+            ));
         }
         let mut out = self.emit_tool_calls();
         if self.terminal {
@@ -397,14 +459,26 @@ impl OpenAiStreamParser {
         self.terminal = true;
         self.tool_calls.clear();
         self.stop_reason.clear();
-        vec![super::retained_state_failure("openai")]
+        vec![super::retained_state_failure(&self.provider_name)]
     }
 
     fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal_failure(crate::error::ProviderErrorKind::Protocol, message)
+    }
+
+    fn terminal_failure(
+        &mut self,
+        kind: crate::error::ProviderErrorKind,
+        message: impl Into<String>,
+    ) -> Vec<StreamDelta> {
         self.terminal = true;
         self.tool_calls.clear();
         self.stop_reason.clear();
-        vec![super::protocol_failure("openai", message)]
+        vec![super::stream_failure_without_model(
+            &self.provider_name,
+            kind,
+            message,
+        )]
     }
 
     fn absorb_usage(&mut self, u: &Value) {
@@ -429,6 +503,39 @@ impl OpenAiStreamParser {
         {
             self.usage.reasoning_tokens = n;
         }
+    }
+}
+
+fn compatible_stream_error_kind(error: &Value) -> crate::error::ProviderErrorKind {
+    let status = error
+        .get("status")
+        .or_else(|| error.get("code"))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok());
+    match status {
+        Some(401 | 403) => return crate::error::ProviderErrorKind::Authentication,
+        Some(408) => return crate::error::ProviderErrorKind::Timeout,
+        Some(429) => return crate::error::ProviderErrorKind::RateLimited,
+        Some(500..=599) => return crate::error::ProviderErrorKind::Server,
+        Some(400..=499) => return crate::error::ProviderErrorKind::InvalidRequest,
+        _ => {}
+    }
+
+    match error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "authentication" | "authentication_error" | "invalid_api_key" => {
+            crate::error::ProviderErrorKind::Authentication
+        }
+        "rate_limit_exceeded" | "rate_limit_error" => crate::error::ProviderErrorKind::RateLimited,
+        "request_timeout" | "timeout" => crate::error::ProviderErrorKind::Timeout,
+        "server_error" | "overloaded_error" => crate::error::ProviderErrorKind::Server,
+        "content_filter" | "safety" => crate::error::ProviderErrorKind::Safety,
+        "bad_request" | "invalid_request_error" => crate::error::ProviderErrorKind::InvalidRequest,
+        _ => crate::error::ProviderErrorKind::Protocol,
     }
 }
 
@@ -497,134 +604,167 @@ impl Provider for OpenAiProvider {
         &self,
         req: ProviderRequest,
     ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
-        let options = req.options_for(self.name());
-        let wire_model = self
-            .model_prefix
-            .as_deref()
-            .and_then(|prefix| req.model.strip_prefix(prefix))
-            .unwrap_or(&req.model);
-        let body = build_request(
-            wire_model,
-            req.max_tokens,
-            &req.messages,
-            &req.tools,
-            Some(&options),
+        stream_compatible(
+            self.name(),
+            "OpenAI Chat",
+            &self.api_key,
+            &self.base_url,
+            self.model_prefix.as_deref(),
+            "max_completion_tokens",
+            true,
+            &self.client,
+            req,
         )
-        .map_err(|error| {
-            crate::error::ProviderError::new(
-                self.name(),
-                &req.model,
-                crate::error::ProviderErrorKind::InvalidRequest,
-                error.to_string(),
-            )
-        })?;
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| super::transport_failure(self.name(), &req.model, error))?;
+        .await
+    }
+}
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
-            let text = super::read_error_body(resp).await;
-            return Err(super::http_failure(
-                self.name(),
-                &req.model,
-                status,
-                retry_after.as_ref(),
-                text,
-            ));
-        }
+/// Shared HTTP/SSE machinery for providers that implement the OpenAI Chat Completions wire
+/// contract. First-class provider modules supply their own endpoint, namespace, token field,
+/// display label, and credential while errors remain attributed to the real provider.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stream_compatible(
+    provider_name: &str,
+    public_provider_name: &str,
+    api_key: &str,
+    base_url: &str,
+    model_prefix: Option<&str>,
+    output_token_field: &str,
+    include_usage_stream_option: bool,
+    client: &reqwest::Client,
+    req: ProviderRequest,
+) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
+    let options = req.options_for(provider_name);
+    let wire_model = model_prefix
+        .and_then(|prefix| req.model.strip_prefix(prefix))
+        .unwrap_or(&req.model);
+    let body = build_compatible_request(
+        provider_name,
+        output_token_field,
+        include_usage_stream_option,
+        wire_model,
+        req.max_tokens,
+        &req.messages,
+        &req.tools,
+        Some(&options),
+    )
+    .map_err(|error| {
+        crate::error::ProviderError::new(
+            provider_name,
+            &req.model,
+            crate::error::ProviderErrorKind::InvalidRequest,
+            error.to_string(),
+        )
+    })?;
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("accept", "text/event-stream")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| super::transport_failure(provider_name, &req.model, error))?;
 
-        let model = req.model.clone();
-        let provider_name = self.provider_name.clone();
-        let mut byte_stream = resp.bytes_stream().boxed();
-        let out = async_stream::stream! {
-            let mut parser = OpenAiStreamParser::new();
-            let mut buf: Vec<u8> = Vec::new();
-            let mut done = false;
-            while let Some(chunk) = byte_stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        if !super::append_sse_chunk(&mut buf, &bytes) {
-                            yield super::stream_failure(
-                                &provider_name,
-                                &model,
-                                crate::error::ProviderErrorKind::Protocol,
-                                "OpenAI Chat SSE event exceeded the size limit",
-                            );
-                            return;
-                        }
-                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                            let line = String::from_utf8_lossy(&line_bytes);
-                            if let Some(data) = line.trim().strip_prefix("data:") {
-                                let data = data.trim();
-                                if data.is_empty() {
-                                    continue;
-                                }
-                                if data == "[DONE]" {
-                                    for d in parser.finish() {
-                                        yield super::with_stream_context(d, &provider_name, &model);
-                                    }
-                                    done = true;
-                                    break;
-                                }
-                                match serde_json::from_str::<Value>(data) {
-                                    Ok(json) => {
-                                        for d in parser.push_chunk(&json) {
-                                            yield super::with_stream_context(d, &provider_name, &model);
-                                        }
-                                        if parser.is_terminal() {
-                                            return;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        yield super::stream_failure(
-                                            &provider_name,
-                                            &model,
-                                            crate::error::ProviderErrorKind::Protocol,
-                                            "malformed OpenAI Chat SSE data",
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        yield super::response_stream_failure(
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
+        let text = super::read_error_body(resp).await;
+        return Err(super::http_failure(
+            provider_name,
+            &req.model,
+            status,
+            retry_after.as_ref(),
+            text,
+        ));
+    }
+
+    let model = req.model.clone();
+    let provider_name = provider_name.to_string();
+    let public_provider_name = public_provider_name.to_string();
+    let mut byte_stream = resp.bytes_stream().boxed();
+    let out = async_stream::stream! {
+        let mut parser = OpenAiStreamParser::for_provider(
+            &provider_name,
+            &public_provider_name,
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let mut done = false;
+        while let Some(chunk) = byte_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if !super::append_sse_chunk(&mut buf, &bytes) {
+                        yield super::stream_failure(
                             &provider_name,
                             &model,
-                            error,
-                            "OpenAI Chat",
+                            crate::error::ProviderErrorKind::Protocol,
+                            format!("{public_provider_name} SSE event exceeded the size limit"),
                         );
                         return;
                     }
+                    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        if let Some(data) = line.trim().strip_prefix("data:") {
+                            let data = data.trim();
+                            if data.is_empty() {
+                                continue;
+                            }
+                            if data == "[DONE]" {
+                                for d in parser.finish() {
+                                    yield super::with_stream_context(d, &provider_name, &model);
+                                }
+                                done = true;
+                                break;
+                            }
+                            match serde_json::from_str::<Value>(data) {
+                                Ok(json) => {
+                                    for d in parser.push_chunk(&json) {
+                                        yield super::with_stream_context(d, &provider_name, &model);
+                                    }
+                                    if parser.is_terminal() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    yield super::stream_failure(
+                                        &provider_name,
+                                        &model,
+                                        crate::error::ProviderErrorKind::Protocol,
+                                        format!("malformed {public_provider_name} SSE data"),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    yield super::response_stream_failure(
+                        &provider_name,
+                        &model,
+                        error,
+                        &public_provider_name,
+                    );
+                    return;
                 }
             }
-            // `[DONE]` is the Chat Completions commit marker. Never turn a truncated clean EOF
-            // into a successful MessageStop.
-            if !done {
-                yield super::stream_failure(
-                    &provider_name,
-                    &model,
-                    crate::error::ProviderErrorKind::Protocol,
-                    "OpenAI Chat stream ended before [DONE]",
-                );
-            }
-        };
-        Ok(Box::pin(out))
-    }
+        }
+        // `[DONE]` is the Chat Completions commit marker. Never turn a truncated clean EOF
+        // into a successful MessageStop.
+        if !done {
+            yield super::stream_failure(
+                &provider_name,
+                &model,
+                crate::error::ProviderErrorKind::Protocol,
+                format!("{public_provider_name} stream ended before [DONE]"),
+            );
+        }
+    };
+    Ok(Box::pin(out))
 }
 
 #[cfg(test)]

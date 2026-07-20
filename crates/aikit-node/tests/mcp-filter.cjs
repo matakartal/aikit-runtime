@@ -2,23 +2,27 @@
 
 const assert = require("node:assert/strict");
 const http = require("node:http");
-const { Agent, McpServer } = require("..");
+const binding = require("..");
+const { Agent, McpConnection, legacy } = binding;
 
 function mcpReply(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
 }
 
 async function main() {
-  assert.equal(typeof McpServer?.connectHttp, "function");
+  assert.equal(typeof McpConnection?.connectHttp, "function");
+  assert.equal(typeof legacy?.McpServer?.connectHttp, "function");
+  assert.equal(binding.McpServer, undefined);
+  assert.throws(() => new McpConnection(), /contains no .*constructor/i);
 
   await assert.rejects(
-    McpServer.connectHttp("http://127.0.0.1:1/mcp", "bad", undefined, {
+    McpConnection.connectHttp("http://127.0.0.1:1/mcp", "bad", undefined, {
       unexpected: [],
     }),
     /MCP tool filter contains an unknown field/,
   );
   await assert.rejects(
-    McpServer.connectHttp("http://127.0.0.1:1/mcp", "bad", undefined, {
+    McpConnection.connectHttp("http://127.0.0.1:1/mcp", "bad", undefined, {
       deny: ["hidden", "hidden"],
     }),
     /duplicate name/,
@@ -78,7 +82,7 @@ async function main() {
     const address = server.address();
     assert(address && typeof address === "object");
     const endpoint = `http://127.0.0.1:${address.port}/mcp`;
-    const filtered = await McpServer.connectHttp(endpoint, "local", undefined, {
+    const filtered = await McpConnection.connectHttp(endpoint, "local", undefined, {
       allow: ["safe", "hidden"],
       deny: ["hidden"],
     });
@@ -96,7 +100,7 @@ async function main() {
     }
     assert.deepEqual(calls, ["safe"]);
 
-    const allowAll = await McpServer.connectHttp(endpoint, "default");
+    const allowAll = await McpConnection.connectHttp(endpoint, "default");
     const defaultAgent = Agent.fromEnv({});
     defaultAgent.registerMcp(allowAll);
     assert.deepEqual(
@@ -105,7 +109,7 @@ async function main() {
       ["safe", "safe_extra", "hidden"],
     );
 
-    const allowNone = await McpServer.connectHttp(endpoint, "none", undefined, {
+    const allowNone = await McpConnection.connectHttp(endpoint, "none", undefined, {
       allow: [],
     });
     const emptyAgent = Agent.fromEnv({});

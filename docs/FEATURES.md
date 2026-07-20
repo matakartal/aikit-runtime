@@ -1,9 +1,9 @@
-# aikit 0.2 feature reference
+# aikit 0.3 alpha feature reference
 
 This document describes the source-first implementation in this repository. Public registry
 packages are not distributed, and changing live provider APIs are not claimed as validated. See
-the [architecture guide](ARCHITECTURE.md) for component ownership and the
-[migration guide](MIGRATING-0.2.md) for breaking changes from the 0.1 source preview.
+the [architecture guide](ARCHITECTURE.md) for component ownership, the
+[0.3 migration guide](MIGRATING-0.3.md), and the live [parity matrix](PARITY-MATRIX.md).
 
 ## Source-first CLI
 
@@ -36,6 +36,48 @@ Provider metadata is deliberately lossless and therefore potentially sensitive. 
 contain generated tokens; grounding fields can contain prompt-derived searches, URLs, and
 citations. It is not included in metadata-only audit events, but run outcomes and sessions retain
 it, so stores and host logs must protect it like prompts and model output.
+
+### 0.3 canonical contracts
+
+- Model features are tri-state: `supported`, `unsupported`, or `unknown`. Routing treats both
+  unknown and unsupported required features as ineligible and reports which state caused the
+  rejection.
+- The embedded offline catalog is versioned and integrity-hashed. Caller overrides resolve into a
+  separate hash and never mutate shipped data.
+- `StreamEvent` adds event/response/block identity and monotonic `start/delta/end`, usage,
+  warning, error, and raw-provider-event envelopes. Legacy `StreamDelta` is bridged during v0.x.
+- Strict `MediaInput` values require MIME, size and SHA-256 identity. The existing `ContentPart`
+  input union still carries URL/base64 media through its compatibility representation; projecting
+  strict media identity through every older convenience surface remains a v1 gate.
+- `OutputPart` materializes text, reasoning, media, files, transcripts, tool results, structured
+  data, and citations without flattening them.
+- Realtime event fingerprints survive serialization so reconnect duplicates remain idempotent;
+  reusing an event id with different content fails closed.
+
+Python and Node expose the v2 async event stream and the same durable run/eval state machine. Full
+schema-generated declarations for every older convenience surface remain a tracked v1 gate rather
+than an implied completion claim.
+
+The provider media layer includes catalog-gated OpenAI HTTP contracts for image generation,
+transcription, speech, and realtime WebRTC call setup. It uses typed cancellation/errors, bounded
+responses, randomized multipart boundaries, and a host-owned stage/commit/abort artifact store.
+The shipped catalog does not mark a media model supported without live acceptance, so these
+transports fail closed by default instead of converting keyless wire proof into a support claim.
+
+### Durable execution and protocol interop
+
+`RunState` is reconstructed from an append-only event log. Checkpoints are projections, not the
+authority. Activities must be declared `pure`, `idempotent`, or `reconcile_required`; an ambiguous
+external effect stops for reconciliation instead of being automatically replayed. Rewind appends a
+reverse event, fork creates a new run/branch identity, and approvals survive restart. SQLite uses
+event-sequence compare-and-swap. The feature-gated PostgreSQL adapter adds transactional row locks,
+revision CAS, and append-only validation; the Temporal reference adapter maps replay-safe IDs,
+retry policy, history outcomes, and explicit reconciliation without pretending an SDK worker was
+run locally.
+
+MCP Tasks, A2A and ACP mappings share the governance envelope and cannot directly execute tools.
+The current implementation proves state/authz/dedupe mappings; network server/editor transports are
+still marked `Partial` in the parity matrix.
 
 ## Provider capabilities
 
@@ -376,14 +418,18 @@ the public built-in-tool and multimodal/routed-input contracts. Platform-specifi
 timestamps, run ids, and selected containment backend names are removed; their security invariants
 are asserted instead.
 
-## Deferred beyond the 0.2 source preview
+## Remaining v1 parity gates
 
-- Remote/distributed database adapters beyond transactional local SQLite.
+- Live PostgreSQL failover proof and a deployed Temporal SDK worker beyond the implemented
+  transactional PostgreSQL store and deterministic Temporal mapping.
 - Model-generated/two-pass summaries beyond deterministic extractive compaction.
-- MCP server mode and WASM/browser-runtime packaging.
+- MCP/A2A/ACP network transports and official conformance beyond the governed protocol mappings.
 - Stronger Windows filesystem/network isolation beyond Job Objects.
 - Built-in LLM risk judge (the trait + heuristic scorer ship now; hosts can plug their own).
-- Network-egress allowlist proxy for contained Bash beyond Docker `--network=none`.
-- microVM containment backends, durable checkpoint resume, and ACP/A2A protocol surfaces.
+- Transparent egress enforcement for arbitrary child processes beyond explicit brokered HTTP and
+  browser calls.
+- A production Firecracker backend, live-accepted multimodal model profiles, persistent fuzz/chaos
+  jobs, signed multi-platform artifacts, public registry publication, and rollback rehearsal.
 
-These are not silently represented as current capabilities.
+These are not silently represented as current capabilities. Row-level status and evidence live in
+[`PARITY-MATRIX.md`](PARITY-MATRIX.md).

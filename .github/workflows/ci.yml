@@ -221,6 +221,9 @@ jobs:
           grep -Fxq LICENSE-APACHE /tmp/aikit-core-package-files.txt
           grep -Fxq LICENSE-MIT /tmp/aikit-core-package-files.txt
           grep -Fxq README.md /tmp/aikit-core-package-files.txt
+          grep -Fxq cassettes/providers/v1/anthropic.json /tmp/aikit-core-package-files.txt
+          cargo test --manifest-path target/package/aikit-runtime-core-*/Cargo.toml \
+            --test provider_cassettes --locked
           # The facade depends on the sibling core package. Check its source file set without
           # contacting an external package service.
           cargo package -p aikit-runtime --allow-dirty --list --locked > /tmp/aikit-package-files.txt
@@ -277,15 +280,18 @@ jobs:
           set +e
           env \
             -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u DEEPSEEK_API_KEY \
-            -u GEMINI_API_KEY -u GOOGLE_API_KEY \
+            -u GEMINI_API_KEY -u GOOGLE_API_KEY -u OPENROUTER_API_KEY \
+            -u GROQ_API_KEY -u MISTRAL_API_KEY -u XAI_API_KEY \
             -u AIKIT_SMOKE_ANTHROPIC_MODEL -u AIKIT_SMOKE_OPENAI_MODEL \
             -u AIKIT_SMOKE_DEEPSEEK_MODEL -u AIKIT_SMOKE_GOOGLE_MODEL \
+            -u AIKIT_SMOKE_OPENROUTER_MODEL -u AIKIT_SMOKE_GROQ_MODEL \
+            -u AIKIT_SMOKE_MISTRAL_MODEL -u AIKIT_SMOKE_XAI_MODEL \
             AIKIT_LIVE_SMOKE=1 AIKIT_LIVE_SMOKE_FULL=1 \
             ./scripts/live-smoke.sh > /tmp/full-smoke-contract.log 2>&1
           status=$?
           set -e
           test "$status" -ne 0
-          grep -Fq 'requires the complete four-provider matrix before any live call' \
+          grep -Fq 'requires the complete eight-provider matrix before any live call' \
             /tmp/full-smoke-contract.log
 
   eval:

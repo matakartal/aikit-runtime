@@ -2,7 +2,8 @@
 
 > Archived milestone. It records why provider replay rules exist; it is not a current feature or
 > release dashboard. Use [`FEATURES.md`](FEATURES.md) and
-> [`PROJECT-STATUS.md`](PROJECT-STATUS.md) for the 0.2 source tree.
+> [`PROJECT-STATUS.md`](PROJECT-STATUS.md) and [`PARITY-MATRIX.md`](PARITY-MATRIX.md) for the current
+> 0.3 alpha source tree.
 
 This is an archived milestone note. Phase 1 established the canonical schema, four provider
 adapters, provider-specific reasoning replay, capability grades, and credential activation. Those

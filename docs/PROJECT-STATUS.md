@@ -1,67 +1,68 @@
 # Project status
 
-**Snapshot date:** 2026-07-20
+**Snapshot:** 2026-07-20
+**Release state:** source-first `v0.3.0-alpha.1` candidate on `main`; not published
 
-**Release state:** source-first `v0.2.0` development preview on `main`
-
-This page separates what the repository proves locally and in keyless CI from evidence that still
-requires external credentials, registries, or deployment authority. The live workflow badges and
-GitHub Actions pages remain the authoritative source for the newest remote run result.
+The five-phase parity implementation now has a substantially larger local core. This page keeps
+local proof separate from evidence that needs provider credentials, external services, signing
+identity, registry ownership, or another operating system.
 
 ## Implemented and keylessly verifiable
 
-- One canonical Rust core drives the Rust facade, Python/PyO3 binding, Node/napi binding, and CLI.
-- Anthropic, OpenAI, Google, and DeepSeek use native adapters with provider-specific reasoning
-  replay; OpenRouter, Groq, Mistral, and xAI use isolated compatible endpoints.
-- Governance, tools, routing, budgets, sessions, memory, audit, containment, orchestration,
-  structured output, and deterministic evaluations run without API keys through `mock-1`.
-- Structured output supports async semantic `accept` / `retry` / `reject` validation after JSON
-  Schema, with bounded repair and fail-closed callback handling.
-- MCP stdio and Streamable HTTP clients support bounded tool/resource/prompt discovery, exact
-  allow/deny tool visibility, governed execution, and call-boundary revalidation.
-- Eval datasets produce deterministic text/tool/status/usage verdicts over the current invocation,
-  with redacted reports and distinct input, infrastructure, and gate-failure exit codes.
-- JSON and transactional SQLite session stores use revision checks and execution leases; expired
-  leases require explicit side-effect reconciliation before recovery.
-- Configured source-artifact targets are Linux x64/ARM64 with glibc 2.28+, macOS x64/ARM64, and
-  Windows x64. A specific 0.2 assembly is proven only by its workflow/evidence record. The Windows
-  file-tool jail remains intentionally unavailable and fails closed.
+- One Rust core drives Rust, Python/PyO3, Node/napi, and the CLI.
+- Eight named provider adapters exist: Anthropic, OpenAI, Google, DeepSeek, OpenRouter, Groq,
+  Mistral, and xAI. Authentication, endpoint/model namespace, streaming, tool/error mapping, and
+  protected parameters have keyless wire tests.
+- `CapabilityState` distinguishes `supported`, `unsupported`, and `unknown`; required unknown
+  capabilities fail closed. A versioned eight-provider catalog is embedded offline and user
+  overrides form a separate hashed layer.
+- The v2 stream protocol has event/response/block identity, monotonic ordering, usage/warning/error
+  events, and a compatibility bridge from legacy `StreamDelta`.
+- Scoped governance contracts, immutable policy hashes, information-flow labels, approval evidence,
+  hardened sandbox/egress profiles, and verified skill packages are implemented in the core.
+- Durable runs use an append-only event log, replay-validated projections, checkpoints,
+  activity/idempotency records, reconciliation, approvals, resume/fork/rewind/cancel, and SQLite
+  compare-and-swap persistence. Python and Node expose the same `DurableRun` state machine.
+- A feature-gated PostgreSQL store adds transactional row-lock/revision CAS, and the Temporal
+  reference adapter deterministically maps activity, retry, idempotency and reconciliation state.
+- Working, episodic, and semantic memory planes preserve provenance and use CAS rather than
+  last-write-wins.
+- Multimodal artifacts, transcription/speech/image/realtime SPIs, persisted realtime dedupe, and
+  capability-aware fallback policy are typed. Catalog-gated OpenAI image, transcription, speech,
+  and WebRTC-call HTTP transports have keyless wire tests; the shipped catalog still marks
+  unproven media models unsupported until live acceptance exists.
+- Governed MCP task, A2A 1.0, and ACP v1 mapping state machines are present. Network server/editor
+  transports and official conformance suites remain open.
+- Deterministic outcome and trace evals, redacted span hierarchy, security dependency/license/secret
+  checks, CycloneDX SBOM, and provenance validation are present.
 
-## Proof available in the repository
+## Proof commands
 
-| Proof | Command or location | What it establishes |
+| Proof | Command | Meaning |
 |---|---|---|
-| Rust workspace | `cargo +1.97.1 test --workspace --all-features --locked` | Core, facade, CLI, and binding-crate behavior. |
-| MSRV | `cargo +1.88.0 check --workspace --all-targets --all-features --locked` | Declared Rust 1.88 compatibility. |
-| Cross-language parity | `./scripts/parity-check.sh` | Seven canonical modules and transcripts agree across Rust/Python/Node. |
-| Deterministic eval | `cargo +1.97.1 run -p aikit-cli --locked -- eval evals/smoke.json` | Keyless dataset parsing, execution, gates, and reporting. |
-| Source candidate | `./scripts/release-check.sh --candidate` | Version alignment, immutable CI inputs, history/tag collision checks, and artifact policy. |
-| Security automation | CodeQL, `cargo audit`, and Gitleaks | Static, dependency, and committed-secret review; not a formal security proof. |
+| Rust workspace | `cargo test --workspace --all-features --locked --exclude aikit-py` | Core, facade, CLI and Node binding-crate behavior on this host; PyO3 is verified through `maturin` below |
+| Python binding | `.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml` plus the Python scenarios | Native extension linkage, runtime behavior and strict typing on this host |
+| Node binding | `./scripts/build-node.sh` plus the Node scenarios | Native addon linkage, wrapper behavior and strict typing on this host |
+| Strict Rust lint | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | No accepted Rust warnings |
+| Three-language parity | `./scripts/parity-check.sh` after both binding builds above | Registered Rust/Python/Node observable contracts are byte-identical |
+| Provider cassettes | `cargo test -p aikit-runtime-core --test provider_cassettes --locked` | Sanitized required scenario inventory and envelope validation |
+| Keyless eval | `cargo run -p aikit-cli --locked -- eval evals/smoke.json` | Dataset parsing, execution and deterministic gates |
+| Security/SBOM | `./scripts/security-check.sh --all` | Advisory/license/secret/SBOM/provenance policy on this checkout |
+| Source candidate | `./scripts/release-check.sh --candidate` | Version, immutable CI input, history collision and package policy |
+| Live providers | `AIKIT_LIVE_SMOKE=1 AIKIT_LIVE_SMOKE_FULL=1 ./scripts/live-smoke.sh` | Fail-closed billable acceptance; requires all eight credential/model pairs |
 
-## Distribution boundaries
+## Not yet v1-complete
 
-- GitHub source is the official usage path. No npm, PyPI, or crates.io publication is claimed.
-- The manual release workflow assembles temporary GitHub Actions artifacts; it does not publish to
-  a registry and does not grant release authority.
-- The current source version is `0.2.0`, but there is no committed `v0.2.0` evidence record or tag.
-- [`releases/v0.1.0.md`](releases/v0.1.0.md) is a historical draft artifact snapshot for a different
-  commit and must not be reused as proof for current `main`.
-- No paid live-provider acceptance result is claimed for `v0.2.0`. Local real-socket wire tests do
-  not prove that a changing provider currently accepts the same request.
+- Complete Rust-schema-generated declarations across every Python/TypeScript public type.
+- Paid live acceptance for every advertised provider/model/capability combination.
+- Live-accepted media models, other provider media endpoints, and full realtime reconnect/event
+  transports; the OpenAI HTTP contracts exist but are not advertised as live-proven support.
+- Transparent egress enforcement for arbitrary child processes and a Firecracker backend; the
+  explicit HTTP/browser broker already pins DNS and revalidates every redirect hop.
+- Authorized live PostgreSQL failover proof and a real Temporal SDK worker integration.
+- MCP server transport, A2A transport and ACP editor/CLI integration against official examples.
+- Persistent fuzz targets, process-level chaos jobs and multi-platform signing proof.
+- crates.io/PyPI/npm ownership, publication authority, published packages and rollback rehearsal.
 
-## Intentionally deferred
-
-- public registry publication and registry ownership/namespace work;
-- MCP server mode, ACP/A2A, skills/plugin loading, and WASM packaging;
-- durable checkpoint/time-travel replay, which requires an explicit external-side-effect model;
-- model-generated compaction and distributed session/memory services;
-- microVM containment, a caller-transparent browser egress proxy, and a Windows descriptor-relative
-  file jail.
-
-The current tree is suitable for source evaluation and integration with the documented boundaries.
-It must not be described as a published package, a completed live-provider certification, or a
-general sandbox for arbitrary host callbacks.
-
-See the [architecture](ARCHITECTURE.md), [feature reference](FEATURES.md),
-[implementation matrix](V1-COMPLETION-MATRIX.md), [release guide](RELEASE.md), and
-[live-provider contract](LIVE-SMOKE.md).
+No missing external gate is converted into a synthetic pass. See
+[`PARITY-MATRIX.md`](PARITY-MATRIX.md) for row-level status and exact upstream pins.

@@ -9,6 +9,7 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -528,7 +529,11 @@ fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
     }
     let dataset = serde_json::from_slice(&bytes)
         .map_err(|error| CliError::Input(format!("invalid eval dataset JSON: {error}")))?;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let digest = Sha256::digest(&bytes);
+    let mut sha256 = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut sha256, "{byte:02x}").expect("writing into String cannot fail");
+    }
     Ok(LoadedEvalDataset { dataset, sha256 })
 }
 

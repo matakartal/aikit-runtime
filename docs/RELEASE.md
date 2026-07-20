@@ -1,7 +1,8 @@
 # Source distribution guide
 
-`aikit-runtime` is distributed from its GitHub source repository. npm, PyPI, and crates.io uploads
-are intentionally out of scope. Cloning the repository is the official installation path.
+This candidate is distributed from its GitHub source repository. The current workflow does not
+upload to npm, PyPI, or crates.io; registry ownership and publication remain explicit future
+release gates. Cloning the repository is the supported installation path for this candidate.
 
 ## Use from source
 
@@ -29,6 +30,30 @@ existing tag/evidence version for different source bytes, checks that Cargo/Pyth
 and exact Node platform dependencies agree, requires immutable GitHub Action SHAs and digest-pinned
 manylinux images, and verifies that the checksum manifest is self-contained. Run it from a clean,
 non-shallow checkout before recording evidence.
+
+## Commit signatures
+
+[`.github/allowed_signers`](../.github/allowed_signers) records the maintainer's SSH signing key so
+any reviewer can verify a commit locally:
+
+```bash
+git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-commit <sha>
+```
+
+History currently mixes unsigned commits with signatures that are not verifiable through this
+repository's maintainer SSH allowlist, so CI does not yet gate on signatures. Once
+`git config commit.gpgsign true` is consistently in effect for new maintainer commits, the step
+below can verify directly pushed commits:
+
+```yaml
+# Not active: enable only after the maintainer signs commits locally.
+# - name: Verify pushed commit signatures
+#   if: github.event_name == 'push'
+#   run: git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-commit HEAD
+```
+
+Squash-merges performed in the GitHub web UI are signed by GitHub's own web-flow key rather than this
+SSH key, so such a gate can only cover directly pushed, locally signed commits.
 
 ## Manual artifact assembly
 

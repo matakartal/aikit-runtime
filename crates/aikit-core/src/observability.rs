@@ -8,7 +8,7 @@ use crate::error::{AikitError, Result};
 use crate::types::Usage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,157 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static JSONL_APPEND_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanKind {
+    Agent,
+    Workflow,
+    Model,
+    Tool,
+    Checkpoint,
+    Activity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanStatus {
+    #[default]
+    Running,
+    Ok,
+    Error,
+    Cancelled,
+}
+
+/// Sensitive prompt/tool/media payloads are excluded unless explicitly enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryPolicy {
+    #[serde(default)]
+    pub include_sensitive_payloads: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceSpan {
+    pub span_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    pub kind: TraceSpanKind,
+    pub name: String,
+    pub started_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_unix_ms: Option<u128>,
+    pub status: TraceSpanStatus,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, Value>,
+    /// Present only when [`TelemetryPolicy::include_sensitive_payloads`] is explicitly true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive_payload: Option<Value>,
+}
+
+/// In-process span builder used by the OpenTelemetry bridge and deterministic tests.
+pub struct TraceCollector {
+    policy: TelemetryPolicy,
+    spans: Mutex<BTreeMap<String, TraceSpan>>,
+}
+
+impl TraceCollector {
+    pub fn new(policy: TelemetryPolicy) -> Self {
+        Self {
+            policy,
+            spans: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_span(
+        &self,
+        span_id: impl Into<String>,
+        parent_span_id: Option<String>,
+        kind: TraceSpanKind,
+        name: impl Into<String>,
+        attributes: BTreeMap<String, Value>,
+        sensitive_payload: Option<Value>,
+    ) -> std::result::Result<(), String> {
+        let span_id = span_id.into();
+        let name = name.into();
+        if span_id.trim().is_empty() || name.trim().is_empty() {
+            return Err("span_id and name must not be empty".into());
+        }
+        if attributes.len() > 128 {
+            return Err("trace attributes exceed the 128-item limit".into());
+        }
+        let mut spans = self
+            .spans
+            .lock()
+            .map_err(|_| "trace collector mutex poisoned".to_string())?;
+        if spans.contains_key(&span_id) {
+            return Err(format!("duplicate span_id '{span_id}'"));
+        }
+        if parent_span_id
+            .as_ref()
+            .is_some_and(|parent| !spans.contains_key(parent))
+        {
+            return Err("parent span must exist before its child".into());
+        }
+        spans.insert(
+            span_id.clone(),
+            TraceSpan {
+                span_id,
+                parent_span_id,
+                kind,
+                name,
+                started_unix_ms: now_unix_ms(),
+                ended_unix_ms: None,
+                status: TraceSpanStatus::Running,
+                attributes,
+                sensitive_payload: self
+                    .policy
+                    .include_sensitive_payloads
+                    .then_some(sensitive_payload)
+                    .flatten(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn end_span(
+        &self,
+        span_id: &str,
+        status: TraceSpanStatus,
+    ) -> std::result::Result<(), String> {
+        if status == TraceSpanStatus::Running {
+            return Err("a completed span cannot retain running status".into());
+        }
+        let mut spans = self
+            .spans
+            .lock()
+            .map_err(|_| "trace collector mutex poisoned".to_string())?;
+        let span = spans
+            .get_mut(span_id)
+            .ok_or_else(|| format!("unknown span_id '{span_id}'"))?;
+        if span.ended_unix_ms.is_some() {
+            return Err(format!("span '{span_id}' already ended"));
+        }
+        span.status = status;
+        span.ended_unix_ms = Some(now_unix_ms().max(span.started_unix_ms));
+        Ok(())
+    }
+
+    pub fn spans(&self) -> Vec<TraceSpan> {
+        self.spans
+            .lock()
+            .map(|spans| spans.values().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 /// Whether audit payloads contain tool inputs/results or metadata only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,6 +793,66 @@ fn otel_event(event: &AuditEvent, sequence: u64) -> (String, Vec<opentelemetry::
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trace_collector_redacts_payloads_and_enforces_parent_order() {
+        let collector = TraceCollector::new(TelemetryPolicy::default());
+        collector
+            .start_span(
+                "agent-1",
+                None,
+                TraceSpanKind::Agent,
+                "agent",
+                BTreeMap::new(),
+                Some(json!({"prompt": "secret"})),
+            )
+            .unwrap();
+        collector
+            .start_span(
+                "tool-1",
+                Some("agent-1".into()),
+                TraceSpanKind::Tool,
+                "search",
+                BTreeMap::new(),
+                Some(json!({"input": "private"})),
+            )
+            .unwrap();
+        collector.end_span("tool-1", TraceSpanStatus::Ok).unwrap();
+        let spans = collector.spans();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|span| span.sensitive_payload.is_none()));
+        assert!(collector
+            .start_span(
+                "orphan",
+                Some("missing".into()),
+                TraceSpanKind::Activity,
+                "orphan",
+                BTreeMap::new(),
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn sensitive_trace_payloads_require_explicit_opt_in() {
+        let collector = TraceCollector::new(TelemetryPolicy {
+            include_sensitive_payloads: true,
+        });
+        collector
+            .start_span(
+                "model-1",
+                None,
+                TraceSpanKind::Model,
+                "model",
+                BTreeMap::new(),
+                Some(json!({"prompt": "allowed"})),
+            )
+            .unwrap();
+        assert_eq!(
+            collector.spans()[0].sensitive_payload,
+            Some(json!({"prompt": "allowed"}))
+        );
+    }
 
     #[test]
     fn in_memory_sink_preserves_order_and_redacts_payloads_by_default() {

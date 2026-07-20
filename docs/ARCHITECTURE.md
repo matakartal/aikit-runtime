@@ -2,7 +2,7 @@
 
 This document explains where behavior lives, how one request moves through the runtime, and which
 boundaries remain the embedding application's responsibility. It describes the source-first
-`v0.2.0` tree; the code and tests remain authoritative when this document drifts.
+`v0.3.0-alpha.1` tree; the code and tests remain authoritative when this document drifts.
 
 ## Design goals
 
@@ -68,7 +68,8 @@ content across provider boundaries.
 
 ## Provider layer
 
-The four native adapters keep distinct request/stream contracts:
+AIKit exposes eight named, separately authenticated adapters. Four vendor-native adapters keep
+distinct request/stream contracts:
 
 | Provider | Native surface | Continuation state |
 |---|---|---|
@@ -77,8 +78,9 @@ The four native adapters keep distinct request/stream contracts:
 | Google | Gemini `generateContent` | Thought signatures on their original parts. |
 | DeepSeek | Chat Completions | Conditional `reasoning_content` replay for tool continuation. |
 
-OpenRouter, Groq, Mistral, and xAI are isolated OpenAI-compatible endpoints. They receive explicit
-credential/model routing but do not inherit native-provider fidelity claims automatically.
+OpenRouter, Groq, Mistral, and xAI are first-class isolated OpenAI-compatible adapters rather than a
+caller-supplied base URL. They receive explicit credential, endpoint, model, stream, tool, error,
+usage, and metadata handling, but do not inherit native-provider fidelity claims automatically.
 
 ## Governance and tool execution
 
@@ -125,13 +127,19 @@ permissions.
 - JSON stores provide durable local files with owner-only permissions where supported, but their
   coordination is process-local.
 - SQLite stores provide transactional cross-process compare-and-swap behavior.
+- The optional PostgreSQL durable store uses a row lock plus revision CAS and verifies that every
+  replacement is an append-only extension. Live database/failover proof is a separate gate.
 - Session execution leases prevent concurrent work. Lease expiry does not prove the previous
   owner failed before an external effect, so normal execution never auto-takes an expired lease.
 - Recovery is an explicit operator action after the old worker is stopped and external effects are
   reconciled. Random fencing tokens prevent same-owner ABA during commit/release.
 
-Durable checkpoint/time-travel replay is deliberately not implemented because safe rewind requires
-an explicit model for irreversible tool and provider side effects.
+Durable runs use an append-only event log with checkpoint projections. Resume and fork preserve
+activity identity; rewind appends a reverse event instead of deleting history. Activities are
+classified as pure, idempotent, or reconciliation-required, so an ambiguous external effect stops
+for operator reconciliation instead of being presented as exactly-once execution.
+The Temporal adapter is a deterministic SDK-neutral mapping layer; a host still owns the actual
+Temporal worker, history transport, and deployment compatibility.
 
 ## Containment and trust boundaries
 
@@ -141,9 +149,11 @@ namespaces+seccomp, Windows Job Objects, or digest-pinned hardened Docker. These
 different guarantees; consult the [threat model](THREAT-MODEL.md).
 
 Rust executors, Python/Node callbacks, semantic validators, external MCP servers, and WebDriver
-browsers remain host/application trust boundaries. Browser registration requires an assertion that
-the caller already enforces hostname and public-IP policy before each browser request; aikit does
-not install that network interceptor itself.
+browsers remain host/application trust boundaries. The explicit `EgressBroker` validates method,
+scheme, domain, port, each redirect, and freshly resolved public IPs before pinned HTTP connects;
+an exact HTTPS policy can produce the assertion required by browser registration. Arbitrary child
+processes and external WebDriver deployments must still be routed through an enforcing proxy by
+the host.
 
 ## Cross-language contract
 

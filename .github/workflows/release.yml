@@ -31,6 +31,8 @@ jobs:
         run: |
           mkdir -p dist/source
           cargo package -p aikit-runtime-core --locked
+          cargo test --manifest-path target/package/aikit-runtime-core-*/Cargo.toml \
+            --test provider_cassettes --locked
           cp target/package/aikit-runtime-core-*.crate dist/source/
           # The facade depends on the sibling core package. Record its source file set without
           # contacting or publishing to an external registry.

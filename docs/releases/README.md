@@ -20,9 +20,9 @@ These records describe GitHub Actions artifacts only; they do not authorize exte
 |---|---|---|
 | [v0.1.0](v0.1.0.md) | `draft` | Historical source/native artifact snapshot. |
 
-There is currently no `v0.2.0` evidence record. The version in workspace manifests and current
-source documentation must not be interpreted as a tag, registry release, or completed artifact
-review.
+There is currently no `v0.2.0` or `v0.3.0-alpha.1` evidence record. The version in workspace
+manifests and current source documentation must not be interpreted as a tag, registry release, or
+completed artifact review.
 
-No registry publication is claimed or planned. See [`RELEASE.md`](../RELEASE.md) for the current
-source-first distribution policy.
+No registry publication is claimed for this candidate. See [`RELEASE.md`](../RELEASE.md) for the
+current source-first distribution policy and future release gates.

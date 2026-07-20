@@ -5,8 +5,8 @@ canonical agent, streaming, structured-output, routing, memory, governance, and 
 the Rust core, with type information in `aikit.pyi` / `py.typed`.
 
 > The PyPI distribution name is **`aikit-runtime`**; the existing bare `aikit` package on PyPI is
-> unrelated. Python imports remain `import aikit`. No PyPI publication is currently claimed or
-> planned; local artifact assembly uses this name only for package-layout verification.
+> unrelated. Python imports remain `import aikit`. No PyPI publication is claimed for this
+> candidate; local artifact assembly uses this name only for package-layout verification.
 
 ## Build from this checkout
 
@@ -205,7 +205,7 @@ Cross-language parity is enforced by:
 
 See the root [README](../../README.md), [feature reference](../../docs/FEATURES.md), and
 [threat model](../../docs/THREAT-MODEL.md). For ownership and upgrade details, see the
-[architecture](../../docs/ARCHITECTURE.md), [0.2 migration guide](../../docs/MIGRATING-0.2.md),
+[architecture](../../docs/ARCHITECTURE.md), [0.3 migration guide](../../docs/MIGRATING-0.3.md),
 and [evaluation guide](../../docs/EVALUATIONS.md).
 
 ## Documentation map
@@ -216,7 +216,8 @@ and [evaluation guide](../../docs/EVALUATIONS.md).
 | [Architecture](../../docs/ARCHITECTURE.md) | Core ownership, run lifecycle, state, and trust boundaries |
 | [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
 | [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |
-| [0.2 migration](../../docs/MIGRATING-0.2.md) | Breaking source-preview changes and upgrade checklist |
+| [Competitor parity](../../docs/PARITY-MATRIX.md) | Current evidence, gaps, and v1 gate |
+| [0.3 migration](../../docs/MIGRATING-0.3.md) | Streaming, MCP naming, capability and durability changes |
 | [Evaluation guide](../../docs/EVALUATIONS.md) | Dataset, gate, report, and CI contracts |
 
 Licensed under MIT OR Apache-2.0; both license texts are included in the package.

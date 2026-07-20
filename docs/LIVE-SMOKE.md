@@ -4,10 +4,10 @@ The normal suite is deterministic, keyless, and non-billable. It validates provi
 stream handling with local real-socket mock servers; it does not prove that a changing live API
 accepted the request.
 
-**Status:** no live-provider run is claimed for the current draft `v0.2.0` candidate. The
+**Status:** no live-provider run is claimed for the current draft `v0.3.0-alpha.1` candidate. The
 [`v0.1.0` evidence](releases/v0.1.0.md) is a historical snapshot, not proof for this candidate.
 The deterministic `aikit eval` suite is a different proof layer: it validates outcome gates and
-may optionally use live models, but it does not replace this four-native-provider replay contract.
+may optionally use live models, but it does not replace this eight-provider replay contract.
 
 Every live mode requires `AIKIT_LIVE_SMOKE=1` as an explicit acknowledgement of network and
 billable calls. The wrapper exits before the test when that flag is absent.
@@ -20,6 +20,10 @@ billable calls. The wrapper exits before the test when that flag is absent.
 | OpenAI | `OPENAI_API_KEY` | `AIKIT_SMOKE_OPENAI_MODEL` |
 | DeepSeek | `DEEPSEEK_API_KEY` | `AIKIT_SMOKE_DEEPSEEK_MODEL` |
 | Google | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `AIKIT_SMOKE_GOOGLE_MODEL` |
+| OpenRouter | `OPENROUTER_API_KEY` | `AIKIT_SMOKE_OPENROUTER_MODEL` |
+| Groq | `GROQ_API_KEY` | `AIKIT_SMOKE_GROQ_MODEL` |
+| Mistral | `MISTRAL_API_KEY` | `AIKIT_SMOKE_MISTRAL_MODEL` |
+| xAI | `XAI_API_KEY` | `AIKIT_SMOKE_XAI_MODEL` |
 
 ## Configured-provider text probe
 
@@ -32,7 +36,7 @@ export AIKIT_SMOKE_ANTHROPIC_MODEL='your-current-model-id'
 AIKIT_LIVE_SMOKE=1 ./scripts/live-smoke.sh
 ```
 
-## Full four-provider contract
+## Full eight-provider contract
 
 Release-level evidence uses both flags:
 
@@ -40,7 +44,7 @@ Release-level evidence uses both flags:
 AIKIT_LIVE_SMOKE=1 AIKIT_LIVE_SMOKE_FULL=1 ./scripts/live-smoke.sh
 ```
 
-Full mode resolves **all four** key/model pairs before the first billable request and fails closed
+Full mode resolves **all eight** key/model pairs before the first billable request and fails closed
 if any is missing. For each provider it verifies:
 
 1. A non-empty text generation.

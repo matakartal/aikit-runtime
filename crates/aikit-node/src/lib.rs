@@ -18,29 +18,31 @@
 //! PyO3's `into_future` — and it composes with the streaming seam without deadlock because the JS
 //! main thread stays in its event loop while Rust awaits the oneshot the promise resolves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use aikit_core::orchestration::{ExecutionContext, Orchestrator, SubagentSpec};
 use aikit_core::{
-    evaluate_outcome as core_evaluate_outcome, request_capability_tool, Agent as CoreAgent,
-    AgentError, AgentOptions as CoreAgentOptions, AikitError, ApprovalDecision, ApprovalRequest,
-    AuditFailureMode, AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools,
-    BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle,
-    CapabilityBroker, CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy,
-    DockerConfig, EvalGate, FailureContext, FailureHookOutcome, GeneratedText, Governance,
-    GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
+    evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
+    request_capability_tool, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions,
+    AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
+    AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
+    BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
+    Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig, DurabilityMode,
+    ErrorCode, ErrorInfo, EvalGate, EvalSuite, FailureContext, FailureHookOutcome, GeneratedText,
+    Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
     InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
     McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile, NoTools,
     ObjectOptions, ObjectStream as CoreObjectStream, PermissionEngine, PermissionMode,
     PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext, PreToolUseContext,
     PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
-    RoutingOptions as CoreRoutingOptions, Rule, RunConfig, RunOutcome, RunRecorder,
-    RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
-    SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
-    StopContext, StreamDelta, StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter,
-    ToolSpec, WebTools,
+    RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig, RunOutcome, RunRecorder,
+    RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator,
+    Session, SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore,
+    StdioTransport, StopContext, StreamDelta, StreamEvent, StreamEventEncoder,
+    StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter, ToolSpec, TraceInput,
+    WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -722,6 +724,196 @@ pub fn evaluate_outcome(outcome: Value, gates: Value) -> Result<Value> {
     let verdict = core_evaluate_outcome(&outcome, &gates)
         .map_err(|error| Error::from_reason(error.to_string()))?;
     serde_json::to_value(verdict).map_err(|_| Error::from_reason("failed to encode EvalVerdict"))
+}
+
+fn node_durability_mode(value: Option<String>) -> Result<DurabilityMode> {
+    match value.as_deref().unwrap_or("sync") {
+        "sync" => Ok(DurabilityMode::Sync),
+        "async" => Ok(DurabilityMode::Async),
+        "exit" => Ok(DurabilityMode::Exit),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            "durability must be one of: sync, async, exit",
+        )),
+    }
+}
+
+fn encoded_durability_error(error: aikit_core::DurabilityError) -> Error {
+    let payload = serde_json::json!({
+        "message": error.to_string(),
+        "info": ErrorInfo::new(ErrorCode::Conflict),
+    });
+    Error::from_reason(format!("{TYPED_ERROR_MARKER}{payload}"))
+}
+
+fn node_command_outcome_value(outcome: aikit_core::CommandOutcome) -> Result<Value> {
+    match outcome {
+        aikit_core::CommandOutcome::Resumed { sequence } => {
+            Ok(serde_json::json!({"type": "resumed", "sequence": sequence}))
+        }
+        aikit_core::CommandOutcome::Forked { run } => Ok(serde_json::json!({
+            "type": "forked",
+            "run": serde_json::to_value(run)
+                .map_err(|_| Error::from_reason("failed to encode forked durable run"))?,
+        })),
+        aikit_core::CommandOutcome::Rewound {
+            checkpoint_id,
+            sequence,
+        } => Ok(serde_json::json!({
+            "type": "rewound",
+            "checkpoint_id": checkpoint_id,
+            "sequence": sequence,
+        })),
+        aikit_core::CommandOutcome::Cancelled { sequence } => {
+            Ok(serde_json::json!({"type": "cancelled", "sequence": sequence}))
+        }
+    }
+}
+
+/// Stateful binding over the canonical append-only Rust durability engine.
+#[napi]
+pub struct DurableRun {
+    inner: RunState,
+}
+
+#[napi]
+impl DurableRun {
+    #[napi(constructor)]
+    pub fn new(session_id: String, run_id: String, durability: Option<String>) -> Result<Self> {
+        let inner = RunState::new(session_id, run_id, node_durability_mode(durability)?)
+            .map_err(encoded_durability_error)?;
+        Ok(Self { inner })
+    }
+
+    #[napi(factory)]
+    pub fn from_state(state: Value) -> Result<Self> {
+        let inner = serde_json::from_value(state).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid durable state: {error}"),
+            )
+        })?;
+        Ok(Self { inner })
+    }
+
+    #[napi]
+    pub fn snapshot(&self) -> Result<Value> {
+        serde_json::to_value(&self.inner)
+            .map_err(|_| Error::from_reason("failed to encode durable state"))
+    }
+
+    #[napi(getter)]
+    pub fn schema_version(&self) -> u32 {
+        self.inner.schema_version()
+    }
+
+    #[napi(getter)]
+    pub fn session_id(&self) -> String {
+        self.inner.session_id().to_owned()
+    }
+
+    #[napi(getter)]
+    pub fn run_id(&self) -> String {
+        self.inner.run_id().to_owned()
+    }
+
+    #[napi(getter)]
+    pub fn durability(&self) -> String {
+        match self.inner.durability() {
+            DurabilityMode::Sync => "sync",
+            DurabilityMode::Async => "async",
+            DurabilityMode::Exit => "exit",
+        }
+        .into()
+    }
+
+    #[napi(getter)]
+    pub fn status(&self) -> Result<String> {
+        serde_json::to_value(self.inner.status())
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| Error::from_reason("failed to encode durable status"))
+    }
+
+    #[napi]
+    pub fn replace_state(&mut self, mutation_id: String, state: Value) -> Result<Value> {
+        self.inner
+            .replace_state(&mutation_id, state)
+            .map_err(encoded_durability_error)?;
+        self.snapshot()
+    }
+
+    #[napi]
+    pub fn checkpoint(&mut self, checkpoint_key: String, label: Option<String>) -> Result<Value> {
+        let checkpoint = self
+            .inner
+            .checkpoint(&checkpoint_key, label)
+            .map_err(encoded_durability_error)?;
+        serde_json::to_value(checkpoint)
+            .map_err(|_| Error::from_reason("failed to encode durable checkpoint"))
+    }
+
+    #[napi]
+    pub fn pause(&mut self, pause_id: String, reason: String) -> Result<()> {
+        self.inner
+            .pause(&pause_id, reason)
+            .map_err(encoded_durability_error)
+    }
+
+    #[napi]
+    pub fn request_approval(
+        &mut self,
+        logical_key: String,
+        prompt: String,
+        payload: Value,
+        activity_id: Option<String>,
+    ) -> Result<String> {
+        self.inner
+            .request_approval(&logical_key, activity_id, prompt, payload)
+            .map_err(encoded_durability_error)
+    }
+
+    #[napi]
+    pub fn complete(&mut self, completion_id: String) -> Result<()> {
+        self.inner
+            .complete_run(&completion_id)
+            .map(|_| ())
+            .map_err(encoded_durability_error)
+    }
+
+    #[napi]
+    pub fn fail(&mut self, failure_id: String, error: String) -> Result<()> {
+        self.inner
+            .fail_run(&failure_id, error)
+            .map(|_| ())
+            .map_err(encoded_durability_error)
+    }
+
+    #[napi]
+    pub fn apply_command(&mut self, command: Value) -> Result<Value> {
+        let command: RunCommand = serde_json::from_value(command).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid durable command: {error}"),
+            )
+        })?;
+        let outcome = self
+            .inner
+            .apply_command(command)
+            .map_err(encoded_durability_error)?;
+        node_command_outcome_value(outcome)
+    }
+}
+
+/// Evaluate stream/durability traces deterministically without provider or tool execution.
+#[napi]
+pub fn evaluate_trace(suite: Value, trace: Value) -> Result<Value> {
+    let suite: EvalSuite = serde_json::from_value(suite)
+        .map_err(|error| Error::new(Status::InvalidArg, format!("invalid EvalSuite: {error}")))?;
+    let trace: TraceInput = serde_json::from_value(trace)
+        .map_err(|error| Error::new(Status::InvalidArg, format!("invalid TraceInput: {error}")))?;
+    serde_json::to_value(core_evaluate_trace(&suite, &trace))
+        .map_err(|_| Error::from_reason("failed to encode TraceEvalResult"))
 }
 
 #[napi]
@@ -1537,6 +1729,43 @@ impl Agent {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
+    /// Plane-aware compare-and-swap memory update for concurrent agents.
+    #[napi]
+    pub fn remember_cas(
+        &self,
+        key: String,
+        value: Value,
+        expected_revision: BigInt,
+        plane: Option<String>,
+        provenance: Option<Value>,
+    ) -> Result<BigInt> {
+        let (signed, expected_revision, lossless) = expected_revision.get_u64();
+        if signed || !lossless {
+            return Err(Error::from_reason(
+                "expectedRevision must be a non-negative u64 bigint",
+            ));
+        }
+        let plane = match plane.as_deref().unwrap_or("working") {
+            "working" => aikit_core::MemoryPlane::Working,
+            "episodic" => aikit_core::MemoryPlane::Episodic,
+            "semantic" => aikit_core::MemoryPlane::Semantic,
+            _ => {
+                return Err(Error::from_reason(
+                    "plane must be working, episodic, or semantic",
+                ))
+            }
+        };
+        let provenance = provenance
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| Error::from_reason(format!("invalid memory provenance: {error}")))?
+            .unwrap_or_default();
+        self.inner
+            .remember_cas(key, value, plane, provenance, expected_revision)
+            .map(BigInt::from)
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
     /// Search explicit memories in this agent's namespace.
     #[napi(ts_return_type = "any")]
     pub fn recall(&self, query: String, limit: Option<u32>) -> Result<Value> {
@@ -2336,6 +2565,20 @@ pub struct QueryStream {
     recorder: RunRecorder,
 }
 
+struct QueryEventStreamState {
+    encoder: StreamEventEncoder,
+    pending: VecDeque<StreamEvent>,
+}
+
+/// Versioned start/delta/end view over a canonical query stream.
+#[napi]
+pub struct QueryEventStream {
+    inner: Arc<TokioMutex<Option<CancellableRun>>>,
+    state: Arc<TokioMutex<QueryEventStreamState>>,
+    cancellation: CancellationHandle,
+    recorder: RunRecorder,
+}
+
 fn query_stream(run: CancellableRun) -> QueryStream {
     let cancellation = run.cancellation_handle();
     let recorder = run.recorder();
@@ -2369,6 +2612,24 @@ impl QueryStream {
         }
     }
 
+    /// Consume this run through the versioned event lifecycle. Legacy and v2 views are alternate
+    /// single-consumer surfaces and cannot be polled concurrently.
+    #[napi]
+    pub fn events(&self, response_id: String) -> Result<QueryEventStream> {
+        if response_id.trim().is_empty() {
+            return Err(Error::from_reason("responseId must not be empty"));
+        }
+        Ok(QueryEventStream {
+            inner: self.inner.clone(),
+            state: Arc::new(TokioMutex::new(QueryEventStreamState {
+                encoder: StreamEventEncoder::new(response_id),
+                pending: VecDeque::new(),
+            })),
+            cancellation: self.cancellation.clone(),
+            recorder: self.recorder.clone(),
+        })
+    }
+
     /// Request cooperative cancellation immediately. Call `close()` to await all finalizers.
     #[napi]
     pub fn cancel(&self) {
@@ -2393,6 +2654,71 @@ impl QueryStream {
     }
 
     /// Current recorder snapshot. It is terminal after exhaustion or `close()`.
+    #[napi(ts_return_type = "any")]
+    pub fn outcome(&self) -> Result<Value> {
+        serde_json::to_value(self.recorder.outcome())
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+}
+
+#[napi]
+impl QueryEventStream {
+    #[napi(ts_return_type = "Promise<any | null>")]
+    pub async fn next(&self) -> Result<Option<Value>> {
+        let mut state = self.state.try_lock().map_err(|_| {
+            Error::from_reason(
+                "QueryEventStream is single-consumer; concurrent next() is unsupported",
+            )
+        })?;
+        if let Some(event) = state.pending.pop_front() {
+            return serde_json::to_value(event)
+                .map(Some)
+                .map_err(|error| Error::from_reason(error.to_string()));
+        }
+
+        let delta = {
+            let mut run = self.inner.try_lock().map_err(|_| {
+                Error::from_reason("legacy and event stream views cannot be consumed concurrently")
+            })?;
+            match run.as_mut() {
+                Some(run) => run.next().await,
+                None => None,
+            }
+        };
+        let Some(delta) = delta else {
+            return Ok(None);
+        };
+        let encoded = state.encoder.push(delta);
+        state.pending.extend(encoded);
+        state
+            .pending
+            .pop_front()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| Error::from_reason(error.to_string()))
+    }
+
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    #[napi(getter)]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    #[napi(ts_return_type = "Promise<any>")]
+    pub async fn close(&self) -> Result<Value> {
+        self.cancellation.cancel();
+        let run = self.inner.lock().await.take();
+        let outcome = match run {
+            Some(run) => run.cancel().await,
+            None => self.recorder.outcome(),
+        };
+        serde_json::to_value(outcome).map_err(|error| Error::from_reason(error.to_string()))
+    }
+
     #[napi(ts_return_type = "any")]
     pub fn outcome(&self) -> Result<Value> {
         serde_json::to_value(self.recorder.outcome())
@@ -2434,6 +2760,38 @@ impl ObjectStream {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn durable_binding_round_trips_replay_validated_state_and_evaluates_trace() {
+        let mut run = DurableRun::new("session-sdk".into(), "run-sdk".into(), None).unwrap();
+        run.replace_state("turn-1".into(), serde_json::json!({"answer": 42}))
+            .unwrap();
+        let state = run.snapshot().unwrap();
+        let restored = DurableRun::from_state(state.clone()).unwrap();
+        assert_eq!(restored.status().unwrap(), "running");
+        assert_eq!(restored.snapshot().unwrap(), state);
+
+        let result = evaluate_trace(
+            serde_json::json!({
+                "schema_version": 1,
+                "name": "binding-durability",
+                "assertions": [
+                    {"type": "durable_sequence_monotonic"},
+                    {"type": "run_status", "status": "running"}
+                ]
+            }),
+            serde_json::json!({
+                "durable_events": state["events"].clone(),
+                "run_status": "running"
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["passed"], true);
+
+        let mut tampered = state;
+        tampered["projection"]["status"] = serde_json::json!("completed");
+        assert!(DurableRun::from_state(tampered).is_err());
+    }
 
     #[test]
     fn mcp_tool_filter_options_fail_closed_and_share_core_validation() {

@@ -78,6 +78,9 @@ pub enum MediaSource {
     Base64 { data: String },
 }
 
+/// Forward-compatible name for canonical input content. `ContentBlock` remains the v0.x name.
+pub type ContentPart = ContentBlock;
+
 /// One turn of the conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {

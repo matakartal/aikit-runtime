@@ -1,5 +1,5 @@
 ---
-source_version: 0.2.0
+source_version: 0.3.0-alpha.1
 source_status: draft
 commit_sha:
 source_remote: pending
@@ -8,7 +8,7 @@ live_matrix: optional
 native_artifacts: pending
 ---
 
-# Source-distribution evidence: v0.2.0
+# Source-distribution evidence: v0.3.0-alpha.1
 
 Copy this file to `docs/releases/vX.Y.Z.md` when recording a manual artifact assembly. Never
 record API keys, access tokens, private prompts, or raw provider responses here.
@@ -32,9 +32,9 @@ record API keys, access tokens, private prompts, or raw provider responses here.
 | Rust/Python/Node conformance |  |  |
 | Deterministic eval dataset(s) |  |  |
 | Containment capability review |  |  |
-| CodeQL review |  |  |
-| Dependency advisory review |  |  |
-| Committed-secret review |  |  |
+| CodeQL review (`codeql.yml` run URL) |  |  |
+| Dependency advisory/license review (`security.yml` cargo-deny run URL) |  |  |
+| Committed-secret review (`security.yml` gitleaks run URL) |  |  |
 
 ## Optional live-provider matrix
 
@@ -45,8 +45,12 @@ Record model ids and outcomes, never secrets.
 |---|---|---|---|---|---|
 | Anthropic |  |  |  |  |  |
 | OpenAI |  |  |  |  |  |
-| DeepSeek |  |  |  |  |  |
 | Google |  |  |  |  |  |
+| DeepSeek |  |  |  |  |  |
+| OpenRouter |  |  |  |  |  |
+| Groq |  |  |  |  |  |
+| Mistral |  |  |  |  |  |
+| xAI |  |  |  |  |  |
 
 ## Local artifact inspection
 

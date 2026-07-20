@@ -1,6 +1,6 @@
 """Static contract fixture for the public Python binding surface."""
 
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 from typing_extensions import assert_type
 
 from pydantic import BaseModel
@@ -12,6 +12,7 @@ from aikit import (
     ApprovalResponse,
     Client,
     ContainmentCapabilityReport,
+    ContentPart,
     ErrorInfo,
     ErrorCode,
     EvalGate,
@@ -20,14 +21,18 @@ from aikit import (
     GeneratedText,
     HookResponse,
     JsonValue,
+    legacy,
     Message,
-    McpServer,
+    McpConnection,
     McpToolFilter,
     ModelProfile,
     ModelRouteRequirements,
     ObjectStream,
+    OutputPart,
     PromptInput,
+    ProviderMetadata,
     QueryStream,
+    ResumeCommand,
     RunOutcome,
     RunOptions,
     SemanticValidationDecision,
@@ -41,6 +46,9 @@ from aikit import (
     query,
     tool,
 )
+
+if TYPE_CHECKING:
+    McpConnection()  # type: ignore[call-arg]  # factory-only native handle
 
 
 class Invoice(BaseModel):
@@ -67,6 +75,15 @@ messages: list[Message] = [
     },
 ]
 prompt_input: PromptInput = messages
+canonical_content: ContentPart = {"type": "text", "text": "canonical"}
+materialized_output: OutputPart = {
+    "type": "structured_data",
+    "value": {"status": "ok"},
+}
+provider_metadata: ProviderMetadata = {"mock": [{"request_id": "fixture"}]}
+assert_type(canonical_content, ContentPart)
+assert_type(materialized_output, OutputPart)
+assert_type(provider_metadata, ProviderMetadata)
 
 eval_outcome: RunOutcome = {
     "messages": messages,
@@ -211,10 +228,10 @@ agent.enable_default_guardrails([r"ignore previous instructions"])
 
 async def configure_mcp() -> None:
     tool_filter: McpToolFilter = {"allow": ["read_file", "search"], "deny": ["write_file"]}
-    http_server: McpServer = await connect_mcp_http(
+    http_server: McpConnection = await connect_mcp_http(
         "https://mcp.example.com", "remote", tool_filter=tool_filter
     )
-    stdio_server: McpServer = await connect_mcp_stdio(
+    stdio_server: McpConnection = await connect_mcp_stdio(
         "server", [], "local", env={}, inherit_env=False, tool_filter={"deny": ["Bash"]}
     )
     agent.register_mcp(http_server)
@@ -223,7 +240,11 @@ async def configure_mcp() -> None:
     await http_server.read_resource("file:///guide")
     await http_server.get_prompt("review", {})
     void_server = stdio_server
-    assert_type(void_server, McpServer)
+    assert_type(void_server, McpConnection)
+    assert_type(legacy.McpServer, type[McpConnection])
+
+resume_without_approvals: ResumeCommand = {"command": "resume", "command_id": "resume-1"}
+assert_type(resume_without_approvals, ResumeCommand)
 
 run_options: RunOptions = {
     "model": "mock-1",

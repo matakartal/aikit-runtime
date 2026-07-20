@@ -90,6 +90,8 @@ function normalizeNativeError(error) {
 /** Make a native pull stream (`next()` → value | null) consumable via `for await`. */
 function asyncIterable(stream, transform, signal) {
   const nativeNext = stream.next.bind(stream);
+  const nativeEvents =
+    typeof stream.events === "function" ? stream.events.bind(stream) : null;
   const nativeCancel =
     typeof stream.cancel === "function" ? stream.cancel.bind(stream) : null;
   const nativeClose =
@@ -141,6 +143,9 @@ function asyncIterable(stream, transform, signal) {
     });
   };
   if (nativeClose != null) stream.close = close;
+  if (nativeEvents != null) {
+    stream.events = (responseId) => asyncIterable(nativeEvents(responseId), undefined, signal);
+  }
   if (signal != null) {
     if (typeof signal.addEventListener !== "function") {
       throw new TypeError("options.signal must be an AbortSignal");
@@ -544,11 +549,70 @@ native.Agent.prototype.streamObject = function (prompt, schema, options) {
   });
 };
 
+// Keep durability errors as branchable `AikitError`s just like async agent failures. The native
+// class owns all state transitions; this wrapper only normalizes the encoded error envelope.
+class DurableRun {
+  constructor(sessionId, runId, durability = "sync") {
+    try {
+      this._native = new native.DurableRun(sessionId, runId, durability);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  }
+
+  static fromState(state) {
+    try {
+      const run = Object.create(DurableRun.prototype);
+      run._native = native.DurableRun.fromState(state);
+      return run;
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  }
+
+  get schemaVersion() { return this._native.schemaVersion; }
+  get sessionId() { return this._native.sessionId; }
+  get runId() { return this._native.runId; }
+  get durability() { return this._native.durability; }
+  get status() { return this._native.status; }
+
+  _call(method, ...args) {
+    try {
+      return this._native[method](...args);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  }
+
+  snapshot() { return this._call("snapshot"); }
+  replaceState(mutationId, state) { return this._call("replaceState", mutationId, state); }
+  checkpoint(checkpointKey, label) { return this._call("checkpoint", checkpointKey, label); }
+  pause(pauseId, reason) { return this._call("pause", pauseId, reason); }
+  requestApproval(logicalKey, prompt, payload, activityId) {
+    return this._call("requestApproval", logicalKey, prompt, payload, activityId);
+  }
+  complete(completionId) { return this._call("complete", completionId); }
+  fail(failureId, error) { return this._call("fail", failureId, error); }
+  applyCommand(command) { return this._call("applyCommand", command); }
+}
+
 module.exports = {
   Agent: native.Agent,
   Client: native.Client,
-  McpServer: native.McpServer,
+  DurableRun,
+  McpConnection: native.McpServer,
+  legacy: Object.freeze({
+    // Deprecated v0.x alias. The object is a client connection, not an MCP server.
+    McpServer: native.McpServer,
+  }),
   evaluateOutcome: native.evaluateOutcome,
+  evaluateTrace: (suite, trace) => {
+    try {
+      return native.evaluateTrace(suite, trace);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
   tool,
   // query(prompt, tools?, options?) — `tools` maps a name to a JS `async (input) => string`.
   query: (prompt, tools, options) => {

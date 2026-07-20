@@ -14,8 +14,11 @@ use crate::credentials::{provider_from_env_var, resolve_provider, ResolveError};
 use crate::providers::anthropic::AnthropicProvider;
 use crate::providers::deepseek::DeepSeekProvider;
 use crate::providers::google::GeminiProvider;
-use crate::providers::openai::OpenAiProvider;
+use crate::providers::groq::GroqProvider;
+use crate::providers::mistral::MistralProvider;
 use crate::providers::openai_responses::OpenAiResponsesProvider;
+use crate::providers::openrouter::OpenRouterProvider;
+use crate::providers::xai::XaiProvider;
 use crate::providers::{MockProvider, Provider};
 use crate::runtime::{run_agent, RunConfig};
 use crate::tools::builtin::{BuiltinTools, ALL_TOOL_NAMES};
@@ -183,6 +186,26 @@ impl Agent {
             .map_err(|error| AgentError::Core(crate::error::AikitError::Session(error)))
     }
 
+    /// Optimistic, plane-aware memory update. This is the safe path for concurrent agents;
+    /// stale writers receive a typed session error instead of silently winning.
+    pub fn remember_cas(
+        &self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+        plane: crate::memory::MemoryPlane,
+        provenance: crate::memory::MemoryProvenance,
+        expected_revision: u64,
+    ) -> Result<u64, AgentError> {
+        self.memory
+            .compare_and_swap(
+                crate::memory::MemoryEntry::new(self.memory_namespace.clone(), key, value)
+                    .with_plane(plane)
+                    .with_provenance(provenance),
+                expected_revision,
+            )
+            .map_err(|error| AgentError::Core(crate::error::AikitError::Conflict(error)))
+    }
+
     pub fn recall(
         &self,
         query: &str,
@@ -221,6 +244,7 @@ impl Agent {
                 supports_vision: c.supports_vision,
                 supports_citations: c.supports_citations,
                 structured_output: c.structured_output,
+                structured_output_features: c.structured_output_capabilities(),
             })
             .collect();
         AgentCapabilities {
@@ -231,15 +255,24 @@ impl Agent {
                 "budget_reservations".into(),
                 "cancellation".into(),
                 "compaction".into(),
+                "durable_execution".into(),
+                "eval_trace".into(),
                 "human_governed_capabilities".into(),
                 "mcp".into(),
+                "model_capability_profiles".into(),
+                "multimodal_contracts".into(),
+                "multimodal_routing".into(),
                 "governance_hooks".into(),
                 "guardrails".into(),
                 "memory".into(),
+                "memory_cas".into(),
                 "os_containment".into(),
+                "protocol_governance".into(),
                 "routing".into(),
                 "sessions".into(),
+                "skills".into(),
                 "structured_output".into(),
+                "stream_events_v2".into(),
                 "subagents".into(),
             ],
         }
@@ -281,26 +314,10 @@ impl Agent {
             "deepseek" => Ok(Arc::new(DeepSeekProvider::new(key))),
             "openai" => Ok(Arc::new(OpenAiResponsesProvider::new(key))),
             "google" => Ok(Arc::new(GeminiProvider::new(key))),
-            "openrouter" => Ok(Arc::new(OpenAiProvider::compatible(
-                "openrouter",
-                key,
-                "https://openrouter.ai/api/v1",
-            ))),
-            "groq" => Ok(Arc::new(OpenAiProvider::compatible(
-                "groq",
-                key,
-                "https://api.groq.com/openai/v1",
-            ))),
-            "mistral" => Ok(Arc::new(OpenAiProvider::compatible(
-                "mistral",
-                key,
-                "https://api.mistral.ai/v1",
-            ))),
-            "xai" => Ok(Arc::new(OpenAiProvider::compatible(
-                "xai",
-                key,
-                "https://api.x.ai/v1",
-            ))),
+            "openrouter" => Ok(Arc::new(OpenRouterProvider::new(key))),
+            "groq" => Ok(Arc::new(GroqProvider::new(key))),
+            "mistral" => Ok(Arc::new(MistralProvider::new(key))),
+            "xai" => Ok(Arc::new(XaiProvider::new(key))),
             other => Err(AgentError::NoAdapter(other)),
         }
     }
@@ -961,6 +978,7 @@ pub struct ProviderCapabilityView {
     pub supports_vision: bool,
     pub supports_citations: bool,
     pub structured_output: FidelityGrade,
+    pub structured_output_features: crate::capabilities::StructuredOutputCapabilities,
 }
 
 #[cfg(test)]

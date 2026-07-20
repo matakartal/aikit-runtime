@@ -20,7 +20,7 @@ aikit [--format text|json|jsonl] [--quiet] <command>
 ```
 
 `--quiet` suppresses non-result informational output. `--version` reports the workspace package
-version; this source preview is `0.2.0`.
+version; this source preview is `0.3.0-alpha.1`.
 
 ## Commands
 

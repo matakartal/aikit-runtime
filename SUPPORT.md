@@ -10,7 +10,7 @@ Use the channel that matches the request:
 
 Never post API keys, private prompts, customer data, or vulnerability details in public issues or discussions.
 
-This repository is a source-first `v0.2.0` preview. npm, PyPI, and crates.io installation support
+This repository is a source-first `v0.3.0-alpha.1` preview. npm, PyPI, and crates.io installation support
 is not offered because no public registry release is claimed. Start with the root
 [`README`](README.md), then use the surface-specific guides under `crates/`.
 

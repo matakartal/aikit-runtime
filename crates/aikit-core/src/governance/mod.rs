@@ -10,16 +10,24 @@
 
 pub mod capability;
 pub mod containment;
+pub mod contracts;
+pub mod egress_broker;
 pub mod guardrail;
 pub mod hooks;
 pub mod off_prompt;
 pub mod permissions;
 pub mod plan;
 pub mod policy;
+pub mod policy_adapters;
 pub mod process;
 pub mod reliability;
 pub mod risk;
 pub mod sandbox;
+pub mod skills;
+
+pub use contracts::*;
+pub use policy_adapters::*;
+pub use skills::*;
 
 use async_trait::async_trait;
 use hooks::{HookDispatcher, HookOutcome, PreToolUseContext};

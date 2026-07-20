@@ -2,6 +2,7 @@
 //! provider actually supports and, for structured output, which fidelity tier it will get.
 //! We do NOT claim grammar-constrained decoding on hosted APIs where it is impossible.
 
+use crate::contract::CapabilityState;
 use crate::reasoning::ReplayPolicy;
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,41 @@ pub enum FidelityGrade {
     PromptedAndParsed,
 }
 
+/// Orthogonal structured-output facts. A provider can support native schema while still being
+/// unknown for schema+tools composition or streaming validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredOutputCapabilities {
+    pub native_schema: CapabilityState,
+    pub forced_tool: CapabilityState,
+    pub prompted_parse: CapabilityState,
+    pub schema_with_tools: CapabilityState,
+    pub streaming_schema: CapabilityState,
+    pub parallel_tools: CapabilityState,
+}
+
+impl StructuredOutputCapabilities {
+    pub fn from_fidelity(fidelity: FidelityGrade) -> Self {
+        let mut profile = Self {
+            native_schema: CapabilityState::Unsupported,
+            forced_tool: CapabilityState::Unknown,
+            prompted_parse: CapabilityState::Supported,
+            schema_with_tools: CapabilityState::Unknown,
+            streaming_schema: CapabilityState::Unknown,
+            parallel_tools: CapabilityState::Unknown,
+        };
+        match fidelity {
+            FidelityGrade::NativeConstrained => {
+                profile.native_schema = CapabilityState::Supported;
+            }
+            FidelityGrade::ForcedToolCall => {
+                profile.forced_tool = CapabilityState::Supported;
+            }
+            FidelityGrade::PromptedAndParsed => {}
+        }
+        profile
+    }
+}
+
 /// What one provider can and cannot do. Descriptors are honest, not aspirational.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -31,6 +67,12 @@ pub struct Capabilities {
     /// How reasoning state is replayed across a multi-turn tool loop.
     #[serde(skip)]
     pub reasoning_replay: ReplayPolicy,
+}
+
+impl Capabilities {
+    pub fn structured_output_capabilities(&self) -> StructuredOutputCapabilities {
+        StructuredOutputCapabilities::from_fidelity(self.structured_output)
+    }
 }
 
 /// Registry of built-in provider capabilities. The `Agent` consults it to answer

@@ -1,5 +1,6 @@
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+export type ProviderMetadata = Record<string, JsonValue[]>;
 
 export interface Usage {
   input_tokens: number;
@@ -72,8 +73,57 @@ export type StreamDelta =
   | { type: "message_stop"; stop_reason: string }
   | { type: "error"; message: string; info: ErrorInfo };
 
+export type CapabilityState = "supported" | "unsupported" | "unknown";
+export type CompatibilityMode = "strict" | "warn" | "best_effort";
+
+export interface ProviderWarning {
+  code: string;
+  message: string;
+  parameter?: string;
+  provider?: string;
+  model?: string;
+}
+
+export type StreamBlockKind =
+  | "text"
+  | "reasoning"
+  | "tool_call"
+  | "tool_result"
+  | "citation"
+  | "image"
+  | "audio"
+  | "transcript"
+  | "structured_data";
+
+export type StreamEventKind =
+  | { type: "response_start"; response_id: string; model: string }
+  | { type: "block_start"; block_id: string; block_kind: StreamBlockKind; name?: string }
+  | { type: "block_delta"; block_id: string; delta: JsonValue }
+  | { type: "block_end"; block_id: string; value?: JsonValue }
+  | { type: "provider_metadata"; provider: string; metadata: JsonValue }
+  | { type: "usage"; usage: Usage }
+  | { type: "warning"; warning: ProviderWarning }
+  | { type: "response_end"; response_id: string; stop_reason: string }
+  | { type: "error"; message: string; info: ErrorInfo }
+  | { type: "raw_provider_event"; provider: string; event: JsonValue };
+
+export type StreamEvent = {
+  event_id: string;
+  sequence: number;
+} & StreamEventKind;
+
+export interface QueryEventStream extends AsyncIterable<StreamEvent> {
+  next(): Promise<StreamEvent | null>;
+  cancel(): void;
+  readonly isCancelled: boolean;
+  close(): Promise<RunOutcome>;
+  outcome(): RunOutcome;
+}
+
 export interface QueryStream extends AsyncIterable<StreamDelta> {
   next(): Promise<StreamDelta | null>;
+  /** Alternate single-consumer v2 view with block start/delta/end events. */
+  events(responseId: string): QueryEventStream;
   /** Request cooperative cancellation without waiting for finalizers. */
   cancel(): void;
   readonly isCancelled: boolean;
@@ -115,6 +165,40 @@ export type ContentBlock =
       media_type: string;
       source: { kind: "url"; url: string } | { kind: "base64"; data: string };
     }
+  | { type: "citation"; text: string; source?: string; metadata?: JsonValue };
+
+/** Canonical v0.3 name; ContentBlock remains the v0.x compatibility spelling. */
+export type ContentPart = ContentBlock;
+
+export type MediaInputSource =
+  | { kind: "url"; url: string }
+  | { kind: "base64"; data: string }
+  | { kind: "bytes"; data: number[] }
+  | { kind: "artifact"; artifact_id: string };
+
+export interface MediaInput {
+  media_type: string;
+  source: MediaInputSource;
+  sha256: string;
+  size_bytes: number;
+}
+
+export type OutputPart =
+  | { type: "text"; text: string }
+  | {
+      type: "reasoning";
+      text: string;
+      signature?: string;
+      provider?: string;
+      opaque?: JsonValue;
+    }
+  | { type: "image"; media: MediaInput }
+  | { type: "audio"; media: MediaInput }
+  | { type: "file"; media: MediaInput; filename?: string }
+  | { type: "transcript"; text: string; language?: string }
+  | { type: "tool_call"; id: string; name: string; input: JsonValue }
+  | { type: "tool_result"; tool_use_id: string; content: string; is_error: boolean }
+  | { type: "structured_data"; value: JsonValue }
   | { type: "citation"; text: string; source?: string; metadata?: JsonValue };
 
 export interface Message {
@@ -211,6 +295,11 @@ export type ModelCapability =
   | "native_structured_output"
   | "tool_use"
   | "image_generation"
+  | "document_input"
+  | "audio_input"
+  | "transcription"
+  | "speech_generation"
+  | "realtime_duplex"
   | { custom: string };
 
 export interface ModelPricing {
@@ -229,6 +318,66 @@ export interface ModelProfile {
   quality_score: number;
   skills: string[];
   capabilities: ModelCapability[];
+  /** Missing keys mean unknown; required unknown capabilities fail closed. */
+  capability_states?: Record<string, CapabilityState>;
+}
+
+export type ModalityRequirement =
+  | "text"
+  | "reasoning"
+  | "image_input"
+  | "image_generation"
+  | "document_input"
+  | "audio_input"
+  | "transcription"
+  | "speech_generation"
+  | "realtime_duplex"
+  | "tool_use"
+  | "structured_output";
+
+export interface MediaArtifact {
+  artifact_id: string;
+  media_type: string;
+  sha256: string;
+  size_bytes: number;
+  provider?: string;
+  model?: string;
+}
+
+export interface GeneratedImage {
+  artifact: MediaArtifact;
+  revised_prompt?: string;
+  provider_metadata?: JsonValue;
+}
+
+export interface GeneratedAudio {
+  artifact: MediaArtifact;
+  duration_ms?: number;
+  voice?: string;
+  provider_metadata?: JsonValue;
+}
+
+export interface TranscriptSegment {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker?: string;
+  confidence?: number;
+}
+
+export interface Transcript {
+  text: string;
+  language?: string;
+  segments: TranscriptSegment[];
+  provider_metadata?: JsonValue;
+}
+
+export interface VoiceActivityPolicy {
+  enabled: boolean;
+  threshold: number;
+  prefix_padding_ms: number;
+  silence_duration_ms: number;
+  interrupt_response: boolean;
 }
 
 export type RoutePolicy =
@@ -262,10 +411,19 @@ export interface MemoryEntry {
   namespace: string;
   key: string;
   value: JsonValue;
+  plane: "working" | "episodic" | "semantic";
+  revision: number;
+  provenance: MemoryProvenance;
   tags: string[];
   importance: number;
   created_unix_ms: number;
   updated_unix_ms: number;
+}
+
+export interface MemoryProvenance {
+  source_run_id?: string;
+  source_event_sequence?: number;
+  model_generated?: boolean;
 }
 
 export interface BudgetLimits {
@@ -404,6 +562,129 @@ export function evaluateOutcome(
   gates: readonly EvalGate[],
 ): EvalVerdict;
 
+export type DurabilityMode = "sync" | "async" | "exit";
+export type DurableRunStatus =
+  | "running"
+  | "paused"
+  | "reconcile_required"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface DurableRunState {
+  schema_version: number;
+  session_id: string;
+  run_id: string;
+  durability: DurabilityMode;
+  parent_run_id: string | null;
+  events: Array<Record<string, JsonValue>>;
+  checkpoints: Record<string, JsonValue>;
+  projection: Record<string, JsonValue>;
+}
+
+export interface DurableCheckpoint {
+  checkpoint_id: string;
+  run_id: string;
+  event_sequence: number;
+  parent_checkpoint_id: string | null;
+  label: string | null;
+  projection: Record<string, JsonValue>;
+}
+
+export interface ApprovalResolution {
+  approval_id: string;
+  approved: boolean;
+  response?: JsonValue;
+}
+
+export type DurableCommand =
+  | { command: "resume"; command_id: string; approvals?: ApprovalResolution[] }
+  | {
+      command: "fork";
+      command_id: string;
+      new_run_id: string;
+      checkpoint_id: string;
+      side_effects_reconciled: boolean;
+    }
+  | {
+      command: "rewind";
+      command_id: string;
+      checkpoint_id: string;
+      side_effects_reconciled: boolean;
+    }
+  | { command: "cancel"; command_id: string; reason?: string | null };
+
+export type DurableCommandResult =
+  | { type: "resumed"; sequence: number }
+  | { type: "forked"; run: DurableRunState }
+  | { type: "rewound"; checkpoint_id: string; sequence: number }
+  | { type: "cancelled"; sequence: number };
+
+/** Stateful wrapper over the canonical append-only Rust durability engine. */
+export class DurableRun {
+  constructor(sessionId: string, runId: string, durability?: DurabilityMode);
+  static fromState(state: DurableRunState): DurableRun;
+  readonly schemaVersion: number;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly durability: DurabilityMode;
+  readonly status: DurableRunStatus;
+  snapshot(): DurableRunState;
+  replaceState(mutationId: string, state: JsonValue): DurableRunState;
+  checkpoint(checkpointKey: string, label?: string): DurableCheckpoint;
+  pause(pauseId: string, reason: string): void;
+  requestApproval(
+    logicalKey: string,
+    prompt: string,
+    payload: JsonValue,
+    activityId?: string,
+  ): string;
+  complete(completionId: string): void;
+  fail(failureId: string, error: string): void;
+  applyCommand(command: DurableCommand): DurableCommandResult;
+}
+
+export type TraceAssertion =
+  | { type: "stream_sequence_monotonic" }
+  | { type: "stream_blocks_balanced" }
+  | { type: "durable_sequence_monotonic" }
+  | { type: "no_duplicate_activity_completion" }
+  | { type: "all_required_reconciliations_resolved" }
+  | { type: "approval_resolved"; approval_id: string; approved: boolean }
+  | { type: "run_status"; status: DurableRunStatus };
+
+export interface TraceEvalSuite {
+  schema_version: number;
+  name: string;
+  assertions: TraceAssertion[];
+}
+
+export interface TraceInput {
+  stream_events?: StreamEvent[];
+  durable_events?: Array<Record<string, JsonValue>>;
+  run_status?: DurableRunStatus | null;
+}
+
+export interface TraceCheck {
+  assertion: string;
+  passed: boolean;
+  message: string;
+}
+
+export interface TraceEvalResult {
+  suite: string;
+  passed: boolean;
+  passed_checks: number;
+  total_checks: number;
+  checks: TraceCheck[];
+}
+
+/** Pure deterministic evaluation; performs no provider, tool, filesystem, or network work. */
+export function evaluateTrace(
+  suite: TraceEvalSuite,
+  trace: TraceInput,
+): TraceEvalResult;
+
 export interface SubagentResult {
   id: string;
   status:
@@ -446,6 +727,16 @@ export interface ProviderCapabilityView {
   supports_vision: boolean;
   supports_citations: boolean;
   structured_output: "native_constrained" | "forced_tool_call" | "prompted_and_parsed";
+  structured_output_features: StructuredOutputCapabilities;
+}
+
+export interface StructuredOutputCapabilities {
+  native_schema: CapabilityState;
+  forced_tool: CapabilityState;
+  prompted_parse: CapabilityState;
+  schema_with_tools: CapabilityState;
+  streaming_schema: CapabilityState;
+  parallel_tools: CapabilityState;
 }
 
 export interface AgentCapabilities {
@@ -568,14 +859,18 @@ export interface McpToolFilter {
   deny?: readonly string[];
 }
 
-export class McpServer {
-  static connectHttp(endpoint: string, name: string, bearerToken?: string, toolFilter?: McpToolFilter): Promise<McpServer>;
-  static connectStdio(program: string, args: string[], name: string, env?: Record<string, string>, inheritEnv?: boolean, toolFilter?: McpToolFilter): Promise<McpServer>;
+export class McpConnection {
+  private constructor();
+  static connectHttp(endpoint: string, name: string, bearerToken?: string, toolFilter?: McpToolFilter): Promise<McpConnection>;
+  static connectStdio(program: string, args: string[], name: string, env?: Record<string, string>, inheritEnv?: boolean, toolFilter?: McpToolFilter): Promise<McpConnection>;
   listResources(cursor?: string): Promise<JsonValue>;
   readResource(uri: string): Promise<JsonValue>;
   listPrompts(cursor?: string): Promise<JsonValue>;
   getPrompt(name: string, arguments: JsonValue): Promise<JsonValue>;
 }
+
+/** Deprecated v0.x compatibility namespace. Use McpConnection for new code. */
+export const legacy: Readonly<{ McpServer: typeof McpConnection }>;
 
 export class Agent {
   constructor();
@@ -598,7 +893,7 @@ export class Agent {
     allowedHosts: string[],
     options: BrowserToolsOptions,
   ): void;
-  registerMcp(server: McpServer): void;
+  registerMcp(server: McpConnection): void;
   enableCapabilityRequests(gatedTools: string[]): void;
   enableDefaultGuardrails(blockedInputPatterns?: string[]): void;
   addKey(key: string, provider?: string): string;
@@ -663,6 +958,13 @@ export class Agent {
     options?: GenerateObjectOptions,
   ): ObjectStream<T>;
   remember(key: string, value: JsonValue): void;
+  rememberCas(
+    key: string,
+    value: JsonValue,
+    expectedRevision: bigint,
+    plane?: "working" | "episodic" | "semantic",
+    provenance?: MemoryProvenance,
+  ): bigint;
   recall(query: string, limit?: number): MemoryEntry[];
   route(profiles: ModelProfile[], request: RouteRequest): RouteDecision;
   runSubagent(

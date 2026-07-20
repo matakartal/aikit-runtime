@@ -7,8 +7,9 @@
 //! score. Model id is the final tie-breaker, so catalog insertion order can never change a route.
 
 use crate::budget::ModelPricing;
+use crate::contract::CapabilityState;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// A typed model feature that a route may require.
@@ -25,7 +26,33 @@ pub enum ModelCapability {
     NativeStructuredOutput,
     ToolUse,
     ImageGeneration,
+    DocumentInput,
+    AudioInput,
+    Transcription,
+    SpeechGeneration,
+    RealtimeDuplex,
     Custom(String),
+}
+
+impl ModelCapability {
+    /// Stable key used by the tri-state profile and host-language bindings.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Reasoning => "reasoning".into(),
+            Self::PromptCache => "prompt_cache".into(),
+            Self::Citations => "citations".into(),
+            Self::Vision => "vision".into(),
+            Self::NativeStructuredOutput => "native_structured_output".into(),
+            Self::ToolUse => "tool_use".into(),
+            Self::ImageGeneration => "image_generation".into(),
+            Self::DocumentInput => "document_input".into(),
+            Self::AudioInput => "audio_input".into(),
+            Self::Transcription => "transcription".into(),
+            Self::SpeechGeneration => "speech_generation".into(),
+            Self::RealtimeDuplex => "realtime_duplex".into(),
+            Self::Custom(value) => format!("custom:{value}"),
+        }
+    }
 }
 
 /// Static, caller-maintained facts about one routable model.
@@ -48,7 +75,11 @@ pub struct ModelProfile {
     pub quality_score: u8,
     /// Task-specialization labels such as `summary`, `coding`, or `hard_judgment`.
     pub skills: BTreeSet<String>,
+    /// Legacy positive-only view retained for v0.x compatibility.
     pub capabilities: BTreeSet<ModelCapability>,
+    /// Model-level truth. Missing entries are `unknown`, never implicitly unsupported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capability_states: BTreeMap<String, CapabilityState>,
 }
 
 impl ModelProfile {
@@ -68,6 +99,7 @@ impl ModelProfile {
             quality_score,
             skills: BTreeSet::new(),
             capabilities: BTreeSet::new(),
+            capability_states: BTreeMap::new(),
         }
     }
 
@@ -82,8 +114,39 @@ impl ModelProfile {
     }
 
     pub fn with_capability(mut self, capability: ModelCapability) -> Self {
+        self.capability_states
+            .insert(capability.key(), CapabilityState::Supported);
         self.capabilities.insert(capability);
         self
+    }
+
+    pub fn with_capability_state(
+        mut self,
+        capability: ModelCapability,
+        state: CapabilityState,
+    ) -> Self {
+        let key = capability.key();
+        if state == CapabilityState::Supported {
+            self.capabilities.insert(capability);
+        } else {
+            self.capabilities.remove(&capability);
+        }
+        self.capability_states.insert(key, state);
+        self
+    }
+
+    /// Resolve explicit tri-state data first, then the legacy positive-only set.
+    pub fn capability_state(&self, capability: &ModelCapability) -> CapabilityState {
+        self.capability_states
+            .get(&capability.key())
+            .copied()
+            .unwrap_or_else(|| {
+                if self.capabilities.contains(capability) {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unknown
+                }
+            })
     }
 
     fn validate(&self) -> Result<(), RouteError> {
@@ -121,6 +184,16 @@ impl ModelProfile {
             return Err(RouteError::InvalidProfile {
                 model: self.model.clone(),
                 reason: "skills must not contain an empty value".into(),
+            });
+        }
+        if self
+            .capability_states
+            .keys()
+            .any(|key| key.trim().is_empty())
+        {
+            return Err(RouteError::InvalidProfile {
+                model: self.model.clone(),
+                reason: "capability_states must not contain an empty key".into(),
             });
         }
         if let Some(pricing) = self.pricing {
@@ -268,13 +341,32 @@ pub struct ModelRejection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RejectionReason {
-    MissingCredential { provider: String },
-    MissingSkill { skill: String },
-    MissingCapability { capability: ModelCapability },
-    ContextWindowTooSmall { required: u64, available: u64 },
-    OutputLimitTooSmall { required: u64, available: u64 },
+    MissingCredential {
+        provider: String,
+    },
+    MissingSkill {
+        skill: String,
+    },
+    MissingCapability {
+        capability: ModelCapability,
+    },
+    CapabilityUnavailable {
+        capability: ModelCapability,
+        state: CapabilityState,
+    },
+    ContextWindowTooSmall {
+        required: u64,
+        available: u64,
+    },
+    OutputLimitTooSmall {
+        required: u64,
+        available: u64,
+    },
     UnknownPricing,
-    CostExceedsBudget { estimated: f64, limit: f64 },
+    CostExceedsBudget {
+        estimated: f64,
+        limit: f64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -378,9 +470,16 @@ impl ModelCatalog {
             reasons.extend(
                 request
                     .required_capabilities
-                    .difference(&profile.capabilities)
-                    .cloned()
-                    .map(|capability| RejectionReason::MissingCapability { capability }),
+                    .iter()
+                    .filter_map(|capability| {
+                        let state = profile.capability_state(capability);
+                        (state != CapabilityState::Supported).then(|| {
+                            RejectionReason::CapabilityUnavailable {
+                                capability: capability.clone(),
+                                state,
+                            }
+                        })
+                    }),
             );
             if required_context > profile.context_window_tokens {
                 reasons.push(RejectionReason::ContextWindowTooSmall {

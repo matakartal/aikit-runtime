@@ -1,0 +1,84 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 7 * * 1" # Mondays, after the weekly Dependabot window
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: Dependency advisories, licenses, bans, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          # Global flags precede the `check` subcommand; --locked forbids any Cargo.lock edit.
+          arguments: --all-features --locked
+
+  cargo-audit:
+    name: Independent RustSec audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Reject advisories and audit warnings
+        run: cargo audit --deny warnings
+
+  gitleaks:
+    name: Committed-secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0 # commit-scoped .gitleaksignore fingerprints require full history
+          persist-credentials: false
+      - name: Install pinned gitleaks with checksum verification
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          printf '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz\n' \
+            | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+      - name: Scan committed history
+        run: ./gitleaks git --redact --no-banner --verbose .
+
+  supply-chain-evidence:
+    name: SBOM and release-provenance contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Generate deterministic CycloneDX SBOM
+        run: ./scripts/security-check.sh --sbom dist/security
+      - name: Verify release provenance contract
+        run: ./scripts/security-check.sh --provenance
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: security-sbom
+          path: dist/security/aikit-runtime.cdx.json
+          if-no-files-found: error

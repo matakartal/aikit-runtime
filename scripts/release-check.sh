@@ -93,12 +93,17 @@ import re
 import sys
 
 target, wheel_directory, version = sys.argv[1:]
+# PEP 440 normalizes SemVer pre-releases in wheel filenames (for example
+# 0.3.0-alpha.1 -> 0.3.0a1) while Cargo/npm retain the SemVer spelling.
+wheel_version = re.sub(r"-alpha\.(\d+)$", r"a\1", version)
+wheel_version = re.sub(r"-beta\.(\d+)$", r"b\1", wheel_version)
+wheel_version = re.sub(r"-rc\.(\d+)$", r"rc\1", wheel_version)
 root = pathlib.Path(wheel_directory)
 wheels = sorted(path for path in root.glob("*.whl") if path.is_file())
 if len(wheels) != 1:
     raise SystemExit(f"expected exactly one wheel in {root}, found {len(wheels)}")
 
-prefix = rf"aikit_runtime-{re.escape(version)}-cp39-abi3-"
+prefix = rf"aikit_runtime-{re.escape(wheel_version)}-cp39-abi3-"
 patterns = {
     "linux-x64": prefix + r"manylinux_2_28_x86_64\.whl",
     "linux-arm64": prefix + r"manylinux_2_28_aarch64\.whl",
@@ -128,6 +133,9 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 version = sys.argv[2]
+wheel_version = re.sub(r"-alpha\.(\d+)$", r"a\1", version)
+wheel_version = re.sub(r"-beta\.(\d+)$", r"b\1", wheel_version)
+wheel_version = re.sub(r"-rc\.(\d+)$", r"rc\1", wheel_version)
 if not root.is_dir():
     raise SystemExit(f"bundle directory not found: {root}")
 
@@ -153,7 +161,7 @@ fixed = {
 missing = sorted(fixed - files)
 remaining = set(files - fixed)
 
-wheel_prefix = rf"aikit_runtime-{re.escape(version)}-cp39-abi3-"
+wheel_prefix = rf"aikit_runtime-{re.escape(wheel_version)}-cp39-abi3-"
 wheel_patterns = {
     "python-linux-x64": wheel_prefix + r"manylinux_2_28_x86_64\.whl",
     "python-linux-arm64": wheel_prefix + r"manylinux_2_28_aarch64\.whl",

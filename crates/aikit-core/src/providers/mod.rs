@@ -8,8 +8,12 @@
 pub mod anthropic;
 pub mod deepseek;
 pub mod google;
+pub mod groq;
+pub mod mistral;
 pub mod openai;
 pub mod openai_responses;
+pub mod openrouter;
+pub mod xai;
 
 use crate::error::{AikitError, ProviderError, ProviderErrorKind, Result};
 use crate::types::{ContentBlock, Message, StreamDelta, ToolSpec};
@@ -353,7 +357,7 @@ pub(crate) fn response_stream_failure(
     provider: &str,
     model: &str,
     error: reqwest::Error,
-    public_provider_name: &'static str,
+    public_provider_name: &str,
 ) -> StreamDelta {
     let kind = transport_error_kind(&error);
     let condition = if kind == ProviderErrorKind::Timeout {

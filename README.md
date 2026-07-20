@@ -398,8 +398,8 @@ If required containment is unavailable, built-in Bash is denied before process l
 
 ## Source module map
 
-`aikit-runtime` is distributed from this GitHub repository. Public registry packages are not part
-of the current project plan.
+`aikit-runtime` is currently distributed from this GitHub repository. Registry packages are a
+release gate, not a claim about artifacts that exist today.
 
 | Ecosystem | Workspace package | Import / library |
 |---|---|---|
@@ -409,9 +409,9 @@ of the current project plan.
 | Node wrapper | `aikit-runtime` | local checkout wrapper |
 | Node native binaries | `aikit-runtime-{platform}` | selected locally by the wrapper |
 
-The current `v0.2.0` tree is a **source-first implementation preview**. Keyless source, binding,
+The current `v0.3.0-alpha.1` tree is a **source-first implementation preview**. Keyless source, binding,
 and local package-layout checks run in CI. Use the checkout commands in [Quick start](#quick-start);
-no npm, PyPI, or crates.io publication is claimed or planned at this stage.
+no npm, PyPI, or crates.io publication is claimed for this candidate.
 
 ### Supported binary targets
 
@@ -428,8 +428,11 @@ no npm, PyPI, or crates.io publication is claimed or planned at this stage.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
+cargo test --workspace --all-features --locked --exclude aikit-py
+.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
+./scripts/build-node.sh
 ./scripts/parity-check.sh
+./scripts/security-check.sh --all
 ./scripts/release-check.sh --candidate
 ```
 
@@ -477,8 +480,9 @@ inheriting the GitHub runner's newer glibc requirement.
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
 | [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
-| [0.2 migration guide](docs/MIGRATING-0.2.md) | Breaking API and operational changes from the 0.1 source preview. |
-| [Implementation matrix](docs/V1-COMPLETION-MATRIX.md) | Detailed 0.2 implementation coverage and external proof boundaries. |
+| [Competitor parity matrix](docs/PARITY-MATRIX.md) | Current upstream pins, implementation evidence, honest gaps, and the v1 gate. |
+| [0.3 migration guide](docs/MIGRATING-0.3.md) | Streaming, MCP naming, capability, durability, and release changes from 0.2. |
+| [Historical 0.2 migration guide](docs/MIGRATING-0.2.md) | Archived changes from the 0.1 source preview. |
 | [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and intentionally source-only. |
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |

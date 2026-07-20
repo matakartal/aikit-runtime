@@ -19,6 +19,22 @@ on:
         description: Exact Google model id to accept for this release
         required: true
         type: string
+      openrouter_model:
+        description: Exact OpenRouter model id to accept for this release
+        required: true
+        type: string
+      groq_model:
+        description: Exact Groq model id to accept for this release
+        required: true
+        type: string
+      mistral_model:
+        description: Exact Mistral model id to accept for this release
+        required: true
+        type: string
+      xai_model:
+        description: Exact xAI model id to accept for this release
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -28,8 +44,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  four-provider-contract:
-    name: Four-provider billable contract
+  eight-provider-contract:
+    name: Eight-provider billable contract
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
@@ -54,10 +70,18 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           AIKIT_SMOKE_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
           AIKIT_SMOKE_OPENAI_MODEL: ${{ inputs.openai_model }}
           AIKIT_SMOKE_DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
           AIKIT_SMOKE_GOOGLE_MODEL: ${{ inputs.google_model }}
+          AIKIT_SMOKE_OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          AIKIT_SMOKE_GROQ_MODEL: ${{ inputs.groq_model }}
+          AIKIT_SMOKE_MISTRAL_MODEL: ${{ inputs.mistral_model }}
+          AIKIT_SMOKE_XAI_MODEL: ${{ inputs.xai_model }}
           AIKIT_LIVE_SMOKE: "1"
           AIKIT_LIVE_SMOKE_FULL: "1"
           AIKIT_LIVE_SMOKE_BIN: ${{ steps.build.outputs.binary }}
@@ -69,6 +93,10 @@ jobs:
           OPENAI_MODEL: ${{ inputs.openai_model }}
           DEEPSEEK_MODEL: ${{ inputs.deepseek_model }}
           GOOGLE_MODEL: ${{ inputs.google_model }}
+          OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+          GROQ_MODEL: ${{ inputs.groq_model }}
+          MISTRAL_MODEL: ${{ inputs.mistral_model }}
+          XAI_MODEL: ${{ inputs.xai_model }}
         run: |
           mkdir -p dist
           {
@@ -79,6 +107,10 @@ jobs:
             printf 'openai_model=%s\n' "$OPENAI_MODEL"
             printf 'deepseek_model=%s\n' "$DEEPSEEK_MODEL"
             printf 'google_model=%s\n' "$GOOGLE_MODEL"
+            printf 'openrouter_model=%s\n' "$OPENROUTER_MODEL"
+            printf 'groq_model=%s\n' "$GROQ_MODEL"
+            printf 'mistral_model=%s\n' "$MISTRAL_MODEL"
+            printf 'xai_model=%s\n' "$XAI_MODEL"
             printf 'text=passed\nobject=passed\ngoverned_deny=passed\ntwo_request_replay=passed\n'
           } > dist/live-smoke-evidence.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

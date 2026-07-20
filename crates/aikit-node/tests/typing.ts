@@ -1,17 +1,21 @@
 import {
   Agent,
   Client,
-  McpServer,
+  McpConnection,
+  legacy,
   evaluateOutcome,
   tool,
   type ApprovalResponse,
   type ContainmentCapabilityReport,
+  type ContentPart,
   type FailureContext,
   type EvalGate,
   type EvalVerdict,
   type ModelInput,
   type McpToolFilter,
   type ObjectStream,
+  type OutputPart,
+  type ProviderMetadata,
   type QueryStream,
   type RunOptions,
   type RunOutcome,
@@ -37,6 +41,8 @@ const invoiceSchema: ZodSchemaLike<Invoice> = {
 };
 
 const agent = Agent.fromEnv({});
+// @ts-expect-error MCP connections are factory-only native handles
+new McpConnection();
 const semanticValidator = async (): Promise<SemanticValidationDecision> => ({
   action: "retry",
   reason: "business invariant not met",
@@ -66,6 +72,17 @@ const messages: ModelInput = [
     ],
   },
 ];
+const canonicalContent: ContentPart = { type: "text", text: "canonical" };
+const materializedOutput: OutputPart = {
+  type: "structured_data",
+  value: { status: "ok" },
+};
+const providerMetadata: ProviderMetadata = {
+  mock: [{ request_id: "fixture" }],
+};
+void canonicalContent;
+void materializedOutput;
+void providerMetadata;
 const evalOutcome: RunOutcome = {
   messages,
   usage: {
@@ -153,13 +170,13 @@ async function configureMcp(): Promise<void> {
     allow: ["read_file", "search"],
     deny: ["write_file"],
   };
-  const http = await McpServer.connectHttp(
+  const http = await McpConnection.connectHttp(
     "https://mcp.example.com",
     "remote",
     undefined,
     toolFilter,
   );
-  const stdio = await McpServer.connectStdio(
+  const stdio = await McpConnection.connectStdio(
     "server",
     [],
     "local",
@@ -168,7 +185,10 @@ async function configureMcp(): Promise<void> {
     { deny: ["Bash"] },
   );
   // @ts-expect-error MCP filters fail closed on unknown fields
-  void McpServer.connectHttp("https://mcp.example.com", "bad", undefined, { unknown: [] });
+  void McpConnection.connectHttp("https://mcp.example.com", "bad", undefined, { unknown: [] });
+
+  const legacyHttp = await legacy.McpServer.connectHttp("https://mcp.example.com", "legacy");
+  agent.registerMcp(legacyHttp);
   agent.registerMcp(http);
   await http.listResources();
   await http.listPrompts();

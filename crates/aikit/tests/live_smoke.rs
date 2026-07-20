@@ -2,7 +2,7 @@
 //! model ids, so normal CI stays keyless and never pretends a mock server is a live proof.
 //!
 //! `AIKIT_LIVE_SMOKE=1` preserves the inexpensive, configured-provider text probe.
-//! `AIKIT_LIVE_SMOKE_FULL=1` upgrades that probe to a fail-closed four-provider contract:
+//! `AIKIT_LIVE_SMOKE_FULL=1` upgrades that probe to a fail-closed eight-provider contract:
 //! text, structured output, governance denial, and an allowed two-request tool round-trip.
 
 use aikit::{
@@ -50,6 +50,26 @@ const TARGETS: &[SmokeTarget] = &[
         provider: "google",
         key_vars: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         model_var: "AIKIT_SMOKE_GOOGLE_MODEL",
+    },
+    SmokeTarget {
+        provider: "openrouter",
+        key_vars: &["OPENROUTER_API_KEY"],
+        model_var: "AIKIT_SMOKE_OPENROUTER_MODEL",
+    },
+    SmokeTarget {
+        provider: "groq",
+        key_vars: &["GROQ_API_KEY"],
+        model_var: "AIKIT_SMOKE_GROQ_MODEL",
+    },
+    SmokeTarget {
+        provider: "mistral",
+        key_vars: &["MISTRAL_API_KEY"],
+        model_var: "AIKIT_SMOKE_MISTRAL_MODEL",
+    },
+    SmokeTarget {
+        provider: "xai",
+        key_vars: &["XAI_API_KEY"],
+        model_var: "AIKIT_SMOKE_XAI_MODEL",
     },
 ];
 
@@ -184,7 +204,7 @@ fn configured_targets(full: bool) -> Vec<ConfiguredTarget<'static>> {
 
     assert!(
         missing.is_empty(),
-        "AIKIT_LIVE_SMOKE_FULL=1 requires the complete four-provider matrix before any live call; missing: {}",
+        "AIKIT_LIVE_SMOKE_FULL=1 requires the complete eight-provider matrix before any live call; missing: {}",
         missing.join(", ")
     );
     assert!(
@@ -195,7 +215,7 @@ fn configured_targets(full: bool) -> Vec<ConfiguredTarget<'static>> {
         assert_eq!(
             configured.len(),
             TARGETS.len(),
-            "FULL live smoke must resolve all four providers"
+            "FULL live smoke must resolve all eight providers"
         );
     }
     configured
@@ -371,7 +391,7 @@ fn tool_choice_options(provider: &str) -> (Map<String, Value>, Map<String, Value
             json!({ "tool_choice": { "type": "function", "name": TOOL_NAME } }),
             json!({ "tool_choice": "none" }),
         ),
-        "deepseek" => (
+        "deepseek" | "openrouter" | "groq" | "mistral" | "xai" => (
             json!({
                 "tool_choice": { "type": "function", "function": { "name": TOOL_NAME } }
             }),

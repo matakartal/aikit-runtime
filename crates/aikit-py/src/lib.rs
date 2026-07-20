@@ -11,7 +11,7 @@
 //!
 //! No Python GIL is held while Rust awaits a provider or a Python coroutine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -19,22 +19,24 @@ use aikit_core::orchestration::{
     ExecutionContext, ModelRouteRequirements, Orchestrator, SubagentSpec,
 };
 use aikit_core::{
-    evaluate_outcome as core_evaluate_outcome, request_capability_tool, tools::ToolExecutor, Agent,
-    AgentError, AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest,
-    AuditFailureMode, AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools,
-    BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle,
-    CapabilityBroker, CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy,
-    DockerConfig, EvalGate, FailureContext, FailureHookOutcome, GeneratedText, Governance,
-    GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
-    InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
-    McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile,
+    evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
+    request_capability_tool, tools::ToolExecutor, Agent, AgentError,
+    AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
+    AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits,
+    BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker,
+    CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig,
+    DurabilityMode, ErrorCode, ErrorInfo, EvalGate, EvalSuite, FailureContext, FailureHookOutcome,
+    GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher,
+    HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink,
+    McpClient, McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile,
     ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent, PermissionEngine,
     PermissionMode, PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext,
     PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist,
-    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunOutcome, RunRecorder, RunTerminalStatus,
-    Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session, SessionStore,
-    SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport, StopContext,
-    StreamDelta, StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec, WebTools,
+    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome, RunRecorder, RunState,
+    RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
+    SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
+    StopContext, StreamDelta, StreamEvent, StreamEventEncoder, StreamableHttpTransport,
+    ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -222,15 +224,226 @@ fn evaluate_outcome<'py>(
         .map_err(|_| PyRuntimeError::new_err("failed to encode EvalVerdict"))
 }
 
-#[pyclass(name = "McpServer")]
-struct PyMcpServer {
+fn python_durability_mode(value: &str) -> PyResult<DurabilityMode> {
+    match value {
+        "sync" => Ok(DurabilityMode::Sync),
+        "async" => Ok(DurabilityMode::Async),
+        "exit" => Ok(DurabilityMode::Exit),
+        _ => Err(PyValueError::new_err(
+            "durability must be one of: sync, async, exit",
+        )),
+    }
+}
+
+fn py_durability_error(error: aikit_core::DurabilityError) -> PyErr {
+    py_error_with_info(error.to_string(), ErrorInfo::new(ErrorCode::Conflict))
+}
+
+fn command_outcome_value(outcome: aikit_core::CommandOutcome) -> PyResult<Value> {
+    match outcome {
+        aikit_core::CommandOutcome::Resumed { sequence } => {
+            Ok(serde_json::json!({"type": "resumed", "sequence": sequence}))
+        }
+        aikit_core::CommandOutcome::Forked { run } => Ok(serde_json::json!({
+            "type": "forked",
+            "run": serde_json::to_value(run)
+                .map_err(|_| PyRuntimeError::new_err("failed to encode forked durable run"))?,
+        })),
+        aikit_core::CommandOutcome::Rewound {
+            checkpoint_id,
+            sequence,
+        } => Ok(serde_json::json!({
+            "type": "rewound",
+            "checkpoint_id": checkpoint_id,
+            "sequence": sequence,
+        })),
+        aikit_core::CommandOutcome::Cancelled { sequence } => {
+            Ok(serde_json::json!({"type": "cancelled", "sequence": sequence}))
+        }
+    }
+}
+
+fn python_json<'py>(py: Python<'py>, value: &impl serde::Serialize) -> PyResult<Py<PyAny>> {
+    pythonize::pythonize(py, value)
+        .map(Bound::unbind)
+        .map_err(|_| PyRuntimeError::new_err("failed to encode canonical JSON value"))
+}
+
+/// Thin stateful binding over the canonical append-only Rust durability engine.
+///
+/// Every imported snapshot is replay-validated by `RunState`'s custom serde implementation;
+/// callers cannot smuggle in a projection that disagrees with its event log.
+#[pyclass(name = "DurableRun")]
+struct PyDurableRun {
+    inner: RunState,
+}
+
+#[pymethods]
+impl PyDurableRun {
+    #[new]
+    #[pyo3(signature = (session_id, run_id, durability="sync"))]
+    fn new(session_id: String, run_id: String, durability: &str) -> PyResult<Self> {
+        let inner = RunState::new(session_id, run_id, python_durability_mode(durability)?)
+            .map_err(py_durability_error)?;
+        Ok(Self { inner })
+    }
+
+    #[staticmethod]
+    fn from_state(state: Bound<'_, PyAny>) -> PyResult<Self> {
+        let state: Value = pythonize::depythonize(&state)
+            .map_err(|error| PyValueError::new_err(format!("invalid durable state: {error}")))?;
+        let inner = serde_json::from_value(state)
+            .map_err(|error| PyValueError::new_err(format!("invalid durable state: {error}")))?;
+        Ok(Self { inner })
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        python_json(py, &self.inner)
+    }
+
+    #[getter]
+    fn schema_version(&self) -> u32 {
+        self.inner.schema_version()
+    }
+
+    #[getter]
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    #[getter]
+    fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    #[getter]
+    fn durability(&self) -> &'static str {
+        match self.inner.durability() {
+            DurabilityMode::Sync => "sync",
+            DurabilityMode::Async => "async",
+            DurabilityMode::Exit => "exit",
+        }
+    }
+
+    #[getter]
+    fn status(&self) -> PyResult<String> {
+        serde_json::to_value(self.inner.status())
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| PyRuntimeError::new_err("failed to encode durable status"))
+    }
+
+    fn replace_state<'py>(
+        &mut self,
+        py: Python<'py>,
+        mutation_id: &str,
+        state: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let state = pythonize::depythonize(&state).map_err(|error| {
+            PyValueError::new_err(format!("invalid durable state value: {error}"))
+        })?;
+        self.inner
+            .replace_state(mutation_id, state)
+            .map_err(py_durability_error)?;
+        python_json(py, &self.inner)
+    }
+
+    #[pyo3(signature = (checkpoint_key, label=None))]
+    fn checkpoint<'py>(
+        &mut self,
+        py: Python<'py>,
+        checkpoint_key: &str,
+        label: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let checkpoint = self
+            .inner
+            .checkpoint(checkpoint_key, label)
+            .map_err(py_durability_error)?;
+        python_json(py, &checkpoint)
+    }
+
+    fn pause(&mut self, pause_id: &str, reason: String) -> PyResult<()> {
+        self.inner
+            .pause(pause_id, reason)
+            .map_err(py_durability_error)
+    }
+
+    #[pyo3(signature = (logical_key, prompt, payload, activity_id=None))]
+    fn request_approval(
+        &mut self,
+        logical_key: &str,
+        prompt: String,
+        payload: Bound<'_, PyAny>,
+        activity_id: Option<String>,
+    ) -> PyResult<String> {
+        let payload = pythonize::depythonize(&payload)
+            .map_err(|error| PyValueError::new_err(format!("invalid approval payload: {error}")))?;
+        self.inner
+            .request_approval(logical_key, activity_id, prompt, payload)
+            .map_err(py_durability_error)
+    }
+
+    fn complete(&mut self, completion_id: &str) -> PyResult<()> {
+        self.inner
+            .complete_run(completion_id)
+            .map(|_| ())
+            .map_err(py_durability_error)
+    }
+
+    fn fail(&mut self, failure_id: &str, error: String) -> PyResult<()> {
+        self.inner
+            .fail_run(failure_id, error)
+            .map(|_| ())
+            .map_err(py_durability_error)
+    }
+
+    fn apply_command<'py>(
+        &mut self,
+        py: Python<'py>,
+        command: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let command: RunCommand = pythonize::depythonize(&command)
+            .map_err(|error| PyValueError::new_err(format!("invalid durable command: {error}")))?;
+        let outcome = self
+            .inner
+            .apply_command(command)
+            .map_err(py_durability_error)?;
+        python_json(py, &command_outcome_value(outcome)?)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DurableRun(run_id={:?}, status={:?}, events={})",
+            self.inner.run_id(),
+            self.inner.status(),
+            self.inner.events().len()
+        )
+    }
+}
+
+/// Evaluate stream/durability traces deterministically without provider or tool execution.
+#[pyfunction]
+fn evaluate_trace<'py>(
+    py: Python<'py>,
+    suite: Bound<'_, PyAny>,
+    trace: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let suite: EvalSuite = pythonize::depythonize(&suite)
+        .map_err(|error| PyValueError::new_err(format!("invalid EvalSuite: {error}")))?;
+    let trace: TraceInput = pythonize::depythonize(&trace)
+        .map_err(|error| PyValueError::new_err(format!("invalid TraceInput: {error}")))?;
+    python_json(py, &core_evaluate_trace(&suite, &trace))
+}
+
+#[pyclass(name = "McpConnection")]
+struct PyMcpConnection {
     specs: Vec<ToolSpec>,
     executor: Arc<McpToolExecutor>,
     client: Arc<McpClient>,
 }
 
 #[pymethods]
-impl PyMcpServer {
+impl PyMcpConnection {
     fn list_resources<'py>(
         &self,
         py: Python<'py>,
@@ -335,7 +548,7 @@ fn connect_mcp_http<'py>(
         Python::attach(|py| {
             Py::new(
                 py,
-                PyMcpServer {
+                PyMcpConnection {
                     specs,
                     executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
                     client,
@@ -377,7 +590,7 @@ fn connect_mcp_stdio<'py>(
         Python::attach(|py| {
             Py::new(
                 py,
-                PyMcpServer {
+                PyMcpConnection {
                     specs,
                     executor: Arc::new(McpToolExecutor::new(vec![client.clone()])),
                     client,
@@ -879,6 +1092,20 @@ struct QueryStream {
     recorder: RunRecorder,
 }
 
+struct QueryEventStreamState {
+    encoder: StreamEventEncoder,
+    pending: VecDeque<StreamEvent>,
+}
+
+/// Versioned start/delta/end event view over the same underlying run.
+#[pyclass]
+struct QueryEventStream {
+    inner: Arc<TokioMutex<Option<CancellableRun>>>,
+    state: Arc<TokioMutex<QueryEventStreamState>>,
+    cancellation: CancellationHandle,
+    recorder: RunRecorder,
+}
+
 fn query_stream(run: CancellableRun) -> QueryStream {
     let cancellation = run.cancellation_handle();
     let recorder = run.recorder();
@@ -1270,6 +1497,23 @@ impl QueryStream {
         })
     }
 
+    /// Consume this stream through the versioned block lifecycle. The legacy and event views are
+    /// alternate single-consumer views and must not be polled concurrently.
+    fn events(&self, response_id: String) -> PyResult<QueryEventStream> {
+        if response_id.trim().is_empty() {
+            return Err(PyValueError::new_err("response_id must not be empty"));
+        }
+        Ok(QueryEventStream {
+            inner: self.inner.clone(),
+            state: Arc::new(TokioMutex::new(QueryEventStreamState {
+                encoder: StreamEventEncoder::new(response_id),
+                pending: VecDeque::new(),
+            })),
+            cancellation: self.cancellation.clone(),
+            recorder: self.recorder.clone(),
+        })
+    }
+
     /// `async with` gives Python deterministic early-exit cleanup; plain `async for ... break`
     /// on a custom iterator does not call `aclose()` automatically.
     fn __aenter__<'py>(slf: PyRef<'_, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1321,6 +1565,83 @@ impl QueryStream {
     /// Current recorder snapshot. It is terminal after exhaustion or `await aclose()`.
     fn outcome<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pythonize::pythonize(py, &self.recorder.outcome())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+}
+
+#[pymethods]
+impl QueryEventStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let event = {
+                let mut state = state.try_lock().map_err(|_| {
+                    PyRuntimeError::new_err(
+                        "QueryEventStream is single-consumer; concurrent __anext__ is unsupported",
+                    )
+                })?;
+                if let Some(event) = state.pending.pop_front() {
+                    Some(event)
+                } else {
+                    let delta = {
+                        let mut run = inner.try_lock().map_err(|_| {
+                            PyRuntimeError::new_err(
+                                "legacy and event stream views cannot be consumed concurrently",
+                            )
+                        })?;
+                        match run.as_mut() {
+                            Some(run) => run.next().await,
+                            None => None,
+                        }
+                    };
+                    delta.and_then(|delta| {
+                        let encoded = state.encoder.push(delta);
+                        state.pending.extend(encoded);
+                        state.pending.pop_front()
+                    })
+                }
+            };
+            match event {
+                Some(event) => Python::attach(|py| {
+                    pythonize::pythonize(py, &event)
+                        .map(Bound::unbind)
+                        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+                }),
+                None => Err(PyStopAsyncIteration::new_err("")),
+            }
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.cancellation.cancel();
+        let inner = self.inner.clone();
+        let recorder = self.recorder.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let outcome = close_query_stream(inner, recorder).await;
+            Python::attach(|py| {
+                pythonize::pythonize(py, &outcome)
+                    .map(Bound::unbind)
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            })
+        })
+    }
+
+    fn outcome<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        pythonize::pythonize(py, &self.recorder.outcome())
+            .map(Bound::unbind)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 }
@@ -1761,7 +2082,8 @@ impl PyAgent {
     }
 
     /// Build an agent from an env dict `{VAR: value}`, activating providers by var name
-    /// (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY/GOOGLE_API_KEY).
+    /// (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY/GOOGLE_API_KEY,
+    /// OPENROUTER_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY, XAI_API_KEY).
     #[staticmethod]
     fn from_env(env: HashMap<String, String>) -> Self {
         PyAgent::from_core(Agent::from_env(env))
@@ -1888,7 +2210,7 @@ impl PyAgent {
         self.install_external_tools(specs, Arc::new(tools))
     }
 
-    fn register_mcp(&mut self, server: PyRef<'_, PyMcpServer>) -> PyResult<()> {
+    fn register_mcp(&mut self, server: PyRef<'_, PyMcpConnection>) -> PyResult<()> {
         self.install_external_tools(server.specs.clone(), server.executor.clone())
     }
 
@@ -2313,6 +2635,39 @@ impl PyAgent {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    #[pyo3(signature = (key, value, expected_revision, plane="working", provenance=None))]
+    fn remember_cas(
+        &self,
+        key: String,
+        value: Bound<'_, PyAny>,
+        expected_revision: u64,
+        plane: &str,
+        provenance: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let value =
+            pythonize::depythonize(&value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let plane = match plane {
+            "working" => aikit_core::MemoryPlane::Working,
+            "episodic" => aikit_core::MemoryPlane::Episodic,
+            "semantic" => aikit_core::MemoryPlane::Semantic,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "plane must be working, episodic, or semantic",
+                ))
+            }
+        };
+        let provenance = provenance
+            .map(|value| {
+                pythonize::depythonize(&value)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        self.inner
+            .remember_cas(key, value, plane, provenance, expected_revision)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Search explicit memories in this agent's namespace.
     #[pyo3(signature = (query, limit=10))]
     fn recall<'py>(
@@ -2734,13 +3089,22 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tool, m)?)?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_outcome, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_trace, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_http, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_stdio, m)?)?;
     m.add_class::<PyToolDecorator>()?;
     m.add_class::<QueryStream>()?;
+    m.add_class::<QueryEventStream>()?;
     m.add_class::<ObjectStream>()?;
+    m.add_class::<PyDurableRun>()?;
     m.add_class::<PyAgent>()?;
-    m.add_class::<PyMcpServer>()?;
+    m.add_class::<PyMcpConnection>()?;
+    // v0.x compatibility: the object was historically named McpServer even though it is a
+    // client connection. Keep that name only under the explicit legacy namespace.
+    let connection_type = m.py().get_type::<PyMcpConnection>();
+    let legacy = PyModule::new(m.py(), "legacy")?;
+    legacy.add("McpServer", connection_type)?;
+    m.add_submodule(&legacy)?;
     m.add_class::<PyClient>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
@@ -2750,6 +3114,43 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn durable_binding_uses_replay_validated_state_and_canonical_trace_eval() {
+        assert_eq!(
+            python_durability_mode("sync").unwrap(),
+            DurabilityMode::Sync
+        );
+        assert!(python_durability_mode("eventual").is_err());
+
+        let mut run = PyDurableRun::new("session-sdk".into(), "run-sdk".into(), "sync").unwrap();
+        run.inner
+            .replace_state("turn-1", serde_json::json!({"answer": 42}))
+            .unwrap();
+        let state = serde_json::to_value(&run.inner).unwrap();
+        let restored: RunState = serde_json::from_value(state.clone()).unwrap();
+        assert_eq!(restored, run.inner);
+
+        let suite: EvalSuite = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "name": "binding-durability",
+            "assertions": [
+                {"type": "durable_sequence_monotonic"},
+                {"type": "run_status", "status": "running"}
+            ]
+        }))
+        .unwrap();
+        let trace = TraceInput {
+            durable_events: restored.events().to_vec(),
+            run_status: Some(restored.status()),
+            ..TraceInput::default()
+        };
+        assert!(core_evaluate_trace(&suite, &trace).passed);
+
+        let mut tampered = state;
+        tampered["projection"]["status"] = serde_json::json!("completed");
+        assert!(serde_json::from_value::<RunState>(tampered).is_err());
+    }
 
     #[test]
     fn mcp_tool_filter_options_reject_unknown_fields_and_invalid_names() {

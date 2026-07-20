@@ -9,7 +9,7 @@ if [ "${AIKIT_LIVE_SMOKE:-}" != "1" ]; then
 fi
 
 if [ "${AIKIT_LIVE_SMOKE_FULL:-}" = "1" ]; then
-  echo "Running FULL live matrix: all four key+model pairs are required before any call."
+  echo "Running FULL live matrix: all eight key+model pairs are required before any call."
 fi
 
 if [ -n "${AIKIT_LIVE_SMOKE_BIN:-}" ]; then

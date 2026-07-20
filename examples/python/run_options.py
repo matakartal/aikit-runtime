@@ -85,12 +85,13 @@ async def main() -> None:
 
     blocked = Agent.from_env({})
     entered = asyncio.Event()
+    release = asyncio.Event()
     stop_reasons = []
     tool_calls = 0
 
     async def wait_in_hook(_context):
         entered.set()
-        await asyncio.Event().wait()
+        await release.wait()
 
     async def stopped(context):
         stop_reasons.append(context["reason"])
@@ -112,6 +113,9 @@ async def main() -> None:
     pending = asyncio.ensure_future(during.__anext__())
     await entered.wait()
     during.cancel()
+    # Let the host callback unwind after native cancellation so the interpreter never exits with
+    # an orphaned asyncio task. Cancellation is still requested while the hook is blocked.
+    release.set()
     try:
         await pending
     except StopAsyncIteration:
