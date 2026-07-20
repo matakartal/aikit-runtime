@@ -36,10 +36,10 @@ regex = "1"
 # MSRV. Keep the newest compatible rusqlite line until that upstream MSRV boundary is restored.
 rusqlite = { version = "0.39", features = ["bundled"] }
 url = "2"
-jsonschema = { version = "0.47", default-features = false }
+jsonschema = { version = "0.48", default-features = false }
 schemars = "1"
 tempfile = "3"
-getrandom = "0.3"
+getrandom = "0.4"
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 postgres = { version = "0.19", optional = true }
 yaml-rust2 = { version = "0.11", default-features = false }
