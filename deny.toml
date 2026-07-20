@@ -50,6 +50,7 @@ skip = [
     { crate = "getrandom@0.2", reason = "0.2.x line via ring/rustls; 0.4.x (tempfile) is canonical" },
     { crate = "getrandom@0.3", reason = "0.3.x line via ahash; 0.4.x (tempfile) is canonical" },
     { crate = "windows-sys@<0.61", reason = "0.52 via older transitive deps" },
+    { crate = "hashlink@<0.12", reason = "older line via transitive deps; 0.12 (rusqlite 0.40) is canonical" },
     { crate = "hashbrown@<0.17", reason = "older line via transitive deps" },
     { crate = "io-lifetimes@<3", reason = "older line via transitive deps" },
     { crate = "fallible-iterator@0.2", reason = "postgres 0.19 requires 0.2 while rusqlite 0.39 requires 0.3" },
