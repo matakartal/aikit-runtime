@@ -1,0 +1,131 @@
+name: publish
+
+# Registry publishing is PREPARED but intentionally DISABLED. Dispatching this workflow today
+# fails at the guard job. Enabling it is a deliberate, multi-step decision documented in
+# docs/RELEASE.md ("Registry publishing preparation"): set the REGISTRY_PUBLISH_ENABLED repo
+# variable, create the registry-publish environment with a required reviewer, configure the
+# registry-side trusted publishers, and remove the publish=false / "private": true manifest
+# guards. Until every step is done, this workflow is a documented refusal, not a release path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: Registry to publish
+        required: true
+        type: choice
+        options: [crates, pypi, npm]
+      acknowledge:
+        description: Type PUBLISH to confirm this is a deliberate registry publication
+        required: true
+        type: string
+      artifacts_run_id:
+        description: release.yml run id supplying the built wheel/npm bundle (pypi/npm only)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Publishing is prepared but disabled
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce the enablement checklist in docs/RELEASE.md
+        env:
+          PUBLISH_ENABLED: ${{ vars.REGISTRY_PUBLISH_ENABLED }}
+          ACKNOWLEDGE: ${{ inputs.acknowledge }}
+        run: |
+          if [ "$PUBLISH_ENABLED" != "true" ] || [ "$ACKNOWLEDGE" != "PUBLISH" ]; then
+            echo "Registry publishing is intentionally disabled; see docs/RELEASE.md." >&2
+            exit 1
+          fi
+
+  crates:
+    name: Publish Rust crates (crates.io trusted publishing)
+    if: inputs.registry == 'crates'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: registry-publish
+    permissions:
+      contents: read
+      id-token: write # OIDC exchange for a short-lived crates.io token; no stored secret
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Candidate gates must pass on the exact publish source
+        run: ./scripts/release-check.sh --candidate
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish the core, then the facade once the index can resolve it
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          cargo publish -p aikit-runtime-core --locked
+          cargo publish -p aikit-runtime --locked
+
+  pypi:
+    name: Publish Python wheels (PyPI trusted publisher)
+    if: inputs.registry == 'pypi'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: registry-publish
+    permissions:
+      contents: read
+      id-token: write # PyPI trusted-publisher OIDC
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Download the assembled wheels from the acknowledged release.yml run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifacts_run_id }}
+        run: |
+          test -n "$RUN_ID" || { echo "artifacts_run_id is required for pypi" >&2; exit 1; }
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist/publish
+          mkdir -p dist/wheels
+          find dist/publish -name '*.whl' -exec mv {} dist/wheels/ \;
+          ls -l dist/wheels
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist/wheels
+
+  npm:
+    name: Publish npm packages (npm trusted publishing)
+    if: inputs.registry == 'npm'
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: registry-publish
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (provenance is automatic with npm >= 11.5.1)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - name: Download the assembled npm tarballs from the acknowledged release.yml run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifacts_run_id }}
+        run: |
+          test -n "$RUN_ID" || { echo "artifacts_run_id is required for npm" >&2; exit 1; }
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist/publish
+          find dist/publish -name '*.tgz' | sort
+      - name: Publish platform packages first, then the wrapper
+        run: |
+          wrapper=""
+          while IFS= read -r tarball; do
+            case "$tarball" in
+              *aikit-runtime-[0-9]*.tgz) wrapper="$tarball" ;;
+              *) npm publish "$tarball" ;;
+            esac
+          done < <(find dist/publish -name '*.tgz' | sort)
+          test -n "$wrapper" || { echo "wrapper tarball not found" >&2; exit 1; }
+          npm publish "$wrapper"

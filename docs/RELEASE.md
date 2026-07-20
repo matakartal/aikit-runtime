@@ -88,6 +88,39 @@ historical record to describe a newer commit.
 An evidence record does not create a tag, publish a package, prove registry ownership, or certify
 live-provider behavior. Those are separate explicit decisions.
 
+## Registry publishing preparation (disabled)
+
+[`publish.yml`](../.github/workflows/publish.yml) prepares crates.io/PyPI/npm publication behind
+three independent locks so a future publish is one deliberate decision away, while dispatching it
+today fails loudly at its guard job:
+
+1. the `REGISTRY_PUBLISH_ENABLED` repository variable (unset today) must equal `true`;
+2. the dispatcher must type `PUBLISH` into the acknowledgement input;
+3. every publishing job runs in the `registry-publish` environment, which must be created with a
+   required reviewer before any job can start.
+
+Even past all three locks, the manifests remain the final backstop: all five crates carry
+`publish = false` and all six npm packages carry `"private": true`, so an accidental dispatch
+cannot upload anything.
+
+Enable-time checklist (each step is a deliberate maintainer decision):
+
+- remove `publish = false` from `crates/aikit-core/Cargo.toml` and `crates/aikit/Cargo.toml`
+  only (the CLI and binding crates stay unpublishable to crates.io);
+- remove `"private": true` from `crates/aikit-node/package.json` and the five
+  `crates/aikit-node/npm/*/package.json` platform packages;
+- configure crates.io Trusted Publishing for `aikit-runtime-core` and `aikit-runtime`
+  (repository `matakartal/aikit-runtime`, workflow `publish.yml`, environment
+  `registry-publish`), a PyPI trusted publisher for the wheel project with the same tuple, and
+  npm trusted publishers for the wrapper and platform packages with `publish` selected as the
+  allowed action;
+- create the `registry-publish` GitHub environment with a required reviewer;
+- set the `REGISTRY_PUBLISH_ENABLED` repository variable to `true`.
+
+`release.yml` stays the artifact-assembly workflow and is unchanged: assembly is not
+publication. `publish.yml` consumes an acknowledged `release.yml` run's artifacts by run id for
+the wheel/npm paths and publishes crates from a fresh candidate-checked source checkout.
+
 ## Live-provider boundary
 
 Real-provider testing remains separate and optional because it requires API keys, selected model

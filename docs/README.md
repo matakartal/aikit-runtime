@@ -13,6 +13,7 @@ milestone cannot be mistaken for present behavior.
 | [Competitor parity matrix](PARITY-MATRIX.md) | Everyone | Exact upstream pins, local evidence, honest gaps, and v1 release gate. |
 | [Feature reference](FEATURES.md) | Builders | Runtime capabilities, fidelity, governance, routing, state, and limits. |
 | [Threat model](THREAT-MODEL.md) | Security reviewers | Guarantees and exclusions for built-in tools and Bash containment. |
+| [Regulatory evidence aids](COMPLIANCE.md) | Risk and audit teams | Honest mapping from runtime evidence to assessor questions; explicitly not legal advice. |
 | [Live-provider harness](LIVE-SMOKE.md) | Maintainers | Explicit, billable real-provider acceptance contract. |
 | [Distribution guide](RELEASE.md) | Maintainers | Source-first policy and manual artifact assembly. |
 | [0.3 migration guide](MIGRATING-0.3.md) | Integrators | Stream, MCP naming, capability and durability migration. |
