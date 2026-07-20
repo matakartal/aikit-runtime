@@ -39,7 +39,7 @@ url = "2"
 jsonschema = { version = "0.47", default-features = false }
 schemars = "1"
 tempfile = "3"
-getrandom = "0.3"
+getrandom = "0.4"
 opentelemetry = { version = "0.32", features = ["trace"], optional = true }
 postgres = { version = "0.19", optional = true }
 yaml-rust2 = { version = "0.11", default-features = false }

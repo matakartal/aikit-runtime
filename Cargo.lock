@@ -96,7 +96,7 @@ dependencies = [
  "base64",
  "cap-std",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "jsonschema",
  "libc",
  "opentelemetry",
