@@ -97,48 +97,60 @@ pub(super) fn prepare(
             "-EncodedCommand",
             &script,
         ]);
-        let process_limit = limits.max_processes.unwrap_or(64).clamp(1, u32::MAX as u64);
-        let memory_limit = 512_u64 << 20;
+        let shell = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("cmd.exe");
         Ok(PreparedCommand {
             command: cmd,
             backend: ActiveContainmentBackend::WindowsJob,
-            environment_overrides: vec![
-                (OsString::from("AIKIT_JOB_COMMAND"), OsString::from(command)),
-                (
-                    OsString::from("AIKIT_JOB_WORKDIR"),
-                    workspace.into_os_string(),
-                ),
-                (
-                    OsString::from("AIKIT_JOB_SHELL"),
-                    std::env::var_os("SystemRoot")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-                        .join("System32")
-                        .join("cmd.exe")
-                        .into_os_string(),
-                ),
-                (
-                    OsString::from("AIKIT_JOB_PROCESS_LIMIT"),
-                    OsString::from(process_limit.to_string()),
-                ),
-                (
-                    OsString::from("AIKIT_JOB_MEMORY_LIMIT"),
-                    OsString::from(memory_limit.to_string()),
-                ),
-            ],
+            environment_overrides: job_environment(command, workspace, shell, limits),
             cleanup: None,
             artifacts: Vec::new(),
         })
     }
 }
 
-#[cfg(target_os = "windows")]
+/// The environment contract between `prepare` and the PowerShell launcher: the untrusted command,
+/// resolved workdir/shell, and clamped limits travel as `AIKIT_JOB_*` variables (which the
+/// launcher scrubs before exec). Pure so the contract is unit-testable on any platform.
+#[cfg(any(target_os = "windows", test))]
+fn job_environment(
+    command: &str,
+    workspace: std::path::PathBuf,
+    shell: std::path::PathBuf,
+    limits: ContainmentLimits,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::ffi::OsString;
+
+    let process_limit = limits.max_processes.unwrap_or(64).clamp(1, u32::MAX as u64);
+    let memory_limit = 512_u64 << 20;
+    vec![
+        (OsString::from("AIKIT_JOB_COMMAND"), OsString::from(command)),
+        (
+            OsString::from("AIKIT_JOB_WORKDIR"),
+            workspace.into_os_string(),
+        ),
+        (OsString::from("AIKIT_JOB_SHELL"), shell.into_os_string()),
+        (
+            OsString::from("AIKIT_JOB_PROCESS_LIMIT"),
+            OsString::from(process_limit.to_string()),
+        ),
+        (
+            OsString::from("AIKIT_JOB_MEMORY_LIMIT"),
+            OsString::from(memory_limit.to_string()),
+        ),
+    ]
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn encode_powershell(script: &str) -> String {
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     base64(&bytes)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -162,7 +174,7 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const WINDOWS_JOB_LAUNCHER: &str = r#"
 $src = @'
 using System;
@@ -215,3 +227,87 @@ $processes = [uint32]$env:AIKIT_JOB_PROCESS_LIMIT; $memory = [uint64]$env:AIKIT_
 $env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null; $env:AIKIT_JOB_SHELL = $null
 exit [AikitJob]::Run($command, $cwd, $shell, $processes, $memory)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn encode_powershell_is_utf16le_base64() {
+        // "exit" in UTF-16LE is 65 00 78 00 69 00 74 00 — the encoding PowerShell's
+        // -EncodedCommand requires.
+        assert_eq!(encode_powershell("exit"), "ZQB4AGkAdAA=");
+    }
+
+    #[test]
+    fn launcher_installs_kill_on_close_process_and_memory_limits() {
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) | ACTIVE_PROCESS (0x8) | JOB_MEMORY (0x200),
+        // with a documented fallback that keeps the process-tree boundary when a nested host
+        // rejects the memory limit.
+        assert!(WINDOWS_JOB_LAUNCHER.contains("0x2000u | 0x8u | 0x200u"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("LimitFlags = 0x2000u | 0x8u;"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("AssignProcessToJobObject"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("CreateJobObjectW"));
+        // The child starts suspended and is resumed only after job assignment.
+        assert!(WINDOWS_JOB_LAUNCHER.contains("ResumeThread"));
+    }
+
+    #[test]
+    fn launcher_scrubs_job_environment_before_exec() {
+        for variable in ["AIKIT_JOB_COMMAND", "AIKIT_JOB_WORKDIR", "AIKIT_JOB_SHELL"] {
+            assert!(
+                WINDOWS_JOB_LAUNCHER.contains(&format!("$env:{variable} = $null")),
+                "launcher must scrub {variable} before exec"
+            );
+        }
+    }
+
+    #[test]
+    fn job_environment_carries_command_workdir_and_clamped_limits() {
+        let lookup = |environment: &[(std::ffi::OsString, std::ffi::OsString)], key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        let environment = job_environment(
+            "echo merhaba",
+            std::path::PathBuf::from("/w"),
+            std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            ContainmentLimits::default(),
+        );
+        assert_eq!(lookup(&environment, "AIKIT_JOB_COMMAND"), "echo merhaba");
+        assert_eq!(lookup(&environment, "AIKIT_JOB_WORKDIR"), "/w");
+        assert!(lookup(&environment, "AIKIT_JOB_SHELL").ends_with("cmd.exe"));
+        assert_eq!(lookup(&environment, "AIKIT_JOB_PROCESS_LIMIT"), "64");
+        assert_eq!(lookup(&environment, "AIKIT_JOB_MEMORY_LIMIT"), "536870912");
+
+        // Explicit limits pass through; zero clamps up to one instead of disabling the limit.
+        let custom = |max: u64| {
+            job_environment(
+                "x",
+                std::path::PathBuf::from("/w"),
+                std::path::PathBuf::from("cmd.exe"),
+                ContainmentLimits {
+                    max_processes: Some(max),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(lookup(&custom(16), "AIKIT_JOB_PROCESS_LIMIT"), "16");
+        assert_eq!(lookup(&custom(0), "AIKIT_JOB_PROCESS_LIMIT"), "1");
+    }
+}

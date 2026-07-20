@@ -173,12 +173,7 @@ pub(super) fn prepare(command: &str, workdir: &Path) -> Result<PreparedCommand> 
 
         let home_root = safe_home_root();
         let mut cmd = Command::new(SEATBELT_EXECUTABLE);
-        cmd.arg("-p").arg(PROFILE);
-        push_definition(&mut cmd, "USERS_ROOT", Path::new("/Users"));
-        push_definition(&mut cmd, "HOME_ROOT", &home_root);
-        push_definition(&mut cmd, "WORKSPACE", &workspace);
-        push_definition(&mut cmd, "TMPDIR", &temp_path);
-        cmd.arg("--").arg("/bin/sh").arg("-c").arg(command);
+        cmd.args(seatbelt_args(command, &workspace, &home_root, &temp_path));
 
         Ok(PreparedCommand {
             command: cmd,
@@ -195,20 +190,55 @@ pub(super) fn prepare(command: &str, workdir: &Path) -> Result<PreparedCommand> 
 
 #[cfg(target_os = "macos")]
 fn safe_home_root() -> PathBuf {
-    let candidate = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| path != Path::new("/"));
-    candidate.unwrap_or_else(|| PathBuf::from("/var/empty"))
+    resolve_home_root(std::env::var_os("HOME").map(PathBuf::from))
 }
 
-#[cfg(target_os = "macos")]
-fn push_definition(cmd: &mut Command, name: &str, value: &Path) {
-    let mut definition = OsString::from(name);
-    definition.push("=");
-    definition.push(value.as_os_str());
-    cmd.arg("-D").arg(definition);
+/// Resolve the HOME root the profile hides: an absolute, canonicalizable, non-`/` candidate, or
+/// the conservative `/var/empty` fallback. Pure over its input so the fallback matrix is testable
+/// on any platform.
+#[cfg(any(target_os = "macos", test))]
+fn resolve_home_root(candidate: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    candidate
+        .filter(|path| path.is_absolute())
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path != Path::new("/"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/empty"))
+}
+
+/// The exact `sandbox-exec` argv (everything after the program itself): the inline profile, the
+/// four `-D` parameter definitions the profile references, then the shell invocation with the
+/// untrusted command as the single final argument. Pure so profile wiring and argv-injection
+/// safety are unit-testable on any platform.
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_args(
+    command: &str,
+    workspace: &Path,
+    home_root: &Path,
+    temp_path: &Path,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    let definition = |name: &str, value: &Path| {
+        let mut definition = OsString::from(name);
+        definition.push("=");
+        definition.push(value.as_os_str());
+        definition
+    };
+    let mut args: Vec<OsString> = vec!["-p".into(), PROFILE.into()];
+    for (name, value) in [
+        ("USERS_ROOT", Path::new("/Users")),
+        ("HOME_ROOT", home_root),
+        ("WORKSPACE", workspace),
+        ("TMPDIR", temp_path),
+    ] {
+        args.push("-D".into());
+        args.push(definition(name, value));
+    }
+    args.push("--".into());
+    args.push("/bin/sh".into());
+    args.push("-c".into());
+    args.push(command.into());
+    args
 }
 
 #[cfg(test)]
@@ -221,5 +251,101 @@ mod tests {
         assert!(PROFILE.contains("(deny file-write*"));
         assert!(PROFILE.contains("(deny appleevent-send)"));
         assert!(PROFILE.contains("(deny lsopen)"));
+    }
+
+    #[test]
+    fn profile_denies_home_and_users_reads_outside_workspace() {
+        // Both read-deny rules must reference their roots AND carve the workspace back out —
+        // a profile that hides the workspace itself would break the tool it contains.
+        for root in ["USERS_ROOT", "HOME_ROOT"] {
+            let rule_start = PROFILE
+                .find(&format!("(subpath (param \"{root}\"))"))
+                .unwrap_or_else(|| panic!("profile must reference {root}"));
+            let rule_region = &PROFILE[rule_start.saturating_sub(64)..];
+            assert!(
+                rule_region.contains("(require-not (subpath (param \"WORKSPACE\")))"),
+                "{root} deny rule must exempt the workspace"
+            );
+        }
+        assert!(PROFILE.contains("(deny file-read*"));
+    }
+
+    #[test]
+    fn seatbelt_argv_defines_all_four_parameters_and_shell() {
+        let args = seatbelt_args(
+            "echo merhaba",
+            Path::new("/work/space"),
+            Path::new("/Users/someone"),
+            Path::new("/private/tmp/aikit-x"),
+        );
+        let as_str: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+
+        assert_eq!(as_str[0], "-p");
+        assert_eq!(as_str[1], PROFILE);
+        // Every profile parameter is defined exactly once, as a -D NAME=value pair.
+        for expected in [
+            "USERS_ROOT=/Users",
+            "HOME_ROOT=/Users/someone",
+            "WORKSPACE=/work/space",
+            "TMPDIR=/private/tmp/aikit-x",
+        ] {
+            let position = as_str
+                .iter()
+                .position(|a| *a == expected)
+                .unwrap_or_else(|| panic!("missing definition {expected}"));
+            assert_eq!(
+                as_str[position - 1],
+                "-D",
+                "{expected} must follow a -D flag"
+            );
+        }
+        let tail: Vec<&str> = as_str[as_str.len() - 4..].to_vec();
+        assert_eq!(tail, ["--", "/bin/sh", "-c", "echo merhaba"]);
+    }
+
+    #[test]
+    fn seatbelt_argv_is_argv_safe() {
+        let hostile = "true; touch /tmp/pwned; $(id) `id` && echo owned";
+        let args = seatbelt_args(
+            hostile,
+            Path::new("/w"),
+            Path::new("/Users/x"),
+            Path::new("/tmp/t"),
+        );
+        assert_eq!(args.last(), Some(&std::ffi::OsString::from(hostile)));
+        let occurrences = args
+            .iter()
+            .filter(|a| a.to_str().is_some_and(|s| s.contains("pwned")))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "hostile command leaked into extra argv entries"
+        );
+    }
+
+    #[test]
+    fn resolve_home_root_falls_back_to_var_empty() {
+        let fallback = std::path::PathBuf::from("/var/empty");
+        // No candidate, a relative candidate, a non-existent candidate, and `/` itself must all
+        // fall back rather than exposing (or hiding) the wrong tree.
+        assert_eq!(resolve_home_root(None), fallback);
+        assert_eq!(
+            resolve_home_root(Some(std::path::PathBuf::from("relative/home"))),
+            fallback
+        );
+        assert_eq!(
+            resolve_home_root(Some(std::path::PathBuf::from(
+                "/nonexistent-aikit-test-home-4711"
+            ))),
+            fallback
+        );
+        assert_eq!(
+            resolve_home_root(Some(std::path::PathBuf::from("/"))),
+            fallback
+        );
+        // A real directory resolves to its canonical path.
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(resolve_home_root(Some(dir.path().to_path_buf())), canonical);
     }
 }
