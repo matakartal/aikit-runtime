@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tasks/result",
+  "params": {
+    "taskId": "mcp-task-0000000000000001"
+  }
+}

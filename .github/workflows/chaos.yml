@@ -1,0 +1,52 @@
+name: chaos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  process-and-postgres:
+    name: Process kill and PostgreSQL CAS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
+        env:
+          POSTGRES_USER: aikit
+          POSTGRES_PASSWORD: aikit
+          POSTGRES_DB: aikit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aikit -d aikit"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Kill a checkpoint writer and recover in a new process
+        run: cargo test -p aikit-runtime-core --test process_chaos --locked
+      - name: Prove cross-connection PostgreSQL compare-and-swap
+        env:
+          AIKIT_TEST_POSTGRES_URL: host=localhost port=5432 user=aikit password=aikit dbname=aikit
+        run: >-
+          cargo test -p aikit-runtime-core --features postgres-store --locked
+          postgres_store::tests::postgres_store_enforces_cross_connection_cas
+          -- --ignored --exact --nocapture

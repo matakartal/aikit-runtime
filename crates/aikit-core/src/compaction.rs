@@ -74,7 +74,7 @@ fn estimate_message_tokens(m: &Message) -> u64 {
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             ContentBlock::Citation { text, .. } => text.len(),
             // Media is heavy and not text; charge a rough flat cost.
-            ContentBlock::Media { .. } => 512,
+            ContentBlock::Media { .. } | ContentBlock::MediaInput { .. } => 512,
         })
         .sum();
     (chars as u64 / 4) + 4

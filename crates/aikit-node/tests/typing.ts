@@ -1,10 +1,23 @@
 import {
   Agent,
   Client,
+  DurableRun,
   McpConnection,
   legacy,
   evaluateOutcome,
+  normalizeCedarDecision,
+  normalizeOpaDecision,
+  modelCapabilityState,
+  resolveModelCatalog,
+  sealGovernanceBinding,
+  sealPolicySnapshot,
+  shippedModelCatalog,
   tool,
+  validateMediaArtifact,
+  validateMediaInput,
+  validateModelProfile,
+  type AuditablePolicyDecision,
+  type CapabilityState,
   type ApprovalResponse,
   type ContainmentCapabilityReport,
   type ContentPart,
@@ -12,6 +25,13 @@ import {
   type EvalGate,
   type EvalVerdict,
   type ModelInput,
+  type MediaArtifact,
+  type MediaInput,
+  type PolicyDocument,
+  type PolicySnapshot,
+  type DurableApproval,
+  type DurableApprovalRequest,
+  type GovernanceBinding,
   type McpToolFilter,
   type ObjectStream,
   type OutputPart,
@@ -19,8 +39,12 @@ import {
   type QueryStream,
   type RunOptions,
   type RunOutcome,
+  type StreamDelta,
+  type ModelCapability,
   type SemanticValidationDecision,
   type ModelProfile,
+  type ModelCatalogSnapshot,
+  type ResolvedModelCatalog,
   type SubagentResult,
   type SubagentSpec,
   type ZodSchemaLike,
@@ -69,6 +93,15 @@ const messages: ModelInput = [
         media_type: "image/png",
         source: { kind: "url", url: "https://example.com/chart.png" },
       },
+      {
+        type: "media_input",
+        media: {
+          media_type: "application/octet-stream",
+          source: { kind: "bytes", data: [97, 98, 99] },
+          sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          size_bytes: 3,
+        },
+      },
     ],
   },
 ];
@@ -83,6 +116,107 @@ const providerMetadata: ProviderMetadata = {
 void canonicalContent;
 void materializedOutput;
 void providerMetadata;
+const strictMedia: MediaInput = {
+  media_type: "image/png",
+  source: { kind: "artifact", artifact_id: "artifact-1" },
+  sha256: "a".repeat(64),
+  size_bytes: 12,
+};
+const strictArtifact: MediaArtifact = {
+  artifact_id: "artifact-1",
+  media_type: "image/png",
+  sha256: "a".repeat(64),
+  size_bytes: 12,
+};
+const checkedMedia: MediaInput = validateMediaInput(strictMedia);
+const checkedArtifact: MediaArtifact = validateMediaArtifact(strictArtifact);
+const shippedCatalog: ModelCatalogSnapshot = shippedModelCatalog();
+const checkedProfile: ModelProfile = validateModelProfile(shippedCatalog.profiles[0]);
+const capabilityState: CapabilityState = modelCapabilityState(checkedProfile, "tool_use");
+const customCapability: ModelCapability = { custom: "acme_grounding" };
+// @ts-expect-error custom capabilities require a string value
+const invalidCustomCapability: ModelCapability = { custom: 1 };
+const resolvedCatalog: ResolvedModelCatalog = resolveModelCatalog(shippedCatalog.profiles);
+const opaEvidence: AuditablePolicyDecision = normalizeOpaDecision(
+  { result: { effect: "allow", rule_id: "allow.read" } },
+  { policy_rule_id: "package/aikit/read", input_summary: "tool=Read" },
+);
+const cedarEvidence: AuditablePolicyDecision = normalizeCedarDecision(
+  { decision: "Deny", forbid_policy_ids: ["forbid.secret"] },
+  { policy_rule_id: "package/aikit/read", input_summary: "tool=Read" },
+);
+void checkedMedia;
+void checkedArtifact;
+void capabilityState;
+void customCapability;
+void invalidCustomCapability;
+void resolvedCatalog;
+void opaEvidence;
+void cedarEvidence;
+
+const durable = new DurableRun("session-typed", "run-typed");
+const confirmationId = durable.requestConfirmation("confirm", "Proceed?", { risk: "low" });
+const confirmationOutcome = durable.resolveApproval(
+  "resume-confirm",
+  confirmationId,
+  true,
+  { accepted: true },
+);
+void confirmationOutcome;
+durable.requestInput("missing", "Currency?", { type: "string" });
+durable.requestOutputReview("review", "Review output", { status: "draft" });
+durable.requestEditRetry("retry", "Edit or retry", { status: "invalid" }, "mismatch");
+
+const policyDocument: PolicyDocument = {
+  schema_version: 1,
+  default_effect: "deny",
+  rules: [{
+    id: "allow.read",
+    scope: { scope: "tool", tool: "Read" },
+    effect: "allow",
+  }],
+};
+const policySnapshot: PolicySnapshot = sealPolicySnapshot(policyDocument);
+const governedDurable = DurableRun.withPolicySnapshot(
+  "session-governed",
+  "run-governed",
+  policySnapshot,
+);
+const governanceBinding: GovernanceBinding = sealGovernanceBinding(
+  policySnapshot,
+  "run-scoped",
+  "tenant-a",
+  "agent-a",
+);
+const scopedDurable = DurableRun.withGovernanceBinding(
+  "session-scoped",
+  "run-scoped",
+  governanceBinding,
+);
+void scopedDurable.governanceBinding;
+const typedApprovalRequest: DurableApprovalRequest = {
+  logical_key: "customer-id",
+  kind: "missing_input",
+  prompt: "Customer id?",
+  payload: { field: "customer_id" },
+  policy_snapshot_hash: policySnapshot.hash,
+  requested_at_unix_ms: 100,
+  expires_at_unix_ms: 200,
+};
+const typedApprovalId = governedDurable.requestTypedApproval(typedApprovalRequest);
+const typedApproval: DurableApproval =
+  governedDurable.snapshot().projection.approvals[typedApprovalId];
+const typedResume = governedDurable.resolveApprovalAt(
+  "resume-typed",
+  typedApprovalId,
+  true,
+  150n,
+  "cust-1",
+);
+void governedDurable.policySnapshotHash;
+void typedApproval;
+void typedResume;
+void governedDurable.expireApprovals("sweep-typed", 200n);
 const evalOutcome: RunOutcome = {
   messages,
   usage: {
@@ -131,6 +265,7 @@ const stream: ObjectStream<Invoice> = agent.streamObject(
   invoiceSchema,
   {
     providerOptions: { openai: { temperature: 0 } },
+    compatibilityMode: "best_effort",
     validator: semanticValidator,
   },
 );
@@ -210,6 +345,7 @@ const runOptions: RunOptions = {
   maxTokens: 128,
   maxTurns: 4,
   providerOptions: { openai: { temperature: 0 } },
+  compatibilityMode: "warn",
   budget: { maxTotalTokens: 1000 },
   retry: { maxAttemptsPerModel: 2 },
   compaction: { maxContextTokens: 4096, keepRecentMessages: 8 },
@@ -238,6 +374,9 @@ const runOptions: RunOptions = {
   },
   signal: controller.signal,
 };
+// @ts-expect-error compatibility modes are closed and exact
+const invalidCompatibilityOptions: RunOptions = { compatibilityMode: "loose" };
+void invalidCompatibilityOptions;
 const runStream: QueryStream = agent.run(messages, runOptions);
 const client = new Client(agent);
 const clientStream: QueryStream = client.query(messages, runOptions);
@@ -309,12 +448,37 @@ async function typedSubagentResume(): Promise<void> {
 async function typedCanonicalInputs(): Promise<void> {
   const generated = await agent.generateText(messages);
   void generated.messages;
+  void generated.warnings[0]?.parameter;
+
+  const warningDelta: StreamDelta = {
+    type: "warning",
+    warning: { code: "unsupported_parameter", message: "ignored", parameter: "future" },
+  };
+  if (warningDelta.type === "warning") void warningDelta.warning.parameter;
+  const errorDelta: StreamDelta = {
+    type: "error",
+    message: "provider invalid request",
+    info: {
+      code: "provider_invalid_request",
+      message: "provider invalid request",
+      provider: "mock",
+      model: "mock-1",
+      status: null,
+      retry_after_ms: null,
+      retryable: false,
+      warnings: [warningDelta.warning],
+    },
+  };
+  if (errorDelta.type === "error") void errorDelta.info.warnings?.[0]?.parameter;
 
   const textStream = agent.streamText(messages);
   void textStream;
 
-  const object = await agent.generateObject(messages, invoiceSchema);
+  const object = await agent.generateObject(messages, invoiceSchema, {
+    compatibilityMode: "best_effort",
+  });
   const invoice: Invoice = object.value;
+  void object.warnings[0]?.parameter;
   void invoice;
 }
 

@@ -34,7 +34,10 @@ use hooks::{HookDispatcher, HookOutcome, PreToolUseContext};
 use permissions::{Outcome, PermissionEngine};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 /// The decision for a single tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +135,406 @@ pub trait ToolApprover: Send + Sync {
     async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision;
 }
 
+#[derive(Debug, Error)]
+pub enum DurableApproverError {
+    #[error("durable approver requires a sealed governance policy snapshot")]
+    MissingPolicySnapshot,
+    #[error("durable run policy `{run_policy:?}` does not match governance policy `{governance_policy}`")]
+    PolicyMismatch {
+        run_policy: Option<String>,
+        governance_policy: String,
+    },
+    #[error("durable run is missing its complete governance binding")]
+    MissingGovernanceBinding,
+    #[error("durable governance binding mismatch: {0}")]
+    BindingMismatch(String),
+    #[error("durable approval timeout must be greater than zero")]
+    InvalidTimeout,
+    #[error("durable run state is unavailable")]
+    StateUnavailable,
+    #[error("durable governance binding registry reached its fail-closed capacity of {capacity}")]
+    BindingRegistryFull { capacity: usize },
+    #[error(
+        "durable run `{run_id}` cannot retire its governance binding while status is {status:?}"
+    )]
+    RunNotTerminal {
+        run_id: String,
+        status: crate::durability::DurableRunStatus,
+    },
+    #[error("terminal durable run `{run_id}` cannot be attached to governance")]
+    RunTerminal { run_id: String },
+    #[error("durable approval store is unavailable or out of sync: {0}")]
+    Store(String),
+}
+
+/// Compatibility adapter that turns the existing callback-based approver into an append-only
+/// durable approval lifecycle. Calls are serialized per run so overlapping callbacks cannot
+/// accidentally resume through each other's pending approval.
+#[derive(Clone)]
+pub struct DurableToolApprover {
+    legacy: Arc<dyn ToolApprover>,
+    run: Arc<Mutex<crate::durability::RunState>>,
+    governance_binding: GovernanceBinding,
+    timeout: Duration,
+    approval_gate: Arc<tokio::sync::Mutex<()>>,
+    store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+}
+
+impl DurableToolApprover {
+    pub fn new(
+        legacy: Arc<dyn ToolApprover>,
+        run: Arc<Mutex<crate::durability::RunState>>,
+        policy_snapshot: &PolicySnapshot,
+        timeout: Duration,
+    ) -> Result<Self, DurableApproverError> {
+        Self::new_inner(legacy, run, policy_snapshot, timeout, None)
+    }
+
+    /// Construct an adapter that commits every request/resolution through the durable store CAS
+    /// boundary before exposing the new in-memory projection.
+    pub fn new_persisted(
+        legacy: Arc<dyn ToolApprover>,
+        run: Arc<Mutex<crate::durability::RunState>>,
+        policy_snapshot: &PolicySnapshot,
+        timeout: Duration,
+        store: Arc<dyn crate::durable_store::DurableStore>,
+    ) -> Result<Self, DurableApproverError> {
+        Self::new_inner(legacy, run, policy_snapshot, timeout, Some(store))
+    }
+
+    fn new_inner(
+        legacy: Arc<dyn ToolApprover>,
+        run: Arc<Mutex<crate::durability::RunState>>,
+        policy_snapshot: &PolicySnapshot,
+        timeout: Duration,
+        store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+    ) -> Result<Self, DurableApproverError> {
+        if timeout.is_zero() || timeout.as_millis() == 0 {
+            return Err(DurableApproverError::InvalidTimeout);
+        }
+        let guard = run
+            .lock()
+            .map_err(|_| DurableApproverError::StateUnavailable)?;
+        let run_policy = guard.policy_snapshot_hash().map(str::to_owned);
+        if run_policy.as_deref() != Some(policy_snapshot.hash()) {
+            return Err(DurableApproverError::PolicyMismatch {
+                run_policy,
+                governance_policy: policy_snapshot.hash().to_owned(),
+            });
+        }
+        let governance_binding = guard
+            .governance_binding()
+            .cloned()
+            .ok_or(DurableApproverError::MissingGovernanceBinding)?;
+        governance_binding
+            .validate()
+            .map_err(|error| DurableApproverError::BindingMismatch(error.to_string()))?;
+        if governance_binding.run_id() != guard.run_id()
+            || governance_binding.policy_snapshot_hash() != policy_snapshot.hash()
+        {
+            return Err(DurableApproverError::BindingMismatch(
+                "run, policy, or binding identity differs".into(),
+            ));
+        }
+        if let Some(store) = &store {
+            let persisted = store
+                .load(guard.run_id())
+                .map_err(|error| DurableApproverError::Store(error.to_string()))?;
+            if persisted != *guard {
+                return Err(DurableApproverError::Store(
+                    "persisted run does not match the supplied run state".into(),
+                ));
+            }
+        }
+        drop(guard);
+        Ok(Self {
+            legacy,
+            run,
+            governance_binding,
+            timeout,
+            approval_gate: Arc::new(tokio::sync::Mutex::new(())),
+            store,
+        })
+    }
+
+    pub fn run_state(&self) -> Arc<Mutex<crate::durability::RunState>> {
+        self.run.clone()
+    }
+
+    fn fail_closed(message: impl Into<String>) -> ApprovalDecision {
+        ApprovalDecision::Deny {
+            message: message.into(),
+            interrupt: true,
+        }
+    }
+
+    fn commit_candidate(
+        &self,
+        current: &mut crate::durability::RunState,
+        candidate: crate::durability::RunState,
+    ) -> Result<(), String> {
+        if let Some(store) = &self.store {
+            let expected_sequence = current.events().last().map_or(0, |event| event.sequence);
+            store
+                .compare_and_swap(expected_sequence, &candidate)
+                .map_err(|error| error.to_string())?;
+        }
+        *current = candidate;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ToolApprover for DurableToolApprover {
+    async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision {
+        let _gate = self.approval_gate.lock().await;
+        let request_for_callback = request.clone();
+        let requested_at_unix_ms = match unix_time_ms() {
+            Ok(now) => now,
+            Err(message) => return Self::fail_closed(message),
+        };
+        let expected_payload = serde_json::json!({
+            "turn": request.turn,
+            "tool_use_id": request.tool_use_id,
+            "tool": request.tool,
+            "input": request.input,
+        });
+        let timeout_ms = u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX);
+        let proposed_expiry = requested_at_unix_ms.saturating_add(timeout_ms);
+        let (approval_id, expires_at_unix_ms) = {
+            let mut run = match self.run.lock() {
+                Ok(run) => run,
+                Err(_) => return Self::fail_closed("durable approval state is unavailable"),
+            };
+            if run.run_id() != request.run_id {
+                return Self::fail_closed(format!(
+                    "approval run `{}` does not match durable run `{}`",
+                    request.run_id,
+                    run.run_id()
+                ));
+            }
+            if run.governance_binding() != Some(&self.governance_binding) {
+                return Self::fail_closed(
+                    "durable run governance binding changed after approver attachment",
+                );
+            }
+            let existing = run
+                .projection()
+                .approvals
+                .values()
+                .filter(|approval| approval.logical_key == request.tool_use_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if existing.len() > 1 {
+                return Self::fail_closed("durable approval identity is ambiguous");
+            }
+            if let Some(existing) = existing.into_iter().next() {
+                if existing.governance_binding.as_ref() != Some(&self.governance_binding)
+                    || existing.policy_snapshot_hash.as_deref()
+                        != Some(self.governance_binding.policy_snapshot_hash())
+                    || existing.payload != expected_payload
+                {
+                    return Self::fail_closed(
+                        "durable approval replay does not match the current governed action",
+                    );
+                }
+                match existing.status {
+                    crate::durability::DurableApprovalStatus::Approved => {
+                        return durable_approval_decision(&existing)
+                            .unwrap_or_else(Self::fail_closed)
+                    }
+                    crate::durability::DurableApprovalStatus::Rejected => {
+                        return durable_approval_decision(&existing)
+                            .unwrap_or_else(Self::fail_closed)
+                    }
+                    crate::durability::DurableApprovalStatus::Pending => {
+                        let Some(expires_at) = existing.expires_at_unix_ms else {
+                            return Self::fail_closed(
+                                "durable approval is missing its expiration clock",
+                            );
+                        };
+                        (existing.approval_id, expires_at)
+                    }
+                }
+            } else {
+                let mut candidate = run.clone();
+                match candidate.request_typed_approval(crate::durability::DurableApprovalRequest {
+                    logical_key: request.tool_use_id.clone(),
+                    activity_id: None,
+                    kind: crate::durability::DurableApprovalKind::Confirmation,
+                    prompt: format!("Allow tool `{}`?", request.tool),
+                    payload: expected_payload.clone(),
+                    policy_snapshot_hash: Some(
+                        self.governance_binding.policy_snapshot_hash().to_owned(),
+                    ),
+                    governance_binding: Some(self.governance_binding.clone()),
+                    requested_at_unix_ms,
+                    expires_at_unix_ms: proposed_expiry,
+                }) {
+                    Ok(approval_id) => {
+                        if let Err(error) = self.commit_candidate(&mut run, candidate) {
+                            return Self::fail_closed(format!(
+                                "durable approval request could not be committed: {error}"
+                            ));
+                        }
+                        (approval_id, proposed_expiry)
+                    }
+                    Err(error) => {
+                        return Self::fail_closed(format!(
+                            "durable approval request could not be recorded: {error}"
+                        ))
+                    }
+                }
+            }
+        };
+
+        let remaining_ms = expires_at_unix_ms.saturating_sub(requested_at_unix_ms);
+        let callback = if remaining_ms == 0 {
+            None
+        } else {
+            tokio::time::timeout(
+                Duration::from_millis(remaining_ms),
+                self.legacy.approve(request_for_callback),
+            )
+            .await
+            .ok()
+        };
+        let (decision, approved, response, timed_out) = match callback {
+            Some(decision @ ApprovalDecision::Allow { .. }) => {
+                let response = approval_decision_payload(&decision);
+                (decision, true, response, false)
+            }
+            Some(decision @ ApprovalDecision::Deny { .. }) => {
+                let response = approval_decision_payload(&decision);
+                (decision, false, response, false)
+            }
+            None => (
+                ApprovalDecision::deny("approval timed out"),
+                false,
+                Some(serde_json::json!({"reason": "approval_timeout"})),
+                true,
+            ),
+        };
+        let resolved_at_unix_ms = if timed_out {
+            expires_at_unix_ms
+        } else {
+            match unix_time_ms() {
+                Ok(now) => now,
+                Err(message) => return Self::fail_closed(message),
+            }
+        };
+        let durable_status = self.run.lock().map_err(|_| ()).and_then(|mut run| {
+            let mut candidate = run.clone();
+            candidate
+                .apply_command_at(
+                    crate::durability::RunCommand::Resume {
+                        command_id: format!("approval:{approval_id}"),
+                        approvals: vec![crate::durability::ApprovalResolution {
+                            approval_id: approval_id.clone(),
+                            approved,
+                            response,
+                        }],
+                    },
+                    resolved_at_unix_ms,
+                )
+                .map_err(|_| ())?;
+            let status = candidate.projection().approvals[&approval_id].status;
+            self.commit_candidate(&mut run, candidate).map_err(|_| ())?;
+            Ok(status)
+        });
+        match durable_status {
+            Ok(crate::durability::DurableApprovalStatus::Approved) => decision,
+            Ok(crate::durability::DurableApprovalStatus::Rejected) if approved => {
+                ApprovalDecision::deny("approval timed out")
+            }
+            Ok(crate::durability::DurableApprovalStatus::Rejected) => decision,
+            Ok(crate::durability::DurableApprovalStatus::Pending) | Err(()) => {
+                Self::fail_closed("durable approval resolution could not be recorded")
+            }
+        }
+    }
+}
+
+fn unix_time_ms() -> Result<u64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| "system clock exceeds durable timestamp range".to_string())
+}
+
+fn approval_decision_payload(decision: &ApprovalDecision) -> Option<Value> {
+    match decision {
+        ApprovalDecision::Allow {
+            updated_input,
+            updated_permissions,
+        } => Some(serde_json::json!({
+            "decision": "allow",
+            "updated_input": updated_input,
+            "updated_permissions": updated_permissions.iter().map(|permission| match permission {
+                PermissionUpdate::AllowExactInput => "allow_exact_input",
+                PermissionUpdate::AllowTool => "allow_tool",
+            }).collect::<Vec<_>>(),
+        })),
+        ApprovalDecision::Deny { message, interrupt } => Some(serde_json::json!({
+            "decision": "deny",
+            "message": message,
+            "interrupt": interrupt,
+        })),
+    }
+}
+
+fn durable_approval_decision(
+    approval: &crate::durability::DurableApproval,
+) -> Result<ApprovalDecision, String> {
+    if approval.timed_out {
+        return Ok(ApprovalDecision::deny("approval timed out"));
+    }
+    let response = approval
+        .response
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| "durable approval response is missing".to_string())?;
+    match response.get("decision").and_then(Value::as_str) {
+        Some("allow") if approval.status == crate::durability::DurableApprovalStatus::Approved => {
+            let updated_input = response
+                .get("updated_input")
+                .cloned()
+                .filter(|value| !value.is_null());
+            let permissions = response
+                .get("updated_permissions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "durable approval permissions are malformed".to_string())?
+                .iter()
+                .map(|permission| match permission.as_str() {
+                    Some("allow_exact_input") => Ok(PermissionUpdate::AllowExactInput),
+                    Some("allow_tool") => Ok(PermissionUpdate::AllowTool),
+                    _ => Err("durable approval permission is unknown".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ApprovalDecision::Allow {
+                updated_input,
+                updated_permissions: permissions,
+            })
+        }
+        Some("deny") if approval.status == crate::durability::DurableApprovalStatus::Rejected => {
+            let message = response
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "durable denial message is missing".to_string())?;
+            let interrupt = response
+                .get("interrupt")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "durable denial interrupt flag is missing".to_string())?;
+            Ok(ApprovalDecision::Deny {
+                message: message.into(),
+                interrupt,
+            })
+        }
+        _ => Err("durable approval status and response disagree".into()),
+    }
+}
+
 /// Context needed for enforcing hooks and an optional approval callback.
 #[derive(Debug, Clone)]
 pub struct AuthorizationContext {
@@ -199,7 +602,18 @@ pub struct Governance {
     pub hooks: HookDispatcher,
     approver: Option<Arc<dyn ToolApprover>>,
     approved_permissions: Arc<RwLock<ApprovedPermissionSet>>,
+    policy_snapshot: Option<PolicySnapshot>,
+    tenant_id: Option<String>,
+    agent_id: Option<String>,
+    durable_binding: Option<GovernanceBinding>,
+    durable_run: Option<Arc<Mutex<crate::durability::RunState>>>,
+    durable_bindings: Arc<RwLock<BTreeMap<String, GovernanceBinding>>>,
+    binding_violation: Option<String>,
 }
+
+/// A hard fail-closed ceiling. Bindings are security state and therefore cannot be silently
+/// evicted while a run may still resume; terminal runs must be retired explicitly.
+pub const MAX_REGISTERED_DURABLE_BINDINGS: usize = 4_096;
 
 impl Governance {
     pub fn new(permissions: PermissionEngine, hooks: HookDispatcher) -> Self {
@@ -208,12 +622,177 @@ impl Governance {
             hooks,
             approver: None,
             approved_permissions: Arc::new(RwLock::new(ApprovedPermissionSet::default())),
+            policy_snapshot: None,
+            tenant_id: None,
+            agent_id: None,
+            durable_binding: None,
+            durable_run: None,
+            durable_bindings: Arc::new(RwLock::new(BTreeMap::new())),
+            binding_violation: None,
         }
     }
 
     pub fn with_approver(mut self, approver: Arc<dyn ToolApprover>) -> Self {
+        if self.durable_binding.is_some() {
+            self.binding_violation =
+                Some("durable approver cannot be replaced after governance binding".into());
+        }
         self.approver = Some(approver);
         self
+    }
+
+    /// Wrap an existing callback approver with durable request/resolution recording.
+    pub fn with_durable_approver(
+        mut self,
+        approver: Arc<dyn ToolApprover>,
+        run: Arc<Mutex<crate::durability::RunState>>,
+        timeout: Duration,
+    ) -> Result<Self, DurableApproverError> {
+        let snapshot = self
+            .policy_snapshot
+            .as_ref()
+            .ok_or(DurableApproverError::MissingPolicySnapshot)?;
+        let binding = self.validate_run_binding(&run)?;
+        self.register_durable_binding(&binding)?;
+        self.approver = Some(Arc::new(DurableToolApprover::new(
+            approver,
+            run.clone(),
+            snapshot,
+            timeout,
+        )?));
+        self.durable_binding = Some(binding);
+        self.durable_run = Some(run);
+        Ok(self)
+    }
+
+    /// Durable approver variant that persists each event-log transition with store-level CAS.
+    pub fn with_persisted_durable_approver(
+        mut self,
+        approver: Arc<dyn ToolApprover>,
+        run: Arc<Mutex<crate::durability::RunState>>,
+        timeout: Duration,
+        store: Arc<dyn crate::durable_store::DurableStore>,
+    ) -> Result<Self, DurableApproverError> {
+        let snapshot = self
+            .policy_snapshot
+            .as_ref()
+            .ok_or(DurableApproverError::MissingPolicySnapshot)?;
+        let binding = self.validate_run_binding(&run)?;
+        self.register_durable_binding(&binding)?;
+        self.approver = Some(Arc::new(DurableToolApprover::new_persisted(
+            approver,
+            run.clone(),
+            snapshot,
+            timeout,
+            store,
+        )?));
+        self.durable_binding = Some(binding);
+        self.durable_run = Some(run);
+        Ok(self)
+    }
+
+    /// Attach a replayed durable run even when its policy never asks for human approval. This makes
+    /// the event-sourced binding available to every subsequent authorization check.
+    pub fn with_durable_run(
+        mut self,
+        run: Arc<Mutex<crate::durability::RunState>>,
+    ) -> Result<Self, DurableApproverError> {
+        let binding = self.validate_run_binding(&run)?;
+        self.register_durable_binding(&binding)?;
+        self.durable_binding = Some(binding);
+        self.durable_run = Some(run);
+        Ok(self)
+    }
+
+    /// Attach the sealed policy that will be cloned unchanged into each invocation.
+    pub fn with_policy_snapshot(mut self, policy_snapshot: PolicySnapshot) -> Self {
+        if self
+            .durable_binding
+            .as_ref()
+            .is_some_and(|binding| binding.policy_snapshot_hash() != policy_snapshot.hash())
+        {
+            self.binding_violation =
+                Some("policy snapshot changed after durable governance binding".into());
+            return self;
+        }
+        self.policy_snapshot = Some(policy_snapshot);
+        self
+    }
+
+    /// Bind tenant/agent scopes used when evaluating the sealed policy. The run and tool scopes
+    /// come from each [`AuthorizationContext`].
+    pub fn with_policy_identity(
+        mut self,
+        tenant_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Self {
+        if self.durable_binding.as_ref().is_some_and(|binding| {
+            binding.tenant_id() != tenant_id.as_deref() || binding.agent_id() != agent_id.as_deref()
+        }) {
+            self.binding_violation =
+                Some("policy identity changed after durable governance binding".into());
+            return self;
+        }
+        self.tenant_id = tenant_id;
+        self.agent_id = agent_id;
+        self
+    }
+
+    pub fn policy_snapshot(&self) -> Option<&PolicySnapshot> {
+        self.policy_snapshot.as_ref()
+    }
+
+    pub fn policy_snapshot_hash(&self) -> Option<&str> {
+        self.policy_snapshot.as_ref().map(PolicySnapshot::hash)
+    }
+
+    /// Construct a durable run whose first post-start event pins this governance policy.
+    pub fn start_durable_run(
+        &self,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        durability: crate::durability::DurabilityMode,
+    ) -> crate::durability::DurabilityResult<crate::durability::RunState> {
+        let snapshot = self.policy_snapshot.as_ref().ok_or_else(|| {
+            crate::durability::DurabilityError::InvalidEvent {
+                reason: "governed durable run requires a sealed policy snapshot".into(),
+            }
+        })?;
+        let run_id = run_id.into();
+        if let Some(reason) = &self.binding_violation {
+            return Err(crate::durability::DurabilityError::InvalidEvent {
+                reason: format!("durable governance binding is invalid: {reason}"),
+            });
+        }
+        if self
+            .durable_binding
+            .as_ref()
+            .is_some_and(|binding| binding.run_id() != run_id)
+        {
+            return Err(crate::durability::DurabilityError::InvalidEvent {
+                reason: "governance instance is already bound to another durable run".into(),
+            });
+        }
+        let binding = GovernanceBinding::seal(
+            snapshot.hash(),
+            self.tenant_id.clone(),
+            self.agent_id.clone(),
+            run_id.clone(),
+        )
+        .map_err(|error| crate::durability::DurabilityError::InvalidEvent {
+            reason: format!("invalid governance binding: {error}"),
+        })?;
+        let run = crate::durability::RunState::new_with_governance_binding(
+            session_id, run_id, durability, binding,
+        )?;
+        self.register_durable_binding(
+            run.governance_binding()
+                .expect("new governed run has a binding"),
+        )
+        .map_err(|error| crate::durability::DurabilityError::InvalidEvent {
+            reason: error.to_string(),
+        })?;
+        Ok(run)
     }
 
     /// Clone immutable policy/callback configuration for one invocation while allocating a fresh
@@ -225,6 +804,214 @@ impl Governance {
             hooks: self.hooks.clone(),
             approver: self.approver.clone(),
             approved_permissions: Arc::new(RwLock::new(ApprovedPermissionSet::default())),
+            policy_snapshot: self.policy_snapshot.clone(),
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            durable_binding: self.durable_binding.clone(),
+            durable_run: self.durable_run.clone(),
+            durable_bindings: self.durable_bindings.clone(),
+            binding_violation: self.binding_violation.clone(),
+        }
+    }
+
+    fn validate_run_binding(
+        &self,
+        run: &Arc<Mutex<crate::durability::RunState>>,
+    ) -> Result<GovernanceBinding, DurableApproverError> {
+        let snapshot = self
+            .policy_snapshot
+            .as_ref()
+            .ok_or(DurableApproverError::MissingPolicySnapshot)?;
+        let guard = run
+            .lock()
+            .map_err(|_| DurableApproverError::StateUnavailable)?;
+        if guard.status().is_terminal() {
+            return Err(DurableApproverError::RunTerminal {
+                run_id: guard.run_id().to_owned(),
+            });
+        }
+        let actual = guard
+            .governance_binding()
+            .cloned()
+            .ok_or(DurableApproverError::MissingGovernanceBinding)?;
+        let expected = GovernanceBinding::seal(
+            snapshot.hash(),
+            self.tenant_id.clone(),
+            self.agent_id.clone(),
+            guard.run_id(),
+        )
+        .map_err(|error| DurableApproverError::BindingMismatch(error.to_string()))?;
+        if actual != expected {
+            return Err(DurableApproverError::BindingMismatch(format!(
+                "expected {}, found {}",
+                expected.binding_hash(),
+                actual.binding_hash()
+            )));
+        }
+        Ok(actual)
+    }
+
+    fn register_durable_binding(
+        &self,
+        binding: &GovernanceBinding,
+    ) -> Result<(), DurableApproverError> {
+        let mut bindings = self
+            .durable_bindings
+            .write()
+            .map_err(|_| DurableApproverError::StateUnavailable)?;
+        if let Some(existing) = bindings.get(binding.run_id()) {
+            if existing != binding {
+                return Err(DurableApproverError::BindingMismatch(format!(
+                    "run `{}` is already bound to {}",
+                    binding.run_id(),
+                    existing.binding_hash()
+                )));
+            }
+            return Ok(());
+        }
+        if bindings.len() >= MAX_REGISTERED_DURABLE_BINDINGS {
+            return Err(DurableApproverError::BindingRegistryFull {
+                capacity: MAX_REGISTERED_DURABLE_BINDINGS,
+            });
+        }
+        bindings.insert(binding.run_id().to_owned(), binding.clone());
+        Ok(())
+    }
+
+    /// Retire an exact terminal run binding and its ephemeral approvals. Paused, running, and
+    /// reconciliation-required runs remain registered because they may legally resume.
+    /// Repeating retirement is idempotent, while a mismatched binding always fails closed.
+    pub fn retire_durable_run(
+        &self,
+        run: &crate::durability::RunState,
+    ) -> Result<(), DurableApproverError> {
+        if !run.status().is_terminal() {
+            return Err(DurableApproverError::RunNotTerminal {
+                run_id: run.run_id().to_owned(),
+                status: run.status(),
+            });
+        }
+        let binding = run
+            .governance_binding()
+            .ok_or(DurableApproverError::MissingGovernanceBinding)?;
+        binding
+            .validate()
+            .map_err(|error| DurableApproverError::BindingMismatch(error.to_string()))?;
+
+        // Acquire both locks before mutation. A partial cleanup must never remove the binding
+        // while leaving a reusable approval grant behind for the same run id.
+        let mut bindings = self
+            .durable_bindings
+            .write()
+            .map_err(|_| DurableApproverError::StateUnavailable)?;
+        let mut approved = self
+            .approved_permissions
+            .write()
+            .map_err(|_| DurableApproverError::StateUnavailable)?;
+        if let Some(registered) = bindings.get(run.run_id()) {
+            if registered != binding {
+                return Err(DurableApproverError::BindingMismatch(format!(
+                    "terminal run `{}` does not match registered binding {}",
+                    run.run_id(),
+                    registered.binding_hash()
+                )));
+            }
+            bindings.remove(run.run_id());
+        }
+        approved.grants.retain(|grant| grant.run_id != run.run_id());
+        Ok(())
+    }
+
+    fn validate_authorization_binding(&self, run_id: &str) -> Result<(), String> {
+        if let Some(reason) = &self.binding_violation {
+            return Err(reason.clone());
+        }
+        let registered = self
+            .durable_bindings
+            .read()
+            .map_err(|_| "durable governance binding registry is unavailable".to_string())?
+            .get(run_id)
+            .cloned();
+        let binding = match (&self.durable_binding, registered.as_ref()) {
+            (Some(attached), Some(registered)) if attached != registered => {
+                return Err("attached and registered durable bindings disagree".into())
+            }
+            (Some(_), None) => {
+                return Err(
+                    "attached durable governance binding is not registered or was retired".into(),
+                )
+            }
+            (Some(attached), Some(_)) => attached,
+            (None, Some(registered)) => registered,
+            (None, None) => return Ok(()),
+        };
+        let snapshot = self
+            .policy_snapshot
+            .as_ref()
+            .ok_or_else(|| "durable governance policy snapshot is missing".to_string())?;
+        let expected = GovernanceBinding::seal(
+            snapshot.hash(),
+            self.tenant_id.clone(),
+            self.agent_id.clone(),
+            run_id,
+        )
+        .map_err(|error| format!("invalid durable governance identity: {error}"))?;
+        if &expected != binding {
+            return Err("authorization context does not match durable governance binding".into());
+        }
+        if let Some(run) = &self.durable_run {
+            let run = run
+                .lock()
+                .map_err(|_| "durable governance run state is unavailable".to_string())?;
+            if run.governance_binding() != Some(binding) || run.run_id() != run_id {
+                return Err("durable run governance binding changed after attachment".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_permission(
+        &self,
+        run_id: &str,
+        tool: &str,
+        input: &Value,
+    ) -> permissions::PermissionDecision {
+        let legacy = self.permissions.evaluate_detailed(tool, input);
+        let Some(snapshot) = &self.policy_snapshot else {
+            return legacy;
+        };
+        let policy = snapshot.evaluate(&PolicyEvaluationContext {
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            run_id: Some(run_id.to_owned()),
+            tool: tool.to_owned(),
+        });
+        let policy_source = policy
+            .deciding_rule_id
+            .as_deref()
+            .unwrap_or("policy.default");
+        match (&legacy.outcome, policy.effect) {
+            (Outcome::Deny(_), _) => legacy,
+            (_, PolicyEffect::Deny) => permissions::PermissionDecision {
+                outcome: Outcome::Deny(format!("denied by sealed policy `{policy_source}`")),
+                source: format!("policy_snapshot:{}:{policy_source}", snapshot.hash()),
+            },
+            (Outcome::Ask, _) | (_, PolicyEffect::Ask) => permissions::PermissionDecision {
+                outcome: Outcome::Ask,
+                source: format!(
+                    "{}+policy_snapshot:{}:{policy_source}",
+                    legacy.source,
+                    snapshot.hash()
+                ),
+            },
+            (Outcome::Allow, PolicyEffect::Allow) => permissions::PermissionDecision {
+                outcome: Outcome::Allow,
+                source: format!(
+                    "{}+policy_snapshot:{}:{policy_source}",
+                    legacy.source,
+                    snapshot.hash()
+                ),
+            },
         }
     }
 
@@ -270,6 +1057,17 @@ impl Governance {
         &self,
         ctx: AuthorizationContext,
     ) -> AuthorizationReport {
+        if let Err(reason) = self.validate_authorization_binding(&ctx.run_id) {
+            return AuthorizationReport {
+                authorization: Authorization::interrupted(format!(
+                    "durable governance binding rejected authorization: {reason}"
+                )),
+                interrupt: true,
+                pre_hook_outcome: "not_evaluated",
+                permission_outcome: "binding_mismatch",
+                permission_source: "durable_governance_binding".into(),
+            };
+        }
         // 1. Enforcing hooks first — they can block outright or rewrite the input.
         let (effective, pre_hook_outcome) = match self
             .hooks
@@ -296,7 +1094,7 @@ impl Governance {
         };
 
         // 2. Permission rules on the (possibly rewritten) input.
-        let permission = self.permissions.evaluate_detailed(&ctx.tool, &effective);
+        let permission = self.evaluate_permission(&ctx.run_id, &ctx.tool, &effective);
         match permission.outcome {
             Outcome::Allow => AuthorizationReport {
                 authorization: Authorization::Allowed(effective),
@@ -402,9 +1200,8 @@ impl Governance {
                         };
                         // Recheck static policy too, so a callback cannot turn an ask-able call
                         // into an explicit deny and accidentally bypass it.
-                        let recheck = self
-                            .permissions
-                            .evaluate_detailed(&ctx.tool, &approved_input);
+                        let recheck =
+                            self.evaluate_permission(&ctx.run_id, &ctx.tool, &approved_input);
                         if let Outcome::Deny(reason) = recheck.outcome {
                             return AuthorizationReport {
                                 authorization: Authorization::denied(reason),
@@ -492,8 +1289,18 @@ impl Governance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable_store::{DurableStore, InMemoryDurableStore};
     use permissions::{PermissionMode, Rule};
     use serde_json::json;
+
+    fn snapshot(effect: PolicyEffect) -> PolicySnapshot {
+        PolicySnapshot::seal(PolicyDocument {
+            schema_version: GOVERNANCE_CONTRACT_VERSION,
+            default_effect: effect,
+            rules: Vec::new(),
+        })
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn default_governance_allows_everything_unchanged() {
@@ -932,5 +1739,653 @@ mod tests {
         assert!(report.authorization.interrupt());
         assert_eq!(report.permission_outcome, "ask_denied_interrupt");
         assert!(report.permission_source.contains("human_approval:ask-bash"));
+    }
+
+    #[tokio::test]
+    async fn sealed_snapshot_is_enforced_and_frozen_per_invocation() {
+        let allow = snapshot(PolicyEffect::Allow);
+        let deny = snapshot(PolicyEffect::Deny);
+        let configured = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(allow.clone());
+        let invocation = configured.fork_for_run();
+        let changed = configured.with_policy_snapshot(deny);
+
+        assert!(matches!(
+            invocation.authorize("network.fetch", &json!({})).await,
+            Authorization::Allowed(_)
+        ));
+        assert!(matches!(
+            changed.authorize("network.fetch", &json!({})).await,
+            Authorization::Denied { .. }
+        ));
+        assert_eq!(invocation.policy_snapshot_hash(), Some(allow.hash()));
+
+        let run = invocation
+            .start_durable_run("session", "run", crate::durability::DurabilityMode::Sync)
+            .unwrap();
+        assert_eq!(run.policy_snapshot_hash(), Some(allow.hash()));
+    }
+
+    #[tokio::test]
+    async fn high_level_authorization_applies_tenant_and_agent_policy_scopes() {
+        let policy = PolicySnapshot::seal(PolicyDocument {
+            schema_version: GOVERNANCE_CONTRACT_VERSION,
+            default_effect: PolicyEffect::Allow,
+            rules: vec![
+                ScopedPolicyRule {
+                    id: "deny-tenant".into(),
+                    scope: PolicyScope::Tenant {
+                        tenant_id: "tenant-a".into(),
+                    },
+                    effect: PolicyEffect::Deny,
+                    reason: None,
+                },
+                ScopedPolicyRule {
+                    id: "allow-agent".into(),
+                    scope: PolicyScope::Agent {
+                        agent_id: "agent-a".into(),
+                    },
+                    effect: PolicyEffect::Allow,
+                    reason: None,
+                },
+            ],
+        })
+        .unwrap();
+        let governance = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy)
+            .with_policy_identity(Some("tenant-a".into()), Some("agent-a".into()));
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "run-a".into(),
+                turn: 1,
+                tool_use_id: "call-a".into(),
+                tool: "filesystem.read".into(),
+                input: json!({"path": "report.txt"}),
+            })
+            .await;
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert!(report.permission_source.contains("deny-tenant"));
+    }
+
+    struct DelayedApprover {
+        delay: Duration,
+        decision: ApprovalDecision,
+    }
+
+    #[async_trait]
+    impl ToolApprover for DelayedApprover {
+        async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            tokio::time::sleep(self.delay).await;
+            self.decision.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_approver_is_recorded_as_a_durable_approval() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let run = Arc::new(Mutex::new(
+            base.start_durable_run("session", "durable-run", crate::DurabilityMode::Sync)
+                .unwrap(),
+        ));
+        let governance = base
+            .with_durable_approver(
+                Arc::new(DelayedApprover {
+                    delay: Duration::ZERO,
+                    decision: ApprovalDecision::allow(None),
+                }),
+                run.clone(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            governance
+                .authorize_detailed_with_context(AuthorizationContext {
+                    run_id: "durable-run".into(),
+                    turn: 1,
+                    tool_use_id: "call-1".into(),
+                    tool: "network.fetch".into(),
+                    input: json!({"url": "https://example.com"}),
+                })
+                .await
+                .authorization,
+            Authorization::Allowed(_)
+        ));
+        let run = run.lock().unwrap();
+        let approval = run.projection().approvals.values().next().unwrap();
+        assert_eq!(approval.status, crate::DurableApprovalStatus::Approved);
+        assert_eq!(
+            approval.kind,
+            crate::durability::DurableApprovalKind::Confirmation
+        );
+        assert_eq!(
+            approval.governance_binding.as_ref(),
+            run.governance_binding()
+        );
+        assert_eq!(
+            approval.governance_binding.as_ref().unwrap().run_id(),
+            "durable-run"
+        );
+        assert_eq!(run.status(), crate::durability::DurableRunStatus::Running);
+        assert_eq!(
+            crate::durability::RunState::from_events(run.events().to_vec()).unwrap(),
+            *run
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_binding_rejects_policy_identity_and_run_bypasses() {
+        let ask = snapshot(PolicyEffect::Ask);
+        let allow = snapshot(PolicyEffect::Allow);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(ask)
+            .with_policy_identity(Some("tenant-a".into()), Some("agent-a".into()));
+        let run = Arc::new(Mutex::new(
+            base.start_durable_run("session", "bound-run", crate::DurabilityMode::Sync)
+                .unwrap(),
+        ));
+        let pre_attachment_drift = base
+            .clone()
+            .with_policy_identity(Some("tenant-b".into()), Some("agent-a".into()))
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "bound-run".into(),
+                turn: 1,
+                tool_use_id: "pre-attachment".into(),
+                tool: "network.fetch".into(),
+                input: json!({}),
+            })
+            .await;
+        assert!(pre_attachment_drift.interrupt);
+        assert_eq!(pre_attachment_drift.permission_outcome, "binding_mismatch");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bound = base
+            .clone()
+            .with_durable_approver(
+                Arc::new(FixedApprover {
+                    decision: ApprovalDecision::allow(None),
+                    calls: calls.clone(),
+                }),
+                run.clone(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let context = |run_id: &str| AuthorizationContext {
+            run_id: run_id.into(),
+            turn: 1,
+            tool_use_id: "binding-call".into(),
+            tool: "network.fetch".into(),
+            input: json!({"url": "https://example.com"}),
+        };
+
+        for governance in [
+            bound.clone().with_policy_snapshot(allow),
+            bound
+                .clone()
+                .with_policy_identity(Some("tenant-b".into()), Some("agent-a".into())),
+        ] {
+            let report = governance
+                .authorize_detailed_with_context(context("bound-run"))
+                .await;
+            assert!(report.interrupt);
+            assert_eq!(report.permission_outcome, "binding_mismatch");
+        }
+        let wrong_run = bound
+            .authorize_detailed_with_context(context("different-run"))
+            .await;
+        assert!(wrong_run.interrupt);
+        assert_eq!(wrong_run.permission_outcome, "binding_mismatch");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let replayed = Arc::new(Mutex::new(
+            crate::durability::RunState::from_events(run.lock().unwrap().events().to_vec())
+                .unwrap(),
+        ));
+        let drifted_identity =
+            base.with_policy_identity(Some("tenant-b".into()), Some("agent-a".into()));
+        assert!(matches!(
+            drifted_identity.with_durable_approver(
+                Arc::new(DelayedApprover {
+                    delay: Duration::ZERO,
+                    decision: ApprovalDecision::allow(None),
+                }),
+                replayed,
+                Duration::from_secs(1),
+            ),
+            Err(DurableApproverError::BindingMismatch(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_approver_timeout_is_a_replayable_deny() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let run = Arc::new(Mutex::new(
+            base.start_durable_run("session", "timeout-run", crate::DurabilityMode::Sync)
+                .unwrap(),
+        ));
+        let governance = base
+            .with_durable_approver(
+                Arc::new(DelayedApprover {
+                    delay: Duration::from_millis(50),
+                    decision: ApprovalDecision::allow(None),
+                }),
+                run.clone(),
+                Duration::from_millis(5),
+            )
+            .unwrap();
+
+        let decision = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "timeout-run".into(),
+                turn: 1,
+                tool_use_id: "call-timeout".into(),
+                tool: "network.fetch".into(),
+                input: json!({}),
+            })
+            .await;
+        assert!(matches!(
+            decision.authorization,
+            Authorization::Denied { .. }
+        ));
+        let run = run.lock().unwrap();
+        let approval = run.projection().approvals.values().next().unwrap();
+        assert_eq!(approval.status, crate::DurableApprovalStatus::Rejected);
+        assert!(approval.timed_out);
+        assert_eq!(
+            crate::durability::RunState::from_events(run.events().to_vec()).unwrap(),
+            *run
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_replays_only_the_exact_durable_approval_without_reprompting() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let original_run = Arc::new(Mutex::new(
+            base.start_durable_run("session", "restart-run", crate::DurabilityMode::Sync)
+                .unwrap(),
+        ));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback = Arc::new(FixedApprover {
+            decision: ApprovalDecision::allow(None),
+            calls: calls.clone(),
+        });
+        let first = base
+            .clone()
+            .with_durable_approver(
+                callback.clone(),
+                original_run.clone(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let context = |input| AuthorizationContext {
+            run_id: "restart-run".into(),
+            turn: 1,
+            tool_use_id: "stable-call".into(),
+            tool: "network.fetch".into(),
+            input,
+        };
+        assert!(matches!(
+            first
+                .authorize_detailed_with_context(context(json!({"url": "https://example.com"})))
+                .await
+                .authorization,
+            Authorization::Allowed(_)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let restarted_state = {
+            let run = original_run.lock().unwrap();
+            crate::durability::RunState::from_events(run.events().to_vec()).unwrap()
+        };
+        let restarted_run = Arc::new(Mutex::new(restarted_state));
+        let restarted = base
+            .with_durable_approver(callback, restarted_run, Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            restarted
+                .authorize_detailed_with_context(context(json!({"url": "https://example.com"})))
+                .await
+                .authorization,
+            Authorization::Allowed(_)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mismatch = restarted
+            .authorize_detailed_with_context(context(json!({"url": "https://attacker.example"})))
+            .await;
+        assert!(mismatch.interrupt);
+        assert!(matches!(
+            mismatch.authorization,
+            Authorization::Denied { .. }
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_adapter_commits_request_and_resolution_through_store_cas() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run("session", "stored-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        let run = Arc::new(Mutex::new(initial.clone()));
+        let store = Arc::new(InMemoryDurableStore::default());
+        store.create(&initial).unwrap();
+        let governance = base
+            .with_persisted_durable_approver(
+                Arc::new(DelayedApprover {
+                    delay: Duration::ZERO,
+                    decision: ApprovalDecision::allow(None),
+                }),
+                run.clone(),
+                Duration::from_secs(1),
+                store.clone(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            governance
+                .authorize_detailed_with_context(AuthorizationContext {
+                    run_id: "stored-run".into(),
+                    turn: 1,
+                    tool_use_id: "stored-call".into(),
+                    tool: "network.fetch".into(),
+                    input: json!({"url": "https://example.com"}),
+                })
+                .await
+                .authorization,
+            Authorization::Allowed(_)
+        ));
+        let in_memory = run.lock().unwrap().clone();
+        let persisted = store.load("stored-run").unwrap();
+        assert_eq!(persisted, in_memory);
+        assert_eq!(
+            persisted
+                .projection()
+                .approvals
+                .values()
+                .next()
+                .unwrap()
+                .status,
+            crate::DurableApprovalStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_adapter_store_conflict_fails_closed_without_local_drift() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run("session", "conflict-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        let run = Arc::new(Mutex::new(initial.clone()));
+        let store = Arc::new(InMemoryDurableStore::default());
+        store.create(&initial).unwrap();
+        let governance = base
+            .with_persisted_durable_approver(
+                Arc::new(DelayedApprover {
+                    delay: Duration::ZERO,
+                    decision: ApprovalDecision::allow(None),
+                }),
+                run.clone(),
+                Duration::from_secs(1),
+                store.clone(),
+            )
+            .unwrap();
+
+        let mut competing = initial.clone();
+        competing
+            .replace_state("other-worker", json!({"revision": 2}))
+            .unwrap();
+        let expected = initial.events().last().unwrap().sequence;
+        store.compare_and_swap(expected, &competing).unwrap();
+
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "conflict-run".into(),
+                turn: 1,
+                tool_use_id: "conflicting-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({}),
+            })
+            .await;
+        assert!(report.interrupt);
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert_eq!(*run.lock().unwrap(), initial);
+        assert_eq!(store.load("conflict-run").unwrap(), competing);
+    }
+
+    #[test]
+    fn durable_binding_retirement_rejects_every_resumable_run_state() {
+        let governance = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(snapshot(PolicyEffect::Allow));
+
+        let running = governance
+            .start_durable_run("session", "running-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        assert!(matches!(
+            governance.retire_durable_run(&running),
+            Err(DurableApproverError::RunNotTerminal {
+                status: crate::DurableRunStatus::Running,
+                ..
+            })
+        ));
+
+        let mut paused = governance
+            .start_durable_run("session", "paused-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        paused.pause("operator-pause", "awaiting operator").unwrap();
+        assert!(matches!(
+            governance.retire_durable_run(&paused),
+            Err(DurableApproverError::RunNotTerminal {
+                status: crate::DurableRunStatus::Paused,
+                ..
+            })
+        ));
+
+        let mut reconcile = governance
+            .start_durable_run("session", "reconcile-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        let (activity_id, attempt) = match reconcile
+            .prepare_activity(
+                "external-write",
+                "logical-write",
+                json!({"value": 1}),
+                crate::durability::SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap()
+        {
+            crate::durability::ActivityDecision::Execute {
+                activity_id,
+                attempt,
+                ..
+            } => (activity_id, attempt),
+            other => panic!("expected activity execution, got {other:?}"),
+        };
+        reconcile
+            .fail_activity(&activity_id, attempt, "ambiguous outcome", true, true)
+            .unwrap();
+        assert!(matches!(
+            governance.retire_durable_run(&reconcile),
+            Err(DurableApproverError::RunNotTerminal {
+                status: crate::DurableRunStatus::ReconcileRequired,
+                ..
+            })
+        ));
+
+        let bindings = governance.durable_bindings.read().unwrap();
+        assert!(bindings.contains_key("running-run"));
+        assert!(bindings.contains_key("paused-run"));
+        assert!(bindings.contains_key("reconcile-run"));
+    }
+
+    #[test]
+    fn terminal_retirement_is_exact_and_idempotent() {
+        let policy = snapshot(PolicyEffect::Allow);
+        let governance = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy.clone());
+        let mut exact = governance
+            .start_durable_run("session", "terminal-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        exact.complete_run("completed").unwrap();
+
+        let wrong_binding = GovernanceBinding::seal(
+            snapshot(PolicyEffect::Deny).hash(),
+            None,
+            None,
+            "terminal-run",
+        )
+        .unwrap();
+        let mut wrong = crate::durability::RunState::new_with_governance_binding(
+            "session",
+            "terminal-run",
+            crate::DurabilityMode::Sync,
+            wrong_binding,
+        )
+        .unwrap();
+        wrong.complete_run("completed").unwrap();
+        assert!(matches!(
+            governance.retire_durable_run(&wrong),
+            Err(DurableApproverError::BindingMismatch(_))
+        ));
+        assert_eq!(
+            governance
+                .durable_bindings
+                .read()
+                .unwrap()
+                .get("terminal-run"),
+            exact.governance_binding()
+        );
+
+        governance.retire_durable_run(&exact).unwrap();
+        governance.retire_durable_run(&exact).unwrap();
+        assert!(!governance
+            .durable_bindings
+            .read()
+            .unwrap()
+            .contains_key("terminal-run"));
+        assert_eq!(exact.policy_snapshot_hash(), Some(policy.hash()));
+    }
+
+    #[test]
+    fn binding_capacity_fails_closed_and_terminal_retirement_reopens_one_slot() {
+        let policy = snapshot(PolicyEffect::Allow);
+        let governance = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy.clone());
+        let mut retired = governance
+            .start_durable_run("session", "capacity-retire", crate::DurabilityMode::Sync)
+            .unwrap();
+        retired.complete_run("completed").unwrap();
+
+        {
+            let mut bindings = governance.durable_bindings.write().unwrap();
+            for index in 1..MAX_REGISTERED_DURABLE_BINDINGS {
+                let run_id = format!("capacity-{index}");
+                let binding =
+                    GovernanceBinding::seal(policy.hash(), None, None, run_id.clone()).unwrap();
+                bindings.insert(run_id, binding);
+            }
+            assert_eq!(bindings.len(), MAX_REGISTERED_DURABLE_BINDINGS);
+        }
+
+        let error = governance
+            .start_durable_run("session", "overflow-run", crate::DurabilityMode::Sync)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::durability::DurabilityError::InvalidEvent { ref reason }
+                if reason.contains("fail-closed capacity")
+        ));
+        assert_eq!(
+            governance.durable_bindings.read().unwrap().len(),
+            MAX_REGISTERED_DURABLE_BINDINGS
+        );
+
+        governance.retire_durable_run(&retired).unwrap();
+        assert_eq!(
+            governance.durable_bindings.read().unwrap().len(),
+            MAX_REGISTERED_DURABLE_BINDINGS - 1
+        );
+        let replacement = governance
+            .start_durable_run("session", "replacement-run", crate::DurabilityMode::Sync)
+            .unwrap();
+        assert_eq!(replacement.run_id(), "replacement-run");
+        assert_eq!(
+            governance.durable_bindings.read().unwrap().len(),
+            MAX_REGISTERED_DURABLE_BINDINGS
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_binding_revokes_stale_clone_and_clears_reusable_approval() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(snapshot(PolicyEffect::Ask));
+        let run = Arc::new(Mutex::new(
+            base.start_durable_run("session", "retired-run", crate::DurabilityMode::Sync)
+                .unwrap(),
+        ));
+        let governance = base
+            .with_durable_approver(
+                Arc::new(FixedApprover {
+                    decision: ApprovalDecision::Allow {
+                        updated_input: None,
+                        updated_permissions: vec![PermissionUpdate::AllowTool],
+                    },
+                    calls: calls.clone(),
+                }),
+                run.clone(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let context = |tool_use_id: &str| AuthorizationContext {
+            run_id: "retired-run".into(),
+            turn: 1,
+            tool_use_id: tool_use_id.into(),
+            tool: "network.fetch".into(),
+            input: json!({"url": "https://example.com"}),
+        };
+        assert!(matches!(
+            governance
+                .authorize_detailed_with_context(context("approved"))
+                .await
+                .authorization,
+            Authorization::Allowed(_)
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            governance.approved_permissions.read().unwrap().grants.len(),
+            1
+        );
+        let stale_clone = governance.clone();
+
+        run.lock().unwrap().complete_run("completed").unwrap();
+        governance.retire_durable_run(&run.lock().unwrap()).unwrap();
+        assert!(governance
+            .approved_permissions
+            .read()
+            .unwrap()
+            .grants
+            .is_empty());
+
+        let report = stale_clone
+            .authorize_detailed_with_context(context("after-retirement"))
+            .await;
+        assert!(report.interrupt);
+        assert_eq!(report.permission_outcome, "binding_mismatch");
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            stale_clone.with_durable_run(run),
+            Err(DurableApproverError::RunTerminal { ref run_id }) if run_id == "retired-run"
+        ));
     }
 }

@@ -155,6 +155,9 @@ pub struct RunOutcome {
     /// (including generated tokens or grounding queries) and is persisted by session stores.
     #[serde(default, skip_serializing_if = "ProviderMetadata::is_empty")]
     pub provider_metadata: ProviderMetadata,
+    /// Ordered, non-fatal adapter compatibility decisions observed during the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::contract::ProviderWarning>,
     pub terminal_status: RunTerminalStatus,
     pub stop_reason: Option<String>,
     pub model_attempts: Vec<String>,
@@ -170,6 +173,7 @@ impl Default for RunOutcome {
             invocation_start_message_index: None,
             usage: Usage::default(),
             provider_metadata: ProviderMetadata::new(),
+            warnings: Vec::new(),
             terminal_status: RunTerminalStatus::Running,
             stop_reason: None,
             model_attempts: Vec::new(),
@@ -233,6 +237,14 @@ impl RunRecorder {
             .entry(provider.into())
             .or_default()
             .push(metadata);
+    }
+
+    pub fn record_warning(&self, warning: crate::contract::ProviderWarning) {
+        self.inner
+            .lock()
+            .expect("run recorder mutex poisoned")
+            .warnings
+            .push(warning);
     }
 
     /// Stores a convenient terminal text projection without flattening canonical message history.
@@ -1813,6 +1825,13 @@ mod tests {
                 })],
             )]
             .into(),
+            warnings: vec![crate::contract::ProviderWarning {
+                code: "unverified_provider_parameter".into(),
+                message: "forwarded without semantic adaptation".into(),
+                parameter: Some("future_option".into()),
+                provider: Some("openai".into()),
+                model: Some("model-a".into()),
+            }],
             terminal_status: RunTerminalStatus::Completed,
             stop_reason: Some("end_turn".into()),
             model_attempts: vec!["model-a".into()],

@@ -29,14 +29,17 @@ use aikit_core::{
     AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
     AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
     BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
-    Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig, DurabilityMode,
-    ErrorCode, ErrorInfo, EvalGate, EvalSuite, FailureContext, FailureHookOutcome, GeneratedText,
-    Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
-    InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
-    McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile, NoTools,
-    ObjectOptions, ObjectStream as CoreObjectStream, PermissionEngine, PermissionMode,
-    PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext, PreToolUseContext,
-    PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
+    CedarDecisionAdapter, Client as CoreClient, CompactionPolicy, CompatibilityMode,
+    ContainmentPolicy, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode, ErrorInfo,
+    EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
+    GeneratedText, Governance, GovernanceBinding, GuardedExecutor, GuardrailChain, HookDispatcher,
+    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
+    JsonlAuditSink, McpClient, McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message,
+    ModelCapability, ModelCatalog, ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing,
+    ModelProfile, NoTools, ObjectOptions, ObjectStream as CoreObjectStream, OpaDecisionAdapter,
+    PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument,
+    PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext,
+    PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
     RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig, RunOutcome, RunRecorder,
     RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator,
     Session, SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore,
@@ -738,6 +741,29 @@ fn node_durability_mode(value: Option<String>) -> Result<DurabilityMode> {
     }
 }
 
+fn node_compatibility_mode(value: Option<String>, field: &str) -> Result<CompatibilityMode> {
+    match value.as_deref().unwrap_or("strict") {
+        "strict" => Ok(CompatibilityMode::Strict),
+        "warn" => Ok(CompatibilityMode::Warn),
+        "best_effort" => Ok(CompatibilityMode::BestEffort),
+        value => Err(Error::new(
+            Status::InvalidArg,
+            format!("{field} must be one of strict, warn, or best_effort; received `{value}`"),
+        )),
+    }
+}
+
+fn node_u64(value: BigInt, field: &str) -> Result<u64> {
+    let (signed, value, lossless) = value.get_u64();
+    if signed || !lossless {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{field} must be a non-negative u64 bigint"),
+        ));
+    }
+    Ok(value)
+}
+
 fn encoded_durability_error(error: aikit_core::DurabilityError) -> Error {
     let payload = serde_json::json!({
         "message": error.to_string(),
@@ -796,6 +822,54 @@ impl DurableRun {
         Ok(Self { inner })
     }
 
+    #[napi(factory)]
+    pub fn with_policy_snapshot(
+        session_id: String,
+        run_id: String,
+        policy_snapshot: Value,
+        durability: Option<String>,
+    ) -> Result<Self> {
+        let snapshot: PolicySnapshot =
+            serde_json::from_value(policy_snapshot).map_err(|error| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("invalid policy snapshot: {error}"),
+                )
+            })?;
+        let inner = RunState::new_with_policy_snapshot(
+            session_id,
+            run_id,
+            node_durability_mode(durability)?,
+            &snapshot,
+        )
+        .map_err(encoded_durability_error)?;
+        Ok(Self { inner })
+    }
+
+    #[napi(factory)]
+    pub fn with_governance_binding(
+        session_id: String,
+        run_id: String,
+        governance_binding: Value,
+        durability: Option<String>,
+    ) -> Result<Self> {
+        let binding: GovernanceBinding =
+            serde_json::from_value(governance_binding).map_err(|error| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("invalid governance binding: {error}"),
+                )
+            })?;
+        let inner = RunState::new_with_governance_binding(
+            session_id,
+            run_id,
+            node_durability_mode(durability)?,
+            binding,
+        )
+        .map_err(encoded_durability_error)?;
+        Ok(Self { inner })
+    }
+
     #[napi]
     pub fn snapshot(&self) -> Result<Value> {
         serde_json::to_value(&self.inner)
@@ -825,6 +899,22 @@ impl DurableRun {
             DurabilityMode::Exit => "exit",
         }
         .into()
+    }
+
+    #[napi(getter)]
+    pub fn policy_snapshot_hash(&self) -> Option<String> {
+        self.inner.policy_snapshot_hash().map(str::to_owned)
+    }
+
+    #[napi(getter)]
+    pub fn governance_binding(&self) -> Result<Option<Value>> {
+        self.inner
+            .governance_binding()
+            .map(|binding| {
+                serde_json::to_value(binding)
+                    .map_err(|_| Error::from_reason("failed to encode governance binding"))
+            })
+            .transpose()
     }
 
     #[napi(getter)]
@@ -874,6 +964,158 @@ impl DurableRun {
     }
 
     #[napi]
+    pub fn request_typed_approval(&mut self, request: Value) -> Result<String> {
+        let request: DurableApprovalRequest = serde_json::from_value(request).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid approval request: {error}"),
+            )
+        })?;
+        self.inner
+            .request_typed_approval(request)
+            .map_err(encoded_durability_error)
+    }
+
+    #[napi]
+    pub fn expire_approvals(
+        &mut self,
+        expiration_id: String,
+        now_unix_ms: BigInt,
+    ) -> Result<Vec<String>> {
+        let now_unix_ms = node_u64(now_unix_ms, "nowUnixMs")?;
+        self.inner
+            .expire_approvals(&expiration_id, now_unix_ms)
+            .map_err(encoded_durability_error)
+    }
+
+    /// Persist a durable yes/no confirmation and pause until an explicit resolution arrives.
+    #[napi]
+    pub fn request_confirmation(
+        &mut self,
+        logical_key: String,
+        prompt: String,
+        details: Option<Value>,
+        activity_id: Option<String>,
+    ) -> Result<String> {
+        self.inner
+            .request_approval(
+                &logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "confirmation", "details": details}),
+            )
+            .map_err(encoded_durability_error)
+    }
+
+    /// Persist a durable missing-input request with an optional JSON Schema hint.
+    #[napi]
+    pub fn request_input(
+        &mut self,
+        logical_key: String,
+        prompt: String,
+        input_schema: Option<Value>,
+        activity_id: Option<String>,
+    ) -> Result<String> {
+        self.inner
+            .request_approval(
+                &logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "missing_input", "input_schema": input_schema}),
+            )
+            .map_err(encoded_durability_error)
+    }
+
+    /// Persist a durable output-review request without mutating the reviewed value.
+    #[napi]
+    pub fn request_output_review(
+        &mut self,
+        logical_key: String,
+        prompt: String,
+        output: Value,
+        activity_id: Option<String>,
+    ) -> Result<String> {
+        self.inner
+            .request_approval(
+                &logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "output_review", "output": output}),
+            )
+            .map_err(encoded_durability_error)
+    }
+
+    /// Persist a durable edit/retry decision with the rejected output and validation issue.
+    #[napi]
+    pub fn request_edit_retry(
+        &mut self,
+        logical_key: String,
+        prompt: String,
+        output: Value,
+        error: Option<String>,
+        activity_id: Option<String>,
+    ) -> Result<String> {
+        self.inner
+            .request_approval(
+                &logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "edit_retry", "output": output, "error": error}),
+            )
+            .map_err(encoded_durability_error)
+    }
+
+    /// Resolve exactly one durable approval through the canonical resume command.
+    #[napi]
+    pub fn resolve_approval(
+        &mut self,
+        command_id: String,
+        approval_id: String,
+        approved: bool,
+        response: Option<Value>,
+    ) -> Result<Value> {
+        let outcome = self
+            .inner
+            .apply_command(RunCommand::Resume {
+                command_id,
+                approvals: vec![aikit_core::ApprovalResolution {
+                    approval_id,
+                    approved,
+                    response,
+                }],
+            })
+            .map_err(encoded_durability_error)?;
+        node_command_outcome_value(outcome)
+    }
+
+    #[napi]
+    pub fn resolve_approval_at(
+        &mut self,
+        command_id: String,
+        approval_id: String,
+        approved: bool,
+        now_unix_ms: BigInt,
+        response: Option<Value>,
+    ) -> Result<Value> {
+        let now_unix_ms = node_u64(now_unix_ms, "nowUnixMs")?;
+        let outcome = self
+            .inner
+            .apply_command_at(
+                RunCommand::Resume {
+                    command_id,
+                    approvals: vec![aikit_core::ApprovalResolution {
+                        approval_id,
+                        approved,
+                        response,
+                    }],
+                },
+                now_unix_ms,
+            )
+            .map_err(encoded_durability_error)?;
+        node_command_outcome_value(outcome)
+    }
+
+    #[napi]
     pub fn complete(&mut self, completion_id: String) -> Result<()> {
         self.inner
             .complete_run(&completion_id)
@@ -903,6 +1145,22 @@ impl DurableRun {
             .map_err(encoded_durability_error)?;
         node_command_outcome_value(outcome)
     }
+
+    #[napi]
+    pub fn apply_command_at(&mut self, command: Value, now_unix_ms: BigInt) -> Result<Value> {
+        let command: RunCommand = serde_json::from_value(command).map_err(|error| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid durable command: {error}"),
+            )
+        })?;
+        let now_unix_ms = node_u64(now_unix_ms, "nowUnixMs")?;
+        let outcome = self
+            .inner
+            .apply_command_at(command, now_unix_ms)
+            .map_err(encoded_durability_error)?;
+        node_command_outcome_value(outcome)
+    }
 }
 
 /// Evaluate stream/durability traces deterministically without provider or tool execution.
@@ -914,6 +1172,177 @@ pub fn evaluate_trace(suite: Value, trace: Value) -> Result<Value> {
         .map_err(|error| Error::new(Status::InvalidArg, format!("invalid TraceInput: {error}")))?;
     serde_json::to_value(core_evaluate_trace(&suite, &trace))
         .map_err(|_| Error::from_reason("failed to encode TraceEvalResult"))
+}
+
+/// Validate and return a canonical provider-neutral media input.
+#[napi]
+pub fn validate_media_input(media: Value) -> Result<Value> {
+    let media: MediaInput = serde_json::from_value(media)
+        .map_err(|error| Error::new(Status::InvalidArg, format!("invalid MediaInput: {error}")))?;
+    media
+        .validate()
+        .map_err(|error| Error::new(Status::InvalidArg, error))?;
+    serde_json::to_value(media).map_err(|_| Error::from_reason("failed to encode MediaInput"))
+}
+
+/// Validate and return immutable media-artifact metadata.
+#[napi]
+pub fn validate_media_artifact(artifact: Value) -> Result<Value> {
+    let artifact: MediaArtifact = serde_json::from_value(artifact).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid MediaArtifact: {error}"),
+        )
+    })?;
+    artifact
+        .validate()
+        .map_err(|error| Error::new(Status::InvalidArg, error))?;
+    serde_json::to_value(artifact).map_err(|_| Error::from_reason("failed to encode MediaArtifact"))
+}
+
+/// Load the reviewed, versioned catalog compiled into this exact package.
+#[napi]
+pub fn shipped_model_catalog() -> Result<Value> {
+    let snapshot =
+        ModelCatalogSnapshot::shipped().map_err(|error| Error::from_reason(error.to_string()))?;
+    serde_json::to_value(snapshot)
+        .map_err(|_| Error::from_reason("failed to encode shipped model catalog"))
+}
+
+/// Validate one profile using the same invariant set used by routing catalogs.
+#[napi]
+pub fn validate_model_profile(profile: Value) -> Result<Value> {
+    let profile: ModelProfile = serde_json::from_value(profile).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("invalid ModelProfile: {error}"))
+    })?;
+    ModelCatalog::new([profile.clone()])
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    serde_json::to_value(profile).map_err(|_| Error::from_reason("failed to encode ModelProfile"))
+}
+
+/// Resolve one profile's explicit tri-state capability without collapsing unknown to false.
+#[napi]
+pub fn model_capability_state(profile: Value, capability: Value) -> Result<String> {
+    let profile: ModelProfile = serde_json::from_value(profile).map_err(|error| {
+        Error::new(Status::InvalidArg, format!("invalid ModelProfile: {error}"))
+    })?;
+    ModelCatalog::new([profile.clone()])
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    let capability: ModelCapability = serde_json::from_value(capability).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid ModelCapability: {error}"),
+        )
+    })?;
+    serde_json::to_value(profile.capability_state(&capability))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| Error::from_reason("failed to encode CapabilityState"))
+}
+
+/// Overlay caller-owned profiles without mutating the compiled shipped snapshot.
+#[napi]
+pub fn resolve_model_catalog(overrides: Option<Value>) -> Result<Value> {
+    let profiles: Vec<ModelProfile> = overrides
+        .map(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("invalid model overrides: {error}"),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let shipped =
+        ModelCatalogSnapshot::shipped().map_err(|error| Error::from_reason(error.to_string()))?;
+    let resolved = ModelCatalogOverrides { profiles }
+        .resolve(&shipped)
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    let resolved_profiles: Vec<_> = resolved.catalog().profiles().cloned().collect();
+    Ok(serde_json::json!({
+        "schema_version": shipped.schema_version,
+        "catalog_version": shipped.catalog_version,
+        "verified_at": shipped.verified_at,
+        "sources": shipped.sources,
+        "profiles": resolved_profiles,
+        "shipped_hash": resolved.shipped_hash,
+        "overrides_hash": resolved.overrides_hash,
+        "override_count": resolved.override_count,
+    }))
+}
+
+/// Normalize a completed OPA Data API response into auditable, fail-closed evidence.
+#[napi]
+pub fn normalize_opa_decision(response: Value, metadata: Value) -> Result<Value> {
+    normalize_external_decision(response, metadata, true)
+}
+
+/// Normalize a completed Cedar authorization response into auditable, deny-wins evidence.
+#[napi]
+pub fn normalize_cedar_decision(response: Value, metadata: Value) -> Result<Value> {
+    normalize_external_decision(response, metadata, false)
+}
+
+fn normalize_external_decision(response: Value, metadata: Value, opa: bool) -> Result<Value> {
+    let metadata: ExternalDecisionMetadata = serde_json::from_value(metadata).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid decision metadata: {error}"),
+        )
+    })?;
+    let response = serde_json::to_string(&response).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid decision response: {error}"),
+        )
+    })?;
+    let decision = if opa {
+        OpaDecisionAdapter::from_json(&response, metadata)
+    } else {
+        CedarDecisionAdapter::from_json(&response, metadata)
+    }
+    .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    serde_json::to_value(decision)
+        .map_err(|_| Error::from_reason("failed to encode auditable policy decision"))
+}
+
+/// Seal a policy document into the integrity-checked snapshot accepted by durable runs.
+#[napi]
+pub fn seal_policy_snapshot(policy: Value) -> Result<Value> {
+    let policy: PolicyDocument = serde_json::from_value(policy).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid policy document: {error}"),
+        )
+    })?;
+    let snapshot = PolicySnapshot::seal(policy)
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    serde_json::to_value(snapshot)
+        .map_err(|_| Error::from_reason("failed to encode policy snapshot"))
+}
+
+/// Seal a policy snapshot together with its complete durable scope identity.
+#[napi]
+pub fn seal_governance_binding(
+    policy_snapshot: Value,
+    run_id: String,
+    tenant_id: Option<String>,
+    agent_id: Option<String>,
+) -> Result<Value> {
+    let snapshot: PolicySnapshot = serde_json::from_value(policy_snapshot).map_err(|error| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid policy snapshot: {error}"),
+        )
+    })?;
+    snapshot
+        .validate()
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    let binding = GovernanceBinding::seal(snapshot.hash(), tenant_id, agent_id, run_id)
+        .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+    serde_json::to_value(binding)
+        .map_err(|_| Error::from_reason("failed to encode governance binding"))
 }
 
 #[napi]
@@ -1191,7 +1620,10 @@ async fn generate_configured(
                         .unwrap_or_else(|| "run failed".into()),
                 )
             },
-            |(message, info)| AgentError::Stream { message, info },
+            |(message, info)| AgentError::Stream {
+                message,
+                info: Box::new(info),
+            },
         ));
     }
     Ok(GeneratedText {
@@ -1200,6 +1632,7 @@ async fn generate_configured(
         stop_reason: outcome.stop_reason,
         messages: outcome.messages,
         provider_metadata: outcome.provider_metadata,
+        warnings: outcome.warnings,
     })
 }
 
@@ -1898,6 +2331,7 @@ impl Agent {
             max_tokens: None,
             name: None,
             provider_options: None,
+            compatibility_mode: None,
         });
         let provider_options: ProviderOptions = options
             .provider_options
@@ -1917,6 +2351,10 @@ impl Agent {
             max_tokens: u64::from(options.max_tokens.unwrap_or(1024)),
             name: options.name.unwrap_or_else(|| "respond".into()),
             provider_options,
+            compatibility_mode: node_compatibility_mode(
+                options.compatibility_mode,
+                "GenerateObjectOptions.compatibilityMode",
+            )?,
             semantic_validator,
         };
         AsyncBlockBuilder::new(async move {
@@ -1955,6 +2393,7 @@ impl Agent {
             max_tokens: None,
             name: None,
             provider_options: None,
+            compatibility_mode: None,
         });
         let provider_options: ProviderOptions = options
             .provider_options
@@ -1977,6 +2416,10 @@ impl Agent {
                     max_tokens: u64::from(options.max_tokens.unwrap_or(1024)),
                     name: options.name.unwrap_or_else(|| "respond".into()),
                     provider_options,
+                    compatibility_mode: node_compatibility_mode(
+                        options.compatibility_mode,
+                        "GenerateObjectOptions.compatibilityMode",
+                    )?,
                     semantic_validator,
                 },
                 Some(&audit),
@@ -2053,6 +2496,7 @@ pub struct RunOptions {
     pub max_tokens: Option<u32>,
     pub max_turns: Option<u32>,
     pub provider_options: Option<Value>,
+    pub compatibility_mode: Option<String>,
     pub budget: Option<Value>,
     pub retry: Option<Value>,
     pub routing: Option<Value>,
@@ -2313,6 +2757,8 @@ fn build_agent_options(
             Error::from_reason(format!("invalid RunOptions.providerOptions: {error}"))
         })?;
     }
+    mapped.compatibility_mode =
+        node_compatibility_mode(options.compatibility_mode, "RunOptions.compatibilityMode")?;
     mapped.budget = parse_budget_policy(options.budget)?;
     mapped.retry = parse_retry_policy(options.retry)?;
     mapped.routing = parse_routing_options(options.routing)?;
@@ -2374,6 +2820,7 @@ pub struct GenerateObjectOptions {
     pub max_tokens: Option<u32>,
     pub name: Option<String>,
     pub provider_options: Option<Value>,
+    pub compatibility_mode: Option<String>,
 }
 
 /// A single permission rule, mirroring the Python `{"effect","tool","pattern"?,"field"?}` dict.
@@ -2395,6 +2842,7 @@ pub struct QueryOptions {
     pub max_tokens: Option<u32>,
     pub max_turns: Option<u32>,
     pub provider_options: Option<Value>,
+    pub compatibility_mode: Option<String>,
     pub budget: Option<Value>,
     pub retry: Option<Value>,
     pub routing: Option<Value>,
@@ -2475,6 +2923,7 @@ pub fn query(
         max_tokens: None,
         max_turns: None,
         provider_options: None,
+        compatibility_mode: None,
         budget: None,
         retry: None,
         routing: None,
@@ -2506,6 +2955,7 @@ pub fn query(
         max_tokens,
         max_turns,
         provider_options,
+        compatibility_mode,
         budget,
         retry,
         routing,
@@ -2531,6 +2981,7 @@ pub fn query(
             max_tokens,
             max_turns,
             provider_options,
+            compatibility_mode,
             budget,
             retry,
             routing,
@@ -2932,6 +3383,7 @@ mod tests {
                 provider_options: Some(serde_json::json!({
                     "openai": {"temperature": 0}
                 })),
+                compatibility_mode: Some("warn".into()),
                 budget: Some(serde_json::json!({
                     "maxTotalTokens": 999,
                     "maxCostUsd": 1.25,
@@ -2961,6 +3413,7 @@ mod tests {
         assert_eq!(options.max_tokens, 321);
         assert_eq!(options.max_turns, 7);
         assert_eq!(options.provider_options["openai"]["temperature"], 0);
+        assert_eq!(options.compatibility_mode, CompatibilityMode::Warn);
         assert_eq!(options.budget.max_total_tokens, Some(999));
         assert_eq!(options.budget.max_cost_usd, Some(1.25));
         assert_eq!(options.budget.pricing.unwrap().output_per_million_usd, 4.0);

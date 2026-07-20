@@ -32,6 +32,8 @@ pub struct RunConfig {
     /// request, preventing Anthropic/OpenAI/Google/DeepSeek options from leaking across fallback
     /// boundaries. Provider-keyed values override the legacy flat map on conflicts.
     pub provider_options: crate::types::ProviderOptions,
+    /// Provider-parameter compatibility behavior. Strict is the safe default.
+    pub compatibility_mode: crate::contract::CompatibilityMode,
     /// The governance harness: enforcing hooks + permission engine, applied at the tool seam.
     /// Default is fully permissive.
     pub governance: crate::governance::Governance,
@@ -65,6 +67,7 @@ impl RunConfig {
             max_tokens: 4096,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
             governance: crate::governance::Governance::default(),
             audit: crate::observability::AuditTrail::default(),
             budget: crate::budget::BudgetPolicy::default(),
@@ -226,6 +229,16 @@ impl RetainedRunBudget {
             ),
             StreamDelta::ProviderMetadata { provider, metadata } => (
                 provider.len().saturating_add(retained_json_bytes(metadata)),
+                1,
+            ),
+            StreamDelta::Warning { warning } => (
+                warning
+                    .code
+                    .len()
+                    .saturating_add(warning.message.len())
+                    .saturating_add(warning.parameter.as_ref().map_or(0, String::len))
+                    .saturating_add(warning.provider.as_ref().map_or(0, String::len))
+                    .saturating_add(warning.model.as_ref().map_or(0, String::len)),
                 1,
             ),
             StreamDelta::MessageStop { stop_reason } => (stop_reason.len(), 0),
@@ -694,6 +707,7 @@ pub fn run_agent(
                 max_tokens: cfg.max_tokens,
                 options: cfg.options.clone(),
                 provider_options: cfg.provider_options.clone(),
+                compatibility_mode: cfg.compatibility_mode,
             };
 
             let provider_result = tokio::select! {
@@ -798,6 +812,9 @@ pub fn run_agent(
                     StreamDelta::ProviderMetadata { provider, metadata } => {
                         cfg.recorder
                             .record_provider_metadata(provider.clone(), metadata.clone());
+                    }
+                    StreamDelta::Warning { warning } => {
+                        cfg.recorder.record_warning(warning.clone());
                     }
                     StreamDelta::ToolCallStart { id, name } => {
                         index_by_id.insert(id.clone(), tool_calls.len());

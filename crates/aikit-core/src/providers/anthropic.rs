@@ -47,6 +47,7 @@ pub fn build_request(
             "stream_options",
         ],
     )?;
+    super::validate_media_input_roles(messages, "anthropic", model)?;
     let mut system: Vec<Value> = Vec::new();
     let mut wire: Vec<Value> = Vec::new();
 
@@ -63,15 +64,15 @@ pub fn build_request(
             // Anthropic has no "tool" role — tool results ride in a user message.
             Role::Tool => wire.push(serde_json::json!({
                 "role": "user",
-                "content": map_blocks(&m.content),
+                "content": map_blocks(model, &m.content)?,
             })),
             Role::User => wire.push(serde_json::json!({
                 "role": "user",
-                "content": map_blocks(&m.content),
+                "content": map_blocks(model, &m.content)?,
             })),
             Role::Assistant => wire.push(serde_json::json!({
                 "role": "assistant",
-                "content": map_blocks(&m.content),
+                "content": map_blocks(model, &m.content)?,
             })),
         }
     }
@@ -109,11 +110,13 @@ pub fn build_request(
 }
 
 /// Map canonical content blocks to Anthropic wire blocks.
-fn map_blocks(blocks: &[ContentBlock]) -> Vec<Value> {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(serde_json::json!({ "type": "text", "text": text })),
+fn map_blocks(model: &str, blocks: &[ContentBlock]) -> crate::error::Result<Vec<Value>> {
+    let mut mapped = Vec::new();
+    for block in blocks {
+        let value = match block {
+            ContentBlock::Text { text } => {
+                Some(serde_json::json!({ "type": "text", "text": text }))
+            }
             // Replay reasoning as a signed `thinking` block — signature MUST survive. A block
             // carrying only opaque data (no signature/text) is redacted_thinking → replay verbatim.
             ContentBlock::Reasoning {
@@ -126,23 +129,30 @@ fn map_blocks(blocks: &[ContentBlock]) -> Vec<Value> {
                     .as_deref()
                     .is_some_and(|source| source != "anthropic")
                 {
-                    return None;
-                }
-                if signature.is_none() && text.is_empty() {
-                    if let Some(Value::String(data)) = opaque {
-                        return Some(serde_json::json!({ "type": "redacted_thinking", "data": data }));
+                    None
+                } else if signature.is_none() && text.is_empty() {
+                    match opaque.as_ref() {
+                        Some(Value::String(data)) => {
+                            Some(serde_json::json!({ "type": "redacted_thinking", "data": data }))
+                        }
+                        _ => Some(serde_json::json!({ "type": "thinking", "thinking": text })),
                     }
+                } else {
+                    let mut value = serde_json::json!({ "type": "thinking", "thinking": text });
+                    if let Some(signature) = signature {
+                        value["signature"] = Value::String(signature.clone());
+                    }
+                    Some(value)
                 }
-                let mut o = serde_json::json!({ "type": "thinking", "thinking": text });
-                if let Some(sig) = signature {
-                    o["signature"] = Value::String(sig.clone());
-                }
-                Some(o)
             }
             ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
                 "type": "tool_use", "id": id, "name": name, "input": input,
             })),
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => Some(serde_json::json!({
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some(serde_json::json!({
                 "type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error,
             })),
             ContentBlock::Media { media_type, source } => {
@@ -154,10 +164,33 @@ fn map_blocks(blocks: &[ContentBlock]) -> Vec<Value> {
                 };
                 Some(serde_json::json!({ "type": "image", "source": src }))
             }
+            ContentBlock::MediaInput { media } => {
+                if !super::is_image_media_type(&media.media_type) {
+                    return Err(crate::error::ProviderError::new(
+                        "anthropic",
+                        model,
+                        crate::error::ProviderErrorKind::InvalidRequest,
+                        "Anthropic message media input currently supports image MIME types only",
+                    )
+                    .into());
+                }
+                let source = match super::resolve_media_input(media, "anthropic", model)? {
+                    super::ResolvedMediaInput::Base64(data) => serde_json::json!({
+                        "type": "base64",
+                        "media_type": media.media_type,
+                        "data": data,
+                    }),
+                };
+                Some(serde_json::json!({ "type": "image", "source": source }))
+            }
             // Citations are output-only; never sent on a request.
             ContentBlock::Citation { .. } => None,
-        })
-        .collect()
+        };
+        if let Some(value) = value {
+            mapped.push(value);
+        }
+    }
+    Ok(mapped)
 }
 
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
@@ -195,7 +228,9 @@ impl Provider for AnthropicProvider {
         &self,
         req: ProviderRequest,
     ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
-        let options = req.options_for(self.name());
+        let validated = req.validated_options_for(self.name(), super::ANTHROPIC_OPTIONS)?;
+        let options = validated.options;
+        let warnings = validated.warnings;
         let body = build_request(
             &req.model,
             req.max_tokens,
@@ -210,6 +245,7 @@ impl Provider for AnthropicProvider {
                 crate::error::ProviderErrorKind::InvalidRequest,
                 error.to_string(),
             )
+            .with_warnings(warnings.clone())
         })?;
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -221,7 +257,10 @@ impl Provider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| super::transport_failure("anthropic", &req.model, error))?;
+            .map_err(|error| {
+                super::transport_failure("anthropic", &req.model, error)
+                    .with_provider_warnings(warnings.clone())
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -233,7 +272,8 @@ impl Provider for AnthropicProvider {
                 status,
                 retry_after.as_ref(),
                 text,
-            ));
+            )
+            .with_provider_warnings(warnings));
         }
 
         let model = req.model.clone();
@@ -307,7 +347,7 @@ impl Provider for AnthropicProvider {
                 );
             }
         };
-        Ok(Box::pin(out))
+        Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
     }
 }
 
@@ -672,7 +712,26 @@ impl AnthropicStreamParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{MediaInput, MediaInputSource};
     use serde_json::json;
+
+    #[test]
+    fn strict_inline_media_reaches_anthropic_only_after_integrity_validation() {
+        let media = MediaInput {
+            media_type: "image/png".into(),
+            source: MediaInputSource::Base64 {
+                data: "YWJj".into(),
+            },
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size_bytes: 3,
+        };
+        let message = Message::user("inspect").with_media_input(media).unwrap();
+        let request = build_request("claude-test", 64, &[message], &[], None).unwrap();
+        let source = &request["messages"][0]["content"][1]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/png");
+        assert_eq!(source["data"], "YWJj");
+    }
 
     #[test]
     fn citations_delta_preserves_provider_metadata() {
@@ -1071,6 +1130,7 @@ mod tests {
             max_tokens: 100,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let out: Vec<StreamDelta> = provider.stream(req).await.unwrap().collect().await;
 
@@ -1111,6 +1171,7 @@ mod tests {
                 max_tokens: 100,
                 options: serde_json::Map::new(),
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .unwrap()

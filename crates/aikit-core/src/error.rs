@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::contract::ProviderWarning;
+
 /// Stable, host-facing error classification. These serialized names are part of the public wire
 /// contract: bindings should branch on `code`, never parse a display message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +77,11 @@ pub struct ErrorInfo {
     pub status: Option<u16>,
     pub retry_after_ms: Option<u64>,
     pub retryable: bool,
+    /// Compatibility warnings collected before a provider failure. Keeping them on the typed
+    /// envelope ensures `warn`/`best_effort` never lose preflight evidence when HTTP never starts
+    /// or returns an error response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ProviderWarning>,
 }
 
 impl ErrorInfo {
@@ -87,6 +94,7 @@ impl ErrorInfo {
             status: None,
             retry_after_ms: None,
             retryable: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -130,6 +138,8 @@ pub struct ProviderError {
     pub status: Option<u16>,
     pub retry_after_ms: Option<u64>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ProviderWarning>,
 }
 
 impl ProviderError {
@@ -146,6 +156,7 @@ impl ProviderError {
             status: None,
             retry_after_ms: None,
             message: message.into(),
+            warnings: Vec::new(),
         }
     }
 
@@ -171,7 +182,18 @@ impl ProviderError {
             status: Some(status),
             retry_after_ms,
             message: message.into(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Preserve compatibility evidence without weakening the underlying typed failure.
+    pub fn with_warnings(mut self, warnings: Vec<ProviderWarning>) -> Self {
+        for warning in warnings {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+        self
     }
 
     pub fn retryable(&self) -> bool {
@@ -209,6 +231,7 @@ impl From<&ProviderError> for ErrorInfo {
         info.status = error.status;
         info.retry_after_ms = error.retry_after_ms;
         info.retryable = error.retryable();
+        info.warnings = error.warnings.clone();
         info
     }
 }
@@ -222,7 +245,7 @@ impl From<ProviderError> for ErrorInfo {
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum AikitError {
     #[error(transparent)]
-    ProviderFailure(#[from] ProviderError),
+    ProviderFailure(Box<ProviderError>),
 
     /// Compatibility variant for local/custom providers that have not adopted typed failures.
     #[error("provider error: {0}")]
@@ -271,7 +294,7 @@ pub enum AikitError {
 impl AikitError {
     pub fn provider_error(&self) -> Option<&ProviderError> {
         match self {
-            AikitError::ProviderFailure(error) => Some(error),
+            AikitError::ProviderFailure(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -280,12 +303,30 @@ impl AikitError {
     pub fn info(&self) -> ErrorInfo {
         self.into()
     }
+
+    /// Attach preflight compatibility evidence when the failure is a typed provider error.
+    /// Non-provider failures deliberately remain unchanged because inventing provider context
+    /// would make retry and fallback classification unsafe.
+    pub fn with_provider_warnings(self, warnings: Vec<ProviderWarning>) -> Self {
+        match self {
+            AikitError::ProviderFailure(error) => {
+                AikitError::ProviderFailure(Box::new((*error).with_warnings(warnings)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl From<ProviderError> for AikitError {
+    fn from(error: ProviderError) -> Self {
+        AikitError::ProviderFailure(Box::new(error))
+    }
 }
 
 impl From<&AikitError> for ErrorInfo {
     fn from(error: &AikitError) -> Self {
         match error {
-            AikitError::ProviderFailure(error) => error.into(),
+            AikitError::ProviderFailure(error) => error.as_ref().into(),
             // Compatibility provider failures have no trustworthy structured classification or
             // routing metadata. Guessing would make retry/fallback unsafe, so they remain unknown.
             AikitError::Provider(_) | AikitError::Other(_) => ErrorInfo::new(ErrorCode::Unknown),

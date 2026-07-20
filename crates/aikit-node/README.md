@@ -109,6 +109,9 @@ Async generation and terminal structured-stream failures reject with `AikitError
 whose stable `code` and full redacted `info` envelope are safe to branch on.
 Unknown top-level or nested option fields are rejected instead of silently falling back to a
 default, so misspelled budget and retry controls cannot weaken a run unnoticed.
+Provider-specific options use `compatibilityMode: "strict"` by default. `"warn"` and
+`"best_effort"` are explicit opt-ins; both preserve `ProviderWarning` values as normal warning
+deltas and on completed results/outcomes instead of silently dropping parameters.
 
 ## MCP tool visibility
 
@@ -140,6 +143,26 @@ and 4 MiB per transport response/stdio line.
 `fanOut` implementation. Existing `addTool`, `runSubagent`, and `fanOut` names remain supported.
 Tool-specific failure hooks use `onPostToolFailure(callback, tool?)` and run before global
 `onFailure` hooks.
+
+The reviewed model catalog is available offline through `shippedModelCatalog()`. Use
+`resolveModelCatalog(overrides)` for a separate hashed override layer, and
+`modelCapabilityState(profile, capability)` to preserve the `supported` / `unsupported` /
+`unknown` distinction. `validateModelProfile`, `validateMediaInput`, and
+`validateMediaArtifact` fail before provider I/O.
+
+Completed external authorization results are normalized by `normalizeOpaDecision` and
+`normalizeCedarDecision`; partial/undefined OPA results and Cedar forbids or diagnostic errors fail
+closed. `DurableRun` also provides `requestConfirmation`, `requestInput`, `requestOutputReview`,
+and `requestEditRetry` as non-expiring compatibility helpers. Restart-safe typed approvals use
+`requestTypedApproval`, `resolveApprovalAt`/`applyCommandAt`, and an explicit trusted `bigint`
+timestamp; `expireApprovals` appends idempotent timeout denials. `sealPolicySnapshot` and
+`DurableRun.withPolicySnapshot` pin a complete run-scoped governance binding before mutable work.
+Use `sealGovernanceBinding` and `DurableRun.withGovernanceBinding` when tenant/agent scope must also
+be pinned; typed approvals inherit the replay-validated binding.
+Canonical messages may carry strict `{ type: "media_input", media }` blocks instead of legacy
+source-only `media` blocks. Credential-free absolute HTTP(S) URLs round-trip as canonical
+references, but provider dispatch rejects unresolved URL/artifact references until a trusted host
+resolver verifies bytes, size, and SHA-256. Provider MIME matching is case-insensitive.
 
 Production state is opt-in and backed by local files:
 

@@ -59,6 +59,11 @@ pub enum ContentBlock {
         media_type: String,
         source: MediaSource,
     },
+    /// Integrity-bound multimodal input. Unlike the legacy `Media` variant, this form requires
+    /// MIME type, byte length, and SHA-256 identity and is validated before provider network I/O.
+    MediaInput {
+        media: crate::contract::MediaInput,
+    },
     /// A citation emitted by a provider that supports grounded output.
     Citation {
         text: String,
@@ -101,6 +106,16 @@ impl Message {
             role: Role::System,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+
+    /// Add an integrity-bound media input after validating its canonical identity.
+    pub fn with_media_input(
+        mut self,
+        media: crate::contract::MediaInput,
+    ) -> std::result::Result<Self, String> {
+        media.validate()?;
+        self.content.push(ContentBlock::MediaInput { media });
+        Ok(self)
     }
 
     /// The reasoning blocks in this message, in order.
@@ -218,6 +233,11 @@ pub enum StreamDelta {
     ProviderMetadata {
         provider: String,
         metadata: Value,
+    },
+    /// A non-fatal, machine-readable compatibility decision. Unlike provider metadata this is an
+    /// AIKit adapter decision and is safe to assert in deterministic conformance tests.
+    Warning {
+        warning: crate::contract::ProviderWarning,
     },
     Usage(Usage),
     MessageStop {

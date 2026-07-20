@@ -41,7 +41,7 @@ ErrorCode = Literal[
 ]
 
 
-class ErrorInfo(TypedDict):
+class _ErrorInfoRequired(TypedDict):
     code: ErrorCode
     message: str
     provider: Optional[str]
@@ -49,6 +49,10 @@ class ErrorInfo(TypedDict):
     status: Optional[int]
     retry_after_ms: Optional[int]
     retryable: bool
+
+
+class ErrorInfo(_ErrorInfoRequired, total=False):
+    warnings: List["ProviderWarning"]
 
 
 class AikitError(RuntimeError):
@@ -137,6 +141,9 @@ class MediaInput(TypedDict):
     source: MediaInputSource
     sha256: str
     size_bytes: int
+
+
+def validate_media_input(media: MediaInput) -> MediaInput: ...
 
 
 class OutputTextPart(TypedDict):
@@ -232,6 +239,11 @@ class MediaBlock(TypedDict):
     source: MediaSource
 
 
+class MediaInputBlock(TypedDict):
+    type: Literal["media_input"]
+    media: MediaInput
+
+
 class _CitationBlockRequired(TypedDict):
     type: Literal["citation"]
     text: str
@@ -248,6 +260,7 @@ ContentBlock = Union[
     ToolUseBlock,
     ToolResultBlock,
     MediaBlock,
+    MediaInputBlock,
     CitationBlock,
 ]
 
@@ -269,6 +282,7 @@ class GeneratedText(TypedDict):
     stop_reason: Optional[str]
     messages: List[Message]
     provider_metadata: Dict[str, List[JsonValue]]
+    warnings: List["ProviderWarning"]
 
 
 class GeneratedObject(TypedDict, Generic[T]):
@@ -276,6 +290,7 @@ class GeneratedObject(TypedDict, Generic[T]):
     fidelity: Literal["native_constrained", "forced_tool_call", "prompted_and_parsed"]
     attempts: int
     provider_metadata: Dict[str, List[JsonValue]]
+    warnings: List["ProviderWarning"]
 
 
 class SemanticAccept(TypedDict):
@@ -491,6 +506,12 @@ class RetryPolicy(TypedDict, total=False):
 
 CapabilityState = Literal["supported", "unsupported", "unknown"]
 CompatibilityMode = Literal["strict", "warn", "best_effort"]
+
+
+class CustomModelCapability(TypedDict):
+    custom: str
+
+
 ModelCapability = Union[
     Literal[
         "reasoning",
@@ -506,7 +527,7 @@ ModelCapability = Union[
         "speech_generation",
         "realtime_duplex",
     ],
-    Dict[str, str],
+    CustomModelCapability,
 ]
 
 
@@ -523,6 +544,181 @@ class _ModelProfileRequired(TypedDict):
 
 class ModelProfile(_ModelProfileRequired, total=False):
     capability_states: Dict[str, CapabilityState]
+
+
+def validate_model_profile(profile: ModelProfile) -> ModelProfile: ...
+def model_capability_state(
+    profile: ModelProfile, capability: ModelCapability
+) -> CapabilityState: ...
+
+
+class CatalogSource(TypedDict):
+    provider: str
+    reference: str
+    url: str
+
+
+class ModelCatalogSnapshot(TypedDict):
+    schema_version: int
+    catalog_version: str
+    verified_at: str
+    sources: List[CatalogSource]
+    profiles: List[ModelProfile]
+
+
+class ResolvedModelCatalog(ModelCatalogSnapshot):
+    shipped_hash: str
+    overrides_hash: str
+    override_count: int
+
+
+def shipped_model_catalog() -> ModelCatalogSnapshot: ...
+def resolve_model_catalog(overrides: Sequence[ModelProfile] = ...) -> ResolvedModelCatalog: ...
+
+
+class _ExternalDecisionMetadataRequired(TypedDict):
+    policy_rule_id: str
+    input_summary: str
+
+
+class ExternalDecisionMetadata(_ExternalDecisionMetadataRequired, total=False):
+    risk_evidence: List[str]
+    evaluator_revision: Optional[str]
+
+
+class GlobalPolicyScope(TypedDict):
+    scope: Literal["global"]
+
+
+class TenantPolicyScope(TypedDict):
+    scope: Literal["tenant"]
+    tenant_id: str
+
+
+class AgentPolicyScope(TypedDict):
+    scope: Literal["agent"]
+    agent_id: str
+
+
+class RunPolicyScope(TypedDict):
+    scope: Literal["run"]
+    run_id: str
+
+
+class ToolPolicyScope(TypedDict):
+    scope: Literal["tool"]
+    tool: str
+
+
+PolicyScope = Union[
+    GlobalPolicyScope,
+    TenantPolicyScope,
+    AgentPolicyScope,
+    RunPolicyScope,
+    ToolPolicyScope,
+]
+
+
+class _ScopedPolicyRuleRequired(TypedDict):
+    id: str
+    scope: PolicyScope
+    effect: Literal["allow", "ask", "deny"]
+
+
+class ScopedPolicyRule(_ScopedPolicyRuleRequired, total=False):
+    reason: Optional[str]
+
+
+class PolicyDocument(TypedDict):
+    schema_version: int
+    default_effect: Literal["allow", "ask", "deny"]
+    rules: List[ScopedPolicyRule]
+
+
+class PolicySnapshot(TypedDict):
+    policy: PolicyDocument
+    hash: str
+
+
+def seal_policy_snapshot(policy: PolicyDocument) -> PolicySnapshot: ...
+
+
+class _GovernanceBindingRequired(TypedDict):
+    schema_version: int
+    policy_snapshot_hash: str
+    run_id: str
+    binding_hash: str
+
+
+class GovernanceBinding(_GovernanceBindingRequired, total=False):
+    tenant_id: str
+    agent_id: str
+
+
+def seal_governance_binding(
+    policy_snapshot: PolicySnapshot,
+    run_id: str,
+    tenant_id: Optional[str] = ...,
+    agent_id: Optional[str] = ...,
+) -> GovernanceBinding: ...
+
+
+class AuditablePolicyDecision(TypedDict):
+    engine: Literal["opa", "cedar", "native"]
+    effect: Literal["allow", "ask", "deny"]
+    decision_id: Optional[str]
+    deciding_rule_id: Optional[str]
+    matched_rule_ids: List[str]
+    input_summary: str
+    risk_evidence: List[str]
+    evaluator_revision: Optional[str]
+
+
+class _OpaDetailedResultRequired(TypedDict):
+    effect: Literal["allow", "ask", "deny"]
+
+
+class OpaDetailedResult(_OpaDetailedResultRequired, total=False):
+    rule_id: str
+    matched_rule_ids: List[str]
+    risk_evidence: List[str]
+    partial: bool
+
+
+class _OpaDecisionResponseRequired(TypedDict):
+    result: Union[bool, OpaDetailedResult]
+
+
+class OpaDecisionResponse(_OpaDecisionResponseRequired, total=False):
+    decision_id: str
+    metrics: JsonValue
+    provenance: JsonValue
+    warning: str
+
+
+class _CedarDecisionResponseRequired(TypedDict):
+    decision: Literal["Allow", "Deny"]
+
+
+class CedarDiagnostics(TypedDict, total=False):
+    reasons: List[str]
+    errors: List[str]
+
+
+class CedarDecisionResponse(_CedarDecisionResponseRequired, total=False):
+    decision_id: str
+    permit_policy_ids: List[str]
+    forbid_policy_ids: List[str]
+    diagnostics: CedarDiagnostics
+    evaluator_revision: str
+
+
+def normalize_opa_decision(
+    response: OpaDecisionResponse, metadata: ExternalDecisionMetadata
+) -> AuditablePolicyDecision: ...
+def normalize_cedar_decision(
+    response: CedarDecisionResponse, metadata: ExternalDecisionMetadata
+) -> AuditablePolicyDecision: ...
 
 
 ModalityRequirement = Literal[
@@ -550,6 +746,9 @@ class _MediaArtifactRequired(TypedDict):
 class MediaArtifact(_MediaArtifactRequired, total=False):
     provider: str
     model: str
+
+
+def validate_media_artifact(artifact: MediaArtifact) -> MediaArtifact: ...
 
 
 class _GeneratedImageRequired(TypedDict):
@@ -626,6 +825,7 @@ class RunOptions(TypedDict, total=False):
     max_tokens: int
     max_turns: int
     provider_options: ProviderOptions
+    compatibility_mode: CompatibilityMode
     budget: BudgetPolicy
     retry: RetryPolicy
     routing: RoutingOptions
@@ -744,6 +944,7 @@ class _RunOutcomeRequired(TypedDict):
 class RunOutcome(_RunOutcomeRequired, total=False):
     final_text: str
     provider_metadata: Dict[str, List[JsonValue]]
+    warnings: List["ProviderWarning"]
     invocation_start_message_index: int
 
 
@@ -941,6 +1142,11 @@ class ProviderMetadataDelta(TypedDict):
     metadata: JsonValue
 
 
+class WarningDelta(TypedDict):
+    type: Literal["warning"]
+    warning: "ProviderWarning"
+
+
 class UsageDelta(Usage):
     type: Literal["usage"]
 
@@ -966,6 +1172,7 @@ StreamDelta = Union[
     ToolResultDelta,
     CitationDelta,
     ProviderMetadataDelta,
+    WarningDelta,
     UsageDelta,
     MessageStopDelta,
     ErrorDelta,
@@ -1281,6 +1488,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
     ) -> GeneratedObject[T]: ...
 
@@ -1294,6 +1502,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
     ) -> GeneratedObject[JsonValue]: ...
 
@@ -1307,6 +1516,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
     ) -> ObjectStream[T]: ...
 
@@ -1320,6 +1530,7 @@ class Agent:
         max_tokens: int = ...,
         name: Optional[str] = ...,
         provider_options: Optional[ProviderOptions] = ...,
+        compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
     ) -> ObjectStream[JsonValue]: ...
 
@@ -1401,15 +1612,20 @@ DurableRunStatus = Literal[
 ]
 
 
-class DurableRunState(TypedDict):
+class _DurableRunStateRequired(TypedDict):
     schema_version: int
     session_id: str
     run_id: str
     durability: DurabilityMode
     parent_run_id: Optional[str]
+    policy_snapshot_hash: Optional[str]
     events: List[Dict[str, JsonValue]]
     checkpoints: Dict[str, JsonValue]
-    projection: Dict[str, JsonValue]
+    projection: "DurableRunProjection"
+
+
+class DurableRunState(_DurableRunStateRequired, total=False):
+    governance_binding: GovernanceBinding
 
 
 class Checkpoint(TypedDict):
@@ -1418,7 +1634,70 @@ class Checkpoint(TypedDict):
     event_sequence: int
     parent_checkpoint_id: Optional[str]
     label: Optional[str]
-    projection: Dict[str, JsonValue]
+    projection: "DurableRunProjection"
+
+
+DurableApprovalKind = Literal[
+    "confirmation", "missing_input", "output_review", "edit_retry"
+]
+DurableApprovalStatus = Literal["pending", "approved", "rejected"]
+
+
+class _ApprovalResolutionRequired(TypedDict):
+    approval_id: str
+    approved: bool
+
+
+class ApprovalResolution(_ApprovalResolutionRequired, total=False):
+    response: JsonValue
+
+
+class _DurableApprovalRequestRequired(TypedDict):
+    logical_key: str
+    kind: DurableApprovalKind
+    prompt: str
+    payload: JsonValue
+    requested_at_unix_ms: int
+    expires_at_unix_ms: int
+
+
+class DurableApprovalRequest(_DurableApprovalRequestRequired, total=False):
+    activity_id: str
+    policy_snapshot_hash: str
+    governance_binding: GovernanceBinding
+
+
+class _DurableApprovalRequired(TypedDict):
+    approval_id: str
+    logical_key: str
+    activity_id: Optional[str]
+    kind: DurableApprovalKind
+    prompt: str
+    payload: JsonValue
+    status: DurableApprovalStatus
+    response: Optional[JsonValue]
+    timed_out: bool
+    requested_sequence: int
+    resolved_sequence: Optional[int]
+
+
+class DurableApproval(_DurableApprovalRequired, total=False):
+    policy_snapshot_hash: str
+    governance_binding: GovernanceBinding
+    requested_at_unix_ms: int
+    expires_at_unix_ms: int
+    resolved_at_unix_ms: int
+
+
+class DurableRunProjection(TypedDict):
+    branch_id: str
+    status: DurableRunStatus
+    state: JsonValue
+    activities: Dict[str, JsonValue]
+    approvals: Dict[str, DurableApproval]
+    artifacts: Dict[str, List[JsonValue]]
+    current_checkpoint_id: Optional[str]
+    pause_reason: Optional[str]
 
 
 class _ResumeCommandRequired(TypedDict):
@@ -1426,7 +1705,7 @@ class _ResumeCommandRequired(TypedDict):
     command_id: str
 
 class ResumeCommand(_ResumeCommandRequired, total=False):
-    approvals: List[Dict[str, JsonValue]]
+    approvals: List[ApprovalResolution]
 
 
 class ForkCommand(TypedDict):
@@ -1469,6 +1748,20 @@ class DurableRun:
     ) -> None: ...
     @staticmethod
     def from_state(state: DurableRunState) -> "DurableRun": ...
+    @staticmethod
+    def with_policy_snapshot(
+        session_id: str,
+        run_id: str,
+        policy_snapshot: PolicySnapshot,
+        durability: DurabilityMode = ...,
+    ) -> "DurableRun": ...
+    @staticmethod
+    def with_governance_binding(
+        session_id: str,
+        run_id: str,
+        governance_binding: GovernanceBinding,
+        durability: DurabilityMode = ...,
+    ) -> "DurableRun": ...
     @property
     def schema_version(self) -> int: ...
     @property
@@ -1477,6 +1770,10 @@ class DurableRun:
     def run_id(self) -> str: ...
     @property
     def durability(self) -> DurabilityMode: ...
+    @property
+    def policy_snapshot_hash(self) -> Optional[str]: ...
+    @property
+    def governance_binding(self) -> Optional[GovernanceBinding]: ...
     @property
     def status(self) -> DurableRunStatus: ...
     def snapshot(self) -> DurableRunState: ...
@@ -1494,9 +1791,58 @@ class DurableRun:
         payload: JsonValue,
         activity_id: Optional[str] = ...,
     ) -> str: ...
+    def request_typed_approval(self, request: DurableApprovalRequest) -> str: ...
+    def expire_approvals(self, expiration_id: str, now_unix_ms: int) -> List[str]: ...
+    def request_confirmation(
+        self,
+        logical_key: str,
+        prompt: str,
+        details: JsonValue = ...,
+        activity_id: Optional[str] = ...,
+    ) -> str: ...
+    def request_input(
+        self,
+        logical_key: str,
+        prompt: str,
+        input_schema: JsonValue = ...,
+        activity_id: Optional[str] = ...,
+    ) -> str: ...
+    def request_output_review(
+        self,
+        logical_key: str,
+        prompt: str,
+        output: JsonValue,
+        activity_id: Optional[str] = ...,
+    ) -> str: ...
+    def request_edit_retry(
+        self,
+        logical_key: str,
+        prompt: str,
+        output: JsonValue,
+        error: Optional[str] = ...,
+        activity_id: Optional[str] = ...,
+    ) -> str: ...
+    def resolve_approval(
+        self,
+        command_id: str,
+        approval_id: str,
+        approved: bool,
+        response: JsonValue = ...,
+    ) -> DurableCommandResult: ...
+    def resolve_approval_at(
+        self,
+        command_id: str,
+        approval_id: str,
+        approved: bool,
+        now_unix_ms: int,
+        response: JsonValue = ...,
+    ) -> DurableCommandResult: ...
     def complete(self, completion_id: str) -> None: ...
     def fail(self, failure_id: str, error: str) -> None: ...
     def apply_command(self, command: DurableCommand) -> DurableCommandResult: ...
+    def apply_command_at(
+        self, command: DurableCommand, now_unix_ms: int
+    ) -> DurableCommandResult: ...
 
 
 class SimpleTraceAssertion(TypedDict):

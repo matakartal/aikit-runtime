@@ -140,6 +140,17 @@ tokens, grounding queries, URLs, and citations. Metadata-only audit sinks omit i
 run outcomes and session stores preserve it for provider fidelity; applications must protect those
 stores and must not forward provider metadata to logs without their own redaction policy.
 
+Provider option compatibility warnings never contain option values, but parameter names and model
+ids remain operational metadata. Strict mode rejects unknown parameters before network I/O;
+warn/best-effort forward them unchanged and therefore require the caller to trust the provider's
+new wire semantics. Typed provider failures preserve this warning evidence even when transport or
+HTTP startup fails. Neither mode can upgrade an unknown capability to supported.
+
+Integrity-bound media is guaranteed only after AIKit has the bytes. Inline bytes/base64 are
+size/hash verified. Strict URL and artifact references fail before provider dispatch until the host
+resolves them through an enforcing egress/artifact boundary and returns verified bytes. Allowing a
+provider to fetch a mutable URL would not preserve the recorded SHA-256 identity.
+
 JSON memory/session files can contain prompts, tool results, explicit remembered values, and raw
 provider metadata. JSONL audit is metadata-only by default, but error text, model/tool names, and
 timing remain operationally sensitive; explicit `Full` mode also records tool inputs and bounded
@@ -160,6 +171,13 @@ after an explicit reconciliation assertion, without executing work or creating a
 crash window. JSON remains process-local; SQLite provides the transactional cross-process form.
 File replacement/open checks compare stable device/inode identity on Unix and volume/file-index
 identity on Windows; an identity lookup failure is an error rather than permission to continue.
+
+Durable governance binds policy snapshot hash, tenant, agent, and run id into one sealed value in
+the append-only event log and approval records. Restart attachment and every authorization verify
+the same binding. Legacy hash-only history remains readable but cannot silently satisfy a new
+full-binding authorization. The in-process binding registry is capped at 4,096 entries and fails
+closed at capacity. Only terminal runs can retire their exact binding; retirement invalidates stale
+clones and reusable grants before releasing the slot, and terminal runs cannot be attached again.
 
 Web fetches validate each HTTPS redirect target against the exact host allowlist before following
 it, reject mixed/private/non-routable DNS answers, and pin the checked public addresses into a
@@ -185,6 +203,28 @@ Exact allow/deny filtering happens before discovery-cache retention and again im
 execution. Deny wins. Every allowed MCP call still passes the normal schema/governance/tool-result
 pipeline. Applications must separately decide whether the remote server, its credentials, and its
 side effects are acceptable.
+
+Inbound server state is also attacker-controlled pressure. Tasks, receipts, HTTP sessions, replay
+events, result bytes/items/depth, and TTL are bounded and old terminal state is collected. Schema
+drift approval is followed by validation against the newly approved schema. Cancellation is not
+committed as complete before the host confirms the underlying operation stopped; timeout or an
+ambiguous external effect remains fail-closed for reconciliation.
+
+A completed side-effect receipt is replay evidence, not disposable cache. When its retention
+window expires, AIKit retires that connection's request-id/dedupe namespace and rejects later
+requests on it as reconciliation-required. A caller must establish a fresh connection/session
+identity before submitting new work; this bounds retained receipts without turning expiry into an
+unsafe duplicate-execution window.
+
+### Firecracker
+
+The optional Firecracker lifecycle is a Linux deployment boundary, not a guarantee established by
+macOS unit tests. It requires immutable hash-pinned kernel/rootfs/VMM/jailer inputs, trusted path
+ownership, KVM, TAP/netns prerequisites, and a bounded API startup/configuration sequence. The VMM
+child and jail staging share one supervisor; cleanup waits for child exit and deliberately retains
+the staging directory on irrecoverable reap failure to avoid reusing a live jail path. Guest
+command/workspace transport, production resource quotas, Linux root+KVM boot/escape tests, and
+network egress enforcement remain deployment gates before it can back the built-in Bash tool.
 
 ### Semantic validators and evaluation
 

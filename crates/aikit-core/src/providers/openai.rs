@@ -86,6 +86,7 @@ pub(crate) fn build_compatible_request(
             "stream_options",
         ],
     )?;
+    super::validate_media_input_roles(messages, provider, model)?;
     let mut wire: Vec<Value> = Vec::new();
 
     for m in messages {
@@ -94,7 +95,7 @@ pub(crate) fn build_compatible_request(
                 "role": "system", "content": join_text(&m.content),
             })),
             Role::User => wire.push(serde_json::json!({
-                "role": "user", "content": openai_user_content(&m.content),
+                "role": "user", "content": openai_user_content(provider, model, &m.content)?,
             })),
             Role::Assistant => {
                 // Reasoning blocks are intentionally dropped here: Chat Completions does not
@@ -201,36 +202,59 @@ fn join_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
-fn openai_user_content(blocks: &[ContentBlock]) -> Value {
-    if !blocks
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Media { .. }))
-    {
-        return Value::String(join_text(blocks));
+fn openai_user_content(
+    provider: &str,
+    model: &str,
+    blocks: &[ContentBlock],
+) -> crate::error::Result<Value> {
+    if !blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Media { .. } | ContentBlock::MediaInput { .. }
+        )
+    }) {
+        return Ok(Value::String(join_text(blocks)));
     }
-    Value::Array(
-        blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => {
-                    Some(serde_json::json!({ "type": "text", "text": text }))
+    let mut content = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                content.push(serde_json::json!({ "type": "text", "text": text }));
+            }
+            ContentBlock::Media { media_type, source } => {
+                let url = match source {
+                    MediaSource::Url { url } => url.clone(),
+                    MediaSource::Base64 { data } => format!("data:{media_type};base64,{data}"),
+                };
+                content.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": url },
+                }));
+            }
+            ContentBlock::MediaInput { media } => {
+                if !super::is_image_media_type(&media.media_type) {
+                    return Err(crate::error::ProviderError::new(
+                        provider,
+                        model,
+                        crate::error::ProviderErrorKind::InvalidRequest,
+                        "OpenAI-compatible chat media input currently supports image MIME types only",
+                    )
+                    .into());
                 }
-                ContentBlock::Media { media_type, source } => {
-                    let url = match source {
-                        MediaSource::Url { url } => url.clone(),
-                        MediaSource::Base64 { data } => {
-                            format!("data:{media_type};base64,{data}")
-                        }
-                    };
-                    Some(serde_json::json!({
-                        "type": "image_url",
-                        "image_url": { "url": url },
-                    }))
-                }
-                _ => None,
-            })
-            .collect(),
-    )
+                let url = match super::resolve_media_input(media, provider, model)? {
+                    super::ResolvedMediaInput::Base64(data) => {
+                        format!("data:{};base64,{data}", media.media_type)
+                    }
+                };
+                content.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": url },
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::Array(content))
 }
 
 /// Accumulator for one streamed tool call (OpenAI groups by `index`; id/name/args arrive in
@@ -634,7 +658,12 @@ pub(crate) async fn stream_compatible(
     client: &reqwest::Client,
     req: ProviderRequest,
 ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
-    let options = req.options_for(provider_name);
+    let validated = req.validated_options_for(
+        provider_name,
+        super::openai_compatible_options(provider_name),
+    )?;
+    let options = validated.options;
+    let warnings = validated.warnings;
     let wire_model = model_prefix
         .and_then(|prefix| req.model.strip_prefix(prefix))
         .unwrap_or(&req.model);
@@ -655,6 +684,7 @@ pub(crate) async fn stream_compatible(
             crate::error::ProviderErrorKind::InvalidRequest,
             error.to_string(),
         )
+        .with_warnings(warnings.clone())
     })?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let resp = client
@@ -664,7 +694,10 @@ pub(crate) async fn stream_compatible(
         .json(&body)
         .send()
         .await
-        .map_err(|error| super::transport_failure(provider_name, &req.model, error))?;
+        .map_err(|error| {
+            super::transport_failure(provider_name, &req.model, error)
+                .with_provider_warnings(warnings.clone())
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -676,7 +709,8 @@ pub(crate) async fn stream_compatible(
             status,
             retry_after.as_ref(),
             text,
-        ));
+        )
+        .with_provider_warnings(warnings));
     }
 
     let model = req.model.clone();
@@ -764,13 +798,91 @@ pub(crate) async fn stream_compatible(
             );
         }
     };
-    Ok(Box::pin(out))
+    Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{MediaInput, MediaInputSource};
     use serde_json::json;
+
+    fn strict_png_bytes() -> MediaInput {
+        MediaInput {
+            media_type: "image/png".into(),
+            source: MediaInputSource::Bytes {
+                data: b"abc".to_vec(),
+            },
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size_bytes: 3,
+        }
+    }
+
+    #[test]
+    fn strict_media_is_validated_and_serialized_without_identity_loss() {
+        let message = Message::user("inspect")
+            .with_media_input(strict_png_bytes())
+            .unwrap();
+        let request = build_request("gpt-test", 64, &[message], &[], None).unwrap();
+        assert_eq!(
+            request["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,YWJj"
+        );
+
+        let unresolved = MediaInput {
+            source: MediaInputSource::Artifact {
+                artifact_id: "artifact-1".into(),
+            },
+            ..strict_png_bytes()
+        };
+        let message = Message::user("inspect")
+            .with_media_input(unresolved)
+            .unwrap();
+        let error = build_request("gpt-test", 64, &[message], &[], None).unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == crate::error::ProviderErrorKind::InvalidRequest
+        ));
+
+        let unresolved_url = MediaInput {
+            source: MediaInputSource::Url {
+                url: "https://example.test/image.png".into(),
+            },
+            ..strict_png_bytes()
+        };
+        let message = Message::user("inspect")
+            .with_media_input(unresolved_url)
+            .unwrap();
+        let error = build_request("gpt-test", 64, &[message], &[], None).unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == crate::error::ProviderErrorKind::InvalidRequest
+        ));
+
+        let invalid_role = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::MediaInput {
+                media: strict_png_bytes(),
+            }],
+        };
+        let error = build_request("gpt-test", 64, &[invalid_role], &[], None).unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == crate::error::ProviderErrorKind::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn strict_media_accepts_case_insensitive_mime_type() {
+        let mut media = strict_png_bytes();
+        media.media_type = "Image/png".into();
+        let message = Message::user("inspect").with_media_input(media).unwrap();
+        let request = build_request("gpt-test", 64, &[message], &[], None).unwrap();
+        assert_eq!(
+            request["messages"][0]["content"][1]["image_url"]["url"],
+            "data:Image/png;base64,YWJj"
+        );
+    }
 
     #[test]
     fn build_request_maps_tool_calls_and_drops_reasoning() {
@@ -1122,6 +1234,7 @@ mod tests {
             max_tokens: 100,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let out: Vec<StreamDelta> = provider.stream(req).await.unwrap().collect().await;
 
@@ -1134,6 +1247,39 @@ mod tests {
         assert!(out.contains(&StreamDelta::MessageStop {
             stop_reason: "end_turn".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn warn_mode_preserves_preflight_warning_on_http_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("provider unavailable"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::with_base_url("sk-openai-test", server.uri());
+        let request = ProviderRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::user("selam")],
+            tools: vec![],
+            max_tokens: 100,
+            options: serde_json::Map::from_iter([("future_option".into(), Value::Bool(true))]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Warn,
+        };
+
+        let error = match provider.stream(request).await {
+            Ok(_) => panic!("provider HTTP failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        let info = error.info();
+        assert_eq!(info.code, crate::error::ErrorCode::ProviderServer);
+        assert_eq!(info.warnings.len(), 1);
+        assert_eq!(info.warnings[0].parameter.as_deref(), Some("future_option"));
     }
 
     #[tokio::test]
@@ -1161,6 +1307,7 @@ mod tests {
                 max_tokens: 100,
                 options: serde_json::Map::new(),
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .unwrap()
@@ -1200,6 +1347,7 @@ mod tests {
             max_tokens: 10,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let _: Vec<_> = provider.stream(req).await.unwrap().collect().await;
         let requests = server.received_requests().await.unwrap();
@@ -1233,6 +1381,7 @@ mod tests {
             max_tokens: 10,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
 
         let _: Vec<_> = provider.stream(req).await.unwrap().collect().await;

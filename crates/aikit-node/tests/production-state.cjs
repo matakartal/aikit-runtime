@@ -5,7 +5,20 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { Agent } = require("..");
+const {
+  Agent,
+  DurableRun,
+  normalizeCedarDecision,
+  modelCapabilityState,
+  normalizeOpaDecision,
+  resolveModelCatalog,
+  sealGovernanceBinding,
+  sealPolicySnapshot,
+  shippedModelCatalog,
+  validateMediaArtifact,
+  validateMediaInput,
+  validateModelProfile,
+} = require("..");
 
 const profiles = [
   {
@@ -37,6 +50,244 @@ const objectSchema = {
   additionalProperties: false,
 };
 
+function sdkContractHelpers() {
+  const digest = "a".repeat(64);
+  const media = {
+    media_type: "image/png",
+    source: { kind: "artifact", artifact_id: "artifact-image-1" },
+    sha256: digest,
+    size_bytes: 12,
+  };
+  assert.deepEqual(validateMediaInput(media), media);
+  const inlineMedia = {
+    media_type: "application/octet-stream",
+    source: { kind: "bytes", data: [97, 98, 99] },
+    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    size_bytes: 3,
+  };
+  assert.deepEqual(validateMediaInput(inlineMedia), inlineMedia);
+  const artifact = {
+    artifact_id: "artifact-image-1",
+    media_type: "image/png",
+    sha256: digest,
+    size_bytes: 12,
+  };
+  assert.deepEqual(validateMediaArtifact(artifact), artifact);
+  const mediaRejected = (candidate) => {
+    try {
+      validateMediaInput(candidate);
+      return false;
+    } catch (_error) {
+      return true;
+    }
+  };
+  const abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+  const base64Media = {
+    media_type: "application/octet-stream",
+    source: { kind: "base64", data: "YWJj" },
+    sha256: abcHash,
+    size_bytes: 3,
+  };
+  const urlMedia = {
+    media_type: "image/png",
+    source: { kind: "url", url: "https://example.com/image.png" },
+    sha256: digest,
+    size_bytes: 1,
+  };
+  assert.deepEqual(validateMediaInput(base64Media), base64Media);
+  const mediaValidation = {
+    artifact_empty_rejected: mediaRejected({
+      ...media, source: { kind: "artifact", artifact_id: " " },
+    }),
+    base64_hash_rejected: mediaRejected({ ...base64Media, sha256: "0".repeat(64) }),
+    base64_invalid_rejected: mediaRejected({
+      ...base64Media, source: { kind: "base64", data: "%%%INVALID" },
+    }),
+    base64_size_rejected: mediaRejected({ ...base64Media, size_bytes: 2 }),
+    base64_valid: true,
+    bytes_hash_rejected: mediaRejected({ ...inlineMedia, sha256: "0".repeat(64) }),
+    bytes_size_rejected: mediaRejected({ ...inlineMedia, size_bytes: 2 }),
+    bytes_valid: true,
+    credential_url_rejected: mediaRejected({
+      ...urlMedia,
+      source: { kind: "url", url: "https://user:secret@example.com/image.png" },
+    }),
+    mime_case_insensitive_valid: validateMediaInput({
+      ...base64Media, media_type: "Image/PNG",
+    }).media_type === "Image/PNG",
+    mime_extra_slash_rejected: mediaRejected({ ...urlMedia, media_type: "image/png/extra" }),
+    mime_parameter_rejected: mediaRejected({
+      ...urlMedia, media_type: "image/png; charset=utf-8",
+    }),
+    mime_whitespace_rejected: mediaRejected({ ...urlMedia, media_type: "image /png" }),
+    relative_url_rejected: mediaRejected({
+      ...urlMedia, source: { kind: "url", url: "/image.png" },
+    }),
+    unknown_field_rejected: mediaRejected({ ...urlMedia, unexpected: true }),
+    url_reference_valid: (() => {
+      assert.deepEqual(validateMediaInput(urlMedia), urlMedia);
+      return true;
+    })(),
+    url_scheme_rejected: mediaRejected({
+      ...urlMedia, source: { kind: "url", url: "file:///tmp/image.png" },
+    }),
+  };
+  assert(Object.values(mediaValidation).every(Boolean));
+  assert.throws(() => validateMediaInput({ ...media, sha256: digest.toUpperCase() }));
+  assert.throws(() => validateMediaInput({ ...media, size_bytes: 0 }));
+  assert.throws(() => validateMediaInput({ ...inlineMedia, sha256: "0".repeat(64) }));
+  assert.throws(() => validateMediaArtifact({ ...artifact, artifact_id: "" }));
+
+  const shipped = shippedModelCatalog();
+  assert.equal(shipped.sources.length, 8);
+  assert.equal(shipped.profiles.length, 8);
+  assert.deepEqual(validateModelProfile(shipped.profiles[0]), shipped.profiles[0]);
+  assert(["supported", "unsupported", "unknown"].includes(
+    modelCapabilityState(shipped.profiles[0], "realtime_duplex"),
+  ));
+  const originalLimit = shipped.profiles[0].max_output_tokens;
+  const override = { ...shipped.profiles[0], max_output_tokens: originalLimit - 1 };
+  const resolved = resolveModelCatalog([override]);
+  assert.equal(resolved.override_count, 1);
+  assert.notEqual(resolved.shipped_hash, resolved.overrides_hash);
+  assert.equal(shippedModelCatalog().profiles[0].max_output_tokens, originalLimit);
+
+  const metadata = {
+    policy_rule_id: "package/aikit/allow",
+    input_summary: "tool=Read path=/workspace/a.txt",
+    risk_evidence: ["workspace_path"],
+    evaluator_revision: "rev-1",
+  };
+  const opa = normalizeOpaDecision(
+    { result: { effect: "allow", rule_id: "allow.read" } },
+    metadata,
+  );
+  assert.equal(opa.engine, "opa");
+  assert.equal(opa.effect, "allow");
+  assert.throws(() => normalizeOpaDecision(
+    { result: { effect: "allow", partial: true } }, metadata,
+  ));
+  const cedar = normalizeCedarDecision(
+    {
+      decision: "Allow",
+      permit_policy_ids: ["permit.read"],
+      forbid_policy_ids: ["forbid.secret"],
+    },
+    metadata,
+  );
+  assert.equal(cedar.engine, "cedar");
+  assert.equal(cedar.effect, "deny");
+
+  const requestCases = [
+    ["confirmation", (run) => run.requestConfirmation("confirm", "Proceed?")],
+    ["missing_input", (run) => run.requestInput(
+      "input", "Currency?", { type: "string", enum: ["EUR"] },
+    )],
+    ["output_review", (run) => run.requestOutputReview(
+      "review", "Review output", { status: "draft" },
+    )],
+    ["edit_retry", (run) => run.requestEditRetry(
+      "retry", "Edit or retry", { status: "invalid" }, "status mismatch",
+    )],
+  ];
+  requestCases.forEach(([kind, request], index) => {
+    const run = new DurableRun("session-sdk", `run-sdk-${index}`);
+    const approvalId = request(run);
+    const approval = run.snapshot().projection.approvals[approvalId];
+    assert.equal(approval.payload.kind, kind);
+    const outcome = run.resolveApproval(
+      `resume-${index}`, approvalId, true, { accepted: true },
+    );
+    assert.equal(outcome.type, "resumed");
+    assert.equal(run.status, "running");
+  });
+
+  const policySnapshot = sealPolicySnapshot({
+    schema_version: 1,
+    default_effect: "deny",
+    rules: [{
+      id: "allow.read",
+      scope: { scope: "tool", tool: "Read" },
+      effect: "allow",
+    }],
+  });
+  const governed = DurableRun.withPolicySnapshot(
+    "session-governed", "run-governed", policySnapshot,
+  );
+  assert.equal(governed.policySnapshotHash, policySnapshot.hash);
+  assert.equal(governed.snapshot().events[1].kind.type, "governance_binding_pinned");
+  assert.deepEqual(governed.governanceBinding, governed.snapshot().events[1].kind.binding);
+  const typedId = governed.requestTypedApproval({
+    logical_key: "customer-id",
+    kind: "missing_input",
+    prompt: "Customer id?",
+    payload: { field: "customer_id" },
+    policy_snapshot_hash: policySnapshot.hash,
+    requested_at_unix_ms: 100,
+    expires_at_unix_ms: 200,
+  });
+  const typed = governed.snapshot().projection.approvals[typedId];
+  assert.equal(typed.kind, "missing_input");
+  assert.equal(typed.policy_snapshot_hash, policySnapshot.hash);
+  assert.deepEqual(typed.governance_binding, governed.governanceBinding);
+  assert.equal(typed.requested_at_unix_ms, 100);
+  assert.equal(typed.expires_at_unix_ms, 200);
+  const beforeClockRejection = governed.snapshot();
+  assert.throws(() => governed.resolveApproval(
+    "resume-without-clock", typedId, true, "cust-1",
+  ));
+  assert.deepEqual(governed.snapshot(), beforeClockRejection);
+  const restarted = DurableRun.fromState(governed.snapshot());
+  const typedOutcome = restarted.resolveApprovalAt(
+    "resume-with-clock", typedId, true, 150n, "cust-1",
+  );
+  assert.equal(typedOutcome.type, "resumed");
+  const resolvedApproval = restarted.snapshot().projection.approvals[typedId];
+  assert.equal(resolvedApproval.response, "cust-1");
+  assert.equal(resolvedApproval.resolved_at_unix_ms, 150);
+  assert.equal(resolvedApproval.timed_out, false);
+
+  const scopedBinding = sealGovernanceBinding(
+    policySnapshot, "run-scoped", "tenant-a", "agent-a",
+  );
+  const scoped = DurableRun.withGovernanceBinding(
+    "session-scoped", "run-scoped", scopedBinding,
+  );
+  assert.deepEqual(scoped.governanceBinding, scopedBinding);
+  assert.equal(scoped.policySnapshotHash, policySnapshot.hash);
+  assert.throws(() => DurableRun.withGovernanceBinding(
+    "session-tampered",
+    "run-scoped",
+    { ...scopedBinding, tenant_id: "tenant-b" },
+  ));
+  assert.throws(() => DurableRun.withGovernanceBinding(
+    "session-mismatch", "different-run", scopedBinding,
+  ));
+  mediaValidation.governance_binding_valid = true;
+
+  const timeoutRun = new DurableRun("session-timeout", "run-timeout");
+  const timeoutId = timeoutRun.requestTypedApproval({
+    logical_key: "review",
+    kind: "output_review",
+    prompt: "Review output",
+    payload: { status: "draft" },
+    requested_at_unix_ms: 100,
+    expires_at_unix_ms: 110,
+  });
+  const eventCount = timeoutRun.snapshot().events.length;
+  assert.deepEqual(timeoutRun.expireApprovals("sweep-1", 110n), [timeoutId]);
+  assert.equal(timeoutRun.snapshot().events.length, eventCount + 1);
+  assert.deepEqual(timeoutRun.expireApprovals("sweep-1", 110n), []);
+  const expired = timeoutRun.snapshot().projection.approvals[timeoutId];
+  assert.equal(expired.status, "rejected");
+  assert.equal(expired.timed_out, true);
+  assert.equal(expired.resolved_at_unix_ms, 110);
+  assert.equal(timeoutRun.applyCommandAt(
+    { command: "resume", command_id: "resume-timeout" }, 110n,
+  ).type, "resumed");
+  return mediaValidation;
+}
+
 function childSpec(id) {
   return {
     id,
@@ -66,6 +317,67 @@ async function drainObject(stream) {
   for await (const _event of stream) {
     // Exhaust every structured-output event.
   }
+}
+
+async function compatibilityContract() {
+  const agent = Agent.fromEnv({});
+  const providerOptions = { mock: { future_option: true } };
+
+  const strictStream = agent.run("strict-default", { providerOptions });
+  const strictEvents = [];
+  for await (const event of strictStream) strictEvents.push(event);
+  const strictOutcome = strictStream.outcome();
+  assert.equal(strictOutcome.terminal_status, "failed");
+  assert.equal(strictEvents.at(-1)?.type, "error");
+  assert.equal(strictEvents.at(-1)?.info?.code, "provider_invalid_request");
+
+  const warningRuns = {};
+  for (const compatibilityMode of ["warn", "best_effort"]) {
+    const stream = agent.run(compatibilityMode, { providerOptions, compatibilityMode });
+    const events = [];
+    for await (const event of stream) events.push(event);
+    const warning = events.find((event) => event.type === "warning")?.warning;
+    const outcome = stream.outcome();
+    assert.equal(warning?.parameter, "future_option");
+    assert.equal(outcome.warnings?.[0]?.parameter, "future_option");
+    warningRuns[compatibilityMode] = true;
+  }
+
+  assert.throws(() => agent.run("invalid-mode", { compatibilityMode: "loose" }));
+
+  await assert.rejects(
+    agent.generateObject("strict object", objectSchema, { providerOptions }),
+    (error) => error?.code === "provider_invalid_request",
+  );
+  const warnedObject = await agent.generateObject("warn object", objectSchema, {
+    providerOptions,
+    compatibilityMode: "warn",
+  });
+  assert.equal(warnedObject.warnings[0].parameter, "future_option");
+
+  const objectStream = agent.streamObject("best effort object", objectSchema, {
+    providerOptions,
+    compatibilityMode: "best_effort",
+  });
+  const objectEvents = [];
+  for await (const event of objectStream) objectEvents.push(event);
+  assert(objectEvents.some((event) =>
+    event.type === "delta" &&
+    event.delta.type === "warning" &&
+    event.delta.warning.parameter === "future_option"));
+  assert.equal(
+    objectEvents.find((event) => event.type === "completed")?.object.warnings[0].parameter,
+    "future_option",
+  );
+
+  return {
+    compatibility_best_effort_warning: warningRuns.best_effort,
+    compatibility_default_strict: true,
+    compatibility_invalid_mode_rejected: true,
+    compatibility_object_strict: true,
+    compatibility_object_warning: true,
+    compatibility_warn_warning: warningRuns.warn,
+  };
 }
 
 function readJsonl(file) {
@@ -104,6 +416,12 @@ function symlinkGuard(tmp) {
 }
 
 async function main() {
+  const mediaValidation = sdkContractHelpers();
+  const compatibilityValidation = await compatibilityContract();
+  const sdkValidation = Object.fromEntries(
+    Object.entries({ ...mediaValidation, ...compatibilityValidation })
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
+  );
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aikit-production-state-"));
   try {
     const metadataPath = path.join(tmp, "metadata.jsonl");
@@ -393,6 +711,7 @@ async function main() {
           recalled[0].key === "customer_note" &&
           recalled[0].value === "Ada prefers EUR",
       },
+      sdk: sdkValidation,
       session: {
         file_persisted:
           JSON.parse(fs.readFileSync(sessionPath, "utf8")).sessions["persist-session"]

@@ -5,9 +5,15 @@
 //! backend can be proved available, command preparation fails before untrusted code starts.
 
 mod container;
+mod firecracker;
 mod linux;
 mod macos;
 mod windows;
+
+pub use firecracker::{
+    firecracker_capability, FirecrackerConfig, FirecrackerError, FirecrackerLaunchPlan,
+    FirecrackerNetwork, FirecrackerResult, FirecrackerStaging, FirecrackerVm, ImmutableHostFile,
+};
 
 use crate::error::{AikitError, Result};
 use serde::{Deserialize, Serialize};
@@ -131,6 +137,9 @@ pub enum ActiveContainmentBackend {
     LinuxNamespace,
     WindowsJob,
     Docker,
+    /// Low-level lifecycle capability only; the Bash path does not select this backend until a
+    /// guest command/workspace transport is available.
+    Firecracker,
     Uncontained,
 }
 
@@ -179,6 +188,23 @@ impl ContainmentGuarantees {
             descendant_inheritance: true,
             syscall_filter: true,
             resource_limits: true,
+        }
+    }
+
+    const fn firecracker(_network: &FirecrackerNetwork) -> Self {
+        ContainmentGuarantees {
+            filesystem_write_boundary: true,
+            sensitive_home_read_boundary: true,
+            // Disabled mode exposes no NIC; TAP mode always joins an explicitly pinned network
+            // namespace. What that namespace may reach remains the operator's egress policy.
+            network_boundary: true,
+            descendant_inheritance: true,
+            // Firecracker enables its production seccomp filters by default and this backend
+            // intentionally exposes no switch that disables them.
+            syscall_filter: true,
+            // Guest RAM/vCPU sizing is enforced, but the host VMM is not yet placed into a
+            // caller-supplied cgroup. Do not overstate this as complete host resource limiting.
+            resource_limits: false,
         }
     }
 
@@ -499,6 +525,9 @@ pub(crate) async fn prepare_command(
             container::prepare(command, workdir, config, environment, limits)
         }
         ActiveContainmentBackend::WindowsJob => windows::prepare(command, workdir, limits),
+        ActiveContainmentBackend::Firecracker => {
+            unreachable!("Firecracker has no Bash guest transport and is never selected here")
+        }
         ActiveContainmentBackend::Uncontained => unreachable!("required policy selected opt-out"),
     }
 }

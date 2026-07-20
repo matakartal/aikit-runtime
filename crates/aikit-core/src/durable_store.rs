@@ -136,7 +136,13 @@ impl DurableStore for InMemoryDurableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durability::DurabilityMode;
+    use crate::durability::{
+        ApprovalResolution, DurabilityMode, DurableApprovalKind, DurableApprovalRequest,
+        DurableApprovalStatus, RunCommand,
+    };
+    use crate::governance::{
+        PolicyDocument, PolicyEffect, PolicySnapshot, GOVERNANCE_CONTRACT_VERSION,
+    };
     use serde_json::json;
 
     #[test]
@@ -185,5 +191,58 @@ mod tests {
             Err(DurableStoreError::Invalid(_))
         ));
         assert_eq!(store.load("run-1").unwrap(), committed);
+    }
+
+    #[test]
+    fn restart_preserves_policy_and_turns_expired_approval_into_a_durable_deny() {
+        let policy = PolicySnapshot::seal(PolicyDocument {
+            schema_version: GOVERNANCE_CONTRACT_VERSION,
+            default_effect: PolicyEffect::Ask,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let mut initial =
+            RunState::new_with_policy_snapshot("session", "restart", DurabilityMode::Sync, &policy)
+                .unwrap();
+        let approval_id = initial
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "publish".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::OutputReview,
+                prompt: "Publish output?".into(),
+                payload: json!({"artifact": "report"}),
+                policy_snapshot_hash: Some(policy.hash().into()),
+                governance_binding: None,
+                requested_at_unix_ms: 10,
+                expires_at_unix_ms: 20,
+            })
+            .unwrap();
+        let store = InMemoryDurableStore::default();
+        store.create(&initial).unwrap();
+
+        let mut restarted = store.load("restart").unwrap();
+        let revision = last_sequence(&restarted);
+        restarted
+            .apply_command_at(
+                RunCommand::Resume {
+                    command_id: "resume-after-restart".into(),
+                    approvals: vec![ApprovalResolution {
+                        approval_id: approval_id.clone(),
+                        approved: true,
+                        response: None,
+                    }],
+                },
+                20,
+            )
+            .unwrap();
+        store.compare_and_swap(revision, &restarted).unwrap();
+
+        let persisted = store.load("restart").unwrap();
+        assert_eq!(persisted.policy_snapshot_hash(), Some(policy.hash()));
+        assert_eq!(
+            persisted.projection().approvals[&approval_id].status,
+            DurableApprovalStatus::Rejected
+        );
+        assert!(persisted.projection().approvals[&approval_id].timed_out);
     }
 }

@@ -362,6 +362,7 @@ async function main() {
   let objectCompleted;
   for await (const event of agent.streamObject("Stream the invoice status", invoiceSchema, {
     providerOptions: { mock: { temperature: 0 } },
+    compatibilityMode: "warn",
   })) {
     objectEvents.push(event.type);
     if (event.type === "completed") objectCompleted = event.object;

@@ -41,10 +41,12 @@ pub fn build_request(
         ],
     )?;
     if messages.iter().any(|message| {
-        message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Media { .. }))
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Media { .. } | ContentBlock::MediaInput { .. }
+            )
+        })
     }) {
         return Err(ProviderError::new(
             "deepseek",
@@ -538,7 +540,9 @@ impl Provider for DeepSeekProvider {
         &self,
         req: ProviderRequest,
     ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
-        let options = req.options_for(self.name());
+        let validated = req.validated_options_for(self.name(), super::DEEPSEEK_OPTIONS)?;
+        let options = validated.options;
+        let warnings = validated.warnings;
         let body = build_request(
             &req.model,
             req.max_tokens,
@@ -553,6 +557,7 @@ impl Provider for DeepSeekProvider {
                 crate::error::ProviderErrorKind::InvalidRequest,
                 error.to_string(),
             )
+            .with_warnings(warnings.clone())
         })?;
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -563,7 +568,10 @@ impl Provider for DeepSeekProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| super::transport_failure("deepseek", &req.model, error))?;
+            .map_err(|error| {
+                super::transport_failure("deepseek", &req.model, error)
+                    .with_provider_warnings(warnings.clone())
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -575,7 +583,8 @@ impl Provider for DeepSeekProvider {
                 status,
                 retry_after.as_ref(),
                 text,
-            ));
+            )
+            .with_provider_warnings(warnings));
         }
 
         let model = req.model.clone();
@@ -657,13 +666,14 @@ impl Provider for DeepSeekProvider {
                 );
             }
         };
-        Ok(Box::pin(out))
+        Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{MediaInput, MediaInputSource};
     use serde_json::json;
 
     #[test]
@@ -678,6 +688,24 @@ mod tests {
             }],
         }];
         let error = build_request("deepseek-chat", 100, &messages, &[], None).unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == ProviderErrorKind::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn strict_media_input_is_also_rejected_before_dispatch() {
+        let media = MediaInput {
+            media_type: "image/png".into(),
+            source: MediaInputSource::Url {
+                url: "https://example.test/a.png".into(),
+            },
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+        };
+        let message = Message::user("inspect").with_media_input(media).unwrap();
+        let error = build_request("deepseek-chat", 100, &[message], &[], None).unwrap_err();
         assert!(matches!(
             error.provider_error(),
             Some(error) if error.kind == ProviderErrorKind::InvalidRequest
@@ -1030,6 +1058,7 @@ mod tests {
             max_tokens: 100,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let out: Vec<StreamDelta> = provider.stream(req).await.unwrap().collect().await;
 
@@ -1071,6 +1100,7 @@ mod tests {
                 max_tokens: 100,
                 options: serde_json::Map::new(),
                 provider_options: options,
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .err()
@@ -1105,6 +1135,7 @@ mod tests {
                 max_tokens: 100,
                 options: serde_json::Map::new(),
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .unwrap()

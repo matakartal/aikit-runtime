@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-11-25",
+    "capabilities": {
+      "tasks": {
+        "list": {},
+        "cancel": {}
+      }
+    },
+    "clientInfo": {
+      "name": "aikit-conformance-fixture",
+      "version": "1.0.0"
+    }
+  }
+}

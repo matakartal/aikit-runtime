@@ -8,6 +8,7 @@ use super::common::{
     GovernanceEnvelope, GovernedAction, ProtocolError, ProtocolKind, ProtocolPrincipal,
     ProtocolResult,
 };
+use crate::durability::stable_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,7 +75,21 @@ impl McpToolDefinition {
                 "MCP tool input_schema must be a JSON object",
             ));
         }
+        jsonschema::validator_for(&self.input_schema).map_err(|error| {
+            ProtocolError::invalid(format!("MCP tool input_schema is invalid: {error}"))
+        })?;
         validate_scope_set(&self.required_scopes)
+    }
+
+    /// Stable identity for the complete executable contract advertised to MCP clients.
+    ///
+    /// Description and approval/task metadata are intentionally included: changing any of them
+    /// invalidates an in-flight authorization decision just as changing `input_schema` does.
+    pub fn definition_hash(&self) -> ProtocolResult<String> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            ProtocolError::invalid(format!("MCP tool definition is not serializable: {error}"))
+        })?;
+        Ok(stable_input_hash(&value))
     }
 }
 
@@ -164,6 +179,15 @@ pub enum McpTaskStatus {
     Cancelled,
 }
 
+/// Durable cancellation handshake state. A task remains non-terminal until the host confirms
+/// that the underlying activity stopped; ambiguous outcomes must be reconciled after restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCancellationState {
+    Requested,
+    ReconcileRequired,
+}
+
 impl McpTaskStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
@@ -223,6 +247,9 @@ pub struct McpTask {
     pub owner_tenant_id: Option<String>,
     #[serde(default)]
     pub required_scopes: BTreeSet<String>,
+    /// Hash of the tool contract approved when this task entered `working`.
+    #[serde(default)]
+    pub definition_hash: String,
     pub advertised: bool,
     pub created_revision: u64,
     pub updated_revision: u64,
@@ -232,6 +259,8 @@ pub struct McpTask {
     pub progress: Option<McpProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<McpApprovalChallenge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<McpCancellationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,6 +371,46 @@ impl McpServerRegistry {
         Ok(())
     }
 
+    /// Install a new tool definition, invalidating non-terminal work when its executable contract
+    /// changes. The task stays durable but must be approved again before execution can resume.
+    pub fn upsert_tool(&mut self, definition: McpToolDefinition) -> ProtocolResult<bool> {
+        definition.validate()?;
+        let new_hash = definition.definition_hash()?;
+        let changed = self
+            .tools
+            .get(&definition.name)
+            .is_none_or(|existing| existing != &definition);
+        if !changed {
+            return Ok(false);
+        }
+
+        let tool_name = definition.name.clone();
+        let mut required_scopes = scopes(&[TOOLS_CALL_SCOPE]);
+        required_scopes.extend(definition.required_scopes.iter().cloned());
+        self.tools.insert(tool_name.clone(), definition);
+        self.bump_revision();
+        let revision = self.revision;
+
+        for task in self.tasks.values_mut() {
+            let McpTaskOperation::ToolCall { name, .. } = &task.operation;
+            if name != &tool_name || task.status.is_terminal() || task.definition_hash == new_hash {
+                continue;
+            }
+            task.status = McpTaskStatus::InputRequired;
+            task.required_scopes = required_scopes.clone();
+            task.definition_hash = new_hash.clone();
+            task.pending_approval = Some(McpApprovalChallenge {
+                approval_id: format!("{}:schema:{revision}", task.task_id),
+                prompt: format!(
+                    "The MCP contract for `{tool_name}` changed; approve the new schema before resuming"
+                ),
+            });
+            task.status_message = Some("tool schema changed; renewed approval required".into());
+            task.updated_revision = revision;
+        }
+        Ok(true)
+    }
+
     pub fn register_resource(&mut self, definition: McpResourceDefinition) -> ProtocolResult<()> {
         definition.validate()?;
         if self.resources.contains_key(&definition.uri) {
@@ -448,6 +517,9 @@ impl McpServerRegistry {
             approval_id: format!("{task_id}:approval"),
             prompt: format!("Approve MCP tool call `{}`", tool.name),
         });
+        let definition_hash = tool
+            .definition_hash()
+            .expect("validated MCP tool definitions are serializable");
         self.bump_revision();
         let status = if pending_approval.is_some() {
             McpTaskStatus::InputRequired
@@ -465,12 +537,14 @@ impl McpServerRegistry {
             owner_subject: principal.subject.clone(),
             owner_tenant_id: principal.tenant_id.clone(),
             required_scopes: required,
+            definition_hash,
             advertised: request.execution_mode == McpToolExecutionMode::Task,
             created_revision: self.revision,
             updated_revision: self.revision,
             status_message: None,
             progress: None,
             pending_approval: pending_approval.clone(),
+            cancellation: None,
             result: None,
             error: None,
         };
@@ -536,6 +610,31 @@ impl McpServerRegistry {
                 "MCP approval does not match the pending challenge",
             );
             return GovernedAction::denied(envelope);
+        }
+        if existing.cancellation.is_some() {
+            envelope = envelope.deny(
+                GovernanceDenialCode::StateConflict,
+                "MCP task cancellation must be reconciled before approval can resume",
+            );
+            return GovernedAction::denied(envelope);
+        }
+        if response.approved {
+            if let Err(error) = self.validate_task_contract(&existing) {
+                self.bump_revision();
+                let task = self
+                    .tasks
+                    .get_mut(task_id)
+                    .expect("task was resolved before schema validation");
+                task.status = McpTaskStatus::Failed;
+                task.updated_revision = self.revision;
+                task.pending_approval = None;
+                task.status_message = Some(error.message.clone());
+                task.error = Some(error);
+                return GovernedAction::from_envelope(
+                    envelope,
+                    McpServerAction::ApprovalDenied { task: task.clone() },
+                );
+            }
         }
 
         self.bump_revision();
@@ -697,7 +796,12 @@ impl McpServerRegistry {
         correlation: CorrelationIdentity,
         principal: Option<&ProtocolPrincipal>,
     ) -> GovernedAction<McpServerAction> {
-        let Some(task) = self.tasks.get(task_id).cloned() else {
+        let Some(task) = self
+            .tasks
+            .get(task_id)
+            .filter(|task| task.advertised)
+            .cloned()
+        else {
             return denied_unknown_task(
                 correlation,
                 principal,
@@ -728,12 +832,82 @@ impl McpServerRegistry {
             self.tasks
                 .values()
                 .filter(|task| {
-                    principal.matches_identity(&task.owner_subject, task.owner_tenant_id.as_deref())
+                    task.advertised
+                        && principal
+                            .matches_identity(&task.owner_subject, task.owner_tenant_id.as_deref())
                 })
                 .cloned()
                 .collect()
         });
         GovernedAction::from_envelope(envelope, McpServerAction::ListTasks { tasks })
+    }
+
+    /// Recover a persisted non-terminal task after process restart. The stable task id remains the
+    /// host's idempotency/reconciliation key; this method never creates another task.
+    pub fn prepare_recover_task(
+        &self,
+        task_id: &str,
+        correlation: CorrelationIdentity,
+        principal: Option<&ProtocolPrincipal>,
+    ) -> GovernedAction<McpServerAction> {
+        let Some(task) = self.tasks.get(task_id).cloned() else {
+            return denied_unknown_task(
+                correlation,
+                principal,
+                "tasks/recover",
+                task_id,
+                scopes(&[TOOLS_CALL_SCOPE]),
+            );
+        };
+        let mut envelope = GovernanceEnvelope::evaluate(
+            ProtocolKind::Mcp,
+            correlation_with_task(correlation, &task),
+            principal,
+            "tasks/recover",
+            task_id,
+            task.required_scopes.clone(),
+        );
+        if envelope.authorization.is_allowed()
+            && principal.is_none_or(|value| {
+                !value.matches_identity(&task.owner_subject, task.owner_tenant_id.as_deref())
+            })
+        {
+            envelope = envelope.deny(
+                GovernanceDenialCode::PrincipalMismatch,
+                "MCP task is not accessible",
+            );
+        }
+        let action = match (&task.status, &task.pending_approval) {
+            (_, _) if task.cancellation.is_some() => Some(McpServerAction::CancelTask { task }),
+            (McpTaskStatus::Working, _) if self.validate_task_contract(&task).is_ok() => {
+                Some(McpServerAction::InvokeTool { task })
+            }
+            (McpTaskStatus::InputRequired, Some(challenge)) => {
+                if self.validate_task_contract(&task).is_ok() {
+                    Some(McpServerAction::AwaitApproval {
+                        task: task.clone(),
+                        challenge: challenge.clone(),
+                    })
+                } else {
+                    envelope = envelope.deny(
+                        GovernanceDenialCode::StateConflict,
+                        "stored MCP tool arguments no longer match the current schema",
+                    );
+                    None
+                }
+            }
+            _ => {
+                envelope = envelope.deny(
+                    GovernanceDenialCode::StateConflict,
+                    "only a working or input-required MCP task can be recovered",
+                );
+                None
+            }
+        };
+        match action {
+            Some(action) => GovernedAction::from_envelope(envelope, action),
+            None => GovernedAction::denied(envelope),
+        }
     }
 
     pub fn prepare_cancel_task(
@@ -761,12 +935,6 @@ impl McpServerRegistry {
         if !envelope.authorization.is_allowed() {
             return GovernedAction::denied(envelope);
         }
-        if existing.status == McpTaskStatus::Cancelled {
-            return GovernedAction::from_envelope(
-                envelope,
-                McpServerAction::CancelTask { task: existing },
-            );
-        }
         if existing.status.is_terminal() {
             envelope = envelope.deny(
                 GovernanceDenialCode::StateConflict,
@@ -775,16 +943,111 @@ impl McpServerRegistry {
             return GovernedAction::denied(envelope);
         }
 
-        self.bump_revision();
+        if existing.cancellation.is_none() {
+            self.bump_revision();
+            let task = self
+                .tasks
+                .get_mut(task_id)
+                .expect("task was resolved before cancellation");
+            task.cancellation = Some(McpCancellationState::Requested);
+            task.status_message = Some("cancellation requested; awaiting host confirmation".into());
+            task.updated_revision = self.revision;
+        }
         let task = self
             .tasks
-            .get_mut(task_id)
+            .get(task_id)
             .expect("task was resolved before cancellation");
-        task.status = McpTaskStatus::Cancelled;
-        task.status_message = Some("cancellation requested".into());
-        task.pending_approval = None;
-        task.updated_revision = self.revision;
         GovernedAction::from_envelope(envelope, McpServerAction::CancelTask { task: task.clone() })
+    }
+
+    /// Mark a requested cancellation terminal only after the host confirms the activity stopped.
+    pub fn confirm_cancel_task(&mut self, task_id: &str) -> ProtocolResult<()> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ProtocolError::not_found("MCP task is not registered"))?;
+        if task.status.is_terminal() {
+            return Err(ProtocolError::invalid_transition(
+                "terminal MCP task cannot confirm cancellation",
+            ));
+        }
+        if task.cancellation.is_none() {
+            return Err(ProtocolError::invalid_transition(
+                "MCP task has no pending cancellation",
+            ));
+        }
+        self.bump_revision();
+        let task = self.tasks.get_mut(task_id).expect("task exists");
+        task.status = McpTaskStatus::Cancelled;
+        task.cancellation = None;
+        task.pending_approval = None;
+        task.status_message = Some("cancellation confirmed by host".into());
+        task.updated_revision = self.revision;
+        Ok(())
+    }
+
+    /// Preserve a non-terminal task when the host cancellation outcome is ambiguous.
+    pub fn mark_cancel_reconcile_required(
+        &mut self,
+        task_id: &str,
+        reason: impl Into<String>,
+    ) -> ProtocolResult<()> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ProtocolError::not_found("MCP task is not registered"))?;
+        if task.status.is_terminal() {
+            return Ok(());
+        }
+        if task.cancellation.is_none() {
+            return Err(ProtocolError::invalid_transition(
+                "MCP task has no pending cancellation",
+            ));
+        }
+        self.bump_revision();
+        let task = self.tasks.get_mut(task_id).expect("task exists");
+        task.cancellation = Some(McpCancellationState::ReconcileRequired);
+        task.status_message = Some(format!(
+            "cancellation requires reconciliation: {}",
+            reason.into()
+        ));
+        task.updated_revision = self.revision;
+        Ok(())
+    }
+
+    /// Fail a non-terminal task once its server-issued TTL has elapsed.
+    pub fn expire_task(&mut self, task_id: &str) -> ProtocolResult<()> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ProtocolError::not_found("MCP task is not registered"))?;
+        if task.status.is_terminal() {
+            return Ok(());
+        }
+        self.bump_revision();
+        let task = self.tasks.get_mut(task_id).expect("task exists");
+        task.status = McpTaskStatus::Failed;
+        task.cancellation = None;
+        task.pending_approval = None;
+        task.status_message = Some("MCP task TTL expired".into());
+        task.error = Some(ProtocolError::conflict("MCP task TTL expired"));
+        task.updated_revision = self.revision;
+        Ok(())
+    }
+
+    /// Remove only terminal work selected by the transport's retention policy.
+    pub(crate) fn remove_terminal_task(&mut self, task_id: &str) -> ProtocolResult<bool> {
+        let Some(task) = self.tasks.get(task_id) else {
+            return Ok(false);
+        };
+        if !task.status.is_terminal() {
+            return Err(ProtocolError::invalid_transition(
+                "non-terminal MCP task cannot be garbage collected",
+            ));
+        }
+        self.tasks.remove(task_id);
+        self.bump_revision();
+        Ok(true)
     }
 
     /// Receiver-side progress update. This is not protocol ingress and does not execute work.
@@ -819,6 +1082,23 @@ impl McpServerRegistry {
         self.finish_task(task_id, McpTaskStatus::Completed, Some(result), None)
     }
 
+    /// Complete a tool request using MCP's distinction between transport failure and a
+    /// model-visible tool execution error. `is_error=true` makes the task `failed` while retaining
+    /// the exact `CallToolResult` for `tasks/result` retrieval.
+    pub fn complete_tool_result(
+        &mut self,
+        task_id: &str,
+        result: Value,
+        is_error: bool,
+    ) -> ProtocolResult<()> {
+        let status = if is_error {
+            McpTaskStatus::Failed
+        } else {
+            McpTaskStatus::Completed
+        };
+        self.finish_task(task_id, status, Some(result), None)
+    }
+
     pub fn fail_task(&mut self, task_id: &str, error: ProtocolError) -> ProtocolResult<()> {
         self.finish_task(task_id, McpTaskStatus::Failed, None, Some(error))
     }
@@ -843,6 +1123,7 @@ impl McpServerRegistry {
         self.bump_revision();
         let task = self.tasks.get_mut(task_id).expect("task exists");
         task.status = status;
+        task.cancellation = None;
         task.result = result;
         task.error = error;
         task.updated_revision = self.revision;
@@ -886,6 +1167,25 @@ impl McpServerRegistry {
 
     fn bump_revision(&mut self) {
         self.revision = self.revision.saturating_add(1);
+    }
+
+    fn validate_task_contract(&self, task: &McpTask) -> ProtocolResult<()> {
+        let McpTaskOperation::ToolCall { name, arguments } = &task.operation;
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| ProtocolError::not_found("MCP task tool is not registered"))?;
+        if tool.definition_hash()? != task.definition_hash {
+            return Err(ProtocolError::conflict(
+                "MCP task definition hash does not match the current tool contract",
+            ));
+        }
+        let validator = jsonschema::validator_for(&tool.input_schema).map_err(|error| {
+            ProtocolError::invalid(format!("MCP tool input_schema is invalid: {error}"))
+        })?;
+        validator.validate(arguments).map_err(|_| {
+            ProtocolError::invalid("stored MCP tool arguments no longer match the current schema")
+        })
     }
 }
 

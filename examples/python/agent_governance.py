@@ -403,6 +403,7 @@ async def main():
         "Stream the invoice status",
         invoice_schema,
         provider_options={"mock": {"temperature": 0}},
+        compatibility_mode="warn",
     ):
         object_events.append(event["type"])
         if event["type"] == "completed":

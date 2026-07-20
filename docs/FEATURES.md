@@ -28,9 +28,11 @@ usage, and provider-specific escape hatches. A run recorder keeps canonical mess
 `final_text` is only a convenience projection.
 
 Rust, Python, and Node text/stream/structured surfaces accept either the string convenience form
-or canonical message history. Media blocks retain URL or inline-base64 sources without flattening.
-An adapter that does not support media, such as DeepSeek, returns a typed error instead of silently
-dropping the block.
+or canonical message history. Legacy media blocks retain URL or inline-base64 sources. The new
+integrity-bound media block requires MIME, size and SHA-256; bytes/base64 are verified before
+provider dispatch, unresolved artifact ids fail before network I/O, and non-user placement is
+rejected instead of silently disappearing. An adapter that does not support media, such as
+DeepSeek, returns a typed error.
 
 Provider metadata is deliberately lossless and therefore potentially sensitive. Logprobs can
 contain generated tokens; grounding fields can contain prompt-derived searches, URLs, and
@@ -46,9 +48,12 @@ it, so stores and host logs must protect it like prompts and model output.
   separate hash and never mutate shipped data.
 - `StreamEvent` adds event/response/block identity and monotonic `start/delta/end`, usage,
   warning, error, and raw-provider-event envelopes. Legacy `StreamDelta` is bridged during v0.x.
-- Strict `MediaInput` values require MIME, size and SHA-256 identity. The existing `ContentPart`
-  input union still carries URL/base64 media through its compatibility representation; projecting
-  strict media identity through every older convenience surface remains a v1 gate.
+- Strict `MediaInput` values require MIME, size and SHA-256 identity. `ContentBlock::MediaInput`
+  and the Python/Node canonical message helpers preserve that identity; the legacy source-only
+  media representation remains for v0.x compatibility. Strict URL and artifact references require
+  an explicit governed host resolver that returns hash-verified bytes before provider dispatch.
+- `CompatibilityMode` is enforced before provider network I/O. Strict mode rejects unrecognized
+  parameters; warn/best-effort preserve them and emit typed warnings rather than dropping them.
 - `OutputPart` materializes text, reasoning, media, files, transcripts, tool results, structured
   data, and citations without flattening them.
 - Realtime event fingerprints survive serialization so reconnect duplicates remain idempotent;
@@ -76,8 +81,16 @@ retry policy, history outcomes, and explicit reconciliation without pretending a
 run locally.
 
 MCP Tasks, A2A and ACP mappings share the governance envelope and cannot directly execute tools.
-The current implementation proves state/authz/dedupe mappings; network server/editor transports are
-still marked `Partial` in the parity matrix.
+MCP 2025-11-25 additionally ships byte-level JSON-RPC dispatch, stdio and Streamable HTTP listeners,
+bounded SSE resume, tenant/principal isolation, request dedupe, SQLite CAS restart recovery, and
+schema-drift reapproval. A2A and ACP remain governed canonical mappings; their official wire
+listeners are not claimed until the core types match the official schemas exactly.
+
+The optional Firecracker lifecycle validates immutable kernel/rootfs/VMM/jailer inputs, constructs
+shell-free jailer arguments, checks trusted paths and Linux prerequisites, waits for the API socket,
+configures the VM in bounded order, and owns cleanup. It is deliberately absent from the Bash
+selector because guest command/workspace transport and a Linux root+KVM escape suite are still
+required.
 
 ## Provider capabilities
 

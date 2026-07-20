@@ -188,6 +188,7 @@ const RUN_OPTION_KEYS = new Set([
   "maxTokens",
   "maxTurns",
   "providerOptions",
+  "compatibilityMode",
   "budget",
   "retry",
   "routing",
@@ -488,6 +489,7 @@ const GENERATE_OBJECT_OPTION_KEYS = new Set([
   "maxTokens",
   "name",
   "providerOptions",
+  "compatibilityMode",
   "validator",
 ]);
 function structuredOptions(options) {
@@ -570,10 +572,42 @@ class DurableRun {
     }
   }
 
+  static withPolicySnapshot(sessionId, runId, policySnapshot, durability = "sync") {
+    try {
+      const run = Object.create(DurableRun.prototype);
+      run._native = native.DurableRun.withPolicySnapshot(
+        sessionId,
+        runId,
+        policySnapshot,
+        durability,
+      );
+      return run;
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  }
+
+  static withGovernanceBinding(sessionId, runId, governanceBinding, durability = "sync") {
+    try {
+      const run = Object.create(DurableRun.prototype);
+      run._native = native.DurableRun.withGovernanceBinding(
+        sessionId,
+        runId,
+        governanceBinding,
+        durability,
+      );
+      return run;
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  }
+
   get schemaVersion() { return this._native.schemaVersion; }
   get sessionId() { return this._native.sessionId; }
   get runId() { return this._native.runId; }
   get durability() { return this._native.durability; }
+  get policySnapshotHash() { return this._native.policySnapshotHash; }
+  get governanceBinding() { return this._native.governanceBinding; }
   get status() { return this._native.status; }
 
   _call(method, ...args) {
@@ -591,9 +625,43 @@ class DurableRun {
   requestApproval(logicalKey, prompt, payload, activityId) {
     return this._call("requestApproval", logicalKey, prompt, payload, activityId);
   }
+  requestTypedApproval(request) {
+    return this._call("requestTypedApproval", request);
+  }
+  expireApprovals(expirationId, nowUnixMs) {
+    return this._call("expireApprovals", expirationId, nowUnixMs);
+  }
+  requestConfirmation(logicalKey, prompt, details, activityId) {
+    return this._call("requestConfirmation", logicalKey, prompt, details, activityId);
+  }
+  requestInput(logicalKey, prompt, inputSchema, activityId) {
+    return this._call("requestInput", logicalKey, prompt, inputSchema, activityId);
+  }
+  requestOutputReview(logicalKey, prompt, output, activityId) {
+    return this._call("requestOutputReview", logicalKey, prompt, output, activityId);
+  }
+  requestEditRetry(logicalKey, prompt, output, error, activityId) {
+    return this._call("requestEditRetry", logicalKey, prompt, output, error, activityId);
+  }
+  resolveApproval(commandId, approvalId, approved, response) {
+    return this._call("resolveApproval", commandId, approvalId, approved, response);
+  }
+  resolveApprovalAt(commandId, approvalId, approved, nowUnixMs, response) {
+    return this._call(
+      "resolveApprovalAt",
+      commandId,
+      approvalId,
+      approved,
+      nowUnixMs,
+      response,
+    );
+  }
   complete(completionId) { return this._call("complete", completionId); }
   fail(failureId, error) { return this._call("fail", failureId, error); }
   applyCommand(command) { return this._call("applyCommand", command); }
+  applyCommandAt(command, nowUnixMs) {
+    return this._call("applyCommandAt", command, nowUnixMs);
+  }
 }
 
 module.exports = {
@@ -609,6 +677,76 @@ module.exports = {
   evaluateTrace: (suite, trace) => {
     try {
       return native.evaluateTrace(suite, trace);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  validateMediaInput: (media) => {
+    try {
+      return native.validateMediaInput(media);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  validateMediaArtifact: (artifact) => {
+    try {
+      return native.validateMediaArtifact(artifact);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  shippedModelCatalog: () => {
+    try {
+      return native.shippedModelCatalog();
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  validateModelProfile: (profile) => {
+    try {
+      return native.validateModelProfile(profile);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  modelCapabilityState: (profile, capability) => {
+    try {
+      return native.modelCapabilityState(profile, capability);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  resolveModelCatalog: (overrides) => {
+    try {
+      return native.resolveModelCatalog(overrides);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  normalizeOpaDecision: (response, metadata) => {
+    try {
+      return native.normalizeOpaDecision(response, metadata);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  normalizeCedarDecision: (response, metadata) => {
+    try {
+      return native.normalizeCedarDecision(response, metadata);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  sealPolicySnapshot: (policy) => {
+    try {
+      return native.sealPolicySnapshot(policy);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  sealGovernanceBinding: (policySnapshot, runId, tenantId, agentId) => {
+    try {
+      return native.sealGovernanceBinding(policySnapshot, runId, tenantId, agentId);
     } catch (error) {
       throw normalizeNativeError(error);
     }

@@ -203,6 +203,7 @@ async def structured_facts():
         "structured",
         schema,
         provider_options={"mock": {"temperature": 0, "tag": "parity"}},
+        compatibility_mode="warn",
     ):
         event_types.append(event["type"])
         if event["type"] == "delta":
@@ -253,6 +254,7 @@ async def run_options_facts():
                 "max_tokens": 64,
                 "max_turns": 2,
                 "provider_options": {"mock": {"tag": "parity"}},
+                "compatibility_mode": "warn",
                 "retry": {
                     "max_attempts_per_model": 2,
                     "base_delay_ms": 0,

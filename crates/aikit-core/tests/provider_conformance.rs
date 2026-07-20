@@ -141,6 +141,7 @@ impl ProviderCase {
             max_tokens: 17,
             options: serde_json::Map::new(),
             provider_options: ProviderOptions::new(),
+            compatibility_mode: aikit_core::CompatibilityMode::Strict,
         }
     }
 }

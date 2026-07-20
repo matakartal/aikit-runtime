@@ -85,6 +85,9 @@ pub struct GeneratedObject {
     /// protect it like model output before logging or persistence.
     #[serde(default)]
     pub provider_metadata: crate::types::ProviderMetadata,
+    /// Ordered adapter compatibility warnings observed across all attempts.
+    #[serde(default)]
+    pub warnings: Vec<crate::contract::ProviderWarning>,
 }
 
 impl GeneratedObject {
@@ -108,6 +111,7 @@ pub struct TypedGeneratedObject<T> {
     pub attempts: u32,
     /// Raw, potentially sensitive provider-native response metadata.
     pub provider_metadata: crate::types::ProviderMetadata,
+    pub warnings: Vec<crate::contract::ProviderWarning>,
 }
 
 /// One observable step of [`stream_object`]. Provider deltas are forwarded as they arrive; the
@@ -154,6 +158,7 @@ pub struct ObjectOptions {
     /// are applied after these options, so a caller cannot accidentally override the schema or
     /// weaken the reported fidelity grade.
     pub provider_options: crate::types::ProviderOptions,
+    pub compatibility_mode: crate::contract::CompatibilityMode,
     /// Optional application-level validator, run only after JSON Schema succeeds. The callback
     /// must be pure/idempotent and may accept, request a bounded repair, or reject immediately.
     pub semantic_validator: Option<Arc<dyn SemanticValidator>>,
@@ -167,6 +172,7 @@ impl fmt::Debug for ObjectOptions {
             .field("max_tokens", &self.max_tokens)
             .field("name", &self.name)
             .field("provider_options", &self.provider_options)
+            .field("compatibility_mode", &self.compatibility_mode)
             .field(
                 "semantic_validator",
                 &self.semantic_validator.as_ref().map(|_| "<registered>"),
@@ -182,6 +188,7 @@ impl Default for ObjectOptions {
             max_tokens: 1024,
             name: "respond".into(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
             semantic_validator: None,
         }
     }
@@ -439,6 +446,7 @@ where
         fidelity: generated.fidelity,
         attempts: generated.attempts,
         provider_metadata: generated.provider_metadata,
+        warnings: generated.warnings,
     })
 }
 
@@ -478,6 +486,7 @@ where
         fidelity: generated.fidelity,
         attempts: generated.attempts,
         provider_metadata: generated.provider_metadata,
+        warnings: generated.warnings,
     })
 }
 
@@ -682,6 +691,7 @@ pub fn stream_object_messages_observed(
         let base_messages = base_messages?;
         let mut last_error = String::new();
         let mut provider_metadata = crate::types::ProviderMetadata::new();
+        let mut warnings = Vec::new();
         for attempt_index in 0..total_attempts {
             let attempt = attempt_index + 1;
             if let Some(audit) = &audit {
@@ -722,12 +732,14 @@ pub fn stream_object_messages_observed(
                 max_tokens: options.max_tokens,
                 options: wire_options,
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: options.compatibility_mode,
             };
 
             let mut provider_stream = provider.stream(req).await?;
             let mut text = String::new();
             let mut names: HashMap<String, String> = HashMap::new();
             let mut tool_inputs: Vec<(String, Value)> = Vec::new();
+            let mut stream_error = None;
             while let Some(delta) = provider_stream.next().await {
                 match &delta {
                     StreamDelta::TextDelta { text: part } => text.push_str(part),
@@ -744,9 +756,27 @@ pub fn stream_object_messages_observed(
                             .or_default()
                             .push(metadata.clone());
                     }
+                    StreamDelta::Warning { warning } => warnings.push(warning.clone()),
+                    StreamDelta::Error { message, info } => {
+                        stream_error = Some(
+                            stream_delta_error(
+                                message.clone(),
+                                info.clone(),
+                                &provider_name,
+                                &model,
+                            )
+                            .with_provider_warnings(warnings.clone()),
+                        );
+                    }
                     _ => {}
                 }
                 yield ObjectStreamEvent::Delta { attempt, delta };
+                if stream_error.is_some() {
+                    break;
+                }
+            }
+            if let Some(error) = stream_error {
+                Err(error)?;
             }
 
             // Extract the candidate object per the plan's source only after that attempt's real
@@ -818,6 +848,7 @@ pub fn stream_object_messages_observed(
                         fidelity: grade,
                         attempts: attempt,
                         provider_metadata,
+                        warnings,
                     };
                     if let Some(audit) = &audit {
                         audit.emit(crate::observability::AuditEvent::StructuredOutputCompleted {
@@ -853,6 +884,68 @@ pub fn stream_object_messages_observed(
             "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
         )))?;
     })
+}
+
+fn stream_delta_error(
+    message: String,
+    info: crate::error::ErrorInfo,
+    fallback_provider: &str,
+    fallback_model: &str,
+) -> AikitError {
+    use crate::error::{ErrorCode, ProviderError, ProviderErrorKind};
+
+    let provider_kind = match info.code {
+        ErrorCode::ProviderAuth => Some(ProviderErrorKind::Authentication),
+        ErrorCode::ProviderRateLimit => Some(ProviderErrorKind::RateLimited),
+        ErrorCode::ProviderTimeout => Some(ProviderErrorKind::Timeout),
+        ErrorCode::ProviderTransport => Some(ProviderErrorKind::Transport),
+        ErrorCode::ProviderServer => Some(ProviderErrorKind::Server),
+        ErrorCode::ProviderInvalidRequest => Some(ProviderErrorKind::InvalidRequest),
+        ErrorCode::ProviderProtocol => Some(ProviderErrorKind::Protocol),
+        ErrorCode::ProviderSafety => Some(ProviderErrorKind::Safety),
+        ErrorCode::Unknown if info.provider.is_some() || info.model.is_some() => {
+            Some(ProviderErrorKind::Unknown)
+        }
+        _ => None,
+    };
+    if let Some(kind) = provider_kind {
+        return ProviderError {
+            provider: info
+                .provider
+                .unwrap_or_else(|| fallback_provider.to_string()),
+            model: info.model.unwrap_or_else(|| fallback_model.to_string()),
+            kind,
+            status: info.status,
+            retry_after_ms: info.retry_after_ms,
+            message,
+            warnings: info.warnings,
+        }
+        .into();
+    }
+
+    match info.code {
+        ErrorCode::PermissionDenied => AikitError::PermissionDenied(message),
+        ErrorCode::Sandbox => AikitError::Sandbox(message),
+        ErrorCode::Configuration => AikitError::Configuration(message),
+        ErrorCode::BudgetExceeded => AikitError::BudgetExceeded,
+        ErrorCode::ToolExecution => AikitError::ToolExecution(message),
+        ErrorCode::StructuredOutput => AikitError::StructuredOutput(message),
+        ErrorCode::Session => AikitError::Session(message),
+        ErrorCode::Conflict => AikitError::Conflict(message),
+        ErrorCode::Cancelled => AikitError::Cancelled(message),
+        ErrorCode::MaxTurns => AikitError::MaxTurns,
+        ErrorCode::Audit => AikitError::Audit(message),
+        ErrorCode::Hook => AikitError::Hook(message),
+        ErrorCode::Unknown => AikitError::Other(message),
+        ErrorCode::ProviderAuth
+        | ErrorCode::ProviderRateLimit
+        | ErrorCode::ProviderTimeout
+        | ErrorCode::ProviderTransport
+        | ErrorCode::ProviderServer
+        | ErrorCode::ProviderInvalidRequest
+        | ErrorCode::ProviderProtocol
+        | ErrorCode::ProviderSafety => unreachable!("provider errors returned above"),
+    }
 }
 
 /// Strip a ```json … ``` (or bare ``` … ```) fence some providers wrap JSON in.
@@ -925,6 +1018,56 @@ mod tests {
                 },
             ];
             Ok(Box::pin(futures::stream::iter(deltas)))
+        }
+    }
+
+    struct ErrorAfterValidJsonMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for ErrorAfterValidJsonMock {
+        fn name(&self) -> &str {
+            "error-after-valid-json"
+        }
+
+        async fn stream(
+            &self,
+            req: ProviderRequest,
+        ) -> AikitResult<BoxStream<'static, StreamDelta>> {
+            assert_eq!(
+                req.compatibility_mode,
+                crate::contract::CompatibilityMode::Warn
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut info = crate::error::ErrorInfo::new(crate::error::ErrorCode::ProviderRateLimit)
+                .with_provider("openai", "gpt-x");
+            info.status = Some(429);
+            info.retry_after_ms = Some(2_500);
+            info.retryable = true;
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart { model: "m".into() },
+                StreamDelta::Warning {
+                    warning: crate::contract::ProviderWarning {
+                        code: "unverified_provider_parameter".into(),
+                        message: "provider option `future_option` is unverified".into(),
+                        parameter: Some("future_option".into()),
+                        provider: Some("openai".into()),
+                        model: Some("gpt-x".into()),
+                    },
+                },
+                StreamDelta::TextDelta {
+                    text: r#"{"total":42,"currency":"USD"}"#.into(),
+                },
+                StreamDelta::Error {
+                    message: "rate limited during response stream".into(),
+                    info,
+                },
+                // The consumer must stop at Error rather than accepting a later terminal marker.
+                StreamDelta::MessageStop {
+                    stop_reason: "end_turn".into(),
+                },
+            ])))
         }
     }
 
@@ -1254,7 +1397,10 @@ mod tests {
             "deepseek-chat",
             "x",
             &invoice_schema(),
-            &ObjectOptions::default(),
+            &ObjectOptions {
+                compatibility_mode: crate::contract::CompatibilityMode::Warn,
+                ..ObjectOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -1357,6 +1503,69 @@ mod tests {
         let object = completed.expect("validated completion event");
         assert_eq!(object.value["currency"], "USD");
         assert_eq!(object.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_valid_json_fails_closed_with_typed_provider_info() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut stream = stream_object(
+            Arc::new(ErrorAfterValidJsonMock {
+                calls: calls.clone(),
+            }),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions {
+                compatibility_mode: crate::contract::CompatibilityMode::Warn,
+                ..ObjectOptions::default()
+            },
+        );
+        let mut saw_error_delta = false;
+        let mut terminal_error = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(ObjectStreamEvent::Delta {
+                    delta: StreamDelta::Error { .. },
+                    ..
+                }) => saw_error_delta = true,
+                Ok(ObjectStreamEvent::Completed { .. }) => {
+                    panic!("valid partial output must not complete after a provider stream error")
+                }
+                Err(error) => terminal_error = Some(error),
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_error_delta,
+            "the original provider error delta stays observable"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "provider errors are not validation retries"
+        );
+        let terminal_error =
+            terminal_error.expect("provider stream error must terminate the object stream");
+        let provider_error = terminal_error
+            .provider_error()
+            .expect("provider classification must survive structured-output handling");
+        assert_eq!(provider_error.provider, "openai");
+        assert_eq!(provider_error.model, "gpt-x");
+        assert_eq!(
+            provider_error.kind,
+            crate::error::ProviderErrorKind::RateLimited
+        );
+        assert_eq!(provider_error.status, Some(429));
+        assert_eq!(provider_error.retry_after_ms, Some(2_500));
+        assert!(provider_error.retryable());
+        assert_eq!(provider_error.warnings.len(), 1);
+        assert_eq!(
+            provider_error.warnings[0].parameter.as_deref(),
+            Some("future_option")
+        );
     }
 
     #[tokio::test]

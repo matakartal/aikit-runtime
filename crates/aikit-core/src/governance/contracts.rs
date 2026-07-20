@@ -531,6 +531,170 @@ impl PolicySnapshot {
     }
 }
 
+/// Immutable identity of the policy context governing one durable run.
+///
+/// The policy document hash alone is insufficient because tenant, agent, and run scoped rules can
+/// produce different decisions for the same document. The binding is sealed so persisted events
+/// and approvals cannot silently change any of those inputs during replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceBinding {
+    schema_version: u32,
+    policy_snapshot_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    run_id: String,
+    binding_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GovernanceBindingPayload<'a> {
+    schema_version: u32,
+    policy_snapshot_hash: &'a str,
+    tenant_id: &'a Option<String>,
+    agent_id: &'a Option<String>,
+    run_id: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernanceBindingWire {
+    schema_version: u32,
+    policy_snapshot_hash: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    run_id: String,
+    binding_hash: String,
+}
+
+impl<'de> Deserialize<'de> for GovernanceBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GovernanceBindingWire::deserialize(deserializer)?;
+        let binding = Self {
+            schema_version: wire.schema_version,
+            policy_snapshot_hash: wire.policy_snapshot_hash,
+            tenant_id: wire.tenant_id,
+            agent_id: wire.agent_id,
+            run_id: wire.run_id,
+            binding_hash: wire.binding_hash,
+        };
+        binding.validate().map_err(de::Error::custom)?;
+        Ok(binding)
+    }
+}
+
+impl GovernanceBinding {
+    pub fn seal(
+        policy_snapshot_hash: impl Into<String>,
+        tenant_id: Option<String>,
+        agent_id: Option<String>,
+        run_id: impl Into<String>,
+    ) -> Result<Self, GovernanceContractError> {
+        let mut binding = Self {
+            schema_version: GOVERNANCE_CONTRACT_VERSION,
+            policy_snapshot_hash: policy_snapshot_hash.into(),
+            tenant_id,
+            agent_id,
+            run_id: run_id.into(),
+            binding_hash: String::new(),
+        };
+        binding.validate_shape()?;
+        binding.binding_hash = binding.computed_hash()?;
+        Ok(binding)
+    }
+
+    pub fn policy_snapshot_hash(&self) -> &str {
+        &self.policy_snapshot_hash
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn binding_hash(&self) -> &str {
+        &self.binding_hash
+    }
+
+    pub fn validate(&self) -> Result<(), GovernanceContractError> {
+        self.validate_shape()?;
+        let actual = self.computed_hash()?;
+        if actual != self.binding_hash {
+            return Err(GovernanceContractError::IntegrityMismatch {
+                expected: self.binding_hash.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn for_run(&self, run_id: &str) -> Result<Self, GovernanceContractError> {
+        Self::seal(
+            self.policy_snapshot_hash.clone(),
+            self.tenant_id.clone(),
+            self.agent_id.clone(),
+            run_id,
+        )
+    }
+
+    fn validate_shape(&self) -> Result<(), GovernanceContractError> {
+        if self.schema_version != GOVERNANCE_CONTRACT_VERSION {
+            return Err(GovernanceContractError::Invalid(format!(
+                "unsupported governance binding schema version {}",
+                self.schema_version
+            )));
+        }
+        if !valid_digest(&self.policy_snapshot_hash) {
+            return Err(GovernanceContractError::Invalid(
+                "governance binding policy hash must be sha256:<64 hex>".into(),
+            ));
+        }
+        validate_binding_id("run_id", Some(self.run_id.as_str()))?;
+        validate_binding_id("tenant_id", self.tenant_id.as_deref())?;
+        validate_binding_id("agent_id", self.agent_id.as_deref())?;
+        Ok(())
+    }
+
+    fn computed_hash(&self) -> Result<String, GovernanceContractError> {
+        canonical_digest(&GovernanceBindingPayload {
+            schema_version: self.schema_version,
+            policy_snapshot_hash: &self.policy_snapshot_hash,
+            tenant_id: &self.tenant_id,
+            agent_id: &self.agent_id,
+            run_id: &self.run_id,
+        })
+    }
+}
+
+fn validate_binding_id(field: &str, value: Option<&str>) -> Result<(), GovernanceContractError> {
+    if value.is_some_and(|value| {
+        value.is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+    }) {
+        return Err(GovernanceContractError::Invalid(format!(
+            "governance binding {field} is invalid"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_policy(policy: &PolicyDocument) -> Result<(), GovernanceContractError> {
     if policy.schema_version != GOVERNANCE_CONTRACT_VERSION {
         return Err(GovernanceContractError::Invalid(format!(
@@ -1082,6 +1246,35 @@ mod tests {
         encoded["policy"]["rules"][0]["effect"] = json!("allow");
         let error = serde_json::from_value::<PolicySnapshot>(encoded).unwrap_err();
         assert!(error.to_string().contains("integrity mismatch"));
+    }
+
+    #[test]
+    fn governance_binding_hash_covers_policy_tenant_agent_and_run() {
+        let policy_hash = format!("sha256:{}", "a".repeat(64));
+        let binding = GovernanceBinding::seal(
+            policy_hash,
+            Some("tenant-a".into()),
+            Some("agent-a".into()),
+            "run-a",
+        )
+        .unwrap();
+        let replayed: GovernanceBinding =
+            serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
+        assert_eq!(replayed, binding);
+
+        for (field, value) in [
+            (
+                "policy_snapshot_hash",
+                json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+            ("tenant_id", json!("tenant-b")),
+            ("agent_id", json!("agent-b")),
+            ("run_id", json!("run-b")),
+        ] {
+            let mut tampered = serde_json::to_value(&binding).unwrap();
+            tampered[field] = value;
+            assert!(serde_json::from_value::<GovernanceBinding>(tampered).is_err());
+        }
     }
 
     #[test]

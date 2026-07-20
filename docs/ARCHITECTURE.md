@@ -82,6 +82,12 @@ OpenRouter, Groq, Mistral, and xAI are first-class isolated OpenAI-compatible ad
 caller-supplied base URL. They receive explicit credential, endpoint, model, stream, tool, error,
 usage, and metadata handling, but do not inherit native-provider fidelity claims automatically.
 
+Before network I/O, the selected adapter validates provider parameters against its shipped
+catalog. Strict mode fails on unknown parameters. Warn/best-effort modes preserve the original
+value and emit a typed compatibility warning; neither mode silently removes a field. Strict media
+uses the same fail-closed boundary: inline bytes are hash/size verified, while URL/artifact inputs
+must first be resolved to verified bytes by host-governed egress or artifact storage.
+
 ## Governance and tool execution
 
 The enforcement order is intentionally layered:
@@ -121,6 +127,13 @@ MCP tool execution still flows through normal aikit governance. A remote server 
 because it speaks MCP, and MCP transport limits are not a substitute for application-level tool
 permissions.
 
+The inbound MCP server persists Tasks, request receipts, schema identity, HTTP sessions, and SSE
+replay state behind store compare-and-swap. Duplicate request ids join or replay the same receipt.
+Retention and TTL bounds prevent protocol state from becoming an unbounded durable queue. A host
+cancellation must be confirmed before a task becomes cancelled; timeout or ambiguous teardown
+moves the task to a fail-closed reconciliation state. After schema drift is approved, arguments
+are validated against the new schema before dispatch.
+
 ## State and crash safety
 
 - Memory is explicit: model output is not remembered unless the host calls `remember`.
@@ -141,12 +154,24 @@ for operator reconciliation instead of being presented as exactly-once execution
 The Temporal adapter is a deterministic SDK-neutral mapping layer; a host still owns the actual
 Temporal worker, history transport, and deployment compatibility.
 
+Governed durable runs event-source a sealed binding over policy snapshot hash, tenant, agent, and
+run id. Approval evidence contains the same binding. Reattachment after restart and every tool
+authorization revalidate it, so changing context or replacing a snapshot cannot reuse an earlier
+approval.
+
 ## Containment and trust boundaries
 
 Built-in file tools use descriptor-relative jailed access on Linux/macOS and fail closed on
 unsupported platforms. Built-in Bash requires a probed containment backend: Seatbelt, Linux
 namespaces+seccomp, Windows Job Objects, or digest-pinned hardened Docker. These backends make
 different guarantees; consult the [threat model](THREAT-MODEL.md).
+
+The optional Firecracker lifecycle additionally pins kernel/rootfs/VMM/jailer hashes, validates
+trusted ownership and Linux prerequisites, configures the API in bounded steps, and supervises the
+child together with its jail staging. Cleanup waits for child exit before removing the jail; an
+irrecoverable reap failure leaks the staging directory instead of risking path reuse under a live
+VMM. It is not a Bash backend until guest command/workspace transport and Linux root+KVM tests
+exist.
 
 Rust executors, Python/Node callbacks, semantic validators, external MCP servers, and WebDriver
 browsers remain host/application trust boundaries. The explicit `EgressBroker` validates method,

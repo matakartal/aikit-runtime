@@ -530,13 +530,17 @@ impl Agent {
                             .unwrap_or_else(|| "run failed".into()),
                     )
                 },
-                |(message, info)| AgentError::Stream { message, info },
+                |(message, info)| AgentError::Stream {
+                    message,
+                    info: Box::new(info),
+                },
             ));
         }
         Ok(GeneratedText {
             text: outcome.final_text.clone().unwrap_or_default(),
             usage: outcome.usage,
             provider_metadata: outcome.provider_metadata,
+            warnings: outcome.warnings,
             stop_reason: outcome.stop_reason.clone(),
             messages: outcome.messages,
         })
@@ -862,7 +866,7 @@ pub enum AgentError {
     /// carried independently on the wire.
     Stream {
         message: String,
-        info: crate::error::ErrorInfo,
+        info: Box<crate::error::ErrorInfo>,
     },
 }
 
@@ -890,7 +894,7 @@ impl AgentError {
             AgentError::Run(_) => ErrorInfo::new(ErrorCode::Unknown),
             AgentError::Memory(_) => ErrorInfo::new(ErrorCode::Session),
             AgentError::Core(error) => error.info(),
-            AgentError::Stream { info, .. } => info.clone(),
+            AgentError::Stream { info, .. } => info.as_ref().clone(),
         }
     }
 }
@@ -939,6 +943,8 @@ pub struct GeneratedText {
     pub usage: Usage,
     #[serde(default)]
     pub provider_metadata: crate::types::ProviderMetadata,
+    #[serde(default)]
+    pub warnings: Vec<crate::contract::ProviderWarning>,
     pub stop_reason: Option<String>,
     pub messages: Vec<Message>,
 }

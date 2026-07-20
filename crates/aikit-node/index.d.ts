@@ -41,6 +41,8 @@ export interface ErrorInfo {
   status: number | null;
   retry_after_ms: number | null;
   retryable: boolean;
+  /** Preserved preflight warnings; omitted when no warning was observed. */
+  warnings?: ProviderWarning[];
 }
 
 /** Shape attached to synchronous Agent.run/Client.query startup failures. */
@@ -69,6 +71,7 @@ export type StreamDelta =
     }
   | { type: "citation"; text: string; source?: string; metadata?: JsonValue }
   | { type: "provider_metadata"; provider: string; metadata: JsonValue }
+  | { type: "warning"; warning: ProviderWarning }
   | ({ type: "usage" } & Usage)
   | { type: "message_stop"; stop_reason: string }
   | { type: "error"; message: string; info: ErrorInfo };
@@ -165,6 +168,7 @@ export type ContentBlock =
       media_type: string;
       source: { kind: "url"; url: string } | { kind: "base64"; data: string };
     }
+  | { type: "media_input"; media: MediaInput }
   | { type: "citation"; text: string; source?: string; metadata?: JsonValue };
 
 /** Canonical v0.3 name; ContentBlock remains the v0.x compatibility spelling. */
@@ -182,6 +186,9 @@ export interface MediaInput {
   sha256: string;
   size_bytes: number;
 }
+
+/** Canonical validation gate; rejects malformed MIME, size, hash, and unknown fields. */
+export function validateMediaInput(media: MediaInput): MediaInput;
 
 export type OutputPart =
   | { type: "text"; text: string }
@@ -215,6 +222,7 @@ export interface GeneratedText {
   stop_reason: string | null;
   messages: Message[];
   provider_metadata: Record<string, JsonValue[]>;
+  warnings: ProviderWarning[];
 }
 
 export interface GeneratedObject<T = JsonValue> {
@@ -222,6 +230,7 @@ export interface GeneratedObject<T = JsonValue> {
   fidelity: "native_constrained" | "forced_tool_call" | "prompted_and_parsed";
   attempts: number;
   provider_metadata: Record<string, JsonValue[]>;
+  warnings: ProviderWarning[];
 }
 
 export type SemanticValidationDecision =
@@ -266,6 +275,7 @@ export interface RunOptions {
   maxTokens?: number;
   maxTurns?: number;
   providerOptions?: Record<string, Record<string, JsonValue>>;
+  compatibilityMode?: CompatibilityMode;
   budget?: RunBudgetPolicy;
   retry?: RetryPolicy;
   /** Caller-owned catalog/request used to select the model immediately before provider startup. */
@@ -284,6 +294,7 @@ export interface GenerateObjectOptions {
   maxTokens?: number;
   name?: string;
   providerOptions?: Record<string, Record<string, JsonValue>>;
+  compatibilityMode?: CompatibilityMode;
   validator?: SemanticValidator;
 }
 
@@ -322,6 +333,141 @@ export interface ModelProfile {
   capability_states?: Record<string, CapabilityState>;
 }
 
+/** Validate a profile with the exact invariant set used by the canonical router. */
+export function validateModelProfile(profile: ModelProfile): ModelProfile;
+
+/** Resolve explicit tri-state data first; a missing fact remains `unknown`. */
+export function modelCapabilityState(
+  profile: ModelProfile,
+  capability: ModelCapability,
+): CapabilityState;
+
+export interface CatalogSource {
+  provider: string;
+  reference: string;
+  url: string;
+}
+
+export interface ModelCatalogSnapshot {
+  schema_version: number;
+  catalog_version: string;
+  verified_at: string;
+  sources: CatalogSource[];
+  profiles: ModelProfile[];
+}
+
+export interface ResolvedModelCatalog extends ModelCatalogSnapshot {
+  shipped_hash: string;
+  overrides_hash: string;
+  override_count: number;
+}
+
+/** Reviewed offline catalog compiled into this exact package; performs no network I/O. */
+export function shippedModelCatalog(): ModelCatalogSnapshot;
+
+/** Resolve caller-owned replacements in a separate layer; the shipped snapshot is immutable. */
+export function resolveModelCatalog(overrides?: readonly ModelProfile[]): ResolvedModelCatalog;
+
+export interface ExternalDecisionMetadata {
+  policy_rule_id: string;
+  input_summary: string;
+  risk_evidence?: string[];
+  evaluator_revision?: string | null;
+}
+
+export type PolicyScope =
+  | { scope: "global" }
+  | { scope: "tenant"; tenant_id: string }
+  | { scope: "agent"; agent_id: string }
+  | { scope: "run"; run_id: string }
+  | { scope: "tool"; tool: string };
+
+export interface ScopedPolicyRule {
+  id: string;
+  scope: PolicyScope;
+  effect: "allow" | "ask" | "deny";
+  reason?: string | null;
+}
+
+export interface PolicyDocument {
+  schema_version: number;
+  default_effect: "allow" | "ask" | "deny";
+  rules: ScopedPolicyRule[];
+}
+
+export interface PolicySnapshot {
+  policy: PolicyDocument;
+  hash: string;
+}
+
+/** Validate and integrity-seal a policy before pinning it to a durable run. */
+export function sealPolicySnapshot(policy: PolicyDocument): PolicySnapshot;
+
+export interface GovernanceBinding {
+  schema_version: number;
+  policy_snapshot_hash: string;
+  tenant_id?: string;
+  agent_id?: string;
+  run_id: string;
+  binding_hash: string;
+}
+
+/** Seal the complete tenant/agent/run scope used by a governed durable run. */
+export function sealGovernanceBinding(
+  policySnapshot: PolicySnapshot,
+  runId: string,
+  tenantId?: string,
+  agentId?: string,
+): GovernanceBinding;
+
+export interface AuditablePolicyDecision {
+  engine: "opa" | "cedar" | "native";
+  effect: "allow" | "ask" | "deny";
+  decision_id: string | null;
+  deciding_rule_id: string | null;
+  matched_rule_ids: string[];
+  input_summary: string;
+  risk_evidence: string[];
+  evaluator_revision: string | null;
+}
+
+export interface OpaDecisionResponse {
+  result:
+    | boolean
+    | {
+        effect: "allow" | "ask" | "deny";
+        rule_id?: string;
+        matched_rule_ids?: string[];
+        risk_evidence?: string[];
+        partial?: boolean;
+      };
+  decision_id?: string;
+  metrics?: JsonValue;
+  provenance?: JsonValue;
+  warning?: string;
+}
+
+export interface CedarDecisionResponse {
+  decision: "Allow" | "Deny";
+  decision_id?: string;
+  permit_policy_ids?: string[];
+  forbid_policy_ids?: string[];
+  diagnostics?: { reasons?: string[]; errors?: string[] };
+  evaluator_revision?: string;
+}
+
+/** Normalize a completed external decision; undefined/partial OPA responses fail closed. */
+export function normalizeOpaDecision(
+  response: OpaDecisionResponse,
+  metadata: ExternalDecisionMetadata,
+): AuditablePolicyDecision;
+
+/** Normalize Cedar evidence; matched forbids and evaluator diagnostics always deny. */
+export function normalizeCedarDecision(
+  response: CedarDecisionResponse,
+  metadata: ExternalDecisionMetadata,
+): AuditablePolicyDecision;
+
 export type ModalityRequirement =
   | "text"
   | "reasoning"
@@ -343,6 +489,9 @@ export interface MediaArtifact {
   provider?: string;
   model?: string;
 }
+
+/** Canonical immutable-artifact validation gate, including a non-empty artifact id. */
+export function validateMediaArtifact(artifact: MediaArtifact): MediaArtifact;
 
 export interface GeneratedImage {
   artifact: MediaArtifact;
@@ -523,6 +672,8 @@ export interface RunOutcome {
   invocation_start_message_index?: number;
   /** Omitted by the canonical serializer when no provider metadata was observed. */
   provider_metadata?: Record<string, JsonValue[]>;
+  /** Omitted by the canonical serializer when no compatibility warning was observed. */
+  warnings?: ProviderWarning[];
 }
 
 export type EvalTerminalStatus = Exclude<RunOutcome["terminal_status"], "running">;
@@ -577,9 +728,11 @@ export interface DurableRunState {
   run_id: string;
   durability: DurabilityMode;
   parent_run_id: string | null;
+  policy_snapshot_hash: string | null;
+  governance_binding?: GovernanceBinding;
   events: Array<Record<string, JsonValue>>;
   checkpoints: Record<string, JsonValue>;
-  projection: Record<string, JsonValue>;
+  projection: DurableRunProjection;
 }
 
 export interface DurableCheckpoint {
@@ -588,13 +741,63 @@ export interface DurableCheckpoint {
   event_sequence: number;
   parent_checkpoint_id: string | null;
   label: string | null;
-  projection: Record<string, JsonValue>;
+  projection: DurableRunProjection;
 }
 
 export interface ApprovalResolution {
   approval_id: string;
   approved: boolean;
   response?: JsonValue;
+}
+
+export type DurableApprovalKind =
+  | "confirmation"
+  | "missing_input"
+  | "output_review"
+  | "edit_retry";
+
+export type DurableApprovalStatus = "pending" | "approved" | "rejected";
+
+export interface DurableApprovalRequest {
+  logical_key: string;
+  activity_id?: string;
+  kind: DurableApprovalKind;
+  prompt: string;
+  payload: JsonValue;
+  policy_snapshot_hash?: string;
+  governance_binding?: GovernanceBinding;
+  requested_at_unix_ms: number;
+  expires_at_unix_ms: number;
+}
+
+export interface DurableApproval {
+  approval_id: string;
+  logical_key: string;
+  activity_id: string | null;
+  kind: DurableApprovalKind;
+  prompt: string;
+  payload: JsonValue;
+  policy_snapshot_hash?: string;
+  governance_binding?: GovernanceBinding;
+  requested_at_unix_ms?: number;
+  expires_at_unix_ms?: number;
+  status: DurableApprovalStatus;
+  response: JsonValue | null;
+  resolved_at_unix_ms?: number;
+  timed_out: boolean;
+  requested_sequence: number;
+  resolved_sequence: number | null;
+}
+
+export interface DurableRunProjection {
+  branch_id: string;
+  status: DurableRunStatus;
+  state: JsonValue;
+  activities: Record<string, JsonValue>;
+  approvals: Record<string, DurableApproval>;
+  artifacts: Record<string, JsonValue[]>;
+  current_checkpoint_id: string | null;
+  pause_reason: string | null;
 }
 
 export type DurableCommand =
@@ -624,10 +827,24 @@ export type DurableCommandResult =
 export class DurableRun {
   constructor(sessionId: string, runId: string, durability?: DurabilityMode);
   static fromState(state: DurableRunState): DurableRun;
+  static withPolicySnapshot(
+    sessionId: string,
+    runId: string,
+    policySnapshot: PolicySnapshot,
+    durability?: DurabilityMode,
+  ): DurableRun;
+  static withGovernanceBinding(
+    sessionId: string,
+    runId: string,
+    governanceBinding: GovernanceBinding,
+    durability?: DurabilityMode,
+  ): DurableRun;
   readonly schemaVersion: number;
   readonly sessionId: string;
   readonly runId: string;
   readonly durability: DurabilityMode;
+  readonly policySnapshotHash: string | null;
+  readonly governanceBinding: GovernanceBinding | null;
   readonly status: DurableRunStatus;
   snapshot(): DurableRunState;
   replaceState(mutationId: string, state: JsonValue): DurableRunState;
@@ -639,9 +856,50 @@ export class DurableRun {
     payload: JsonValue,
     activityId?: string,
   ): string;
+  requestTypedApproval(request: DurableApprovalRequest): string;
+  expireApprovals(expirationId: string, nowUnixMs: bigint): string[];
+  requestConfirmation(
+    logicalKey: string,
+    prompt: string,
+    details?: JsonValue,
+    activityId?: string,
+  ): string;
+  requestInput(
+    logicalKey: string,
+    prompt: string,
+    inputSchema?: JsonValue,
+    activityId?: string,
+  ): string;
+  requestOutputReview(
+    logicalKey: string,
+    prompt: string,
+    output: JsonValue,
+    activityId?: string,
+  ): string;
+  requestEditRetry(
+    logicalKey: string,
+    prompt: string,
+    output: JsonValue,
+    error?: string,
+    activityId?: string,
+  ): string;
+  resolveApproval(
+    commandId: string,
+    approvalId: string,
+    approved: boolean,
+    response?: JsonValue,
+  ): DurableCommandResult;
+  resolveApprovalAt(
+    commandId: string,
+    approvalId: string,
+    approved: boolean,
+    nowUnixMs: bigint,
+    response?: JsonValue,
+  ): DurableCommandResult;
   complete(completionId: string): void;
   fail(failureId: string, error: string): void;
   applyCommand(command: DurableCommand): DurableCommandResult;
+  applyCommandAt(command: DurableCommand, nowUnixMs: bigint): DurableCommandResult;
 }
 
 export type TraceAssertion =

@@ -1,0 +1,1 @@
+[{"type":"message_start","model":"mock-1"},{"type":"text_delta","text":"ok"},{"type":"message_stop","stop_reason":"end_turn"}]

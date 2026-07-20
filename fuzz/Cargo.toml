@@ -1,0 +1,37 @@
+[package]
+name = "aikit-runtime-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aikit-core = { package = "aikit-runtime-core", path = "../crates/aikit-core" }
+libfuzzer-sys = "0.4.13"
+serde_json = "1"
+
+[[bin]]
+name = "stream_lifecycle"
+path = "fuzz_targets/stream_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "durable_replay"
+path = "fuzz_targets/durable_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_cassette"
+path = "fuzz_targets/provider_cassette.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

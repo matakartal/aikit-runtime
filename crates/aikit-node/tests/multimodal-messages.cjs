@@ -25,6 +25,15 @@ const MESSAGES = [
         media_type: "image/jpeg",
         source: { kind: "base64", data: "aGVsbG8=" },
       },
+      {
+        type: "media_input",
+        media: {
+          media_type: "application/octet-stream",
+          source: { kind: "bytes", data: [97, 98, 99] },
+          sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          size_bytes: 3,
+        },
+      },
     ],
   },
 ];
@@ -182,7 +191,7 @@ async function main() {
   assert(failureContexts[0].tool === "explode", "failure tool matcher drifted");
 
   const result = {
-    media_sources: ["url", "base64"],
+    media_sources: ["url", "base64", "strict-bytes"],
     object_error: objectError.code,
     post_tool_failure: failureContexts[0].stage,
     routed_model: routed.model_attempts[0],

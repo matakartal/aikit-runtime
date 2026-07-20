@@ -51,7 +51,7 @@ pub enum DurableRunStatus {
 }
 
 impl DurableRunStatus {
-    fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
@@ -140,18 +140,96 @@ pub enum DurableApprovalStatus {
     Rejected,
 }
 
+/// Human-in-the-loop interaction semantics persisted with an approval request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableApprovalKind {
+    /// A binary confirmation. An optional response may contain operator metadata.
+    #[default]
+    Confirmation,
+    /// The run cannot continue until the caller supplies a non-null value.
+    MissingInput,
+    /// A produced value must be accepted, replaced, or rejected by a reviewer.
+    OutputReview,
+    /// The caller must explicitly choose an `edit` or `retry` action.
+    EditRetry,
+}
+
 /// A persisted human or policy approval request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DurableApproval {
     pub approval_id: String,
     pub logical_key: String,
     pub activity_id: Option<String>,
+    #[serde(default)]
+    pub kind: DurableApprovalKind,
     pub prompt: String,
     pub payload: Value,
+    /// Immutable policy identity that governed the request, when governance is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_snapshot_hash: Option<String>,
+    /// Complete immutable policy context for governed runs. Hash-only records remain readable for
+    /// legacy runs, but newly bound runs require this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_binding: Option<crate::governance::GovernanceBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
     pub status: DurableApprovalStatus,
     pub response: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub timed_out: bool,
     pub requested_sequence: u64,
     pub resolved_sequence: Option<u64>,
+}
+
+/// A typed, expiring approval request. Unlike the legacy approval helper, this request can be
+/// safely resumed after a process restart because its clock and policy binding are event-sourced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableApprovalRequest {
+    pub logical_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_id: Option<String>,
+    pub kind: DurableApprovalKind,
+    pub prompt: String,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_binding: Option<crate::governance::GovernanceBinding>,
+    pub requested_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+const DURABLE_APPROVAL_ENVELOPE_KEY: &str = "$aikit_durable_approval";
+const DURABLE_RESOLUTION_ENVELOPE_KEY: &str = "$aikit_durable_resolution";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableApprovalEnvelope {
+    schema_version: u32,
+    kind: DurableApprovalKind,
+    payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    governance_binding: Option<crate::governance::GovernanceBinding>,
+    requested_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableResolutionEnvelope {
+    schema_version: u32,
+    resolved_at_unix_ms: u64,
+    timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<Value>,
 }
 
 /// One response supplied while resuming a paused run.
@@ -227,6 +305,15 @@ pub enum RunEventKind {
         session_id: String,
         durability: DurabilityMode,
         root_branch_id: String,
+    },
+    /// Pins the immutable policy identity before the run performs any work.
+    PolicySnapshotPinned {
+        policy_snapshot_hash: String,
+    },
+    /// Pins the full scoped policy identity for a durable governed run. The older hash-only event
+    /// remains accepted so v0.2 snapshots can be replayed and migrated without rewriting history.
+    GovernanceBindingPinned {
+        binding: crate::governance::GovernanceBinding,
     },
     ForkedFrom {
         session_id: String,
@@ -434,6 +521,10 @@ pub enum DurabilityError {
     ApprovalNotFound { approval_id: String },
     #[error("approval `{approval_id}` has already been resolved")]
     ApprovalAlreadyResolved { approval_id: String },
+    #[error("approval `{approval_id}` requires an explicit trusted clock")]
+    ApprovalClockRequired { approval_id: String },
+    #[error("invalid resolution for approval `{approval_id}`: {reason}")]
+    InvalidApprovalResolution { approval_id: String, reason: String },
     #[error("run still has pending approvals")]
     PendingApprovals,
     #[error("checkpoint `{checkpoint_id}` was not found")]
@@ -466,6 +557,9 @@ pub struct RunState {
     run_id: String,
     durability: DurabilityMode,
     parent_run_id: Option<String>,
+    policy_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    governance_binding: Option<crate::governance::GovernanceBinding>,
     events: Vec<RunEvent>,
     checkpoints: BTreeMap<String, Checkpoint>,
     projection: RunProjection,
@@ -478,6 +572,10 @@ struct SerializedRunState {
     run_id: String,
     durability: DurabilityMode,
     parent_run_id: Option<String>,
+    #[serde(default)]
+    policy_snapshot_hash: Option<String>,
+    #[serde(default)]
+    governance_binding: Option<crate::governance::GovernanceBinding>,
     events: Vec<RunEvent>,
     checkpoints: BTreeMap<String, Checkpoint>,
     projection: RunProjection,
@@ -504,6 +602,8 @@ impl<'de> Deserialize<'de> for RunState {
             || replayed.run_id != serialized.run_id
             || replayed.durability != serialized.durability
             || replayed.parent_run_id != serialized.parent_run_id
+            || replayed.policy_snapshot_hash != serialized.policy_snapshot_hash
+            || replayed.governance_binding != serialized.governance_binding
             || replayed.events != serialized.events
             || replayed.checkpoints != serialized.checkpoints
             || replayed.projection != serialized.projection
@@ -536,6 +636,57 @@ impl RunState {
         let mut state = Self::blank(session_id, run_id.clone(), durability, projection);
         let event_id = stable_identifier("event", &[&run_id, "run_started"]);
         state.emit(event_id, kind)?;
+        Ok(state)
+    }
+
+    /// Start a run and pin the sealed governance policy before any mutable run state exists.
+    pub fn new_with_policy_snapshot(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        durability: DurabilityMode,
+        policy_snapshot: &crate::governance::PolicySnapshot,
+    ) -> DurabilityResult<Self> {
+        policy_snapshot
+            .validate()
+            .map_err(|error| DurabilityError::InvalidEvent {
+                reason: format!("invalid policy snapshot: {error}"),
+            })?;
+        let run_id = run_id.into();
+        let binding = crate::governance::GovernanceBinding::seal(
+            policy_snapshot.hash(),
+            None,
+            None,
+            run_id.clone(),
+        )
+        .map_err(|error| DurabilityError::InvalidEvent {
+            reason: format!("invalid governance binding: {error}"),
+        })?;
+        Self::new_with_governance_binding(session_id, run_id, durability, binding)
+    }
+
+    /// Start a governed run with the complete scoped identity pinned before any work is emitted.
+    pub fn new_with_governance_binding(
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        durability: DurabilityMode,
+        binding: crate::governance::GovernanceBinding,
+    ) -> DurabilityResult<Self> {
+        binding
+            .validate()
+            .map_err(|error| DurabilityError::InvalidEvent {
+                reason: format!("invalid governance binding: {error}"),
+            })?;
+        let run_id = run_id.into();
+        if binding.run_id() != run_id {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "governance binding run_id does not match durable run".into(),
+            });
+        }
+        let mut state = Self::new(session_id, run_id, durability)?;
+        state.emit(
+            stable_identifier("event", &[state.run_id(), "governance_binding_pinned"]),
+            RunEventKind::GovernanceBindingPinned { binding },
+        )?;
         Ok(state)
     }
 
@@ -591,6 +742,8 @@ impl RunState {
             run_id,
             durability,
             parent_run_id: None,
+            policy_snapshot_hash: None,
+            governance_binding: None,
             events: Vec::new(),
             checkpoints: BTreeMap::new(),
             projection,
@@ -615,6 +768,14 @@ impl RunState {
 
     pub fn parent_run_id(&self) -> Option<&str> {
         self.parent_run_id.as_deref()
+    }
+
+    pub fn policy_snapshot_hash(&self) -> Option<&str> {
+        self.policy_snapshot_hash.as_deref()
+    }
+
+    pub fn governance_binding(&self) -> Option<&crate::governance::GovernanceBinding> {
+        self.governance_binding.as_ref()
     }
 
     pub fn events(&self) -> &[RunEvent] {
@@ -1127,6 +1288,133 @@ impl RunState {
         Ok(approval_id)
     }
 
+    /// Persist a typed approval whose deadline and governing policy survive restart/replay.
+    pub fn request_typed_approval(
+        &mut self,
+        mut request: DurableApprovalRequest,
+    ) -> DurabilityResult<String> {
+        validate_identifier("logical_key", &request.logical_key)?;
+        if request.prompt.trim().is_empty() {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "approval prompt cannot be empty".into(),
+            });
+        }
+        if request.expires_at_unix_ms <= request.requested_at_unix_ms {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "approval expiry must be after its request time".into(),
+            });
+        }
+        if self.policy_snapshot_hash.is_some() && self.governance_binding.is_none() {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "legacy hash-only governed runs are read-only for new approvals".into(),
+            });
+        }
+        if request.governance_binding.is_none() {
+            request.governance_binding = self.governance_binding.clone();
+        }
+        match (&self.policy_snapshot_hash, &request.policy_snapshot_hash) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "governed approval is missing its policy snapshot hash".into(),
+                });
+            }
+            (expected, actual) => {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: format!(
+                        "approval policy snapshot does not match run: expected {expected:?}, got {actual:?}"
+                    ),
+                });
+            }
+        }
+        match (&self.governance_binding, &request.governance_binding) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "governed approval is missing its complete governance binding".into(),
+                });
+            }
+            _ => {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "approval governance binding does not match run".into(),
+                });
+            }
+        }
+        if let Some(binding) = request.governance_binding.as_ref() {
+            binding
+                .validate()
+                .map_err(|error| DurabilityError::InvalidEvent {
+                    reason: format!("invalid approval governance binding: {error}"),
+                })?;
+            if binding.run_id() != self.run_id
+                || request.policy_snapshot_hash.as_deref() != Some(binding.policy_snapshot_hash())
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "approval governance binding identity is inconsistent".into(),
+                });
+            }
+        }
+        if let Some(hash) = request.policy_snapshot_hash.as_deref() {
+            validate_policy_hash(hash)?;
+        }
+        let envelope = DurableApprovalEnvelope {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            kind: request.kind,
+            payload: request.payload,
+            policy_snapshot_hash: request.policy_snapshot_hash,
+            governance_binding: request.governance_binding,
+            requested_at_unix_ms: request.requested_at_unix_ms,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+        };
+        let payload = serde_json::json!({ DURABLE_APPROVAL_ENVELOPE_KEY: envelope });
+        self.request_approval(
+            &request.logical_key,
+            request.activity_id,
+            request.prompt,
+            payload,
+        )
+    }
+
+    /// Persist timeout denials without requiring every other pending approval to be resolved.
+    /// Repeating the same sweep is idempotent because already-resolved approvals are skipped.
+    pub fn expire_approvals(
+        &mut self,
+        expiration_id: &str,
+        now_unix_ms: u64,
+    ) -> DurabilityResult<Vec<String>> {
+        validate_identifier("expiration_id", expiration_id)?;
+        self.ensure_active()?;
+        let expired_ids = self
+            .projection
+            .approvals
+            .values()
+            .filter(|approval| {
+                approval.status == DurableApprovalStatus::Pending
+                    && approval
+                        .expires_at_unix_ms
+                        .is_some_and(|expires_at| now_unix_ms >= expires_at)
+            })
+            .map(|approval| approval.approval_id.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.clone();
+        for approval_id in &expired_ids {
+            candidate.resolve_approval(
+                expiration_id,
+                ApprovalResolution {
+                    approval_id: approval_id.clone(),
+                    approved: false,
+                    response: Some(serde_json::json!({"reason": "approval_timeout"})),
+                },
+                Some(now_unix_ms),
+                true,
+            )?;
+        }
+        *self = candidate;
+        Ok(expired_ids)
+    }
+
     /// Publish the next metadata version for an artifact.
     pub fn publish_artifact(
         &mut self,
@@ -1246,7 +1534,7 @@ impl RunState {
             RunCommand::Resume {
                 command_id,
                 approvals,
-            } => self.resume(&command_id, approvals),
+            } => self.resume(&command_id, approvals, None),
             RunCommand::Fork {
                 command_id,
                 new_run_id,
@@ -1267,10 +1555,27 @@ impl RunState {
         }
     }
 
+    /// Apply a command with a caller-supplied trusted wall-clock value. Typed approvals require
+    /// this path so an expired response cannot become valid merely because a worker restarted.
+    pub fn apply_command_at(
+        &mut self,
+        command: RunCommand,
+        now_unix_ms: u64,
+    ) -> DurabilityResult<CommandOutcome> {
+        match command {
+            RunCommand::Resume {
+                command_id,
+                approvals,
+            } => self.resume(&command_id, approvals, Some(now_unix_ms)),
+            command => self.apply_command(command),
+        }
+    }
+
     fn resume(
         &mut self,
         command_id: &str,
         approvals: Vec<ApprovalResolution>,
+        now_unix_ms: Option<u64>,
     ) -> DurabilityResult<CommandOutcome> {
         validate_identifier("command_id", command_id)?;
         let event_id = stable_identifier("event", &[&self.run_id, "resume", command_id]);
@@ -1290,8 +1595,52 @@ impl RunState {
         }
 
         let mut candidate = self.clone();
+        let typed_pending = candidate
+            .projection
+            .approvals
+            .values()
+            .find(|approval| {
+                approval.status == DurableApprovalStatus::Pending
+                    && approval.expires_at_unix_ms.is_some()
+            })
+            .map(|approval| approval.approval_id.clone());
+        if let (Some(approval_id), None) = (typed_pending, now_unix_ms) {
+            return Err(DurabilityError::ApprovalClockRequired { approval_id });
+        }
+
+        let mut expired = BTreeSet::new();
+        if let Some(now_unix_ms) = now_unix_ms {
+            let expired_ids = candidate
+                .projection
+                .approvals
+                .values()
+                .filter(|approval| {
+                    approval.status == DurableApprovalStatus::Pending
+                        && approval
+                            .expires_at_unix_ms
+                            .is_some_and(|expires_at| now_unix_ms >= expires_at)
+                })
+                .map(|approval| approval.approval_id.clone())
+                .collect::<Vec<_>>();
+            for approval_id in expired_ids {
+                expired.insert(approval_id.clone());
+                candidate.resolve_approval(
+                    command_id,
+                    ApprovalResolution {
+                        approval_id,
+                        approved: false,
+                        response: Some(serde_json::json!({"reason": "approval_timeout"})),
+                    },
+                    Some(now_unix_ms),
+                    true,
+                )?;
+            }
+        }
         for resolution in approvals {
-            candidate.resolve_approval(command_id, resolution)?;
+            if expired.contains(&resolution.approval_id) {
+                continue;
+            }
+            candidate.resolve_approval(command_id, resolution, now_unix_ms, false)?;
         }
         if !candidate.projection.pending_approval_ids().is_empty() {
             return Err(DurabilityError::PendingApprovals);
@@ -1306,6 +1655,8 @@ impl RunState {
         &mut self,
         command_id: &str,
         resolution: ApprovalResolution,
+        now_unix_ms: Option<u64>,
+        timed_out: bool,
     ) -> DurabilityResult<()> {
         let approval = self
             .projection
@@ -1319,14 +1670,28 @@ impl RunState {
                 approval_id: resolution.approval_id,
             });
         }
+        validate_approval_resolution(approval, &resolution, now_unix_ms, timed_out)?;
         let event_id =
             stable_identifier("event", &[&resolution.approval_id, "resolved", command_id]);
+        let response = match now_unix_ms {
+            Some(resolved_at_unix_ms) if approval.expires_at_unix_ms.is_some() => {
+                Some(serde_json::json!({
+                    DURABLE_RESOLUTION_ENVELOPE_KEY: DurableResolutionEnvelope {
+                        schema_version: DURABILITY_SCHEMA_VERSION,
+                        resolved_at_unix_ms,
+                        timed_out,
+                        response: resolution.response,
+                    }
+                }))
+            }
+            _ => resolution.response,
+        };
         self.emit(
             event_id,
             RunEventKind::ApprovalResolved {
                 approval_id: resolution.approval_id,
                 approved: resolution.approved,
-                response: resolution.response,
+                response,
             },
         )?;
         Ok(())
@@ -1408,6 +1773,25 @@ impl RunState {
             stable_identifier("event", &[new_run_id, "forked_from", command_id]),
             kind,
         )?;
+        if let Some(binding) = &self.governance_binding {
+            let binding =
+                binding
+                    .for_run(new_run_id)
+                    .map_err(|error| DurabilityError::InvalidEvent {
+                        reason: format!("cannot bind fork governance identity: {error}"),
+                    })?;
+            forked.emit(
+                stable_identifier("event", &[new_run_id, "governance_binding_pinned"]),
+                RunEventKind::GovernanceBindingPinned { binding },
+            )?;
+        } else if let Some(policy_snapshot_hash) = &self.policy_snapshot_hash {
+            forked.emit(
+                stable_identifier("event", &[new_run_id, "policy_snapshot_pinned"]),
+                RunEventKind::PolicySnapshotPinned {
+                    policy_snapshot_hash: policy_snapshot_hash.clone(),
+                },
+            )?;
+        }
         Ok(forked)
     }
 
@@ -1580,6 +1964,44 @@ impl RunState {
         }
 
         match &event.kind {
+            RunEventKind::PolicySnapshotPinned {
+                policy_snapshot_hash,
+            } => {
+                if self.events.len() != 1
+                    || self.policy_snapshot_hash.is_some()
+                    || self.governance_binding.is_some()
+                {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "policy snapshot must be pinned exactly once before run work"
+                            .into(),
+                    });
+                }
+                validate_policy_hash(policy_snapshot_hash)?;
+                self.policy_snapshot_hash = Some(policy_snapshot_hash.clone());
+            }
+            RunEventKind::GovernanceBindingPinned { binding } => {
+                if self.events.len() != 1
+                    || self.policy_snapshot_hash.is_some()
+                    || self.governance_binding.is_some()
+                {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "governance binding must be pinned exactly once before run work"
+                            .into(),
+                    });
+                }
+                binding
+                    .validate()
+                    .map_err(|error| DurabilityError::InvalidEvent {
+                        reason: format!("invalid governance binding: {error}"),
+                    })?;
+                if binding.run_id() != self.run_id {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "governance binding run_id does not match event run".into(),
+                    });
+                }
+                self.policy_snapshot_hash = Some(binding.policy_snapshot_hash().to_owned());
+                self.governance_binding = Some(binding.clone());
+            }
             RunEventKind::StateReplaced { state } => {
                 self.ensure_executing()?;
                 self.projection.state = state.clone();
@@ -1786,16 +2208,56 @@ impl RunState {
                         reason: format!("approval `{approval_id}` was requested twice"),
                     });
                 }
+                let decoded = decode_approval_payload(payload)?;
+                if let Some(policy_hash) = decoded.policy_snapshot_hash.as_deref() {
+                    validate_policy_hash(policy_hash)?;
+                }
+                if decoded.policy_snapshot_hash != self.policy_snapshot_hash {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: format!(
+                            "approval policy snapshot does not match pinned run policy: expected {:?}, got {:?}",
+                            self.policy_snapshot_hash, decoded.policy_snapshot_hash
+                        ),
+                    });
+                }
+                if decoded.governance_binding != self.governance_binding {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "approval governance binding does not match pinned run binding"
+                            .into(),
+                    });
+                }
+                if let Some(binding) = decoded.governance_binding.as_ref() {
+                    binding
+                        .validate()
+                        .map_err(|error| DurabilityError::InvalidEvent {
+                            reason: format!("invalid approval governance binding: {error}"),
+                        })?;
+                    if binding.run_id() != self.run_id
+                        || decoded.policy_snapshot_hash.as_deref()
+                            != Some(binding.policy_snapshot_hash())
+                    {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason: "approval governance binding identity is inconsistent".into(),
+                        });
+                    }
+                }
                 self.projection.approvals.insert(
                     approval_id.clone(),
                     DurableApproval {
                         approval_id: approval_id.clone(),
                         logical_key: logical_key.clone(),
                         activity_id: activity_id.clone(),
+                        kind: decoded.kind,
                         prompt: prompt.clone(),
-                        payload: payload.clone(),
+                        payload: decoded.payload,
+                        policy_snapshot_hash: decoded.policy_snapshot_hash,
+                        governance_binding: decoded.governance_binding,
+                        requested_at_unix_ms: decoded.requested_at_unix_ms,
+                        expires_at_unix_ms: decoded.expires_at_unix_ms,
                         status: DurableApprovalStatus::Pending,
                         response: None,
+                        resolved_at_unix_ms: None,
+                        timed_out: false,
                         requested_sequence: event.sequence,
                         resolved_sequence: None,
                     },
@@ -1820,12 +2282,15 @@ impl RunState {
                         approval_id: approval_id.clone(),
                     });
                 }
+                let decoded = decode_resolution_payload(approval, *approved, response)?;
                 approval.status = if *approved {
                     DurableApprovalStatus::Approved
                 } else {
                     DurableApprovalStatus::Rejected
                 };
-                approval.response = response.clone();
+                approval.response = decoded.response;
+                approval.resolved_at_unix_ms = decoded.resolved_at_unix_ms;
+                approval.timed_out = decoded.timed_out;
                 approval.resolved_sequence = Some(event.sequence);
             }
             RunEventKind::ArtifactPublished { metadata } => {
@@ -2025,6 +2490,193 @@ fn invalid_activity(activity_id: &str, reason: String) -> DurabilityError {
     }
 }
 
+struct DecodedApprovalPayload {
+    kind: DurableApprovalKind,
+    payload: Value,
+    policy_snapshot_hash: Option<String>,
+    governance_binding: Option<crate::governance::GovernanceBinding>,
+    requested_at_unix_ms: Option<u64>,
+    expires_at_unix_ms: Option<u64>,
+}
+
+fn decode_approval_payload(payload: &Value) -> DurabilityResult<DecodedApprovalPayload> {
+    let Some(envelope) = payload
+        .as_object()
+        .and_then(|object| object.get(DURABLE_APPROVAL_ENVELOPE_KEY))
+    else {
+        return Ok(DecodedApprovalPayload {
+            kind: DurableApprovalKind::Confirmation,
+            payload: payload.clone(),
+            policy_snapshot_hash: None,
+            governance_binding: None,
+            requested_at_unix_ms: None,
+            expires_at_unix_ms: None,
+        });
+    };
+    let envelope: DurableApprovalEnvelope =
+        serde_json::from_value(envelope.clone()).map_err(|error| {
+            DurabilityError::InvalidEvent {
+                reason: format!("invalid durable approval envelope: {error}"),
+            }
+        })?;
+    if envelope.schema_version != DURABILITY_SCHEMA_VERSION {
+        return Err(DurabilityError::UnsupportedSchema {
+            expected: DURABILITY_SCHEMA_VERSION,
+            actual: envelope.schema_version,
+        });
+    }
+    if envelope.expires_at_unix_ms <= envelope.requested_at_unix_ms {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "approval expiry must be after its request time".into(),
+        });
+    }
+    Ok(DecodedApprovalPayload {
+        kind: envelope.kind,
+        payload: envelope.payload,
+        policy_snapshot_hash: envelope.policy_snapshot_hash,
+        governance_binding: envelope.governance_binding,
+        requested_at_unix_ms: Some(envelope.requested_at_unix_ms),
+        expires_at_unix_ms: Some(envelope.expires_at_unix_ms),
+    })
+}
+
+struct DecodedResolutionPayload {
+    response: Option<Value>,
+    resolved_at_unix_ms: Option<u64>,
+    timed_out: bool,
+}
+
+fn decode_resolution_payload(
+    approval: &DurableApproval,
+    approved: bool,
+    response: &Option<Value>,
+) -> DurabilityResult<DecodedResolutionPayload> {
+    if approval.expires_at_unix_ms.is_none() {
+        return Ok(DecodedResolutionPayload {
+            response: response.clone(),
+            resolved_at_unix_ms: None,
+            timed_out: false,
+        });
+    }
+    let envelope = response
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(DURABLE_RESOLUTION_ENVELOPE_KEY))
+        .ok_or_else(|| DurabilityError::InvalidApprovalResolution {
+            approval_id: approval.approval_id.clone(),
+            reason: "typed approval resolution is missing its trusted clock envelope".into(),
+        })?;
+    let envelope: DurableResolutionEnvelope =
+        serde_json::from_value(envelope.clone()).map_err(|error| {
+            DurabilityError::InvalidApprovalResolution {
+                approval_id: approval.approval_id.clone(),
+                reason: format!("invalid resolution envelope: {error}"),
+            }
+        })?;
+    if envelope.schema_version != DURABILITY_SCHEMA_VERSION {
+        return Err(DurabilityError::UnsupportedSchema {
+            expected: DURABILITY_SCHEMA_VERSION,
+            actual: envelope.schema_version,
+        });
+    }
+    let resolution = ApprovalResolution {
+        approval_id: approval.approval_id.clone(),
+        approved,
+        response: envelope.response.clone(),
+    };
+    validate_approval_resolution(
+        approval,
+        &resolution,
+        Some(envelope.resolved_at_unix_ms),
+        envelope.timed_out,
+    )?;
+    Ok(DecodedResolutionPayload {
+        response: envelope.response,
+        resolved_at_unix_ms: Some(envelope.resolved_at_unix_ms),
+        timed_out: envelope.timed_out,
+    })
+}
+
+fn validate_approval_resolution(
+    approval: &DurableApproval,
+    resolution: &ApprovalResolution,
+    now_unix_ms: Option<u64>,
+    timed_out: bool,
+) -> DurabilityResult<()> {
+    let invalid = |reason: &str| DurabilityError::InvalidApprovalResolution {
+        approval_id: approval.approval_id.clone(),
+        reason: reason.into(),
+    };
+    if let (Some(requested_at), Some(expires_at)) =
+        (approval.requested_at_unix_ms, approval.expires_at_unix_ms)
+    {
+        let now = now_unix_ms.ok_or_else(|| DurabilityError::ApprovalClockRequired {
+            approval_id: approval.approval_id.clone(),
+        })?;
+        if now < requested_at {
+            return Err(invalid("resolution predates the approval request"));
+        }
+        if timed_out {
+            if resolution.approved || now < expires_at {
+                return Err(invalid(
+                    "timeout denial is before expiry or marked approved",
+                ));
+            }
+        } else if now >= expires_at {
+            return Err(invalid("approval has timed out"));
+        }
+    } else if timed_out {
+        return Err(invalid("legacy approval cannot carry a timeout resolution"));
+    }
+    if resolution.approved {
+        match approval.kind {
+            DurableApprovalKind::MissingInput
+                if resolution.response.as_ref().is_none_or(Value::is_null) =>
+            {
+                return Err(invalid("missing_input requires a non-null response"));
+            }
+            DurableApprovalKind::EditRetry => {
+                let Some(action) = resolution
+                    .response
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|response| response.get("action"))
+                    .and_then(Value::as_str)
+                else {
+                    return Err(invalid("edit_retry requires an edit or retry action"));
+                };
+                if !matches!(action, "edit" | "retry") {
+                    return Err(invalid("edit_retry action must be edit or retry"));
+                }
+                if action == "edit"
+                    && resolution
+                        .response
+                        .as_ref()
+                        .and_then(Value::as_object)
+                        .is_none_or(|response| !response.contains_key("value"))
+                {
+                    return Err(invalid("edit action requires a value"));
+                }
+            }
+            DurableApprovalKind::Confirmation
+            | DurableApprovalKind::OutputReview
+            | DurableApprovalKind::MissingInput => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_hash(hash: &str) -> DurabilityResult<()> {
+    let digest = hash
+        .strip_prefix("sha256:")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "policy snapshot hash must be a sha256 digest".into(),
+        })?;
+    debug_assert_eq!(digest.len(), 64);
+    Ok(())
+}
+
 fn retry_is_safe(definition: &ActivityDefinition, effect_ambiguous: bool) -> bool {
     !effect_ambiguous
         || definition.side_effect_class == SideEffectClass::Pure
@@ -2196,7 +2848,17 @@ fn hex_sha256(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::{PolicyDocument, PolicyEffect, PolicySnapshot};
     use serde_json::json;
+
+    fn policy_snapshot(effect: PolicyEffect) -> PolicySnapshot {
+        PolicySnapshot::seal(PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: effect,
+            rules: Vec::new(),
+        })
+        .unwrap()
+    }
 
     fn execute(decision: ActivityDecision) -> (String, u32) {
         match decision {
@@ -2790,5 +3452,313 @@ mod tests {
         assert!(error
             .to_string()
             .contains("projection does not match its event log"));
+    }
+
+    #[test]
+    fn policy_snapshot_is_pinned_before_work_and_survives_replay_and_fork() {
+        let snapshot = policy_snapshot(PolicyEffect::Allow);
+        let mut run = RunState::new_with_policy_snapshot(
+            "session",
+            "governed",
+            DurabilityMode::Sync,
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(run.policy_snapshot_hash(), Some(snapshot.hash()));
+        assert!(matches!(
+            run.events()[1].kind,
+            RunEventKind::GovernanceBindingPinned { .. }
+        ));
+        assert_eq!(run.governance_binding().unwrap().run_id(), "governed");
+
+        let replayed = RunState::from_events(run.events().to_vec()).unwrap();
+        assert_eq!(replayed, run);
+
+        let before_drift = run.clone();
+        let drift = RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: run.run_id().into(),
+            sequence: run.next_sequence(),
+            event_id: "policy-drift".into(),
+            kind: RunEventKind::PolicySnapshotPinned {
+                policy_snapshot_hash: policy_snapshot(PolicyEffect::Deny).hash().into(),
+            },
+        };
+        assert!(matches!(
+            run.append_event(drift),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(run, before_drift);
+
+        let mut legacy = RunState::new("session", "legacy-governed", DurabilityMode::Sync).unwrap();
+        legacy
+            .append_event(RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: legacy.run_id().into(),
+                sequence: legacy.next_sequence(),
+                event_id: "legacy-policy-pin".into(),
+                kind: RunEventKind::PolicySnapshotPinned {
+                    policy_snapshot_hash: snapshot.hash().into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(legacy.policy_snapshot_hash(), Some(snapshot.hash()));
+        assert!(legacy.governance_binding().is_none());
+        assert_eq!(
+            RunState::from_events(legacy.events().to_vec()).unwrap(),
+            legacy
+        );
+
+        let checkpoint = run.checkpoint("fork-point", None).unwrap();
+        let CommandOutcome::Forked { run: forked } = run
+            .apply_command(RunCommand::Fork {
+                command_id: "fork-1".into(),
+                new_run_id: "governed-fork".into(),
+                checkpoint_id: checkpoint.checkpoint_id,
+                side_effects_reconciled: true,
+            })
+            .unwrap()
+        else {
+            panic!("expected fork");
+        };
+        assert_eq!(forked.policy_snapshot_hash(), Some(snapshot.hash()));
+        assert_eq!(
+            forked.governance_binding().unwrap().run_id(),
+            "governed-fork"
+        );
+        assert_eq!(
+            RunState::from_events(forked.events().to_vec()).unwrap(),
+            *forked
+        );
+    }
+
+    #[test]
+    fn complete_governance_binding_is_event_sourced_and_required_by_approvals() {
+        let snapshot = policy_snapshot(PolicyEffect::Ask);
+        let binding = crate::governance::GovernanceBinding::seal(
+            snapshot.hash(),
+            Some("tenant-a".into()),
+            Some("agent-a".into()),
+            "bound-run",
+        )
+        .unwrap();
+        let mut run = RunState::new_with_governance_binding(
+            "session",
+            "bound-run",
+            DurabilityMode::Sync,
+            binding.clone(),
+        )
+        .unwrap();
+        assert_eq!(run.governance_binding(), Some(&binding));
+        assert!(matches!(
+            run.events()[1].kind,
+            RunEventKind::GovernanceBindingPinned { .. }
+        ));
+        assert_eq!(RunState::from_events(run.events().to_vec()).unwrap(), run);
+
+        let mismatched = crate::governance::GovernanceBinding::seal(
+            snapshot.hash(),
+            Some("tenant-b".into()),
+            Some("agent-a".into()),
+            "bound-run",
+        )
+        .unwrap();
+        let wrong = DurableApprovalRequest {
+            logical_key: "publish".into(),
+            activity_id: None,
+            kind: DurableApprovalKind::Confirmation,
+            prompt: "Publish?".into(),
+            payload: json!({"artifact": "report"}),
+            policy_snapshot_hash: Some(snapshot.hash().into()),
+            governance_binding: Some(mismatched),
+            requested_at_unix_ms: 10,
+            expires_at_unix_ms: 20,
+        };
+        assert!(matches!(
+            run.request_typed_approval(wrong),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        run.request_typed_approval(DurableApprovalRequest {
+            logical_key: "publish".into(),
+            activity_id: None,
+            kind: DurableApprovalKind::Confirmation,
+            prompt: "Publish?".into(),
+            payload: json!({"artifact": "report"}),
+            policy_snapshot_hash: Some(snapshot.hash().into()),
+            governance_binding: None,
+            requested_at_unix_ms: 10,
+            expires_at_unix_ms: 20,
+        })
+        .unwrap();
+        assert_eq!(
+            run.projection()
+                .approvals
+                .values()
+                .next()
+                .unwrap()
+                .governance_binding
+                .as_ref(),
+            Some(&binding)
+        );
+
+        let mut encoded = serde_json::to_value(&run).unwrap();
+        encoded["governance_binding"]["tenant_id"] = json!("tenant-b");
+        assert!(serde_json::from_value::<RunState>(encoded).is_err());
+    }
+
+    #[test]
+    fn typed_hitl_semantics_and_clock_are_fail_closed() {
+        let mut missing = RunState::new("session", "missing", DurabilityMode::Sync).unwrap();
+        let approval_id = missing
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "customer-id".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::MissingInput,
+                prompt: "Customer id?".into(),
+                payload: json!({"field": "customer_id"}),
+                policy_snapshot_hash: None,
+                governance_binding: None,
+                requested_at_unix_ms: 100,
+                expires_at_unix_ms: 200,
+            })
+            .unwrap();
+        let resume = |response| RunCommand::Resume {
+            command_id: "resume-missing".into(),
+            approvals: vec![ApprovalResolution {
+                approval_id: approval_id.clone(),
+                approved: true,
+                response,
+            }],
+        };
+        assert_eq!(
+            missing
+                .apply_command(resume(Some(json!("cust-1"))))
+                .unwrap_err(),
+            DurabilityError::ApprovalClockRequired {
+                approval_id: approval_id.clone()
+            }
+        );
+        assert!(matches!(
+            missing.apply_command_at(resume(None), 150),
+            Err(DurabilityError::InvalidApprovalResolution { .. })
+        ));
+        missing
+            .apply_command_at(resume(Some(json!("cust-1"))), 150)
+            .unwrap();
+        assert_eq!(
+            missing.projection().approvals[&approval_id].status,
+            DurableApprovalStatus::Approved
+        );
+
+        let mut edit = RunState::new("session", "edit", DurabilityMode::Sync).unwrap();
+        let edit_id = edit
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "review-edit".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::EditRetry,
+                prompt: "Edit or retry?".into(),
+                payload: json!({"draft": "old"}),
+                policy_snapshot_hash: None,
+                governance_binding: None,
+                requested_at_unix_ms: 100,
+                expires_at_unix_ms: 200,
+            })
+            .unwrap();
+        assert!(matches!(
+            edit.apply_command_at(
+                RunCommand::Resume {
+                    command_id: "invalid-edit".into(),
+                    approvals: vec![ApprovalResolution {
+                        approval_id: edit_id,
+                        approved: true,
+                        response: Some(json!({"action": "edit"})),
+                    }],
+                },
+                150,
+            ),
+            Err(DurabilityError::InvalidApprovalResolution { .. })
+        ));
+    }
+
+    #[test]
+    fn expired_approval_is_durably_denied_after_restart() {
+        let snapshot = policy_snapshot(PolicyEffect::Ask);
+        let mut run = RunState::new_with_policy_snapshot(
+            "session",
+            "timeout",
+            DurabilityMode::Sync,
+            &snapshot,
+        )
+        .unwrap();
+        let approval_id = run
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "deploy".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::Confirmation,
+                prompt: "Deploy?".into(),
+                payload: json!({"env": "production"}),
+                policy_snapshot_hash: Some(snapshot.hash().into()),
+                governance_binding: None,
+                requested_at_unix_ms: 100,
+                expires_at_unix_ms: 110,
+            })
+            .unwrap();
+        let mut restarted = RunState::from_events(run.events().to_vec()).unwrap();
+        restarted
+            .apply_command_at(
+                RunCommand::Resume {
+                    command_id: "late-resume".into(),
+                    approvals: vec![ApprovalResolution {
+                        approval_id: approval_id.clone(),
+                        approved: true,
+                        response: None,
+                    }],
+                },
+                110,
+            )
+            .unwrap();
+        let approval = &restarted.projection().approvals[&approval_id];
+        assert_eq!(approval.status, DurableApprovalStatus::Rejected);
+        assert!(approval.timed_out);
+        assert_eq!(approval.resolved_at_unix_ms, Some(110));
+        assert_eq!(restarted.status(), DurableRunStatus::Running);
+        assert_eq!(
+            RunState::from_events(restarted.events().to_vec()).unwrap(),
+            restarted
+        );
+    }
+
+    #[test]
+    fn timeout_sweep_persists_even_when_another_approval_is_still_pending() {
+        let mut run = RunState::new("session", "sweep", DurabilityMode::Sync).unwrap();
+        let request = |logical_key: &str, expires_at_unix_ms| DurableApprovalRequest {
+            logical_key: logical_key.into(),
+            activity_id: None,
+            kind: DurableApprovalKind::OutputReview,
+            prompt: "Review?".into(),
+            payload: json!({"key": logical_key}),
+            policy_snapshot_hash: None,
+            governance_binding: None,
+            requested_at_unix_ms: 100,
+            expires_at_unix_ms,
+        };
+        let expired_id = run.request_typed_approval(request("expired", 110)).unwrap();
+        let pending_id = run.request_typed_approval(request("pending", 200)).unwrap();
+
+        assert_eq!(
+            run.expire_approvals("sweep-1", 110).unwrap(),
+            vec![expired_id.clone()]
+        );
+        assert_eq!(
+            run.projection().approvals[&expired_id].status,
+            DurableApprovalStatus::Rejected
+        );
+        assert_eq!(
+            run.projection().approvals[&pending_id].status,
+            DurableApprovalStatus::Pending
+        );
+        assert_eq!(run.status(), DurableRunStatus::Paused);
+        assert!(run.expire_approvals("sweep-1", 110).unwrap().is_empty());
+        assert_eq!(RunState::from_events(run.events().to_vec()).unwrap(), run);
     }
 }

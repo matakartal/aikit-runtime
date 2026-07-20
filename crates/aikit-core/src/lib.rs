@@ -77,8 +77,9 @@ pub use durability::{
     stable_id, stable_input_hash, ActivityAttempt, ActivityAttemptStatus, ActivityDecision,
     ActivityDefinition, ActivityReconciliation, ActivityRecord, AppendOutcome, ApprovalResolution,
     ArtifactMetadata, Checkpoint, CommandOutcome, DurabilityError, DurabilityMode,
-    DurabilityResult, DurableApproval, DurableApprovalStatus, DurableRunStatus, RunCommand,
-    RunEvent, RunEventKind, RunProjection, RunState, SideEffectClass, DURABILITY_SCHEMA_VERSION,
+    DurabilityResult, DurableApproval, DurableApprovalKind, DurableApprovalRequest,
+    DurableApprovalStatus, DurableRunStatus, RunCommand, RunEvent, RunEventKind, RunProjection,
+    RunState, SideEffectClass, DURABILITY_SCHEMA_VERSION,
 };
 pub use durable_store::{
     DurableStore, DurableStoreError, DurableStoreResult, InMemoryDurableStore,
@@ -100,18 +101,20 @@ pub use governance::capability::{
     REQUEST_CAPABILITY_TOOL,
 };
 pub use governance::containment::{
-    containment_capabilities, ActiveContainmentBackend, BackendCapability, BackendSelector,
-    ContainmentCapabilityReport, ContainmentGuarantees, ContainmentPolicy, ContainmentRequirement,
-    DockerConfig,
+    containment_capabilities, firecracker_capability, ActiveContainmentBackend, BackendCapability,
+    BackendSelector, ContainmentCapabilityReport, ContainmentGuarantees, ContainmentPolicy,
+    ContainmentRequirement, DockerConfig, FirecrackerConfig, FirecrackerError,
+    FirecrackerLaunchPlan, FirecrackerNetwork, FirecrackerResult, FirecrackerStaging,
+    FirecrackerVm, ImmutableHostFile,
 };
 pub use governance::contracts::{
     AgentDefinition, ApprovalCheckContext, ApprovalDenyReason, ApprovalEvidence,
     ApprovalEvidenceDecision, ApprovalEvidenceOutcome, ApprovalScope, DataFlowDecision,
     DataFlowPolicy, DataLabel, DataSink, DataSinkKind, DataSourceKind, EgressDecision,
-    EgressPolicy, FilesystemProfile, FlowEffect, GovernanceContractError, PolicyDocument,
-    PolicyEffect, PolicyEvaluationContext, PolicyScope, PolicySnapshot, Provenance, SandboxProfile,
-    ScopedPolicyDecision, ScopedPolicyRule, SkillManifest, SourceToSinkRule, ToolDescriptor,
-    GOVERNANCE_CONTRACT_VERSION,
+    EgressPolicy, FilesystemProfile, FlowEffect, GovernanceBinding, GovernanceContractError,
+    PolicyDocument, PolicyEffect, PolicyEvaluationContext, PolicyScope, PolicySnapshot, Provenance,
+    SandboxProfile, ScopedPolicyDecision, ScopedPolicyRule, SkillManifest, SourceToSinkRule,
+    ToolDescriptor, GOVERNANCE_CONTRACT_VERSION,
 };
 pub use governance::egress_broker::{
     BrowserProxyAssertion, EgressBroker, EgressBrokerBuilder, EgressBrokerError, EgressDnsResolver,
@@ -148,7 +151,7 @@ pub use governance::skills::{
 };
 pub use governance::{
     ApprovalDecision, ApprovalRequest, Authorization, AuthorizationContext, AuthorizationReport,
-    Governance, PermissionUpdate, ToolApprover,
+    DurableApproverError, DurableToolApprover, Governance, PermissionUpdate, ToolApprover,
 };
 pub use mcp::{
     McpClient, McpPrompt, McpResource, McpToolExecutor, McpToolFilter, McpTransport,

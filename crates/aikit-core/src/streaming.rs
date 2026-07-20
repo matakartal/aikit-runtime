@@ -141,7 +141,9 @@ impl StreamEventEncoder {
             StreamDelta::MessageStart { .. } if self.response_started => {
                 return Err(StreamEncodingError::DuplicateResponseStart);
             }
-            StreamDelta::MessageStart { .. } | StreamDelta::Error { .. } => {}
+            StreamDelta::MessageStart { .. }
+            | StreamDelta::Warning { .. }
+            | StreamDelta::Error { .. } => {}
             _ if !self.response_started => {
                 return Err(StreamEncodingError::ResponseNotStarted);
             }
@@ -239,6 +241,9 @@ impl StreamEventEncoder {
             }
             StreamDelta::ProviderMetadata { provider, metadata } => {
                 events.push(self.emit(StreamEventKind::ProviderMetadata { provider, metadata }));
+            }
+            StreamDelta::Warning { warning } => {
+                events.push(self.emit(StreamEventKind::Warning { warning }));
             }
             StreamDelta::Usage(usage) => {
                 events.push(self.emit(StreamEventKind::Usage { usage }));
@@ -340,6 +345,35 @@ mod tests {
                 .unwrap_err(),
             StreamEncodingError::DuplicateResponseStart
         );
+    }
+
+    #[test]
+    fn compatibility_warning_can_precede_provider_response_start() {
+        let mut encoder = StreamEventEncoder::new("response-warning");
+        let warning = crate::contract::ProviderWarning {
+            code: "unverified_provider_parameter".into(),
+            message: "forwarded without semantic adaptation".into(),
+            parameter: Some("future_option".into()),
+            provider: Some("mock".into()),
+            model: Some("mock-1".into()),
+        };
+        let events = encoder
+            .try_push(StreamDelta::Warning {
+                warning: warning.clone(),
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].kind,
+            StreamEventKind::Warning { warning: actual } if actual == &warning
+        ));
+
+        let start = encoder
+            .try_push(StreamDelta::MessageStart {
+                model: "mock-1".into(),
+            })
+            .unwrap();
+        assert_eq!(start[0].sequence, 2);
     }
 
     #[test]

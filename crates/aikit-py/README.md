@@ -126,6 +126,13 @@ does not add a timeout around the Python callback; wrap slow or remote validatio
 application-owned timeout and keep the callback pure/idempotent.
 
 Unsupported media is rejected with a typed error instead of being silently dropped.
+Credential-free absolute HTTP(S) URLs are valid canonical references and round-trip unchanged, but
+provider dispatch rejects unresolved URL/artifact references until a trusted host resolver verifies
+their bytes, size, and SHA-256. MIME type matching at provider boundaries is case-insensitive.
+
+Provider-specific options use `compatibility_mode="strict"` by default. Unknown or unsupported
+parameters fail with a typed error. `"warn"` and `"best_effort"` are explicit opt-ins and preserve
+every `ProviderWarning` in both stream warning deltas and completed result/outcome `warnings`.
 
 ## Deterministic outcome evaluation
 
@@ -145,6 +152,34 @@ gate fields fail closed. Verdict messages report only lengths, counts, and state
 copy raw model output. Text, tool, and turn gates require the runtime-recorded
 `invocation_start_message_index`, so earlier conversation history cannot satisfy the current run;
 legacy outcomes without that field can still use terminal-status and usage gates.
+
+## Offline catalog, policy evidence, and durable HITL
+
+The reviewed model catalog is compiled into the package and never performs runtime discovery:
+
+```python
+catalog = aikit.shipped_model_catalog()
+resolved = aikit.resolve_model_catalog([my_profile])
+state = aikit.model_capability_state(resolved["profiles"][0], "tool_use")
+```
+
+Overrides remain a separate, hashed layer. `validate_model_profile`, `validate_media_input`, and
+`validate_media_artifact` fail before provider I/O. Completed OPA and Cedar evaluator responses can
+be normalized with `normalize_opa_decision` and `normalize_cedar_decision`; undefined/partial OPA
+results and Cedar forbids/diagnostic errors fail closed.
+
+`DurableRun` exposes typed approval helpers for confirmation, missing input, output review, and
+edit/retry. Those legacy-compatible helpers create non-expiring approvals. For restart-safe
+deadlines and canonical approval kinds, call `request_typed_approval`, then
+`resolve_approval_at`/`apply_command_at` with an explicit trusted timestamp. `expire_approvals`
+appends fail-closed timeout denials idempotently. `seal_policy_snapshot` plus
+`DurableRun.with_policy_snapshot` pins a complete run-scoped governance binding before mutable work.
+For tenant/agent scoping, use `seal_governance_binding` and
+`DurableRun.with_governance_binding`; the sealed binding is replay-validated and propagated to
+typed approvals.
+
+Canonical messages also accept `{"type": "media_input", "media": ...}` blocks. This strict form
+preserves MIME, size, SHA-256, bytes/URL/artifact identity and is preferred over legacy `media`.
 
 ## Production state (opt-in)
 

@@ -446,12 +446,23 @@ pub fn evaluate_with_external(
     let native = snapshot.evaluate(context);
     let mut evidence = vec![native_evidence(
         native,
-        input_summary,
+        input_summary.clone(),
         risk_evidence,
         snapshot.hash().to_owned(),
     )];
     for decision in external {
         validate_auditable_decision(&decision)?;
+        if decision.input_summary != input_summary {
+            let engine = match decision.engine {
+                PolicyDecisionEngine::Native => "native",
+                PolicyDecisionEngine::Opa => "opa",
+                PolicyDecisionEngine::Cedar => "cedar",
+            };
+            return Err(invalid_external(
+                engine,
+                "decision input summary does not match the evaluated action",
+            ));
+        }
         evidence.push(decision);
     }
 
@@ -498,13 +509,52 @@ fn validate_auditable_decision(
         return Err(invalid_external(engine, "input_summary must not be empty"));
     }
     if decision
-        .matched_rule_ids
-        .iter()
-        .any(|rule| rule.trim().is_empty())
+        .decision_id
+        .as_deref()
+        .is_some_and(|decision_id| decision_id.trim().is_empty())
+    {
+        return Err(invalid_external(engine, "decision_id must not be empty"));
+    }
+    if decision
+        .deciding_rule_id
+        .as_deref()
+        .is_some_and(|rule| rule.trim().is_empty())
     {
         return Err(invalid_external(
             engine,
-            "matched_rule_ids entries must not be empty",
+            "deciding_rule_id must not be empty",
+        ));
+    }
+    let mut unique_rules = BTreeSet::new();
+    if decision
+        .matched_rule_ids
+        .iter()
+        .any(|rule| rule.trim().is_empty() || !unique_rules.insert(rule.as_str()))
+    {
+        return Err(invalid_external(
+            engine,
+            "matched_rule_ids entries must be non-empty and unique",
+        ));
+    }
+    if decision
+        .risk_evidence
+        .iter()
+        .any(|evidence| evidence.trim().is_empty())
+    {
+        return Err(invalid_external(
+            engine,
+            "risk_evidence entries must not be empty",
+        ));
+    }
+    if decision.engine != PolicyDecisionEngine::Native
+        && decision
+            .evaluator_revision
+            .as_deref()
+            .is_none_or(|revision| revision.trim().is_empty())
+    {
+        return Err(invalid_external(
+            engine,
+            "evaluator_revision is required for replay-safe external decisions",
         ));
     }
     Ok(())
@@ -649,6 +699,21 @@ impl CedarDecisionAdapter {
             diagnostics,
             evaluator_revision: response_revision,
         } = response;
+
+        if decision == CedarDecision::Allow && permit_policy_ids.is_empty() {
+            return Err(invalid_external(
+                "cedar",
+                "allow decision did not identify a permitting policy",
+            ));
+        }
+        if let (Some(expected), Some(actual)) = (&metadata.evaluator_revision, &response_revision) {
+            if expected != actual {
+                return Err(invalid_external(
+                    "cedar",
+                    format!("evaluator revision drift: expected `{expected}`, received `{actual}`"),
+                ));
+            }
+        }
 
         let effect = if decision == CedarDecision::Deny
             || !forbid_policy_ids.is_empty()
@@ -884,7 +949,7 @@ rules:
                 run_id: Some("run-1".into()),
                 tool: "network.fetch".into(),
             },
-            "network.fetch example.com",
+            "tool=network.fetch target=example.com",
             vec!["data_label=secret".into()],
             [external],
         )
@@ -894,5 +959,76 @@ rules:
         assert_eq!(combined.deciding_evidence_index, 0);
         assert_eq!(combined.evidence[0].engine, PolicyDecisionEngine::Native);
         assert_eq!(combined.evidence[1].effect, PolicyEffect::Allow);
+    }
+
+    #[test]
+    fn external_decisions_require_replay_safe_revision_and_clean_evidence() {
+        let mut unversioned = metadata();
+        unversioned.evaluator_revision = None;
+        assert!(matches!(
+            OpaDecisionAdapter::from_json(r#"{"result":true}"#, unversioned),
+            Err(PolicyAdapterError::InvalidExternalDecision { .. })
+        ));
+
+        assert!(matches!(
+            OpaDecisionAdapter::from_json(
+                r#"{
+                    "result": {
+                        "effect": "allow",
+                        "rule_id": "permit.read",
+                        "matched_rule_ids": ["permit.read", "permit.read"]
+                    }
+                }"#,
+                metadata(),
+            ),
+            Err(PolicyAdapterError::InvalidExternalDecision { .. })
+        ));
+    }
+
+    #[test]
+    fn cedar_allow_without_a_permit_policy_fails_closed() {
+        assert!(matches!(
+            CedarDecisionAdapter::from_json(
+                r#"{
+                    "decision": "Allow",
+                    "diagnostics": {"reasons": [], "errors": []},
+                    "evaluator_revision": "entities:7"
+                }"#,
+                metadata(),
+            ),
+            Err(PolicyAdapterError::InvalidExternalDecision { .. })
+        ));
+    }
+
+    #[test]
+    fn external_decision_cannot_be_replayed_for_another_input_or_revision() {
+        let decision = OpaDecisionAdapter::from_json(r#"{"result":true}"#, metadata()).unwrap();
+        assert!(matches!(
+            evaluate_with_external(
+                &native_policy(),
+                &PolicyEvaluationContext {
+                    tenant_id: None,
+                    agent_id: None,
+                    run_id: Some("run-1".into()),
+                    tool: "filesystem.read".into(),
+                },
+                "tool=filesystem.read path=/secret",
+                Vec::new(),
+                [decision],
+            ),
+            Err(PolicyAdapterError::InvalidExternalDecision { .. })
+        ));
+
+        assert!(matches!(
+            CedarDecisionAdapter::from_json(
+                r#"{
+                    "decision": "Allow",
+                    "permit_policy_ids": ["permit.read"],
+                    "evaluator_revision": "bundle:43"
+                }"#,
+                metadata(),
+            ),
+            Err(PolicyAdapterError::InvalidExternalDecision { .. })
+        ));
     }
 }

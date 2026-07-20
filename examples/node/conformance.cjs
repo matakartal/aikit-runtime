@@ -179,6 +179,7 @@ async function structuredFacts() {
   let completed;
   for await (const event of agent.streamObject("structured", schema, {
     providerOptions: { mock: { temperature: 0, tag: "parity" } },
+    compatibilityMode: "warn",
   })) {
     eventTypes.push(event.type);
     if (event.type === "delta") deltaTypes.push(event.delta.type);
@@ -328,6 +329,7 @@ async function runOptionsFacts() {
       maxTokens: 64,
       maxTurns: 2,
       providerOptions: { mock: { tag: "parity" } },
+      compatibilityMode: "warn",
       retry: {
         maxAttemptsPerModel: 2,
         baseDelayMs: 0,

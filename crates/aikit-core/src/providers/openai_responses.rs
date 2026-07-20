@@ -43,6 +43,7 @@ pub fn build_request(
             "stream_options",
         ],
     )?;
+    super::validate_media_input_roles(messages, "openai", model)?;
     let stateless = provider_options
         .and_then(|options| options.get("store"))
         .and_then(Value::as_bool)
@@ -58,7 +59,7 @@ pub fn build_request(
             })),
             Role::User => input.push(serde_json::json!({
                 "role": "user",
-                "content": openai_user_content(&message.content),
+                "content": openai_user_content(model, &message.content)?,
             })),
             Role::Assistant => {
                 let replay = blocks_for_provider_replay(
@@ -185,36 +186,55 @@ fn join_text(blocks: &[ContentBlock]) -> String {
         .join("")
 }
 
-fn openai_user_content(blocks: &[ContentBlock]) -> Value {
-    if !blocks
-        .iter()
-        .any(|block| matches!(block, ContentBlock::Media { .. }))
-    {
-        return Value::String(join_text(blocks));
+fn openai_user_content(model: &str, blocks: &[ContentBlock]) -> Result<Value> {
+    if !blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Media { .. } | ContentBlock::MediaInput { .. }
+        )
+    }) {
+        return Ok(Value::String(join_text(blocks)));
     }
-    Value::Array(
-        blocks
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => {
-                    Some(serde_json::json!({ "type": "input_text", "text": text }))
+    let mut content = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => {
+                content.push(serde_json::json!({ "type": "input_text", "text": text }));
+            }
+            ContentBlock::Media { media_type, source } => {
+                let image_url = match source {
+                    MediaSource::Url { url } => url.clone(),
+                    MediaSource::Base64 { data } => format!("data:{media_type};base64,{data}"),
+                };
+                content.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                }));
+            }
+            ContentBlock::MediaInput { media } => {
+                if !super::is_image_media_type(&media.media_type) {
+                    return Err(crate::error::ProviderError::new(
+                        "openai",
+                        model,
+                        crate::error::ProviderErrorKind::InvalidRequest,
+                        "OpenAI Responses media input currently supports image MIME types only",
+                    )
+                    .into());
                 }
-                ContentBlock::Media { media_type, source } => {
-                    let image_url = match source {
-                        MediaSource::Url { url } => url.clone(),
-                        MediaSource::Base64 { data } => {
-                            format!("data:{media_type};base64,{data}")
-                        }
-                    };
-                    Some(serde_json::json!({
-                        "type": "input_image",
-                        "image_url": image_url,
-                    }))
-                }
-                _ => None,
-            })
-            .collect(),
-    )
+                let image_url = match super::resolve_media_input(media, "openai", model)? {
+                    super::ResolvedMediaInput::Base64(data) => {
+                        format!("data:{};base64,{data}", media.media_type)
+                    }
+                };
+                content.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::Array(content))
 }
 
 fn validate_reasoning_item(item: &Value, stateless: bool) -> Result<()> {
@@ -934,7 +954,9 @@ impl Provider for OpenAiResponsesProvider {
     }
 
     async fn stream(&self, req: ProviderRequest) -> Result<BoxStream<'static, StreamDelta>> {
-        let options = req.options_for(self.name());
+        let validated = req.validated_options_for(self.name(), super::OPENAI_RESPONSES_OPTIONS)?;
+        let options = validated.options;
+        let warnings = validated.warnings;
         let body = build_request(
             &req.model,
             req.max_tokens,
@@ -949,6 +971,7 @@ impl Provider for OpenAiResponsesProvider {
                 crate::error::ProviderErrorKind::InvalidRequest,
                 error.to_string(),
             )
+            .with_warnings(warnings.clone())
         })?;
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let response = self
@@ -959,7 +982,10 @@ impl Provider for OpenAiResponsesProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| super::transport_failure("openai", &req.model, error))?;
+            .map_err(|error| {
+                super::transport_failure("openai", &req.model, error)
+                    .with_provider_warnings(warnings.clone())
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -974,7 +1000,8 @@ impl Provider for OpenAiResponsesProvider {
                 status,
                 retry_after.as_ref(),
                 text,
-            ));
+            )
+            .with_provider_warnings(warnings));
         }
 
         let model = req.model.clone();
@@ -1043,7 +1070,7 @@ impl Provider for OpenAiResponsesProvider {
                 yield super::with_stream_context(delta, "openai", &model);
             }
         };
-        Ok(Box::pin(stream))
+        Ok(super::prepend_provider_warnings(Box::pin(stream), warnings))
     }
 }
 
@@ -1534,6 +1561,7 @@ mod tests {
             max_tokens: 100,
             options: Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let out: Vec<_> = provider.stream(request).await.unwrap().collect().await;
         assert!(out.contains(&StreamDelta::TextDelta {
@@ -1577,6 +1605,7 @@ mod tests {
                 max_tokens: 100,
                 options: Map::new(),
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .unwrap()

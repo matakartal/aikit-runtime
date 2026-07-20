@@ -1,14 +1,15 @@
 use aikit::{
     run_agent, ActiveContainmentBackend, Agent, AgentOptions, ApprovalDecision, ApprovalRequest,
     AuditEvent, AuditTrail, BackendSelector, BudgetLedger, BudgetLimits, BudgetPolicy,
-    BuiltinTools, CancellationToken, Client, ContainmentPolicy, ContainmentRequirement,
-    ContentBlock, DockerConfig, ExecutionContext, FailureHookOutcome, Governance, HookDispatcher,
-    HookMatcher, HookOutcome, InMemoryAuditSink, InMemorySessionStore, MediaSource, Message,
-    MockProvider, ModelCatalog, ModelPricing, ModelProfile, ModelRouteRequirements, NoTools,
-    ObjectOptions, ObjectStreamEvent, Orchestrator, PermissionEngine, PermissionMode,
-    PermissionUpdate, PostToolOutcome, PromptHookOutcome, ProviderOptions, RetryPolicy,
-    RouteObjective, RouteRequest, RoutingOptions, Rule, RunConfig, RunOutcome, RunRecorder,
-    Sandbox, StreamDelta, SubagentSpec, ToolApprover, ToolExecutor, ToolSpec,
+    BuiltinTools, CancellationToken, Client, CompatibilityMode, ContainmentPolicy,
+    ContainmentRequirement, ContentBlock, DockerConfig, ExecutionContext, FailureHookOutcome,
+    Governance, HookDispatcher, HookMatcher, HookOutcome, InMemoryAuditSink, InMemorySessionStore,
+    MediaSource, Message, MockProvider, ModelCatalog, ModelPricing, ModelProfile,
+    ModelRouteRequirements, NoTools, ObjectOptions, ObjectStreamEvent, Orchestrator,
+    PermissionEngine, PermissionMode, PermissionUpdate, PostToolOutcome, PromptHookOutcome,
+    ProviderOptions, RetryPolicy, RouteObjective, RouteRequest, RoutingOptions, Rule, RunConfig,
+    RunOutcome, RunRecorder, Sandbox, StreamDelta, SubagentSpec, ToolApprover, ToolExecutor,
+    ToolSpec,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -375,6 +376,7 @@ async fn structured_facts() -> Value {
             "mock-structured",
             ObjectOptions {
                 provider_options,
+                compatibility_mode: CompatibilityMode::Warn,
                 ..ObjectOptions::default()
             },
         )
@@ -466,6 +468,7 @@ async fn run_options_facts() -> Value {
                     max_tokens: 64,
                     max_turns: 2,
                     provider_options,
+                    compatibility_mode: CompatibilityMode::Warn,
                     retry: RetryPolicy {
                         max_attempts_per_model: 2,
                         base_delay_ms: 0,

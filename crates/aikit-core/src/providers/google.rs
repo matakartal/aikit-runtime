@@ -72,6 +72,7 @@ pub fn build_request(
             "stream_options",
         ],
     )?;
+    super::validate_media_input_roles(messages, "google", model)?;
     // `functionResponse.name` must echo the called function's name; ContentBlock::ToolResult only
     // carries the opaque tool_use_id, so build an id→name lookup from prior ToolUse blocks.
     let mut tool_names: HashMap<&str, &str> = HashMap::new();
@@ -99,22 +100,37 @@ pub fn build_request(
                 }
             }
             Role::User => {
-                let parts: Vec<Value> = m
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
+                let mut parts = Vec::new();
+                for block in &m.content {
+                    let part = match block {
                         ContentBlock::Text { text } => Some(serde_json::json!({ "text": text })),
                         ContentBlock::Media { media_type, source } => Some(match source {
-                            MediaSource::Url { url } => serde_json::json!({
-                                "fileData": { "mimeType": media_type, "fileUri": url },
-                            }),
+                            MediaSource::Url { url } => {
+                                validate_google_file_uri(model, url)?;
+                                serde_json::json!({
+                                    "fileData": { "mimeType": media_type, "fileUri": url },
+                                })
+                            }
                             MediaSource::Base64 { data } => serde_json::json!({
                                 "inlineData": { "mimeType": media_type, "data": data },
                             }),
                         }),
+                        ContentBlock::MediaInput { media } => {
+                            Some(match super::resolve_media_input(media, "google", model)? {
+                                super::ResolvedMediaInput::Base64(data) => serde_json::json!({
+                                    "inlineData": {
+                                        "mimeType": media.media_type,
+                                        "data": data,
+                                    },
+                                }),
+                            })
+                        }
                         _ => None,
-                    })
-                    .collect();
+                    };
+                    if let Some(part) = part {
+                        parts.push(part);
+                    }
+                }
                 contents.push(serde_json::json!({ "role": "user", "parts": parts }));
             }
             Role::Assistant => {
@@ -261,6 +277,50 @@ pub fn build_request(
         }
     }
     Ok(req)
+}
+
+fn validate_google_file_uri(model: &str, uri: &str) -> crate::error::Result<()> {
+    let parsed = url::Url::parse(uri).ok();
+    let is_managed_uri = parsed.as_ref().is_some_and(|parsed| {
+        let has_clean_authority = parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.port().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none();
+        if !has_clean_authority {
+            return false;
+        }
+
+        match parsed.scheme() {
+            // A bucket alone is not a file. Require both a canonical bucket authority and a
+            // non-empty object path so `gs://bucket/` cannot escape local preflight.
+            "gs" => parsed
+                .host_str()
+                .is_some_and(|bucket| !bucket.is_empty())
+                && !parsed.path().trim_matches('/').is_empty(),
+            "https" => {
+                if parsed.host_str() != Some("generativelanguage.googleapis.com") {
+                    return false;
+                }
+                let segments = parsed
+                    .path_segments()
+                    .map(|segments| segments.collect::<Vec<_>>())
+                    .unwrap_or_default();
+                matches!(segments.as_slice(), ["v1" | "v1beta", "files", file_id] if !file_id.is_empty())
+            }
+            _ => false,
+        }
+    });
+    if is_managed_uri {
+        return Ok(());
+    }
+    Err(crate::error::ProviderError::new(
+        "google",
+        model,
+        crate::error::ProviderErrorKind::InvalidRequest,
+        "Google fileData requires a Google-managed gs:// or Files API URI; fetch ordinary web URLs through governed egress and send verified inline bytes",
+    )
+    .into())
 }
 
 /// Stateful translator for Gemini `streamGenerateContent` SSE chunks → canonical [`StreamDelta`]s.
@@ -673,7 +733,9 @@ impl Provider for GeminiProvider {
         &self,
         req: ProviderRequest,
     ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
-        let options = req.options_for(self.name());
+        let validated = req.validated_options_for(self.name(), super::GOOGLE_OPTIONS)?;
+        let options = validated.options;
+        let warnings = validated.warnings;
         let body = build_request(
             &req.model,
             req.max_tokens,
@@ -688,6 +750,7 @@ impl Provider for GeminiProvider {
                 crate::error::ProviderErrorKind::InvalidRequest,
                 error.to_string(),
             )
+            .with_warnings(warnings.clone())
         })?;
         // The model name lives in the URL path for Gemini; `?alt=sse` selects SSE framing.
         let url = format!(
@@ -703,7 +766,10 @@ impl Provider for GeminiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|error| super::transport_failure("google", &req.model, error))?;
+            .map_err(|error| {
+                super::transport_failure("google", &req.model, error)
+                    .with_provider_warnings(warnings.clone())
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -715,7 +781,8 @@ impl Provider for GeminiProvider {
                 status,
                 retry_after.as_ref(),
                 text,
-            ));
+            )
+            .with_provider_warnings(warnings));
         }
 
         let model = req.model.clone();
@@ -786,14 +853,32 @@ impl Provider for GeminiProvider {
                 yield super::with_stream_context(d, "google", &model);
             }
         };
-        Ok(Box::pin(out))
+        Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{MediaInput, MediaInputSource};
     use serde_json::json;
+
+    #[test]
+    fn strict_media_preserves_mime_and_validated_bytes() {
+        let media = MediaInput {
+            media_type: "audio/wav".into(),
+            source: MediaInputSource::Bytes {
+                data: b"abc".to_vec(),
+            },
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size_bytes: 3,
+        };
+        let message = Message::user("transcribe").with_media_input(media).unwrap();
+        let request = build_request("gemini-test", 64, &[message], &[], None).unwrap();
+        let part = &request["contents"][0]["parts"][1]["inlineData"];
+        assert_eq!(part["mimeType"], "audio/wav");
+        assert_eq!(part["data"], "YWJj");
+    }
 
     #[test]
     fn build_request_maps_url_and_inline_media_parts() {
@@ -820,6 +905,72 @@ mod tests {
         assert_eq!(parts[1]["fileData"]["fileUri"], "gs://bucket/image.png");
         assert_eq!(parts[2]["inlineData"]["mimeType"], "image/jpeg");
         assert_eq!(parts[2]["inlineData"]["data"], "AQID");
+    }
+
+    #[test]
+    fn build_request_rejects_ordinary_web_url_as_file_data() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Media {
+                media_type: "image/png".into(),
+                source: MediaSource::Url {
+                    url: "https://example.test/image.png".into(),
+                },
+            }],
+        };
+        let error = build_request("gemini-test", 100, &[message], &[], None).unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == crate::error::ProviderErrorKind::InvalidRequest
+        ));
+    }
+
+    #[test]
+    fn build_request_accepts_canonical_google_files_api_uri() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Media {
+                media_type: "image/png".into(),
+                source: MediaSource::Url {
+                    url: "https://generativelanguage.googleapis.com/v1beta/files/file-123".into(),
+                },
+            }],
+        };
+        let request = build_request("gemini-test", 100, &[message], &[], None).unwrap();
+        assert_eq!(
+            request["contents"][0]["parts"][0]["fileData"]["fileUri"],
+            "https://generativelanguage.googleapis.com/v1beta/files/file-123"
+        );
+    }
+
+    #[test]
+    fn build_request_rejects_malformed_or_lookalike_google_file_uris() {
+        let invalid = [
+            "gs://bucket/",
+            "https://generativelanguage.googleapis.com/",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini",
+            "https://generativelanguage.googleapis.com.evil.test/v1beta/files/file-123",
+            "https://user@generativelanguage.googleapis.com/v1beta/files/file-123",
+            "https://generativelanguage.googleapis.com:444/v1beta/files/file-123",
+        ];
+
+        for uri in invalid {
+            let message = Message {
+                role: Role::User,
+                content: vec![ContentBlock::Media {
+                    media_type: "image/png".into(),
+                    source: MediaSource::Url { url: uri.into() },
+                }],
+            };
+            let error = build_request("gemini-test", 100, &[message], &[], None).unwrap_err();
+            assert!(
+                matches!(
+                    error.provider_error(),
+                    Some(error) if error.kind == crate::error::ProviderErrorKind::InvalidRequest
+                ),
+                "URI should fail local preflight: {uri}"
+            );
+        }
     }
 
     #[test]
@@ -1099,6 +1250,7 @@ mod tests {
             max_tokens: 100,
             options: serde_json::Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         };
         let out: Vec<StreamDelta> = provider.stream(req).await.unwrap().collect().await;
 
@@ -1140,6 +1292,7 @@ mod tests {
                 max_tokens: 100,
                 options: serde_json::Map::new(),
                 provider_options: crate::types::ProviderOptions::new(),
+                compatibility_mode: crate::contract::CompatibilityMode::Strict,
             })
             .await
             .unwrap()

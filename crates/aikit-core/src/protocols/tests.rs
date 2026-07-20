@@ -70,14 +70,23 @@ fn mcp_cancel_is_authorized_owned_and_durable() {
     let cancelled =
         registry.prepare_cancel_task(&task_id, correlation("request-cancel"), Some(&actor));
     assert!(cancelled.is_authorized());
-    assert_eq!(registry.tasks()[&task_id].status, McpTaskStatus::Cancelled);
-    assert!(registry
-        .complete_task(&task_id, json!({"late": true}))
-        .is_err());
+    assert_eq!(registry.tasks()[&task_id].status, McpTaskStatus::Working);
+    assert_eq!(
+        registry.tasks()[&task_id].cancellation,
+        Some(McpCancellationState::Requested)
+    );
 
     let encoded = serde_json::to_vec(&registry).unwrap();
-    let restored: McpServerRegistry = serde_json::from_slice(&encoded).unwrap();
+    let mut restored: McpServerRegistry = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        restored.tasks()[&task_id].cancellation,
+        Some(McpCancellationState::Requested)
+    );
+    restored.confirm_cancel_task(&task_id).unwrap();
     assert_eq!(restored.tasks()[&task_id].status, McpTaskStatus::Cancelled);
+    assert!(restored
+        .complete_task(&task_id, json!({"late": true}))
+        .is_err());
 }
 
 #[test]

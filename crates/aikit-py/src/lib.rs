@@ -24,19 +24,22 @@ use aikit_core::{
     AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
     AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits,
     BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker,
-    CapabilityGate, Client as CoreClient, CompactionPolicy, ContainmentPolicy, DockerConfig,
-    DurabilityMode, ErrorCode, ErrorInfo, EvalGate, EvalSuite, FailureContext, FailureHookOutcome,
-    GeneratedText, Governance, GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher,
-    HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink,
-    McpClient, McpToolExecutor, McpToolFilter, Message, ModelCatalog, ModelPricing, ModelProfile,
-    ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent, PermissionEngine,
-    PermissionMode, PermissionUpdate, PiiRedactor, PostToolOutcome, PostToolUseContext,
-    PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions, RegexBlocklist,
-    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome, RunRecorder, RunState,
-    RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
-    SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
-    StopContext, StreamDelta, StreamEvent, StreamEventEncoder, StreamableHttpTransport,
-    ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
+    CapabilityGate, CedarDecisionAdapter, Client as CoreClient, CompactionPolicy,
+    CompatibilityMode, ContainmentPolicy, DockerConfig, DurabilityMode, DurableApprovalRequest,
+    ErrorCode, ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext,
+    FailureHookOutcome, GeneratedText, Governance, GovernanceBinding, GuardedExecutor,
+    GuardrailChain, HookDispatcher, HookMatcher, HookOutcome, InMemorySessionStore,
+    JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient, McpToolExecutor,
+    McpToolFilter, MediaArtifact, MediaInput, Message, ModelCapability, ModelCatalog,
+    ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing, ModelProfile, ObjectOptions,
+    ObjectStream as CoreObjectStream, ObjectStreamEvent, OpaDecisionAdapter, PermissionEngine,
+    PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument, PolicySnapshot, PostToolOutcome,
+    PostToolUseContext, PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions,
+    RegexBlocklist, RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome,
+    RunRecorder, RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation,
+    SemanticValidator, Session, SessionStore, SessionStoreError, SqliteMemoryStore,
+    SqliteSessionStore, StdioTransport, StopContext, StreamDelta, StreamEvent, StreamEventEncoder,
+    StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -297,6 +300,50 @@ impl PyDurableRun {
         Ok(Self { inner })
     }
 
+    /// Start a run with an integrity-checked policy snapshot pinned as its second event.
+    #[staticmethod]
+    #[pyo3(signature = (session_id, run_id, policy_snapshot, durability="sync"))]
+    fn with_policy_snapshot(
+        session_id: String,
+        run_id: String,
+        policy_snapshot: Bound<'_, PyAny>,
+        durability: &str,
+    ) -> PyResult<Self> {
+        let snapshot: PolicySnapshot = pythonize::depythonize(&policy_snapshot)
+            .map_err(|error| PyValueError::new_err(format!("invalid policy snapshot: {error}")))?;
+        let inner = RunState::new_with_policy_snapshot(
+            session_id,
+            run_id,
+            python_durability_mode(durability)?,
+            &snapshot,
+        )
+        .map_err(py_durability_error)?;
+        Ok(Self { inner })
+    }
+
+    /// Start a run with the complete tenant/agent/run governance identity pinned.
+    #[staticmethod]
+    #[pyo3(signature = (session_id, run_id, governance_binding, durability="sync"))]
+    fn with_governance_binding(
+        session_id: String,
+        run_id: String,
+        governance_binding: Bound<'_, PyAny>,
+        durability: &str,
+    ) -> PyResult<Self> {
+        let binding: GovernanceBinding =
+            pythonize::depythonize(&governance_binding).map_err(|error| {
+                PyValueError::new_err(format!("invalid governance binding: {error}"))
+            })?;
+        let inner = RunState::new_with_governance_binding(
+            session_id,
+            run_id,
+            python_durability_mode(durability)?,
+            binding,
+        )
+        .map_err(py_durability_error)?;
+        Ok(Self { inner })
+    }
+
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         python_json(py, &self.inner)
     }
@@ -323,6 +370,19 @@ impl PyDurableRun {
             DurabilityMode::Async => "async",
             DurabilityMode::Exit => "exit",
         }
+    }
+
+    #[getter]
+    fn policy_snapshot_hash(&self) -> Option<String> {
+        self.inner.policy_snapshot_hash().map(str::to_owned)
+    }
+
+    #[getter]
+    fn governance_binding<'py>(&self, py: Python<'py>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .governance_binding()
+            .map(|binding| python_json(py, binding))
+            .transpose()
     }
 
     #[getter]
@@ -383,6 +443,183 @@ impl PyDurableRun {
             .map_err(py_durability_error)
     }
 
+    /// Persist a typed approval with event-sourced kind, policy binding, and deadline.
+    fn request_typed_approval(&mut self, request: Bound<'_, PyAny>) -> PyResult<String> {
+        let request: DurableApprovalRequest = pythonize::depythonize(&request)
+            .map_err(|error| PyValueError::new_err(format!("invalid approval request: {error}")))?;
+        self.inner
+            .request_typed_approval(request)
+            .map_err(py_durability_error)
+    }
+
+    /// Append timeout denials for every expired pending typed approval.
+    fn expire_approvals(&mut self, expiration_id: &str, now_unix_ms: u64) -> PyResult<Vec<String>> {
+        self.inner
+            .expire_approvals(expiration_id, now_unix_ms)
+            .map_err(py_durability_error)
+    }
+
+    /// Persist a durable yes/no confirmation and pause the run until it is resolved.
+    #[pyo3(signature = (logical_key, prompt, details=None, activity_id=None))]
+    fn request_confirmation(
+        &mut self,
+        logical_key: &str,
+        prompt: String,
+        details: Option<Bound<'_, PyAny>>,
+        activity_id: Option<String>,
+    ) -> PyResult<String> {
+        let details: Option<Value> = details
+            .map(|details| {
+                pythonize::depythonize(&details).map_err(|error| {
+                    PyValueError::new_err(format!("invalid confirmation details: {error}"))
+                })
+            })
+            .transpose()?;
+        self.inner
+            .request_approval(
+                logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "confirmation", "details": details}),
+            )
+            .map_err(py_durability_error)
+    }
+
+    /// Persist a durable missing-input request with an optional JSON Schema hint.
+    #[pyo3(signature = (logical_key, prompt, input_schema=None, activity_id=None))]
+    fn request_input(
+        &mut self,
+        logical_key: &str,
+        prompt: String,
+        input_schema: Option<Bound<'_, PyAny>>,
+        activity_id: Option<String>,
+    ) -> PyResult<String> {
+        let input_schema: Option<Value> = input_schema
+            .map(|schema| {
+                pythonize::depythonize(&schema).map_err(|error| {
+                    PyValueError::new_err(format!("invalid input schema: {error}"))
+                })
+            })
+            .transpose()?;
+        self.inner
+            .request_approval(
+                logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "missing_input", "input_schema": input_schema}),
+            )
+            .map_err(py_durability_error)
+    }
+
+    /// Persist a durable output-review request without copying or mutating the reviewed value.
+    #[pyo3(signature = (logical_key, prompt, output, activity_id=None))]
+    fn request_output_review(
+        &mut self,
+        logical_key: &str,
+        prompt: String,
+        output: Bound<'_, PyAny>,
+        activity_id: Option<String>,
+    ) -> PyResult<String> {
+        let output: Value = pythonize::depythonize(&output)
+            .map_err(|error| PyValueError::new_err(format!("invalid review output: {error}")))?;
+        self.inner
+            .request_approval(
+                logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "output_review", "output": output}),
+            )
+            .map_err(py_durability_error)
+    }
+
+    /// Persist a durable edit/retry decision with the rejected value and validation issue.
+    #[pyo3(signature = (logical_key, prompt, output, error=None, activity_id=None))]
+    fn request_edit_retry(
+        &mut self,
+        logical_key: &str,
+        prompt: String,
+        output: Bound<'_, PyAny>,
+        error: Option<String>,
+        activity_id: Option<String>,
+    ) -> PyResult<String> {
+        let output: Value = pythonize::depythonize(&output)
+            .map_err(|decode| PyValueError::new_err(format!("invalid retry output: {decode}")))?;
+        self.inner
+            .request_approval(
+                logical_key,
+                activity_id,
+                prompt,
+                serde_json::json!({"kind": "edit_retry", "output": output, "error": error}),
+            )
+            .map_err(py_durability_error)
+    }
+
+    /// Resolve exactly one durable approval through the canonical resume command.
+    #[pyo3(signature = (command_id, approval_id, approved, response=None))]
+    fn resolve_approval<'py>(
+        &mut self,
+        py: Python<'py>,
+        command_id: String,
+        approval_id: String,
+        approved: bool,
+        response: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let response: Option<Value> = response
+            .map(|response| {
+                pythonize::depythonize(&response).map_err(|error| {
+                    PyValueError::new_err(format!("invalid approval response: {error}"))
+                })
+            })
+            .transpose()?;
+        let outcome = self
+            .inner
+            .apply_command(RunCommand::Resume {
+                command_id,
+                approvals: vec![aikit_core::ApprovalResolution {
+                    approval_id,
+                    approved,
+                    response,
+                }],
+            })
+            .map_err(py_durability_error)?;
+        python_json(py, &command_outcome_value(outcome)?)
+    }
+
+    /// Resolve one typed approval using an explicit trusted wall-clock value.
+    #[pyo3(signature = (command_id, approval_id, approved, now_unix_ms, response=None))]
+    fn resolve_approval_at<'py>(
+        &mut self,
+        py: Python<'py>,
+        command_id: String,
+        approval_id: String,
+        approved: bool,
+        now_unix_ms: u64,
+        response: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let response: Option<Value> = response
+            .map(|response| {
+                pythonize::depythonize(&response).map_err(|error| {
+                    PyValueError::new_err(format!("invalid approval response: {error}"))
+                })
+            })
+            .transpose()?;
+        let outcome = self
+            .inner
+            .apply_command_at(
+                RunCommand::Resume {
+                    command_id,
+                    approvals: vec![aikit_core::ApprovalResolution {
+                        approval_id,
+                        approved,
+                        response,
+                    }],
+                },
+                now_unix_ms,
+            )
+            .map_err(py_durability_error)?;
+        python_json(py, &command_outcome_value(outcome)?)
+    }
+
     fn complete(&mut self, completion_id: &str) -> PyResult<()> {
         self.inner
             .complete_run(completion_id)
@@ -411,6 +648,22 @@ impl PyDurableRun {
         python_json(py, &command_outcome_value(outcome)?)
     }
 
+    /// Apply a command with the trusted clock required by typed approval resolutions.
+    fn apply_command_at<'py>(
+        &mut self,
+        py: Python<'py>,
+        command: Bound<'_, PyAny>,
+        now_unix_ms: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let command: RunCommand = pythonize::depythonize(&command)
+            .map_err(|error| PyValueError::new_err(format!("invalid durable command: {error}")))?;
+        let outcome = self
+            .inner
+            .apply_command_at(command, now_unix_ms)
+            .map_err(py_durability_error)?;
+        python_json(py, &command_outcome_value(outcome)?)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "DurableRun(run_id={:?}, status={:?}, events={})",
@@ -433,6 +686,167 @@ fn evaluate_trace<'py>(
     let trace: TraceInput = pythonize::depythonize(&trace)
         .map_err(|error| PyValueError::new_err(format!("invalid TraceInput: {error}")))?;
     python_json(py, &core_evaluate_trace(&suite, &trace))
+}
+
+/// Validate and return a canonical provider-neutral media input.
+#[pyfunction]
+fn validate_media_input<'py>(py: Python<'py>, media: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let media: MediaInput = pythonize::depythonize(&media)
+        .map_err(|error| PyValueError::new_err(format!("invalid MediaInput: {error}")))?;
+    media.validate().map_err(PyValueError::new_err)?;
+    python_json(py, &media)
+}
+
+/// Validate and return immutable media-artifact metadata.
+#[pyfunction]
+fn validate_media_artifact<'py>(
+    py: Python<'py>,
+    artifact: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let artifact: MediaArtifact = pythonize::depythonize(&artifact)
+        .map_err(|error| PyValueError::new_err(format!("invalid MediaArtifact: {error}")))?;
+    artifact.validate().map_err(PyValueError::new_err)?;
+    python_json(py, &artifact)
+}
+
+/// Load the reviewed, versioned catalog compiled into this exact package.
+#[pyfunction]
+fn shipped_model_catalog<'py>(py: Python<'py>) -> PyResult<Py<PyAny>> {
+    let snapshot = ModelCatalogSnapshot::shipped()
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    python_json(py, &snapshot)
+}
+
+/// Validate one profile using the same invariant set used by routing catalogs.
+#[pyfunction]
+fn validate_model_profile<'py>(py: Python<'py>, profile: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let profile: ModelProfile = pythonize::depythonize(&profile)
+        .map_err(|error| PyValueError::new_err(format!("invalid ModelProfile: {error}")))?;
+    ModelCatalog::new([profile.clone()])
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    python_json(py, &profile)
+}
+
+/// Resolve one profile's explicit tri-state capability without collapsing unknown to false.
+#[pyfunction]
+fn model_capability_state(
+    profile: Bound<'_, PyAny>,
+    capability: Bound<'_, PyAny>,
+) -> PyResult<String> {
+    let profile: ModelProfile = pythonize::depythonize(&profile)
+        .map_err(|error| PyValueError::new_err(format!("invalid ModelProfile: {error}")))?;
+    ModelCatalog::new([profile.clone()])
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let capability: ModelCapability = pythonize::depythonize(&capability)
+        .map_err(|error| PyValueError::new_err(format!("invalid ModelCapability: {error}")))?;
+    serde_json::to_value(profile.capability_state(&capability))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| PyRuntimeError::new_err("failed to encode CapabilityState"))
+}
+
+/// Overlay caller-owned profiles without mutating the compiled shipped snapshot.
+#[pyfunction]
+#[pyo3(signature = (overrides=None))]
+fn resolve_model_catalog<'py>(
+    py: Python<'py>,
+    overrides: Option<Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let profiles: Vec<ModelProfile> = overrides
+        .map(|value| {
+            pythonize::depythonize(&value)
+                .map_err(|error| PyValueError::new_err(format!("invalid model overrides: {error}")))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let shipped = ModelCatalogSnapshot::shipped()
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let resolved = ModelCatalogOverrides { profiles }
+        .resolve(&shipped)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let resolved_profiles: Vec<_> = resolved.catalog().profiles().cloned().collect();
+    let value = serde_json::json!({
+        "schema_version": shipped.schema_version,
+        "catalog_version": shipped.catalog_version,
+        "verified_at": shipped.verified_at,
+        "sources": shipped.sources,
+        "profiles": resolved_profiles,
+        "shipped_hash": resolved.shipped_hash,
+        "overrides_hash": resolved.overrides_hash,
+        "override_count": resolved.override_count,
+    });
+    python_json(py, &value)
+}
+
+/// Normalize a completed OPA Data API response into auditable, fail-closed evidence.
+#[pyfunction]
+fn normalize_opa_decision<'py>(
+    py: Python<'py>,
+    response: Bound<'_, PyAny>,
+    metadata: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    normalize_external_decision(py, response, metadata, true)
+}
+
+/// Normalize a completed Cedar authorization response into auditable, deny-wins evidence.
+#[pyfunction]
+fn normalize_cedar_decision<'py>(
+    py: Python<'py>,
+    response: Bound<'_, PyAny>,
+    metadata: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    normalize_external_decision(py, response, metadata, false)
+}
+
+fn normalize_external_decision<'py>(
+    py: Python<'py>,
+    response: Bound<'_, PyAny>,
+    metadata: Bound<'_, PyAny>,
+    opa: bool,
+) -> PyResult<Py<PyAny>> {
+    let response: Value = pythonize::depythonize(&response)
+        .map_err(|error| PyValueError::new_err(format!("invalid decision response: {error}")))?;
+    let metadata: ExternalDecisionMetadata = pythonize::depythonize(&metadata)
+        .map_err(|error| PyValueError::new_err(format!("invalid decision metadata: {error}")))?;
+    let response = serde_json::to_string(&response)
+        .map_err(|error| PyValueError::new_err(format!("invalid decision response: {error}")))?;
+    let decision = if opa {
+        OpaDecisionAdapter::from_json(&response, metadata)
+    } else {
+        CedarDecisionAdapter::from_json(&response, metadata)
+    }
+    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    python_json(py, &decision)
+}
+
+/// Seal a policy document into the integrity-checked snapshot accepted by durable runs.
+#[pyfunction]
+fn seal_policy_snapshot<'py>(py: Python<'py>, policy: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let policy: PolicyDocument = pythonize::depythonize(&policy)
+        .map_err(|error| PyValueError::new_err(format!("invalid policy document: {error}")))?;
+    let snapshot =
+        PolicySnapshot::seal(policy).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    python_json(py, &snapshot)
+}
+
+/// Seal a policy snapshot together with its complete durable scope identity.
+#[pyfunction]
+#[pyo3(signature = (policy_snapshot, run_id, tenant_id=None, agent_id=None))]
+fn seal_governance_binding<'py>(
+    py: Python<'py>,
+    policy_snapshot: Bound<'_, PyAny>,
+    run_id: String,
+    tenant_id: Option<String>,
+    agent_id: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let snapshot: PolicySnapshot = pythonize::depythonize(&policy_snapshot)
+        .map_err(|error| PyValueError::new_err(format!("invalid policy snapshot: {error}")))?;
+    snapshot
+        .validate()
+        .map_err(|error| PyValueError::new_err(format!("invalid policy snapshot: {error}")))?;
+    let binding = GovernanceBinding::seal(snapshot.hash(), tenant_id, agent_id, run_id)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    python_json(py, &binding)
 }
 
 #[pyclass(name = "McpConnection")]
@@ -1161,6 +1575,11 @@ fn object_event_to_python(
                 pythonize::pythonize(py, &object.provider_metadata)
                     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
             )?;
+            generated.set_item(
+                "warnings",
+                pythonize::pythonize(py, &object.warnings)
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+            )?;
             let completed = PyDict::new(py);
             completed.set_item("type", "completed")?;
             completed.set_item("object", generated)?;
@@ -1231,6 +1650,17 @@ fn structured_provider_options(
         })
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+fn parse_compatibility_mode(value: Option<&str>, field: &str) -> Result<CompatibilityMode, String> {
+    match value.unwrap_or("strict") {
+        "strict" => Ok(CompatibilityMode::Strict),
+        "warn" => Ok(CompatibilityMode::Warn),
+        "best_effort" => Ok(CompatibilityMode::BestEffort),
+        value => Err(format!(
+            "{field} must be one of strict, warn, or best_effort; received `{value}`"
+        )),
+    }
 }
 
 fn optional_u64(
@@ -1392,6 +1822,7 @@ fn build_agent_options(
             "max_tokens",
             "max_turns",
             "provider_options",
+            "compatibility_mode",
             "budget",
             "retry",
             "routing",
@@ -1447,6 +1878,17 @@ fn build_agent_options(
         options.provider_options = serde_json::from_value(provider_options.clone())
             .map_err(|error| format!("invalid RunOptions.provider_options: {error}"))?;
     }
+    options.compatibility_mode = parse_compatibility_mode(
+        object
+            .get("compatibility_mode")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "RunOptions.compatibility_mode must be a string".to_string())
+            })
+            .transpose()?,
+        "RunOptions.compatibility_mode",
+    )?;
     options.budget = parse_budget_policy(object.get("budget"))?;
     options.retry = parse_retry_policy(object.get("retry"))?;
     options.routing = parse_routing_options(object.get("routing"))?;
@@ -2062,7 +2504,10 @@ async fn generate_configured(
                         .unwrap_or_else(|| "run failed".into()),
                 )
             },
-            |(message, info)| AgentError::Stream { message, info },
+            |(message, info)| AgentError::Stream {
+                message,
+                info: Box::new(info),
+            },
         ));
     }
     Ok(GeneratedText {
@@ -2071,6 +2516,7 @@ async fn generate_configured(
         stop_reason: outcome.stop_reason,
         messages: outcome.messages,
         provider_metadata: outcome.provider_metadata,
+        warnings: outcome.warnings,
     })
 }
 
@@ -2891,7 +3337,7 @@ impl PyAgent {
     /// Generate a schema-validated object. Defaults to the deterministic keyless
     /// `mock-structured` model; pass a live model after activating its provider with `add_key`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, validator=None))]
+    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, compatibility_mode="strict", validator=None))]
     fn generate_object<'py>(
         &self,
         py: Python<'py>,
@@ -2902,6 +3348,7 @@ impl PyAgent {
         max_tokens: u64,
         name: Option<String>,
         provider_options: Option<Bound<'_, PyAny>>,
+        compatibility_mode: &str,
         validator: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = python_messages(&prompt)?;
@@ -2922,6 +3369,11 @@ impl PyAgent {
             max_tokens,
             name: name.unwrap_or_else(|| "respond".into()),
             provider_options,
+            compatibility_mode: parse_compatibility_mode(
+                Some(compatibility_mode),
+                "generate_object.compatibility_mode",
+            )
+            .map_err(PyValueError::new_err)?,
             semantic_validator,
         };
         let model = model.unwrap_or_else(|| "mock-structured".into());
@@ -2961,6 +3413,11 @@ impl PyAgent {
                     pythonize::pythonize(py, &result.provider_metadata)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
                 )?;
+                output.set_item(
+                    "warnings",
+                    pythonize::pythonize(py, &result.warnings)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                )?;
                 Ok(output.into_any().unbind())
             })
         })
@@ -2970,7 +3427,7 @@ impl PyAgent {
     /// failures/repairs, and finally one schema-validated `completed` event. Pydantic v2 classes
     /// materialize only the final `completed.object.value`; no intermediate event is hidden.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, validator=None))]
+    #[pyo3(signature = (prompt, schema, model=None, max_retries=2, max_tokens=1024, name=None, provider_options=None, compatibility_mode="strict", validator=None))]
     fn stream_object(
         &self,
         py: Python<'_>,
@@ -2981,6 +3438,7 @@ impl PyAgent {
         max_tokens: u64,
         name: Option<String>,
         provider_options: Option<Bound<'_, PyAny>>,
+        compatibility_mode: &str,
         validator: Option<Bound<'_, PyAny>>,
     ) -> PyResult<ObjectStream> {
         let messages = python_messages(&prompt)?;
@@ -3007,6 +3465,11 @@ impl PyAgent {
                     max_tokens,
                     name: name.unwrap_or_else(|| "respond".into()),
                     provider_options,
+                    compatibility_mode: parse_compatibility_mode(
+                        Some(compatibility_mode),
+                        "stream_object.compatibility_mode",
+                    )
+                    .map_err(PyValueError::new_err)?,
                     semantic_validator,
                 },
                 Some(&audit),
@@ -3090,6 +3553,16 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(query, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_outcome, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_media_input, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_media_artifact, m)?)?;
+    m.add_function(wrap_pyfunction!(shipped_model_catalog, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_model_profile, m)?)?;
+    m.add_function(wrap_pyfunction!(model_capability_state, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_model_catalog, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_opa_decision, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_cedar_decision, m)?)?;
+    m.add_function(wrap_pyfunction!(seal_policy_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(seal_governance_binding, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_http, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_stdio, m)?)?;
     m.add_class::<PyToolDecorator>()?;

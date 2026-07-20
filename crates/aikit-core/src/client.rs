@@ -92,6 +92,7 @@ pub struct AgentOptions {
     pub max_turns: usize,
     pub tools: Vec<ToolSpec>,
     pub provider_options: ProviderOptions,
+    pub compatibility_mode: crate::contract::CompatibilityMode,
     pub governance: Governance,
     pub audit: AuditTrail,
     pub budget: BudgetPolicy,
@@ -126,6 +127,7 @@ impl Default for AgentOptions {
             max_turns: 16,
             tools: Vec::new(),
             provider_options: ProviderOptions::new(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
             governance: Governance::default(),
             audit: AuditTrail::default(),
             budget: BudgetPolicy::default(),
@@ -319,6 +321,7 @@ impl Client {
         config.max_turns = options.max_turns;
         config.tools = options.tools;
         config.provider_options = options.provider_options;
+        config.compatibility_mode = options.compatibility_mode;
         config.governance = options.governance;
         config.audit = options.audit;
         config.budget = options.budget;
@@ -498,8 +501,41 @@ mod tests {
     fn options_default_is_safe_and_keyless() {
         let options = AgentOptions::default();
         assert_eq!(options.model, "mock-1");
+        assert_eq!(
+            options.compatibility_mode,
+            crate::contract::CompatibilityMode::Strict
+        );
         assert!(options.fallback_models.is_empty());
         assert!(options.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn warn_mode_retains_compatibility_warning_in_non_stream_outcome() {
+        let mut provider_options = ProviderOptions::new();
+        provider_options.insert(
+            "mock".into(),
+            serde_json::Map::from_iter([("future_option".into(), serde_json::Value::Bool(true))]),
+        );
+        let run = Client::default()
+            .query_cancellable(
+                "hello",
+                AgentOptions {
+                    provider_options,
+                    compatibility_mode: crate::contract::CompatibilityMode::Warn,
+                    ..AgentOptions::default()
+                },
+            )
+            .unwrap();
+        let outcome = run.finish().await;
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Completed
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0].parameter.as_deref(),
+            Some("future_option")
+        );
     }
 
     #[tokio::test]

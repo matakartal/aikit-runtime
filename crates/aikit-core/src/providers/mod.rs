@@ -15,13 +15,97 @@ pub mod openai_responses;
 pub mod openrouter;
 pub mod xai;
 
+use crate::contract::{CompatibilityMode, MediaInput, MediaInputSource, ProviderWarning};
 use crate::error::{AikitError, ProviderError, ProviderErrorKind, Result};
-use crate::types::{ContentBlock, Message, StreamDelta, ToolSpec};
+use crate::types::{ContentBlock, Message, Role, StreamDelta, ToolSpec};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{Map, Value};
 use std::time::Duration;
+use std::{borrow::Cow, fmt};
+
+/// Provider-ready media whose inline bytes have passed canonical size/hash validation.
+pub(crate) enum ResolvedMediaInput<'a> {
+    Base64(Cow<'a, str>),
+}
+
+impl fmt::Debug for ResolvedMediaInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Base64(_) => formatter.write_str("Base64([redacted])"),
+        }
+    }
+}
+
+/// Validate strict media and resolve only sources that are safe to serialize to a provider.
+/// Artifact references deliberately fail closed until an artifact store resolves them.
+pub(crate) fn resolve_media_input<'a>(
+    media: &'a MediaInput,
+    provider: &str,
+    model: &str,
+) -> Result<ResolvedMediaInput<'a>> {
+    media.validate().map_err(|message| {
+        ProviderError::new(
+            provider,
+            model,
+            ProviderErrorKind::InvalidRequest,
+            format!("invalid media input: {message}"),
+        )
+    })?;
+    match &media.source {
+        MediaInputSource::Url { .. } => Err(ProviderError::new(
+            provider,
+            model,
+            ProviderErrorKind::InvalidRequest,
+            "strict URL media must be fetched through governed egress, verified against size_bytes and sha256, then supplied as bytes or base64",
+        )
+        .into()),
+        MediaInputSource::Base64 { data } => Ok(ResolvedMediaInput::Base64(Cow::Borrowed(data))),
+        MediaInputSource::Bytes { data } => Ok(ResolvedMediaInput::Base64(Cow::Owned(
+            base64::engine::general_purpose::STANDARD.encode(data),
+        ))),
+        MediaInputSource::Artifact { .. } => Err(ProviderError::new(
+            provider,
+            model,
+            ProviderErrorKind::InvalidRequest,
+            "artifact media must be resolved to verified bytes or base64 before provider dispatch",
+        )
+        .into()),
+    }
+}
+
+pub(crate) fn is_image_media_type(media_type: &str) -> bool {
+    media_type
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+}
+
+/// Integrity-bound media is an input block and must never disappear from a system, assistant, or
+/// tool message merely because a provider wire format has no slot for it.
+pub(crate) fn validate_media_input_roles(
+    messages: &[Message],
+    provider: &str,
+    model: &str,
+) -> Result<()> {
+    if messages.iter().any(|message| {
+        message.role != Role::User
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::MediaInput { .. }))
+    }) {
+        return Err(ProviderError::new(
+            provider,
+            model,
+            ProviderErrorKind::InvalidRequest,
+            "integrity-bound media input is only valid in user messages",
+        )
+        .into());
+    }
+    Ok(())
+}
 
 /// Maximum unparsed SSE bytes retained by a provider transport. A single provider event larger
 /// than this is rejected as a protocol failure instead of growing an attacker-controlled buffer
@@ -325,6 +409,9 @@ pub struct ProviderRequest {
     /// Provider-keyed options retained across routing/fallback. Each adapter merges only its own
     /// entry, so vendor-native fields cannot leak into a different provider's request.
     pub provider_options: crate::types::ProviderOptions,
+    /// Controls preflight handling for provider parameters that are absent from the shipped
+    /// adapter catalog. The default on every high-level surface is fail-closed strict mode.
+    pub compatibility_mode: CompatibilityMode,
 }
 
 impl ProviderRequest {
@@ -335,6 +422,568 @@ impl ProviderRequest {
         }
         options
     }
+
+    pub(crate) fn validated_options_for(
+        &self,
+        provider: &str,
+        allowed: &[&str],
+    ) -> Result<ValidatedProviderOptions> {
+        let options = self.options_for(provider);
+        let mut warnings = Vec::new();
+        for (parameter, value) in &options {
+            if !allowed.contains(&parameter.as_str()) {
+                self.record_option_issue(
+                    provider,
+                    parameter,
+                    "unverified_provider_parameter",
+                    "is not in the shipped adapter catalog and was forwarded without semantic adaptation",
+                    &mut warnings,
+                )?;
+                continue;
+            }
+            let Some(kind) = provider_option_kind(provider, allowed, parameter) else {
+                self.record_option_issue(
+                    provider,
+                    parameter,
+                    "unverified_provider_parameter",
+                    "has no shipped value-type contract and was forwarded without semantic adaptation",
+                    &mut warnings,
+                )?;
+                continue;
+            };
+            if !kind.matches(value) {
+                self.record_option_issue(
+                    provider,
+                    parameter,
+                    "invalid_provider_parameter_type",
+                    &format!(
+                        "must be {}, but received {}",
+                        kind.description(),
+                        json_type_name(value)
+                    ),
+                    &mut warnings,
+                )?;
+                continue;
+            }
+            self.validate_nested_options(provider, allowed, parameter, value, &mut warnings)?;
+        }
+        Ok(ValidatedProviderOptions { options, warnings })
+    }
+
+    fn validate_nested_options(
+        &self,
+        provider: &str,
+        allowed: &[&str],
+        parameter: &str,
+        value: &Value,
+        warnings: &mut Vec<ProviderWarning>,
+    ) -> Result<()> {
+        let Some(fields) = provider_nested_option_fields(provider, allowed, parameter) else {
+            return Ok(());
+        };
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+        for (field, nested_value) in object {
+            let path = format!("{parameter}.{}", safe_parameter_name(field));
+            let Some((_, kind)) = fields.iter().find(|(known, _)| known == &field.as_str()) else {
+                self.record_option_issue(
+                    provider,
+                    &path,
+                    "unverified_provider_parameter",
+                    "is not in the shipped adapter catalog and was forwarded without semantic adaptation",
+                    warnings,
+                )?;
+                continue;
+            };
+            if !kind.matches(nested_value) {
+                self.record_option_issue(
+                    provider,
+                    &path,
+                    "invalid_provider_parameter_type",
+                    &format!(
+                        "must be {}, but received {}",
+                        kind.description(),
+                        json_type_name(nested_value)
+                    ),
+                    warnings,
+                )?;
+                continue;
+            }
+            self.validate_nested_options(provider, allowed, &path, nested_value, warnings)?;
+            // Schema object paths intentionally have no deeper field catalog. Validating JSON
+            // Schema keywords belongs to the provider/schema boundary, not compatibility checks.
+        }
+        Ok(())
+    }
+
+    fn record_option_issue(
+        &self,
+        provider: &str,
+        parameter: &str,
+        code: &str,
+        detail: &str,
+        warnings: &mut Vec<ProviderWarning>,
+    ) -> Result<()> {
+        let safe_parameter = safe_parameter_path(parameter);
+        if self.compatibility_mode == CompatibilityMode::Strict {
+            return Err(ProviderError::new(
+                provider,
+                &self.model,
+                ProviderErrorKind::InvalidRequest,
+                format!("provider option `{safe_parameter}` {detail} in strict compatibility mode"),
+            )
+            .into());
+        }
+        warnings.push(ProviderWarning {
+            code: code.into(),
+            message: format!("provider option `{safe_parameter}` {detail}"),
+            parameter: Some(safe_parameter),
+            provider: Some(provider.to_string()),
+            model: Some(self.model.clone()),
+        });
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedProviderOptions {
+    pub options: serde_json::Map<String, serde_json::Value>,
+    pub warnings: Vec<ProviderWarning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderOptionKind {
+    Any,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Object,
+    StringMap,
+    StringArray,
+    ObjectArray,
+    StringOrArray,
+    StringOrObject,
+}
+
+impl ProviderOptionKind {
+    fn matches(self, value: &Value) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Boolean => value.is_boolean(),
+            Self::Number => value.is_number(),
+            Self::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+            Self::String => value.is_string(),
+            Self::Object => value.is_object(),
+            Self::StringMap => value
+                .as_object()
+                .is_some_and(|values| values.values().all(Value::is_string)),
+            Self::StringArray => value
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string)),
+            Self::ObjectArray => value
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_object)),
+            Self::StringOrArray => value.is_string() || value.is_array(),
+            Self::StringOrObject => value.is_string() || value.is_object(),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Any => "any JSON value",
+            Self::Boolean => "a boolean",
+            Self::Number => "a number",
+            Self::Integer => "an integer",
+            Self::String => "a string",
+            Self::Object => "an object",
+            Self::StringMap => "an object with string values",
+            Self::StringArray => "an array of strings",
+            Self::ObjectArray => "an array of objects",
+            Self::StringOrArray => "a string or array",
+            Self::StringOrObject => "a string or object",
+        }
+    }
+}
+
+fn provider_option_kind(
+    provider: &str,
+    allowed: &[&str],
+    parameter: &str,
+) -> Option<ProviderOptionKind> {
+    use ProviderOptionKind as Kind;
+    if provider == "mock" && matches!(parameter, "tool_name" | "tool_input" | "response_format") {
+        return Some(Kind::Any);
+    }
+    let responses_api = provider == "openai" && allowed.contains(&"max_tool_calls");
+    match parameter {
+        "temperature" | "top_p" | "presence_penalty" | "frequency_penalty" => Some(Kind::Number),
+        "seed" | "top_logprobs" | "top_k" | "max_tool_calls" | "random_seed" => Some(Kind::Integer),
+        "logprobs" | "parallel_tool_calls" | "store" | "safe_prompt" => Some(Kind::Boolean),
+        "reasoning_effort"
+        | "service_tier"
+        | "user"
+        | "truncation"
+        | "safety_identifier"
+        | "prompt_cache_key"
+        | "prompt_cache_retention"
+        | "speed"
+        | "inference_geo"
+        | "reasoning_format"
+        | "route"
+        | "cachedContent" => Some(Kind::String),
+        "stop" => Some(Kind::StringOrArray),
+        "stop_sequences" | "modalities" | "include" | "models" | "transforms" => {
+            Some(Kind::StringArray)
+        }
+        "mcp_servers" | "safetySettings" | "plugins" => Some(Kind::ObjectArray),
+        "tool_choice" => Some(Kind::StringOrObject),
+        "metadata" | "labels" => Some(Kind::StringMap),
+        "response_format" | "prediction" | "audio" | "thinking" | "output_config"
+        | "generationConfig" | "toolConfig" => Some(Kind::Object),
+        "reasoning" | "text" if responses_api => Some(Kind::Object),
+        _ => None,
+    }
+}
+
+const GOOGLE_GENERATION_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("temperature", ProviderOptionKind::Number),
+    ("topP", ProviderOptionKind::Number),
+    ("topK", ProviderOptionKind::Integer),
+    ("candidateCount", ProviderOptionKind::Integer),
+    ("maxOutputTokens", ProviderOptionKind::Integer),
+    ("stopSequences", ProviderOptionKind::StringArray),
+    ("responseMimeType", ProviderOptionKind::String),
+    ("responseSchema", ProviderOptionKind::Object),
+    ("responseJsonSchema", ProviderOptionKind::Object),
+    ("presencePenalty", ProviderOptionKind::Number),
+    ("frequencyPenalty", ProviderOptionKind::Number),
+    ("responseLogprobs", ProviderOptionKind::Boolean),
+    ("logprobs", ProviderOptionKind::Integer),
+    ("seed", ProviderOptionKind::Integer),
+    ("thinkingConfig", ProviderOptionKind::Object),
+    ("mediaResolution", ProviderOptionKind::String),
+    ("imageConfig", ProviderOptionKind::Object),
+    ("speechConfig", ProviderOptionKind::Object),
+];
+
+const OPENAI_REASONING_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("effort", ProviderOptionKind::String),
+    ("summary", ProviderOptionKind::String),
+];
+
+const OPENAI_TEXT_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("format", ProviderOptionKind::Object),
+    ("verbosity", ProviderOptionKind::String),
+];
+
+const GOOGLE_TOOL_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] =
+    &[("functionCallingConfig", ProviderOptionKind::Object)];
+
+const GOOGLE_FUNCTION_CALLING_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("mode", ProviderOptionKind::String),
+    ("allowedFunctionNames", ProviderOptionKind::StringArray),
+    ("streamFunctionCallArguments", ProviderOptionKind::Boolean),
+];
+
+const GOOGLE_THINKING_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("includeThoughts", ProviderOptionKind::Boolean),
+    ("thinkingBudget", ProviderOptionKind::Integer),
+    ("thinkingLevel", ProviderOptionKind::String),
+];
+
+const GOOGLE_IMAGE_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("aspectRatio", ProviderOptionKind::String),
+    ("imageSize", ProviderOptionKind::String),
+];
+
+const OPENAI_RESPONSE_FORMAT_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("json_schema", ProviderOptionKind::Object),
+];
+
+const OPENAI_JSON_SCHEMA_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("name", ProviderOptionKind::String),
+    ("description", ProviderOptionKind::String),
+    ("strict", ProviderOptionKind::Boolean),
+    ("schema", ProviderOptionKind::Object),
+];
+
+const OPENAI_TEXT_FORMAT_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("name", ProviderOptionKind::String),
+    ("description", ProviderOptionKind::String),
+    ("strict", ProviderOptionKind::Boolean),
+    ("schema", ProviderOptionKind::Object),
+];
+
+const OPENAI_TOOL_CHOICE_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("name", ProviderOptionKind::String),
+    ("server_label", ProviderOptionKind::String),
+    ("function", ProviderOptionKind::Object),
+];
+
+const OPENAI_TOOL_CHOICE_FUNCTION_FIELDS: &[(&str, ProviderOptionKind)] =
+    &[("name", ProviderOptionKind::String)];
+
+const OPENAI_PREDICTION_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("content", ProviderOptionKind::StringOrArray),
+];
+
+const OPENAI_AUDIO_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("voice", ProviderOptionKind::String),
+    ("format", ProviderOptionKind::String),
+];
+
+const ANTHROPIC_OUTPUT_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("effort", ProviderOptionKind::String),
+    ("format", ProviderOptionKind::Object),
+];
+
+const ANTHROPIC_OUTPUT_FORMAT_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("name", ProviderOptionKind::String),
+    ("schema", ProviderOptionKind::Object),
+];
+
+const ANTHROPIC_TOOL_CHOICE_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("name", ProviderOptionKind::String),
+    ("disable_parallel_tool_use", ProviderOptionKind::Boolean),
+];
+
+const ANTHROPIC_THINKING_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("type", ProviderOptionKind::String),
+    ("budget_tokens", ProviderOptionKind::Integer),
+];
+
+fn provider_nested_option_fields(
+    provider: &str,
+    allowed: &[&str],
+    path: &str,
+) -> Option<&'static [(&'static str, ProviderOptionKind)]> {
+    let responses_api = provider == "openai" && allowed.contains(&"max_tool_calls");
+    let openai_compatible = matches!(
+        provider,
+        "openai" | "deepseek" | "openrouter" | "groq" | "mistral" | "xai"
+    );
+    match (provider, path) {
+        ("google", "generationConfig") => Some(GOOGLE_GENERATION_CONFIG_FIELDS),
+        ("google", "generationConfig.thinkingConfig") => Some(GOOGLE_THINKING_CONFIG_FIELDS),
+        ("google", "generationConfig.imageConfig") => Some(GOOGLE_IMAGE_CONFIG_FIELDS),
+        ("google", "toolConfig") => Some(GOOGLE_TOOL_CONFIG_FIELDS),
+        ("google", "toolConfig.functionCallingConfig") => Some(GOOGLE_FUNCTION_CALLING_FIELDS),
+        ("openai", "reasoning") if responses_api => Some(OPENAI_REASONING_FIELDS),
+        ("openai", "text") if responses_api => Some(OPENAI_TEXT_FIELDS),
+        ("openai", "text.format") if responses_api => Some(OPENAI_TEXT_FORMAT_FIELDS),
+        ("anthropic", "thinking") => Some(ANTHROPIC_THINKING_FIELDS),
+        ("anthropic", "output_config") => Some(ANTHROPIC_OUTPUT_CONFIG_FIELDS),
+        ("anthropic", "output_config.format") => Some(ANTHROPIC_OUTPUT_FORMAT_FIELDS),
+        ("anthropic", "tool_choice") => Some(ANTHROPIC_TOOL_CHOICE_FIELDS),
+        (_, "response_format") if openai_compatible => Some(OPENAI_RESPONSE_FORMAT_FIELDS),
+        (_, "response_format.json_schema") if openai_compatible => Some(OPENAI_JSON_SCHEMA_FIELDS),
+        (_, "tool_choice") if openai_compatible => Some(OPENAI_TOOL_CHOICE_FIELDS),
+        (_, "tool_choice.function") if openai_compatible => {
+            Some(OPENAI_TOOL_CHOICE_FUNCTION_FIELDS)
+        }
+        (_, "prediction") if openai_compatible => Some(OPENAI_PREDICTION_FIELDS),
+        (_, "audio") if openai_compatible => Some(OPENAI_AUDIO_FIELDS),
+        _ => None,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => {
+            "an integer"
+        }
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn safe_parameter_name(parameter: &str) -> &str {
+    if parameter.len() <= 128
+        && parameter
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'`' && byte != b'.')
+    {
+        parameter
+    } else {
+        "[invalid parameter name]"
+    }
+}
+
+fn safe_parameter_path(path: &str) -> String {
+    path.split('.')
+        .map(safe_parameter_name)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+pub(crate) const OPENAI_CHAT_OPTIONS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "stop",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "logprobs",
+    "top_logprobs",
+    "reasoning_effort",
+    "response_format",
+    "tool_choice",
+    "parallel_tool_calls",
+    "service_tier",
+    "user",
+    "metadata",
+    "store",
+    "prediction",
+    "modalities",
+    "audio",
+];
+
+pub(crate) const OPENAI_RESPONSES_OPTIONS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "reasoning",
+    "text",
+    "response_format",
+    "tool_choice",
+    "parallel_tool_calls",
+    "service_tier",
+    "user",
+    "metadata",
+    "store",
+    "include",
+    "truncation",
+    "max_tool_calls",
+    "safety_identifier",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+];
+
+pub(crate) const ANTHROPIC_OPTIONS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "metadata",
+    "service_tier",
+    "thinking",
+    "output_config",
+    "speed",
+    "inference_geo",
+    "tool_choice",
+];
+
+pub(crate) const GOOGLE_OPTIONS: &[&str] = &[
+    "generationConfig",
+    "safetySettings",
+    "toolConfig",
+    "cachedContent",
+    "labels",
+];
+
+pub(crate) const DEEPSEEK_OPTIONS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+    "response_format",
+    "tool_choice",
+    "logprobs",
+    "top_logprobs",
+];
+
+pub(crate) fn openai_compatible_options(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openrouter" => &[
+            "temperature",
+            "top_p",
+            "stop",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "top_logprobs",
+            "reasoning_effort",
+            "response_format",
+            "tool_choice",
+            "parallel_tool_calls",
+            "user",
+            "route",
+            "transforms",
+            "models",
+        ],
+        "groq" => &[
+            "temperature",
+            "top_p",
+            "stop",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "tool_choice",
+            "parallel_tool_calls",
+            "service_tier",
+            "user",
+            "reasoning_format",
+            "reasoning_effort",
+        ],
+        "mistral" => &[
+            "temperature",
+            "top_p",
+            "stop",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "response_format",
+            "tool_choice",
+            "parallel_tool_calls",
+            "random_seed",
+            "safe_prompt",
+            "prediction",
+        ],
+        "xai" => &[
+            "temperature",
+            "top_p",
+            "stop",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "tool_choice",
+            "parallel_tool_calls",
+            "reasoning_effort",
+        ],
+        _ => OPENAI_CHAT_OPTIONS,
+    }
+}
+
+pub(crate) fn prepend_provider_warnings(
+    stream: BoxStream<'static, StreamDelta>,
+    warnings: Vec<ProviderWarning>,
+) -> BoxStream<'static, StreamDelta> {
+    futures::stream::iter(
+        warnings
+            .into_iter()
+            .map(|warning| StreamDelta::Warning { warning }),
+    )
+    .chain(stream)
+    .boxed()
 }
 
 fn transport_error_kind(error: &reqwest::Error) -> ProviderErrorKind {
@@ -454,6 +1103,9 @@ impl Provider for MockProvider {
     }
 
     async fn stream(&self, req: ProviderRequest) -> Result<BoxStream<'static, StreamDelta>> {
+        let validated = req
+            .validated_options_for(self.name(), &["tool_name", "tool_input", "response_format"])?;
+        let warnings = validated.warnings;
         // Validate explicit fixture controls even when another mock mode (such as structured
         // output) would otherwise return early. A misspelled or unadvertised tool must never be
         // silently ignored.
@@ -462,7 +1114,7 @@ impl Provider for MockProvider {
         // Structured-output binding demos use the same planner + validator as live models while
         // remaining keyless. The native-constrained mock receives the schema through the
         // response_format escape hatch and deterministically materializes one valid value.
-        if let Some(schema) = req
+        if let Some(schema) = validated
             .options
             .get("response_format")
             .and_then(|v| v.get("json_schema"))
@@ -480,7 +1132,10 @@ impl Provider for MockProvider {
                     stop_reason: "end_turn".into(),
                 },
             ];
-            return Ok(Box::pin(futures::stream::iter(deltas)));
+            return Ok(prepend_provider_warnings(
+                Box::pin(futures::stream::iter(deltas)),
+                warnings,
+            ));
         }
 
         let has_tool_result = req.messages.iter().any(|m| {
@@ -533,7 +1188,10 @@ impl Provider for MockProvider {
             ]
         };
 
-        Ok(Box::pin(futures::stream::iter(deltas)))
+        Ok(prepend_provider_warnings(
+            Box::pin(futures::stream::iter(deltas)),
+            warnings,
+        ))
     }
 }
 
@@ -652,6 +1310,7 @@ mod request_tests {
             max_tokens: 64,
             options: Map::new(),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
         }
     }
 
@@ -672,6 +1331,7 @@ mod request_tests {
             max_tokens: 1,
             options: serde_json::Map::from_iter([("shared".into(), Value::Bool(true))]),
             provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
         };
         request.provider_options.insert(
             "anthropic".into(),
@@ -696,6 +1356,291 @@ mod request_tests {
         let google = request.options_for("google");
         assert!(google.contains_key("toolConfig"));
         assert!(!google.contains_key("thinking"));
+    }
+
+    #[test]
+    fn compatibility_mode_rejects_or_warns_without_dropping_parameters() {
+        let mut request = ProviderRequest {
+            model: "gpt-test".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([("future_option".into(), Value::Bool(true))]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+
+        let error = request
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error) if error.kind == ProviderErrorKind::InvalidRequest
+        ));
+
+        request.compatibility_mode = CompatibilityMode::Warn;
+        let validated = request
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap();
+        assert_eq!(validated.options["future_option"], Value::Bool(true));
+        assert_eq!(validated.warnings.len(), 1);
+        assert_eq!(
+            validated.warnings[0].parameter.as_deref(),
+            Some("future_option")
+        );
+
+        request.compatibility_mode = CompatibilityMode::BestEffort;
+        let best_effort = request
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap();
+        assert_eq!(best_effort.options["future_option"], Value::Bool(true));
+        assert_eq!(best_effort.warnings.len(), 1);
+    }
+
+    #[test]
+    fn google_nested_option_typo_is_typed_in_strict_and_path_warned_otherwise() {
+        let mut request = ProviderRequest {
+            model: "gemini-test".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([(
+                "generationConfig".into(),
+                serde_json::json!({"temprature": 0.5}),
+            )]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+
+        let error = request
+            .validated_options_for("google", GOOGLE_OPTIONS)
+            .unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("generationConfig.temprature")
+        ));
+
+        for mode in [CompatibilityMode::Warn, CompatibilityMode::BestEffort] {
+            request.compatibility_mode = mode;
+            let validated = request
+                .validated_options_for("google", GOOGLE_OPTIONS)
+                .unwrap();
+            assert_eq!(
+                validated.options["generationConfig"]["temprature"],
+                serde_json::json!(0.5)
+            );
+            assert_eq!(validated.warnings.len(), 1);
+            assert_eq!(
+                validated.warnings[0].parameter.as_deref(),
+                Some("generationConfig.temprature")
+            );
+            assert_eq!(validated.warnings[0].code, "unverified_provider_parameter");
+        }
+    }
+
+    #[test]
+    fn governed_object_options_validate_recursively_and_opaque_options_require_warn_mode() {
+        let mut google = ProviderRequest {
+            model: "gemini-test".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([(
+                "toolConfig".into(),
+                serde_json::json!({"functionCallingConfigg": {"mode": "ANY"}}),
+            )]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        let error = google
+            .validated_options_for("google", GOOGLE_OPTIONS)
+            .unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("toolConfig.functionCallingConfigg")
+        ));
+
+        google.compatibility_mode = CompatibilityMode::Warn;
+        let warned = google
+            .validated_options_for("google", GOOGLE_OPTIONS)
+            .unwrap();
+        assert_eq!(
+            warned.warnings[0].parameter.as_deref(),
+            Some("toolConfig.functionCallingConfigg")
+        );
+        assert_eq!(
+            warned.options["toolConfig"]["functionCallingConfigg"]["mode"],
+            "ANY"
+        );
+
+        let anthropic = ProviderRequest {
+            model: "claude-test".into(),
+            options: Map::from_iter([(
+                "output_config".into(),
+                serde_json::json!({"formatt": {"type": "json_schema"}}),
+            )]),
+            compatibility_mode: CompatibilityMode::Strict,
+            ..google.clone()
+        };
+        assert!(matches!(
+            anthropic
+                .validated_options_for("anthropic", ANTHROPIC_OPTIONS)
+                .unwrap_err()
+                .provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("output_config.formatt")
+        ));
+
+        // Complex vendor beta objects are not advertised as strict-known until every nested
+        // field is cataloged. Warn mode can still forward them with explicit evidence.
+        let mut beta = ProviderRequest {
+            options: Map::from_iter([(
+                "context_management".into(),
+                serde_json::json!({"edits": []}),
+            )]),
+            ..anthropic
+        };
+        assert!(beta
+            .validated_options_for("anthropic", ANTHROPIC_OPTIONS)
+            .is_err());
+        beta.compatibility_mode = CompatibilityMode::Warn;
+        let warned = beta
+            .validated_options_for("anthropic", ANTHROPIC_OPTIONS)
+            .unwrap();
+        assert_eq!(warned.warnings.len(), 1);
+        assert_eq!(
+            warned.warnings[0].parameter.as_deref(),
+            Some("context_management")
+        );
+    }
+
+    #[test]
+    fn cataloged_option_value_types_are_enforced_without_dropping_warned_values() {
+        let mut request = ProviderRequest {
+            model: "gpt-test".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([("temperature".into(), Value::String("hot".into()))]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        let error = request
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap_err();
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("temperature")
+        ));
+
+        request.compatibility_mode = CompatibilityMode::Warn;
+        let validated = request
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap();
+        assert_eq!(validated.options["temperature"], "hot");
+        assert_eq!(
+            validated.warnings[0].parameter.as_deref(),
+            Some("temperature")
+        );
+        assert_eq!(
+            validated.warnings[0].code,
+            "invalid_provider_parameter_type"
+        );
+    }
+
+    #[test]
+    fn schema_payload_contents_remain_opaque_to_option_keyword_validation() {
+        let google = ProviderRequest {
+            model: "gemini-test".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([(
+                "generationConfig".into(),
+                serde_json::json!({
+                    "responseSchema": {
+                        "type": "object",
+                        "properties": {"temprature": {"type": "number"}}
+                    }
+                }),
+            )]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        assert!(google
+            .validated_options_for("google", GOOGLE_OPTIONS)
+            .unwrap()
+            .warnings
+            .is_empty());
+
+        let openai = ProviderRequest {
+            model: "gpt-test".into(),
+            options: Map::from_iter([(
+                "response_format".into(),
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"unknownValidationKeyword": true}}
+                }),
+            )]),
+            ..google
+        };
+        assert!(openai
+            .validated_options_for("openai", OPENAI_CHAT_OPTIONS)
+            .unwrap()
+            .warnings
+            .is_empty());
+    }
+
+    #[test]
+    fn every_shipped_option_has_a_value_type_and_responses_stateless_is_not_cataloged() {
+        let catalogs = [
+            ("openai", OPENAI_CHAT_OPTIONS),
+            ("openai", OPENAI_RESPONSES_OPTIONS),
+            ("anthropic", ANTHROPIC_OPTIONS),
+            ("google", GOOGLE_OPTIONS),
+            ("deepseek", DEEPSEEK_OPTIONS),
+            ("openrouter", openai_compatible_options("openrouter")),
+            ("groq", openai_compatible_options("groq")),
+            ("mistral", openai_compatible_options("mistral")),
+            ("xai", openai_compatible_options("xai")),
+            (
+                "mock",
+                &["tool_name", "tool_input", "response_format"] as &[&str],
+            ),
+        ];
+        for (provider, allowed) in catalogs {
+            for parameter in allowed {
+                assert!(
+                    provider_option_kind(provider, allowed, parameter).is_some(),
+                    "missing type contract for {provider}.{parameter}"
+                );
+            }
+        }
+        assert!(!OPENAI_RESPONSES_OPTIONS.contains(&"stateless"));
+
+        let request = ProviderRequest {
+            model: "gpt-test".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([("stateless".into(), Value::Bool(true))]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        assert!(matches!(
+            request
+                .validated_options_for("openai", OPENAI_RESPONSES_OPTIONS)
+                .unwrap_err()
+                .provider_error(),
+            Some(error) if error.kind == ProviderErrorKind::InvalidRequest
+        ));
     }
 
     #[test]

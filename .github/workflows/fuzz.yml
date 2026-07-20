@@ -1,0 +1,35 @@
+name: fuzz
+
+on:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 2,5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-libfuzzer:
+    name: Bounded canonical parser fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: nightly-2026-07-15
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Mutate stream lifecycle
+        run: cargo fuzz run stream_lifecycle -- -runs=10000 -max_len=65536
+      - name: Mutate durable event replay
+        run: cargo fuzz run durable_replay -- -runs=10000 -max_len=65536
+      - name: Mutate provider cassettes
+        run: cargo fuzz run provider_cassette -- -runs=10000 -max_len=262144

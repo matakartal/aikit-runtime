@@ -7,6 +7,7 @@ members = [
     "crates/aikit-node",
     "crates/aikit-cli",
 ]
+exclude = ["fuzz"]
 # Bare `cargo build`/`cargo test` operate on these (pure-Rust) crates only. The `aikit-py` and
 # `aikit-node` cdylibs are built out-of-band (maturin for Python; `scripts/build-node.sh` for
 # Node), so they are kept out of the default set — `aikit-py` needs the `extension-module`

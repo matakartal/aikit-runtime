@@ -51,11 +51,27 @@ All notable changes to this project will be documented in this file. The format 
 - Durable event-sourced runs with checkpoints, activity/idempotency/reconciliation records,
   resume/fork/rewind/cancel, durable approvals, SQLite CAS persistence, and equivalent Python/Node
   `DurableRun` wrappers.
+- Policy snapshots pinned into append-only run history, four typed HITL approval states, trusted
+  expiry clocks, restart-safe resolution, and a persisted legacy-approver bridge that commits
+  through `DurableStore` compare-and-swap before exposing state.
+- Integrity-bound `MediaInput` message blocks across Rust, Python, and Node. Inline bytes/base64
+  are size-checked and SHA-256 verified before provider dispatch; unresolved artifacts and media
+  in unsupported roles fail before network I/O. Strict URL inputs also require governed resolution
+  to verified bytes; Google no longer treats ordinary web URLs as Files API URIs.
+- Enforced provider `CompatibilityMode`: strict preflight rejects uncataloged parameters before
+  network I/O, while warn/best-effort preserve the value and emit a typed stream warning.
 - Working, episodic, and semantic memory planes with provenance and compare-and-swap updates.
 - Provider-neutral multimodal image/audio/transcript/realtime contracts, persisted realtime
   dedupe, cancellation, typed provider SPIs, and fallback-disabled capability-aware routing.
-- Governed MCP Tasks, A2A 1.0 and ACP v1 state mappings; protocol transport execution remains a
-  separately tracked parity gate.
+- Governed MCP 2025-11-25 JSON-RPC server with real stdio and Streamable HTTP listeners, bounded
+  SSE replay, Origin/auth/session/version/Host/Accept enforcement, SQLite CAS persistence,
+  restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 and ACP v1 wire
+  listeners remain separately tracked parity gates.
+- Optional fail-closed Firecracker lifecycle: immutable hash-pinned host inputs, shell-free jailer
+  argv, trusted-path/version/KVM/TAP/netns checks, bounded API startup and cleanup. It is not a
+  Bash backend until guest command/workspace transport and Linux escape proof exist.
+- Persistent libFuzzer and chaos workflows for stream/durable/cassette mutation, forced-process
+  SQLite recovery, and disposable PostgreSQL cross-connection CAS.
 - Deterministic trace assertions and redacted agent/run/model/tool/checkpoint/activity spans,
   exposed through Rust, Python, and Node evaluation helpers.
 - Living competitor parity matrix with exact upstream commit/license pins and evidence/status per

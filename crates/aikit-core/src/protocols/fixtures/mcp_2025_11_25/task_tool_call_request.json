@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": {
+      "city": "New York"
+    },
+    "task": {
+      "ttl": 60000
+    },
+    "_meta": {
+      "progressToken": "weather-progress"
+    }
+  }
+}

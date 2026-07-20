@@ -1050,6 +1050,7 @@ mod tests {
             max_tokens,
             options: Default::default(),
             provider_options: Default::default(),
+            compatibility_mode: crate::contract::CompatibilityMode::Strict,
         }
     }
 
