@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "governance-allowed",
+  "model": "mock-1",
+  "max_tokens": 64,
+  "cases": [
+    {
+      "name": "tool-round-trip",
+      "prompt": "Use the probe tool, then finish.",
+      "gates": [
+        { "type": "called_tool", "name": "demo_probe" },
+        { "type": "tool_sequence", "names": ["demo_probe"], "exact": true },
+        { "type": "no_tool_errors" },
+        { "type": "max_turns", "value": 2 },
+        { "type": "max_model_attempts", "value": 2 },
+        { "type": "output_contains", "value": "tamamladım" },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    }
+  ]
+}

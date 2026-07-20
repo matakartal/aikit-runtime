@@ -1,6 +1,7 @@
 use aikit::{
-    evaluate_outcome, Agent, BuiltinTools, ErrorCode, ErrorInfo, EvalCaseReport, EvalDataset,
-    EvalReport, EvalVerdict, Message, NoTools, RunConfig, RunRecorder, Sandbox, StreamDelta,
+    evaluate_outcome, tool, Agent, BuiltinTools, ErrorCode, ErrorInfo, EvalCaseReport, EvalDataset,
+    EvalReport, EvalVerdict, Governance, Message, NoTools, PermissionEngine, PermissionMode, Rule,
+    RunConfig, RunRecorder, Sandbox, StreamDelta, ToolExecutor, ToolSpec,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
@@ -145,6 +146,44 @@ struct EvalArgs {
     /// Hard wall-time ceiling shared by all live cases in this invocation.
     #[arg(long, default_value_t = DEFAULT_MAX_LIVE_WALL_SECONDS, value_parser = clap::value_parser!(u64).range(1..=86_400))]
     max_live_wall_seconds: u64,
+
+    /// Register a deterministic in-process demo probe tool so governance-trajectory datasets can
+    /// exercise a real tool call. `denied` additionally installs a deny rule so the call is refused
+    /// before execution. The probe has no side effects (it echoes its input).
+    #[arg(long, value_enum)]
+    demo_tools: Option<DemoTools>,
+}
+
+/// Keyless demo-tool wiring for governance-trajectory eval datasets. Not a general tool surface.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum DemoTools {
+    /// Advertise the probe and let the call execute.
+    Allowed,
+    /// Advertise the probe but deny it before execution.
+    Denied,
+}
+
+/// The deterministic, side-effect-free tool advertised by `--demo-tools`. The mock provider calls
+/// the first advertised tool with `{"q":"merhaba"}`, so the schema must accept that input.
+fn demo_probe_spec() -> ToolSpec {
+    tool(
+        "demo_probe",
+        "Deterministic keyless eval probe; echoes its input.",
+        json!({
+            "type": "object",
+            "properties": { "q": { "type": "string" } },
+            "additionalProperties": false
+        }),
+    )
+}
+
+struct DemoProbe;
+
+#[async_trait::async_trait]
+impl ToolExecutor for DemoProbe {
+    async fn execute(&self, name: &str, input: Value) -> aikit::Result<String> {
+        Ok(format!("{name}:{input}"))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -315,8 +354,24 @@ async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result
         let mut config = RunConfig::new(&model, case_messages);
         config.max_tokens = max_tokens;
         config.recorder = recorder.clone();
+        let executor: Arc<dyn ToolExecutor> = match args.demo_tools {
+            Some(demo) => {
+                config.tools = vec![demo_probe_spec()];
+                if demo == DemoTools::Denied {
+                    config.governance = Governance::new(
+                        PermissionEngine::with_rules(
+                            PermissionMode::Allow,
+                            vec![Rule::deny("demo_probe")],
+                        ),
+                        Default::default(),
+                    );
+                }
+                Arc::new(DemoProbe)
+            }
+            None => Arc::new(NoTools),
+        };
         let cancellation = config.cancellation.clone();
-        match agent.run_with_config(config, Arc::new(NoTools)) {
+        match agent.run_with_config(config, executor) {
             Ok(stream) => {
                 futures::pin_mut!(stream);
                 let mut stream_error = None;

@@ -228,6 +228,115 @@ fn eval_requires_explicit_live_provider_acknowledgement() {
 }
 
 #[test]
+fn demo_tools_allowed_passes_trajectory_gates() {
+    let mut dataset = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        dataset,
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "name": "gov-allowed",
+            "model": "mock-1",
+            "max_tokens": 64,
+            "cases": [{
+                "name": "round-trip",
+                "prompt": "use the probe tool",
+                "gates": [
+                    {"type": "called_tool", "name": "demo_probe"},
+                    {"type": "tool_sequence", "names": ["demo_probe"], "exact": true},
+                    {"type": "no_tool_errors"},
+                    {"type": "max_turns", "value": 2},
+                    {"type": "terminal_status", "status": "completed"}
+                ]
+            }]
+        })
+    )
+    .unwrap();
+    let output = aikit()
+        .args([
+            "eval",
+            dataset.path().to_str().unwrap(),
+            "--demo-tools",
+            "allowed",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn demo_tools_denied_keeps_loop_alive() {
+    let mut dataset = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        dataset,
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "name": "gov-denied",
+            "model": "mock-1",
+            "max_tokens": 64,
+            "cases": [{
+                "name": "denied-survives",
+                "prompt": "attempt the probe tool",
+                "gates": [
+                    {"type": "called_tool", "name": "demo_probe"},
+                    {"type": "max_turns", "value": 2},
+                    {"type": "terminal_status", "status": "completed"}
+                ]
+            }]
+        })
+    )
+    .unwrap();
+    let output = aikit()
+        .args([
+            "eval",
+            dataset.path().to_str().unwrap(),
+            "--demo-tools",
+            "denied",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn demo_tools_flag_is_required_for_governance_datasets() {
+    // Proves the governance datasets truly depend on an advertised tool: without --demo-tools the
+    // mock never emits a tool call, so the called_tool gate fails and the run exits with the
+    // dedicated gate-failure code (4).
+    let mut dataset = tempfile::NamedTempFile::new().unwrap();
+    write!(
+        dataset,
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "name": "gov-needs-flag",
+            "model": "mock-1",
+            "max_tokens": 64,
+            "cases": [{
+                "name": "requires-tool",
+                "prompt": "use the probe tool",
+                "gates": [{"type": "called_tool", "name": "demo_probe"}]
+            }]
+        })
+    )
+    .unwrap();
+    let output = aikit()
+        .args(["eval", dataset.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
 fn malformed_eval_dataset_is_an_input_error() {
     let mut dataset = tempfile::NamedTempFile::new().unwrap();
     dataset.write_all(b"{not-json").unwrap();

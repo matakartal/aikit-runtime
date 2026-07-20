@@ -1,0 +1,60 @@
+# Dependency gate for the aikit workspace: RustSec advisories, license policy, duplicate
+# and wildcard bans, and registry-source pinning. Enforced by .github/workflows/security.yml.
+# Run locally with: cargo deny check
+
+[graph]
+# Exactly the targets this project ships (see the release.yml native/wheel matrices).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# A yanked transitive release must not silently break unrelated PRs; it stays visible.
+yanked = "warn"
+ignore = [
+    # Accepted advisories require: id, reason, and a revisit date in the comment.
+]
+
+[licenses]
+# The workspace is MIT OR Apache-2.0; everything allowed below is permissive-compatible.
+allow = [
+    "MIT",
+    "MIT-0",                # borrow-or-share, via the jsonschema/fluent-uri chain
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",  # webpki-roots root-store data
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# Intra-workspace path deps (e.g. aikit-cli -> aikit-runtime) carry no version and read as
+# wildcards; that is safe. Registry wildcards are still denied.
+allow-wildcard-paths = true
+# Known transitive duplicate lines in the current lockfile. Each skip names the OLD line with a
+# range, leaving the newer line canonical, so a Dependabot patch bump of the old line stays
+# green while a brand-new third version still fails the gate and forces a deliberate decision.
+skip = [
+    { crate = "getrandom@0.2", reason = "0.2.x line via ring/rustls; 0.4.x (tempfile) is canonical" },
+    { crate = "getrandom@0.3", reason = "0.3.x line via ahash; 0.4.x (tempfile) is canonical" },
+    { crate = "windows-sys@<0.61", reason = "0.52 via older transitive deps" },
+    { crate = "hashbrown@<0.17", reason = "older line via transitive deps" },
+    { crate = "io-lifetimes@<3", reason = "older line via transitive deps" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"   # Cargo.lock currently has zero git dependencies; keep it that way.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

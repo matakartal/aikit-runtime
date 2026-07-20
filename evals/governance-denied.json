@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "governance-denied",
+  "model": "mock-1",
+  "max_tokens": 64,
+  "cases": [
+    {
+      "name": "denied-tool-loop-survives",
+      "prompt": "Attempt the probe tool; governance must deny it.",
+      "gates": [
+        { "type": "called_tool", "name": "demo_probe" },
+        { "type": "max_turns", "value": 2 },
+        { "type": "output_contains", "value": "tamamladım" },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    }
+  ]
+}

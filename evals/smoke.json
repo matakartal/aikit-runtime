@@ -8,21 +8,84 @@
       "name": "mock-completes",
       "prompt": "Explain that the task is complete.",
       "gates": [
-        {
-          "type": "output_contains",
-          "value": "tamamladım"
-        },
-        {
-          "type": "terminal_status",
-          "status": "completed"
-        },
-        {
-          "type": "max_output_tokens",
-          "value": 64
-        },
-        {
-          "type": "no_tool_errors"
-        }
+        { "type": "output_contains", "value": "tamamladım" },
+        { "type": "terminal_status", "status": "completed" },
+        { "type": "max_output_tokens", "value": 64 },
+        { "type": "no_tool_errors" }
+      ]
+    },
+    {
+      "name": "exact-final-answer",
+      "prompt": "Produce the canonical completion text.",
+      "gates": [
+        { "type": "output_exact", "value": "Araç sonucunu aldım; görevi tamamladım." },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "no-failure-vocabulary",
+      "prompt": "Complete without reporting an error.",
+      "gates": [
+        { "type": "output_not_contains", "value": "error" },
+        { "type": "no_tool_errors" },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "single-turn-cap",
+      "prompt": "Finish in one assistant turn.",
+      "gates": [
+        { "type": "max_turns", "value": 1 },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "usage-ceilings-exact",
+      "prompt": "Stay within the deterministic token budget.",
+      "gates": [
+        { "type": "max_input_tokens", "value": 12 },
+        { "type": "max_output_tokens", "value": 9 },
+        { "type": "max_total_tokens", "value": 21 },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "no-tools-advertised",
+      "prompt": "Answer directly without any tool.",
+      "gates": [
+        { "type": "did_not_call_tool", "name": "bash" },
+        { "type": "did_not_call_tool", "name": "read_file" },
+        { "type": "no_tool_errors" },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "single-model-attempt",
+      "prompt": "Complete without retry or fallback.",
+      "gates": [
+        { "type": "max_model_attempts", "value": 1 },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "system-instruction-path",
+      "system": "Yanıtları kısa tut.",
+      "prompt": "Complete the task.",
+      "gates": [
+        { "type": "output_contains", "value": "tamamladım" },
+        { "type": "max_turns", "value": 1 },
+        { "type": "terminal_status", "status": "completed" }
+      ]
+    },
+    {
+      "name": "per-case-model-override",
+      "prompt": "Complete under a case-level model and budget override.",
+      "model": "mock-2",
+      "max_tokens": 32,
+      "gates": [
+        { "type": "output_contains", "value": "tamamladım" },
+        { "type": "max_output_tokens", "value": 32 },
+        { "type": "terminal_status", "status": "completed" }
       ]
     }
   ]

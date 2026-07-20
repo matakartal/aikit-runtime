@@ -319,6 +319,76 @@ pub(crate) struct PreparedCommand {
     pub artifacts: Vec<tempfile::TempDir>,
 }
 
+/// The host operating system, resolved once so the backend-selection decision is a pure function
+/// of policy plus probe results rather than of compile-time `cfg!`. This lets the selection logic
+/// (including every fail-closed path) be exhaustively unit-tested on any single platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostOs {
+    MacOs,
+    Linux,
+    Windows,
+    Other,
+}
+
+const fn current_host_os() -> HostOs {
+    if cfg!(target_os = "macos") {
+        HostOs::MacOs
+    } else if cfg!(target_os = "linux") {
+        HostOs::Linux
+    } else if cfg!(target_os = "windows") {
+        HostOs::Windows
+    } else {
+        HostOs::Other
+    }
+}
+
+/// The native backend for a host, gated by whether that backend actually probed available. Returns
+/// `None` on a host with no native backend, or when the native backend is unavailable — never a
+/// different host's backend.
+fn native_backend(
+    host: HostOs,
+    seatbelt: bool,
+    linux: bool,
+    windows: bool,
+) -> Option<ActiveContainmentBackend> {
+    match host {
+        HostOs::MacOs if seatbelt => Some(ActiveContainmentBackend::Seatbelt),
+        HostOs::Linux if linux => Some(ActiveContainmentBackend::LinuxNamespace),
+        HostOs::Windows if windows => Some(ActiveContainmentBackend::WindowsJob),
+        _ => None,
+    }
+}
+
+/// Select the containment backend for a required policy from the host and per-backend availability.
+/// Pure and fail-closed: an explicit selector never silently substitutes another backend, `Native`
+/// never falls back to Docker, and any unsatisfiable request yields `None`. `Uncontained` is handled
+/// by the caller before this point, so it maps to `None` here and is never reached in practice.
+fn select_backend(
+    requirement: ContainmentRequirement,
+    host: HostOs,
+    seatbelt: bool,
+    linux: bool,
+    windows: bool,
+    docker: bool,
+) -> Option<ActiveContainmentBackend> {
+    match requirement {
+        ContainmentRequirement::Required(BackendSelector::Seatbelt) if seatbelt => {
+            Some(ActiveContainmentBackend::Seatbelt)
+        }
+        ContainmentRequirement::Required(BackendSelector::Docker) if docker => {
+            Some(ActiveContainmentBackend::Docker)
+        }
+        ContainmentRequirement::Required(BackendSelector::Native) => {
+            native_backend(host, seatbelt, linux, windows)
+        }
+        ContainmentRequirement::Required(BackendSelector::Auto) => {
+            native_backend(host, seatbelt, linux, windows)
+                .or(docker.then_some(ActiveContainmentBackend::Docker))
+        }
+        _ => None,
+    }
+}
+
 /// Probe every configured backend and select one according to policy. This is public so services
 /// can fail during startup instead of waiting for the first tool invocation.
 pub async fn containment_capabilities(
@@ -355,39 +425,14 @@ pub async fn containment_capabilities(
         ),
     };
 
-    let selected_backend = match policy.requirement {
-        ContainmentRequirement::Required(BackendSelector::Seatbelt) if seatbelt.available => {
-            Some(ActiveContainmentBackend::Seatbelt)
-        }
-        ContainmentRequirement::Required(BackendSelector::Docker) if docker.available => {
-            Some(ActiveContainmentBackend::Docker)
-        }
-        ContainmentRequirement::Required(BackendSelector::Native) => {
-            if cfg!(target_os = "macos") && seatbelt.available {
-                Some(ActiveContainmentBackend::Seatbelt)
-            } else if cfg!(target_os = "linux") && linux.available {
-                Some(ActiveContainmentBackend::LinuxNamespace)
-            } else if cfg!(target_os = "windows") && windows.available {
-                Some(ActiveContainmentBackend::WindowsJob)
-            } else {
-                None
-            }
-        }
-        ContainmentRequirement::Required(BackendSelector::Auto) => {
-            if cfg!(target_os = "macos") && seatbelt.available {
-                Some(ActiveContainmentBackend::Seatbelt)
-            } else if cfg!(target_os = "linux") && linux.available {
-                Some(ActiveContainmentBackend::LinuxNamespace)
-            } else if cfg!(target_os = "windows") && windows.available {
-                Some(ActiveContainmentBackend::WindowsJob)
-            } else if docker.available {
-                Some(ActiveContainmentBackend::Docker)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+    let selected_backend = select_backend(
+        policy.requirement,
+        current_host_os(),
+        seatbelt.available,
+        linux.available,
+        windows.available,
+        docker.available,
+    );
 
     ContainmentCapabilityReport {
         requirement: policy.requirement,
@@ -468,6 +513,215 @@ mod tests {
             ContainmentPolicy::default().requirement,
             ContainmentRequirement::Required(BackendSelector::Auto)
         );
+    }
+
+    // Backend-selection decision table. These exercise the security boundary's fail-closed logic
+    // on every host from any single platform, because `select_backend` takes the host as a value.
+    const HOSTS: [HostOs; 4] = [HostOs::MacOs, HostOs::Linux, HostOs::Windows, HostOs::Other];
+
+    fn required(selector: BackendSelector) -> ContainmentRequirement {
+        ContainmentRequirement::Required(selector)
+    }
+
+    #[test]
+    fn auto_prefers_native_backend_for_each_host() {
+        // Every native backend available; Auto must pick the host's native one, not Docker.
+        assert_eq!(
+            select_backend(
+                required(BackendSelector::Auto),
+                HostOs::MacOs,
+                true,
+                true,
+                true,
+                true
+            ),
+            Some(ActiveContainmentBackend::Seatbelt)
+        );
+        assert_eq!(
+            select_backend(
+                required(BackendSelector::Auto),
+                HostOs::Linux,
+                true,
+                true,
+                true,
+                true
+            ),
+            Some(ActiveContainmentBackend::LinuxNamespace)
+        );
+        assert_eq!(
+            select_backend(
+                required(BackendSelector::Auto),
+                HostOs::Windows,
+                true,
+                true,
+                true,
+                true
+            ),
+            Some(ActiveContainmentBackend::WindowsJob)
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_docker_only_without_a_native_backend() {
+        // Native unavailable but Docker present -> Docker. Nothing available -> None.
+        for host in HOSTS {
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Auto),
+                    host,
+                    false,
+                    false,
+                    false,
+                    true
+                ),
+                Some(ActiveContainmentBackend::Docker),
+                "auto+docker should select Docker on {host:?}"
+            );
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Auto),
+                    host,
+                    false,
+                    false,
+                    false,
+                    false
+                ),
+                None,
+                "auto with nothing available must fail closed on {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_seatbelt_selector_fails_closed_when_seatbelt_is_unavailable() {
+        // Everything else available must NOT satisfy an explicit Seatbelt request.
+        for host in HOSTS {
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Seatbelt),
+                    host,
+                    false,
+                    true,
+                    true,
+                    true
+                ),
+                None,
+                "explicit Seatbelt must not substitute another backend on {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_selectors_are_host_agnostic_when_available() {
+        // Seatbelt/Docker are explicit mechanisms, not tied to the host OS.
+        for host in HOSTS {
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Seatbelt),
+                    host,
+                    true,
+                    false,
+                    false,
+                    false
+                ),
+                Some(ActiveContainmentBackend::Seatbelt)
+            );
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Docker),
+                    host,
+                    false,
+                    false,
+                    false,
+                    true
+                ),
+                Some(ActiveContainmentBackend::Docker)
+            );
+        }
+    }
+
+    #[test]
+    fn native_selector_never_silently_uses_docker() {
+        // Native requested, native unavailable, Docker available -> must be None (not Docker).
+        for host in HOSTS {
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Native),
+                    host,
+                    false,
+                    false,
+                    false,
+                    true
+                ),
+                None,
+                "Native must never fall back to Docker on {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_host_has_no_native_backend() {
+        // An unrecognized host can only ever be contained by Docker, and only under Auto/Docker.
+        assert_eq!(
+            select_backend(
+                required(BackendSelector::Native),
+                HostOs::Other,
+                true,
+                true,
+                true,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            select_backend(
+                required(BackendSelector::Auto),
+                HostOs::Other,
+                true,
+                true,
+                true,
+                true
+            ),
+            Some(ActiveContainmentBackend::Docker)
+        );
+    }
+
+    #[test]
+    fn docker_selector_ignores_available_native_backends() {
+        // Explicit Docker requested but Docker unavailable, natives available -> fail closed.
+        for host in HOSTS {
+            assert_eq!(
+                select_backend(
+                    required(BackendSelector::Docker),
+                    host,
+                    true,
+                    true,
+                    true,
+                    false
+                ),
+                None,
+                "explicit Docker must not substitute a native backend on {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_availability_always_fails_closed() {
+        // Sweep every selector on every host with no backend available: always None.
+        for host in HOSTS {
+            for selector in [
+                BackendSelector::Auto,
+                BackendSelector::Native,
+                BackendSelector::Seatbelt,
+                BackendSelector::Docker,
+            ] {
+                assert_eq!(
+                    select_backend(required(selector), host, false, false, false, false),
+                    None,
+                    "{selector:?} on {host:?} with nothing available must fail closed"
+                );
+            }
+        }
     }
 
     #[test]

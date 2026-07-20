@@ -287,3 +287,25 @@ jobs:
           test "$status" -ne 0
           grep -Fq 'requires the complete four-provider matrix before any live call' \
             /tmp/full-smoke-contract.log
+
+  eval:
+    name: Deterministic eval dataset gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.97.1"
+      - name: Keyless deterministic evaluations
+        run: cargo run -p aikit-cli --locked -- eval evals/smoke.json
+      - name: Governed tool trajectories (allowed and denied)
+        run: |
+          cargo run -p aikit-cli --locked -- eval evals/governance-allowed.json --demo-tools allowed
+          cargo run -p aikit-cli --locked -- eval evals/governance-denied.json --demo-tools denied
+      - name: Machine-readable eval report artifact
+        run: cargo run -p aikit-cli --locked -- --format json eval evals/smoke.json > eval-report.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: eval-report
+          path: eval-report.json
+          if-no-files-found: error
