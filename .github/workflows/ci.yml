@@ -49,7 +49,12 @@ jobs:
       - name: Clippy (workspace, all targets and features)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests (workspace, all features)
-        run: cargo test --workspace --all-features --locked
+        # aikit-py is excluded: --all-features enables its `extension-module` feature, which
+        # deliberately stops pyo3 from emitting libpython link flags, so the crate's Rust
+        # unit-test harness cannot link (and without an initialized interpreter it aborts at
+        # runtime). The Python binding is exercised by the conformance job instead: maturin
+        # build, the Python scenario scripts, and the strict-mypy typing contract.
+        run: cargo test --workspace --all-features --locked --exclude aikit-py
       - name: Rustdoc warnings and doctests
         env:
           RUSTDOCFLAGS: -D warnings
