@@ -30,6 +30,7 @@ name = "aikit-cli"
 version = "0.2.0"
 dependencies = [
  "aikit-runtime",
+ "async-trait",
  "clap",
  "clap_complete",
  "futures",
