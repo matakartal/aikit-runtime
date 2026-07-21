@@ -154,9 +154,10 @@ pub use governance::{
     DurableApproverError, DurableToolApprover, Governance, PermissionUpdate, ToolApprover,
 };
 pub use mcp::{
-    McpClient, McpPrompt, McpResource, McpToolExecutor, McpToolFilter, McpTransport,
-    StdioTransport, StreamableHttpTransport, MAX_MCP_TOOL_FILTER_NAMES, MAX_MCP_TOOL_NAME_CHARS,
-    MCP_PROTOCOL_VERSION,
+    McpClient, McpInputHandler, McpPrompt, McpProtocolVersion, McpRequestMeta, McpResource,
+    McpRpcError, McpToolExecutor, McpToolFilter, McpTransport, StdioTransport,
+    StreamableHttpTransport, MAX_MCP_INPUT_ROUNDS, MAX_MCP_TOOL_FILTER_NAMES,
+    MAX_MCP_TOOL_NAME_CHARS, MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION_2026,
 };
 pub use media_runtime::*;
 pub use memory::{

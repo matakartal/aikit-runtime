@@ -376,6 +376,18 @@ See [`EVALUATIONS.md`](EVALUATIONS.md).
 
 MCP supports stdio and Streamable HTTP, lifecycle initialization, caller-owned bearer auth,
 paginated tools/resources/prompts, resource reads, prompt retrieval, and governed tool execution.
+The client speaks two protocol revisions: the legacy initialize-handshake flow (default,
+accepting the 2025-06-18/2025-03-26/2025-11-25 lifecycle family) and the stateless 2026-07-28
+revision (`McpProtocolVersion::V2026_07_28`), which replaces the handshake with `server/discover`,
+stamps the `_meta` client-identity triplet on every request, projects `MCP-Protocol-Version`,
+`Mcp-Method`, and `Mcp-Name` HTTP headers, and drops session tracking. `Auto` probes
+`server/discover` and falls back to the handshake on a JSON-RPC refusal; a transport failure is a
+failure, not a fallback. 2026-07-28 `inputRequired` results are honored through a host
+`McpInputHandler` with the opaque `requestState` echoed verbatim, bounded by
+`MAX_MCP_INPUT_ROUNDS`, and failing closed without a handler — including for MCP safety-server
+guardrails. Task handles and extensions are not negotiated; an unrecognized `resultType` is an
+error. The 2026-07-28 revision finalizes on July 28, 2026; aikit tracks the release candidate and
+keeps version-specific details contained to the dialect layer.
 Transport responses are capped at 4 MiB before JSON decoding. One discovery operation is limited
 to 128 pages, 10,000 incoming items, 8 MiB of serialized items, 4 KiB per cursor, and 64 KiB of
 cumulative cursor data; repeated cursors cannot loop forever. Each connection may apply an exact,

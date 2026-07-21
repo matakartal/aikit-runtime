@@ -25,8 +25,78 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
-/// The MCP revision this client advertises in the `initialize` handshake.
+/// The MCP revision this client advertises in the legacy `initialize` handshake.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// The stateless MCP revision (2026-07-28): no `initialize` handshake, client identity in
+/// `_meta`, and proactive capability discovery via `server/discover`. Finalized July 28, 2026;
+/// aikit tracks the release candidate and keeps every version-specific detail inside
+/// [`McpProtocolVersion`] resolution so a late spec change stays contained.
+pub const MCP_PROTOCOL_VERSION_2026: &str = "2026-07-28";
+
+/// Legacy protocol revisions this client accepts from an `initialize` reply. They all share the
+/// initialize/initialized lifecycle, so a compliant server selecting any of them is usable.
+const LEGACY_ACCEPTED_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2025-11-25"];
+
+/// `_meta` keys that carry client identity on every 2026-07-28 request.
+const META_PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+const META_CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// Maximum number of `inputRequired` round trips honored for one `tools/call` before failing
+/// closed. Bounds a hostile or looping server.
+pub const MAX_MCP_INPUT_ROUNDS: usize = 4;
+
+/// Which MCP protocol revision an [`McpClient`] speaks.
+///
+/// The default is the legacy initialize-handshake flow, byte-identical to previous releases.
+/// `V2026_07_28` and `Auto` are explicit opt-ins while the 2026-07-28 revision finalizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpProtocolVersion {
+    /// Today's behavior: `initialize` + `notifications/initialized`, session headers honored.
+    #[default]
+    V2025_06_18,
+    /// Stateless 2026-07-28: `server/discover`, `_meta` client identity, no session header.
+    V2026_07_28,
+    /// Probe `server/discover`; fall back to the legacy handshake when the server answers it
+    /// with a JSON-RPC error. A transport failure is a failure, not a fallback.
+    Auto,
+}
+
+/// The dialect actually resolved for a connection after [`McpClient::initialize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedDialect {
+    Legacy,
+    Rc2026,
+}
+
+/// A JSON-RPC-level error reply (as opposed to a transport failure), surfaced with its code so
+/// protocol logic can branch — e.g. `Auto` falling back to the legacy handshake on
+/// method-not-found — without string matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRpcError {
+    pub code: Option<i64>,
+    pub message: String,
+}
+
+/// Per-request routing metadata for the 2026-07-28 revision. HTTP transports project it into the
+/// `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers; stdio needs no header analogue.
+#[derive(Debug, Clone)]
+pub struct McpRequestMeta {
+    pub protocol_version: &'static str,
+    pub method: String,
+    pub name: Option<String>,
+}
+
+/// Host-provided answers for a 2026-07-28 `inputRequired` result: return `inputResponses` keyed
+/// identically to the server's `inputRequests`. Errors abort the call. Without a configured
+/// handler, an input-requiring tool call fails closed — including for MCP safety-server
+/// guardrails, where a server demanding input is itself a guardrail failure.
+#[async_trait]
+pub trait McpInputHandler: Send + Sync {
+    async fn provide(&self, server: &str, tool: &str, input_requests: Value) -> Result<Value>;
+}
 
 /// Maximum number of Unicode scalar values accepted in one configured MCP tool name.
 ///
@@ -367,6 +437,30 @@ pub trait McpTransport: Send + Sync {
     async fn request(&self, method: &str, params: Value) -> Result<Value>;
     /// Send a fire-and-forget JSON-RPC notification (no `id`, no reply).
     async fn notify(&self, method: &str, params: Value) -> Result<()>;
+
+    /// Like [`request`](Self::request), but a JSON-RPC-level error reply is `Ok(Err(...))` with
+    /// its code, while transport failures stay `Err`. The default cannot distinguish the two, so
+    /// custom transports that keep it also cannot support `Auto` version probing — declare the
+    /// protocol version explicitly instead.
+    async fn request_detailed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, McpRpcError>> {
+        self.request(method, params).await.map(Ok)
+    }
+
+    /// Like [`request`](Self::request), carrying 2026-07-28 routing metadata. HTTP transports
+    /// project it into headers; the default ignores it, which is correct for stdio because the
+    /// decorated `_meta` params already carry the client identity.
+    async fn request_with_meta(
+        &self,
+        method: &str,
+        params: Value,
+        _meta: McpRequestMeta,
+    ) -> Result<Value> {
+        self.request(method, params).await
+    }
 }
 
 /// An MCP client over some [`McpTransport`]. Discovered tools are cached as [`ToolSpec`]s.
@@ -376,6 +470,9 @@ pub struct McpClient {
     tool_filter: McpToolFilter,
     tools: Vec<ToolSpec>,
     initialized: AtomicBool,
+    configured_version: McpProtocolVersion,
+    dialect: std::sync::OnceLock<ResolvedDialect>,
+    input_handler: Option<Arc<dyn McpInputHandler>>,
 }
 
 impl McpClient {
@@ -396,16 +493,58 @@ impl McpClient {
             tool_filter,
             tools: Vec::new(),
             initialized: AtomicBool::new(false),
+            configured_version: McpProtocolVersion::default(),
+            dialect: std::sync::OnceLock::new(),
+            input_handler: None,
         }
+    }
+
+    /// Select the protocol revision this client speaks. The default is the legacy
+    /// initialize-handshake flow; call before [`initialize`](Self::initialize).
+    pub fn with_protocol_version(mut self, version: McpProtocolVersion) -> Self {
+        self.configured_version = version;
+        self
+    }
+
+    /// Install the host callback that answers 2026-07-28 `inputRequired` results. Without one,
+    /// an input-requiring tool call fails closed.
+    pub fn with_input_handler(mut self, handler: Arc<dyn McpInputHandler>) -> Self {
+        self.input_handler = Some(handler);
+        self
     }
 
     pub fn server_name(&self) -> &str {
         &self.server
     }
 
-    /// Perform the `initialize` handshake and send `notifications/initialized`. Returns the raw
-    /// server info/capabilities object.
+    /// Establish the connection for the configured protocol revision and arm the client.
+    ///
+    /// Legacy: the `initialize` handshake plus `notifications/initialized`, returning the raw
+    /// server info/capabilities object. 2026-07-28: a `server/discover` capability fetch (the
+    /// revision has no handshake), returning the raw discover result. `Auto` probes
+    /// `server/discover` and falls back to the legacy handshake when the server answers it with
+    /// a JSON-RPC error; a transport failure fails instead of falling back.
     pub async fn initialize(&self) -> Result<Value> {
+        match self.configured_version {
+            McpProtocolVersion::V2025_06_18 => self.initialize_legacy().await,
+            McpProtocolVersion::V2026_07_28 => match self.discover_2026().await? {
+                Ok(result) => Ok(result),
+                Err(rpc) => Err(AikitError::ToolExecution(format!(
+                    "MCP server does not support protocol {MCP_PROTOCOL_VERSION_2026}: \
+                     server/discover failed: {}",
+                    rpc.message
+                ))),
+            },
+            McpProtocolVersion::Auto => match self.discover_2026().await? {
+                Ok(result) => Ok(result),
+                // Any JSON-RPC error reply (method-not-found, pre-handshake rejection, ...)
+                // means "this server does not speak 2026-07-28"; fall back to the handshake.
+                Err(_rpc) => self.initialize_legacy().await,
+            },
+        }
+    }
+
+    async fn initialize_legacy(&self) -> Result<Value> {
         let result = self
             .transport
             .request(
@@ -423,7 +562,7 @@ impl McpClient {
             .ok_or_else(|| {
                 AikitError::ToolExecution("MCP initialize omitted protocolVersion".into())
             })?;
-        if version != MCP_PROTOCOL_VERSION {
+        if !LEGACY_ACCEPTED_VERSIONS.contains(&version) {
             return Err(AikitError::ToolExecution(format!(
                 "MCP server selected unsupported protocol version '{version}'"
             )));
@@ -431,8 +570,35 @@ impl McpClient {
         self.transport
             .notify("notifications/initialized", json!({}))
             .await?;
+        let _ = self.dialect.set(ResolvedDialect::Legacy);
         self.initialized.store(true, Ordering::Release);
         Ok(result)
+    }
+
+    /// Probe/perform 2026-07-28 startup. Outer `Err` is a transport failure; inner `Err` is the
+    /// server's JSON-RPC error reply (the `Auto` fallback signal); inner `Ok` armed the client.
+    async fn discover_2026(&self) -> Result<std::result::Result<Value, McpRpcError>> {
+        let reply = self
+            .transport
+            .request_detailed("server/discover", json!({}))
+            .await?;
+        let result = match reply {
+            Ok(result) => result,
+            Err(rpc) => return Ok(Err(rpc)),
+        };
+        if !discover_supports_2026(&result) {
+            // The server answers `server/discover` but does not advertise the revision this
+            // client would speak; treat it like a JSON-RPC refusal so Auto can fall back.
+            return Ok(Err(McpRpcError {
+                code: None,
+                message: format!(
+                    "server/discover did not advertise protocol {MCP_PROTOCOL_VERSION_2026}"
+                ),
+            }));
+        }
+        let _ = self.dialect.set(ResolvedDialect::Rc2026);
+        self.initialized.store(true, Ordering::Release);
+        Ok(Ok(result))
     }
 
     fn ensure_initialized(&self) -> Result<()> {
@@ -442,6 +608,61 @@ impl McpClient {
             Err(AikitError::ToolExecution(
                 "MCP client must be initialized before use".into(),
             ))
+        }
+    }
+
+    fn resolved_dialect(&self) -> ResolvedDialect {
+        *self.dialect.get().unwrap_or(&ResolvedDialect::Legacy)
+    }
+
+    /// The one choke point every post-startup request flows through. Legacy is byte-identical to
+    /// the historical direct `transport.request` path; 2026-07-28 decorates `_meta` with the
+    /// client identity triplet and forwards routing metadata for header-based transports.
+    async fn dispatch(&self, method: &str, params: Value) -> Result<Value> {
+        match self.resolved_dialect() {
+            ResolvedDialect::Legacy => self.transport.request(method, params).await,
+            ResolvedDialect::Rc2026 => {
+                let name = params
+                    .get("name")
+                    .or_else(|| params.get("uri"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut params = params;
+                let object = params.as_object_mut().ok_or_else(|| {
+                    AikitError::ToolExecution(format!(
+                        "MCP '{method}' params must be an object to carry _meta"
+                    ))
+                })?;
+                let meta = object
+                    .entry("_meta")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        AikitError::ToolExecution(format!(
+                            "MCP '{method}' params carried a non-object _meta"
+                        ))
+                    })?;
+                meta.insert(
+                    META_PROTOCOL_VERSION_KEY.into(),
+                    Value::String(MCP_PROTOCOL_VERSION_2026.into()),
+                );
+                meta.insert(
+                    META_CLIENT_INFO_KEY.into(),
+                    json!({ "name": "aikit", "version": env!("CARGO_PKG_VERSION") }),
+                );
+                meta.insert(META_CLIENT_CAPABILITIES_KEY.into(), json!({}));
+                self.transport
+                    .request_with_meta(
+                        method,
+                        params,
+                        McpRequestMeta {
+                            protocol_version: MCP_PROTOCOL_VERSION_2026,
+                            method: method.to_owned(),
+                            name,
+                        },
+                    )
+                    .await
+            }
         }
     }
 
@@ -461,7 +682,7 @@ impl McpClient {
             let params = cursor
                 .as_deref()
                 .map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}));
-            let result = self.transport.request(METHOD, params).await?;
+            let result = self.dispatch(METHOD, params).await?;
             let page = result
                 .get("tools")
                 .and_then(Value::as_array)
@@ -530,13 +751,46 @@ impl McpClient {
                 "MCP tool '{name}' was not advertised after visibility filtering"
             )));
         }
-        let result = self
-            .transport
-            .request(
-                "tools/call",
-                json!({ "name": name, "arguments": arguments }),
-            )
-            .await?;
+        let mut params = json!({ "name": name, "arguments": arguments });
+        let mut result = self.dispatch("tools/call", params.clone()).await?;
+
+        // 2026-07-28 multi-round-trip requests: a server may return `inputRequired` with its
+        // questions and an opaque `requestState`; the client gathers answers and re-issues the
+        // original call. Bounded, fail-closed, and the state blob is echoed verbatim — never
+        // parsed. Honored defensively regardless of dialect: a legacy server should never send
+        // `resultType`, and an unrecognized one is an error rather than a silent misparse.
+        let mut rounds = 0usize;
+        while let Some(result_type) = result.get("resultType").and_then(Value::as_str) {
+            if result_type != "inputRequired" {
+                return Err(AikitError::ToolExecution(format!(
+                    "MCP tool '{name}' returned unrecognized resultType '{result_type}'"
+                )));
+            }
+            let Some(handler) = &self.input_handler else {
+                return Err(AikitError::ToolExecution(format!(
+                    "MCP tool '{name}' requires additional input and no input handler is \
+                     configured"
+                )));
+            };
+            rounds += 1;
+            if rounds > MAX_MCP_INPUT_ROUNDS {
+                return Err(AikitError::ToolExecution(format!(
+                    "MCP tool '{name}' exceeded {MAX_MCP_INPUT_ROUNDS} input round trips"
+                )));
+            }
+            let request_state = result.get("requestState").cloned().ok_or_else(|| {
+                AikitError::ToolExecution(format!(
+                    "MCP tool '{name}' requested input without a requestState"
+                ))
+            })?;
+            let input_requests = result.get("inputRequests").cloned().unwrap_or(json!({}));
+            let responses = handler.provide(&self.server, name, input_requests).await?;
+            let object = params.as_object_mut().expect("tools/call params object");
+            object.insert("inputResponses".into(), responses);
+            object.insert("requestState".into(), request_state);
+            result = self.dispatch("tools/call", params.clone()).await?;
+        }
+
         let body = flatten_content(&result);
         if result
             .get("isError")
@@ -561,7 +815,7 @@ impl McpClient {
             let params = cursor
                 .as_deref()
                 .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
-            let result = self.transport.request(METHOD, params).await?;
+            let result = self.dispatch(METHOD, params).await?;
             let page: &[Value] = match result.get("resources") {
                 Some(value) => value.as_array().map(Vec::as_slice).ok_or_else(|| {
                     AikitError::ToolExecution("invalid MCP resources: expected an array".into())
@@ -585,9 +839,7 @@ impl McpClient {
 
     pub async fn read_resource(&self, uri: &str) -> Result<Value> {
         self.ensure_initialized()?;
-        self.transport
-            .request("resources/read", json!({ "uri": uri }))
-            .await
+        self.dispatch("resources/read", json!({ "uri": uri })).await
     }
 
     pub async fn list_prompts(&self, cursor: Option<&str>) -> Result<Vec<McpPrompt>> {
@@ -601,7 +853,7 @@ impl McpClient {
             let params = cursor
                 .as_deref()
                 .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
-            let result = self.transport.request(METHOD, params).await?;
+            let result = self.dispatch(METHOD, params).await?;
             let page: &[Value] = match result.get("prompts") {
                 Some(value) => value.as_array().map(Vec::as_slice).ok_or_else(|| {
                     AikitError::ToolExecution("invalid MCP prompts: expected an array".into())
@@ -625,13 +877,24 @@ impl McpClient {
 
     pub async fn get_prompt(&self, name: &str, arguments: Value) -> Result<Value> {
         self.ensure_initialized()?;
-        self.transport
-            .request(
-                "prompts/get",
-                json!({ "name": name, "arguments": arguments }),
-            )
-            .await
+        self.dispatch(
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments }),
+        )
+        .await
     }
+}
+
+/// Whether a `server/discover` result advertises the 2026-07-28 revision. Tolerant to both
+/// shapes seen across release-candidate snapshots — a `protocolVersions` array or a single
+/// `protocolVersion` string — so a finalization tweak lands here and nowhere else.
+fn discover_supports_2026(result: &Value) -> bool {
+    if let Some(versions) = result.get("protocolVersions").and_then(Value::as_array) {
+        return versions
+            .iter()
+            .any(|version| version.as_str() == Some(MCP_PROTOCOL_VERSION_2026));
+    }
+    result.get("protocolVersion").and_then(Value::as_str) == Some(MCP_PROTOCOL_VERSION_2026)
 }
 
 /// Flatten an MCP `{ content: [ { type: "text", text }, ... ] }` result to a string.
@@ -702,6 +965,17 @@ impl StreamableHttpTransport {
     }
 
     async fn post(&self, payload: Value) -> Result<Option<Value>> {
+        self.post_with(payload, None).await
+    }
+
+    /// POST one JSON-RPC payload. With 2026-07-28 metadata, the revision's routing headers are
+    /// attached and the legacy `Mcp-Session-Id` header is neither sent nor recorded — the
+    /// stateless revision removed sessions entirely.
+    async fn post_with(
+        &self,
+        payload: Value,
+        meta: Option<&McpRequestMeta>,
+    ) -> Result<Option<Value>> {
         let mut request = self
             .client
             .post(self.endpoint.clone())
@@ -713,19 +987,28 @@ impl StreamableHttpTransport {
         if let Some(token) = &self.bearer_token {
             request = request.bearer_auth(token);
         }
-        if let Some(session) = self.session_id.lock().await.clone() {
+        if let Some(meta) = meta {
+            request = request
+                .header("MCP-Protocol-Version", meta.protocol_version)
+                .header("Mcp-Method", meta.method.as_str());
+            if let Some(name) = &meta.name {
+                request = request.header("Mcp-Name", name.as_str());
+            }
+        } else if let Some(session) = self.session_id.lock().await.clone() {
             request = request.header("Mcp-Session-Id", session);
         }
         let response = request.send().await.map_err(|error| {
             AikitError::ToolExecution(format!("MCP HTTP request failed: {error}"))
         })?;
         let status = response.status();
-        if let Some(session) = response
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|value| value.to_str().ok())
-        {
-            *self.session_id.lock().await = Some(session.to_string());
+        if meta.is_none() {
+            if let Some(session) = response
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|value| value.to_str().ok())
+            {
+                *self.session_id.lock().await = Some(session.to_string());
+            }
         }
         let content_type = response
             .headers()
@@ -775,24 +1058,66 @@ impl StreamableHttpTransport {
     }
 }
 
-#[async_trait]
-impl McpTransport for StreamableHttpTransport {
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+impl StreamableHttpTransport {
+    async fn rpc(
+        &self,
+        method: &str,
+        params: Value,
+        meta: Option<McpRequestMeta>,
+    ) -> Result<std::result::Result<Value, McpRpcError>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let response = self
-            .post(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+            .post_with(
+                json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+                meta.as_ref(),
+            )
             .await?
             .ok_or_else(|| AikitError::ToolExecution("MCP request returned no response".into()))?;
         if let Some(error) = response.get("error") {
-            return Err(AikitError::ToolExecution(format!(
-                "MCP '{method}' failed: {}",
-                error
+            return Ok(Err(McpRpcError {
+                code: error.get("code").and_then(Value::as_i64),
+                message: error
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
-            )));
+                    .to_string(),
+            }));
         }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        Ok(Ok(response.get("result").cloned().unwrap_or(Value::Null)))
+    }
+}
+
+fn flatten_rpc_reply(
+    method: &str,
+    reply: std::result::Result<Value, McpRpcError>,
+) -> Result<Value> {
+    reply
+        .map_err(|rpc| AikitError::ToolExecution(format!("MCP '{method}' failed: {}", rpc.message)))
+}
+
+#[async_trait]
+impl McpTransport for StreamableHttpTransport {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let reply = self.rpc(method, params, None).await?;
+        flatten_rpc_reply(method, reply)
+    }
+
+    async fn request_detailed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, McpRpcError>> {
+        self.rpc(method, params, None).await
+    }
+
+    async fn request_with_meta(
+        &self,
+        method: &str,
+        params: Value,
+        meta: McpRequestMeta,
+    ) -> Result<Value> {
+        let reply = self.rpc(method, params, Some(meta)).await?;
+        flatten_rpc_reply(method, reply)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -840,7 +1165,25 @@ impl ToolExecutor for McpToolExecutor {
 // Stdio transport (production): spawn an MCP server subprocess and speak newline-delimited JSON-RPC
 // ---------------------------------------------------------------------------------------------
 
-type PendingSender = oneshot::Sender<std::result::Result<Value, String>>;
+/// Why a pending stdio request did not resolve with a `result`.
+#[derive(Debug, Clone)]
+enum StdioFailure {
+    /// The server replied with a JSON-RPC `error` object.
+    Rpc(McpRpcError),
+    /// The reader stopped (EOF, oversized frame, I/O failure) before or instead of a reply.
+    Stopped(String),
+}
+
+impl StdioFailure {
+    fn message(&self) -> &str {
+        match self {
+            StdioFailure::Rpc(rpc) => &rpc.message,
+            StdioFailure::Stopped(message) => message,
+        }
+    }
+}
+
+type PendingSender = oneshot::Sender<std::result::Result<Value, StdioFailure>>;
 
 #[derive(Default)]
 struct StdioReaderState {
@@ -886,7 +1229,7 @@ async fn stop_stdio_reader(state: &Pending, message: String) {
         state.stopped = Some(message.clone());
     }
     for (_, sender) in state.pending.drain() {
-        let _ = sender.send(Err(message.clone()));
+        let _ = sender.send(Err(StdioFailure::Stopped(message.clone())));
     }
 }
 
@@ -923,11 +1266,14 @@ where
             continue;
         };
         let outcome = if let Some(error) = message.get("error") {
-            Err(error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("MCP error")
-                .to_string())
+            Err(StdioFailure::Rpc(McpRpcError {
+                code: error.get("code").and_then(Value::as_i64),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP error")
+                    .to_string(),
+            }))
         } else {
             Ok(message.get("result").cloned().unwrap_or(Value::Null))
         };
@@ -1016,9 +1362,12 @@ impl StdioTransport {
     }
 }
 
-#[async_trait]
-impl McpTransport for StdioTransport {
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+impl StdioTransport {
+    async fn rpc(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, StdioFailure>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
@@ -1035,13 +1384,36 @@ impl McpTransport for StdioTransport {
             self.pending.lock().await.pending.remove(&id);
             return Err(e);
         }
-        match rx.await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(msg)) => Err(AikitError::ToolExecution(format!(
-                "MCP '{method}' failed: {msg}"
+        rx.await.map_err(|_| {
+            AikitError::ToolExecution(format!("MCP '{method}' response channel dropped"))
+        })
+    }
+}
+
+#[async_trait]
+impl McpTransport for StdioTransport {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        match self.rpc(method, params).await? {
+            Ok(value) => Ok(value),
+            Err(failure) => Err(AikitError::ToolExecution(format!(
+                "MCP '{method}' failed: {}",
+                failure.message()
             ))),
-            Err(_) => Err(AikitError::ToolExecution(format!(
-                "MCP '{method}' response channel dropped"
+        }
+    }
+
+    async fn request_detailed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<std::result::Result<Value, McpRpcError>> {
+        match self.rpc(method, params).await? {
+            Ok(value) => Ok(Ok(value)),
+            // A JSON-RPC error reply carries protocol meaning (e.g. Auto fallback); a stopped
+            // reader is a transport failure and must not be mistaken for one.
+            Err(StdioFailure::Rpc(rpc)) => Ok(Err(rpc)),
+            Err(StdioFailure::Stopped(message)) => Err(AikitError::ToolExecution(format!(
+                "MCP '{method}' failed: {message}"
             ))),
         }
     }
@@ -1539,7 +1911,9 @@ mod tests {
 
         for receiver in [first_receiver, second_receiver] {
             let error = receiver.await.unwrap().unwrap_err();
-            assert!(error.contains("exceeded 4 MiB"));
+            // Reader shutdown is a transport failure, not a JSON-RPC error reply.
+            assert!(matches!(&error, StdioFailure::Stopped(_)));
+            assert!(error.message().contains("exceeded 4 MiB"));
         }
         let state = state.lock().await;
         assert!(state.pending.is_empty());
@@ -1579,5 +1953,473 @@ mod tests {
             true
         );
         assert_eq!(transport.session_id().await.as_deref(), Some("session-1"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 2026-07-28 dual-version tests
+    // -----------------------------------------------------------------------------------------
+
+    /// A 2026-07-28 server: rejects `initialize` with method-not-found, answers
+    /// `server/discover`, and asserts the `_meta` client-identity triplet on every other call.
+    struct Rc2026MockTransport {
+        /// Rounds of `inputRequired` to demand before `tools/call` succeeds.
+        input_rounds: usize,
+        seen_calls: Mutex<Vec<Value>>,
+        notified: Mutex<Vec<String>>,
+    }
+
+    impl Rc2026MockTransport {
+        fn new(input_rounds: usize) -> Self {
+            Rc2026MockTransport {
+                input_rounds,
+                seen_calls: Mutex::new(Vec::new()),
+                notified: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_meta(params: &Value) {
+            let meta = params
+                .get("_meta")
+                .and_then(Value::as_object)
+                .expect("2026-07-28 request must carry _meta");
+            assert_eq!(
+                meta.get(META_PROTOCOL_VERSION_KEY).and_then(Value::as_str),
+                Some(MCP_PROTOCOL_VERSION_2026)
+            );
+            assert_eq!(
+                meta.get(META_CLIENT_INFO_KEY)
+                    .and_then(|info| info.get("name"))
+                    .and_then(Value::as_str),
+                Some("aikit")
+            );
+            assert!(meta.get(META_CLIENT_CAPABILITIES_KEY).is_some());
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for Rc2026MockTransport {
+        async fn request(&self, method: &str, params: Value) -> Result<Value> {
+            match self.request_detailed(method, params).await? {
+                Ok(value) => Ok(value),
+                Err(rpc) => Err(AikitError::ToolExecution(format!(
+                    "MCP '{method}' failed: {}",
+                    rpc.message
+                ))),
+            }
+        }
+
+        async fn request_detailed(
+            &self,
+            method: &str,
+            params: Value,
+        ) -> Result<std::result::Result<Value, McpRpcError>> {
+            match method {
+                "initialize" => Ok(Err(McpRpcError {
+                    code: Some(-32601),
+                    message: "method not found".into(),
+                })),
+                "server/discover" => Ok(Ok(json!({
+                    "protocolVersions": [MCP_PROTOCOL_VERSION_2026],
+                    "serverInfo": { "name": "mock-2026", "version": "0.1" },
+                    "capabilities": {}
+                }))),
+                "tools/list" => {
+                    Self::assert_meta(&params);
+                    Ok(Ok(json!({
+                        "tools": [{
+                            "name": "get_weather",
+                            "description": "Get the weather",
+                            "inputSchema": { "type": "object" }
+                        }]
+                    })))
+                }
+                "tools/call" => {
+                    Self::assert_meta(&params);
+                    let rounds_seen = {
+                        let mut calls = self.seen_calls.lock().await;
+                        calls.push(params.clone());
+                        calls
+                            .iter()
+                            .filter(|call| call.get("requestState").is_some())
+                            .count()
+                    };
+                    if rounds_seen < self.input_rounds {
+                        Ok(Ok(json!({
+                            "resultType": "inputRequired",
+                            "requestState": "opaque-state-blob",
+                            "inputRequests": { "confirm": { "type": "string" } }
+                        })))
+                    } else {
+                        Ok(Ok(json!({
+                            "content": [{ "type": "text", "text": "sunny" }]
+                        })))
+                    }
+                }
+                other => Err(AikitError::ToolExecution(format!(
+                    "unexpected method {other}"
+                ))),
+            }
+        }
+
+        async fn notify(&self, method: &str, _params: Value) -> Result<()> {
+            self.notified.lock().await.push(method.to_string());
+            Ok(())
+        }
+    }
+
+    struct CountingInputHandler {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl McpInputHandler for CountingInputHandler {
+        async fn provide(
+            &self,
+            _server: &str,
+            _tool: &str,
+            input_requests: Value,
+        ) -> Result<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(input_requests.get("confirm").is_some());
+            Ok(json!({ "confirm": "yes" }))
+        }
+    }
+
+    fn rc2026_client(transport: Arc<Rc2026MockTransport>) -> McpClient {
+        McpClient::new(transport, "mock-2026")
+            .with_protocol_version(McpProtocolVersion::V2026_07_28)
+    }
+
+    #[tokio::test]
+    async fn legacy_accepts_every_handshake_revision_it_shares_a_lifecycle_with() {
+        struct VersionMock(&'static str);
+        #[async_trait]
+        impl McpTransport for VersionMock {
+            async fn request(&self, method: &str, _params: Value) -> Result<Value> {
+                assert_eq!(method, "initialize");
+                Ok(json!({ "protocolVersion": self.0 }))
+            }
+            async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        for version in LEGACY_ACCEPTED_VERSIONS {
+            let client = McpClient::new(Arc::new(VersionMock(version)), "legacy");
+            assert!(
+                client.initialize().await.is_ok(),
+                "{version} must be accepted"
+            );
+        }
+        let client = McpClient::new(Arc::new(VersionMock("2099-01-01")), "legacy");
+        let error = client.initialize().await.unwrap_err();
+        assert!(error.to_string().contains("unsupported protocol version"));
+    }
+
+    #[tokio::test]
+    async fn explicit_2026_startup_discovers_and_decorates_every_request() {
+        let transport = Arc::new(Rc2026MockTransport::new(0));
+        let mut client = rc2026_client(transport.clone());
+        let discover = client.initialize().await.unwrap();
+        assert_eq!(discover["serverInfo"]["name"], "mock-2026");
+        // The stateless revision has no initialized notification.
+        assert!(transport.notified.lock().await.is_empty());
+        // Every post-startup request carries the _meta triplet (asserted inside the mock).
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools[0].name, "get_weather");
+        let body = client.call_tool("get_weather", json!({})).await.unwrap();
+        assert_eq!(body, "sunny");
+    }
+
+    #[tokio::test]
+    async fn auto_selects_2026_when_the_server_discovers() {
+        let transport = Arc::new(Rc2026MockTransport::new(0));
+        let client = McpClient::new(transport.clone(), "auto")
+            .with_protocol_version(McpProtocolVersion::Auto);
+        client.initialize().await.unwrap();
+        assert!(transport.notified.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_legacy_on_a_json_rpc_refusal() {
+        struct LegacyOnlyMock {
+            notified: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl McpTransport for LegacyOnlyMock {
+            async fn request(&self, method: &str, params: Value) -> Result<Value> {
+                match self.request_detailed(method, params).await? {
+                    Ok(value) => Ok(value),
+                    Err(rpc) => Err(AikitError::ToolExecution(rpc.message)),
+                }
+            }
+            async fn request_detailed(
+                &self,
+                method: &str,
+                params: Value,
+            ) -> Result<std::result::Result<Value, McpRpcError>> {
+                match method {
+                    "server/discover" => Ok(Err(McpRpcError {
+                        code: Some(-32601),
+                        message: "method not found".into(),
+                    })),
+                    "initialize" => Ok(Ok(json!({ "protocolVersion": MCP_PROTOCOL_VERSION }))),
+                    "tools/list" => {
+                        // A legacy connection must NOT be decorated with 2026 _meta.
+                        assert!(params.get("_meta").is_none());
+                        Ok(Ok(json!({ "tools": [] })))
+                    }
+                    other => Err(AikitError::ToolExecution(format!("unexpected {other}"))),
+                }
+            }
+            async fn notify(&self, method: &str, _params: Value) -> Result<()> {
+                self.notified.lock().await.push(method.to_string());
+                Ok(())
+            }
+        }
+        let transport = Arc::new(LegacyOnlyMock {
+            notified: Mutex::new(Vec::new()),
+        });
+        let mut client = McpClient::new(transport.clone(), "auto-legacy")
+            .with_protocol_version(McpProtocolVersion::Auto);
+        client.initialize().await.unwrap();
+        assert_eq!(
+            transport.notified.lock().await.as_slice(),
+            ["notifications/initialized"]
+        );
+        client.list_tools().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_when_discover_lacks_the_2026_revision() {
+        struct OldDiscoverMock;
+        #[async_trait]
+        impl McpTransport for OldDiscoverMock {
+            async fn request(&self, method: &str, _params: Value) -> Result<Value> {
+                assert_eq!(method, "initialize");
+                Ok(json!({ "protocolVersion": MCP_PROTOCOL_VERSION }))
+            }
+            async fn request_detailed(
+                &self,
+                method: &str,
+                params: Value,
+            ) -> Result<std::result::Result<Value, McpRpcError>> {
+                if method == "server/discover" {
+                    return Ok(Ok(json!({ "protocolVersions": ["2027-06-06"] })));
+                }
+                self.request(method, params).await.map(Ok)
+            }
+            async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let client = McpClient::new(Arc::new(OldDiscoverMock), "auto")
+            .with_protocol_version(McpProtocolVersion::Auto);
+        assert!(client.initialize().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auto_propagates_a_transport_failure_instead_of_falling_back() {
+        struct BrokenTransport;
+        #[async_trait]
+        impl McpTransport for BrokenTransport {
+            async fn request(&self, _method: &str, _params: Value) -> Result<Value> {
+                Err(AikitError::ToolExecution("connection refused".into()))
+            }
+            async fn request_detailed(
+                &self,
+                _method: &str,
+                _params: Value,
+            ) -> Result<std::result::Result<Value, McpRpcError>> {
+                Err(AikitError::ToolExecution("connection refused".into()))
+            }
+            async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let client = McpClient::new(Arc::new(BrokenTransport), "auto")
+            .with_protocol_version(McpProtocolVersion::Auto);
+        let error = client.initialize().await.unwrap_err();
+        assert!(error.to_string().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn explicit_2026_fails_clearly_when_the_server_cannot_discover() {
+        struct NoDiscoverMock;
+        #[async_trait]
+        impl McpTransport for NoDiscoverMock {
+            async fn request(&self, _method: &str, _params: Value) -> Result<Value> {
+                unreachable!("request_detailed answers everything")
+            }
+            async fn request_detailed(
+                &self,
+                _method: &str,
+                _params: Value,
+            ) -> Result<std::result::Result<Value, McpRpcError>> {
+                Ok(Err(McpRpcError {
+                    code: Some(-32601),
+                    message: "method not found".into(),
+                }))
+            }
+            async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        let client = McpClient::new(Arc::new(NoDiscoverMock), "strict-2026")
+            .with_protocol_version(McpProtocolVersion::V2026_07_28);
+        let error = client.initialize().await.unwrap_err().to_string();
+        assert!(error.contains("does not support protocol 2026-07-28"));
+    }
+
+    #[tokio::test]
+    async fn mrtr_round_trip_echoes_the_request_state_verbatim() {
+        let transport = Arc::new(Rc2026MockTransport::new(1));
+        let handler = Arc::new(CountingInputHandler {
+            calls: AtomicUsize::new(0),
+        });
+        let mut client = rc2026_client(transport.clone()).with_input_handler(handler.clone());
+        client.initialize().await.unwrap();
+        client.list_tools().await.unwrap();
+        let body = client.call_tool("get_weather", json!({})).await.unwrap();
+        assert_eq!(body, "sunny");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        let calls = transport.seen_calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        // The re-issued call keeps the original name/arguments, answers the input requests, and
+        // echoes the opaque state byte-for-byte.
+        assert_eq!(calls[1]["requestState"], "opaque-state-blob");
+        assert_eq!(calls[1]["inputResponses"]["confirm"], "yes");
+        assert_eq!(calls[1]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn mrtr_without_a_handler_fails_closed() {
+        let transport = Arc::new(Rc2026MockTransport::new(1));
+        let mut client = rc2026_client(transport);
+        client.initialize().await.unwrap();
+        client.list_tools().await.unwrap();
+        let error = client
+            .call_tool("get_weather", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires additional input"));
+        assert!(error.contains("no input handler"));
+    }
+
+    #[tokio::test]
+    async fn mrtr_round_cap_fails_closed_against_a_looping_server() {
+        // The server demands input forever; the client must stop after MAX_MCP_INPUT_ROUNDS.
+        let transport = Arc::new(Rc2026MockTransport::new(usize::MAX));
+        let handler = Arc::new(CountingInputHandler {
+            calls: AtomicUsize::new(0),
+        });
+        let mut client = rc2026_client(transport).with_input_handler(handler.clone());
+        client.initialize().await.unwrap();
+        client.list_tools().await.unwrap();
+        let error = client
+            .call_tool("get_weather", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeded"));
+        assert_eq!(handler.calls.load(Ordering::SeqCst), MAX_MCP_INPUT_ROUNDS);
+    }
+
+    #[tokio::test]
+    async fn mrtr_handler_error_propagates_and_aborts_the_call() {
+        struct RefusingHandler;
+        #[async_trait]
+        impl McpInputHandler for RefusingHandler {
+            async fn provide(
+                &self,
+                _server: &str,
+                _tool: &str,
+                _input_requests: Value,
+            ) -> Result<Value> {
+                Err(AikitError::ToolExecution("operator declined".into()))
+            }
+        }
+        let transport = Arc::new(Rc2026MockTransport::new(1));
+        let mut client = rc2026_client(transport).with_input_handler(Arc::new(RefusingHandler));
+        client.initialize().await.unwrap();
+        client.list_tools().await.unwrap();
+        let error = client
+            .call_tool("get_weather", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("operator declined"));
+    }
+
+    #[tokio::test]
+    async fn unknown_result_type_is_an_error_not_a_silent_misparse() {
+        struct TaskHandleMock;
+        #[async_trait]
+        impl McpTransport for TaskHandleMock {
+            async fn request(&self, method: &str, _params: Value) -> Result<Value> {
+                match method {
+                    "initialize" => Ok(json!({ "protocolVersion": MCP_PROTOCOL_VERSION })),
+                    "tools/call" => Ok(json!({
+                        "resultType": "taskHandle",
+                        "taskId": "t-1"
+                    })),
+                    other => Err(AikitError::ToolExecution(format!("unexpected {other}"))),
+                }
+            }
+            async fn notify(&self, _method: &str, _params: Value) -> Result<()> {
+                Ok(())
+            }
+        }
+        // This client never declared the tasks extension, so a task handle must be rejected.
+        let client = McpClient::new(Arc::new(TaskHandleMock), "tasky");
+        client.initialize().await.unwrap();
+        let error = client
+            .call_tool("anything", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unrecognized resultType 'taskHandle'"));
+    }
+
+    #[tokio::test]
+    async fn streamable_http_2026_sends_routing_headers_and_never_a_session() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION_2026))
+            .and(header("Mcp-Method", "tools/call"))
+            .and(header("Mcp-Name", "get_weather"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    // Even a server that emits a session header must not create one client-side.
+                    .insert_header("Mcp-Session-Id", "must-not-stick")
+                    .set_body_raw(
+                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}",
+                        "application/json",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let transport =
+            StreamableHttpTransport::new(&format!("{}/mcp", server.uri()), None).unwrap();
+        let result = transport
+            .request_with_meta(
+                "tools/call",
+                json!({ "name": "get_weather" }),
+                McpRequestMeta {
+                    protocol_version: MCP_PROTOCOL_VERSION_2026,
+                    method: "tools/call".into(),
+                    name: Some("get_weather".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(transport.session_id().await, None);
     }
 }
