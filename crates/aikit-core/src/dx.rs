@@ -27,7 +27,7 @@ use futures::{FutureExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -289,6 +289,7 @@ fn fidelity_name(grade: FidelityGrade) -> &'static str {
 /// forced tool). This is the "ask the right way" decision, isolated and unit-testable.
 fn plan_structured(
     provider: &str,
+    model: &str,
     grade: FidelityGrade,
     name: &str,
     schema: &Value,
@@ -317,10 +318,19 @@ fn plan_structured(
         FidelityGrade::NativeConstrained => {
             let mut options = Map::new();
             if provider == "google" {
-                options.insert(
-                    "generationConfig".into(),
-                    json!({ "responseMimeType": "application/json", "responseJsonSchema": schema }),
-                );
+                let generation_config = if model.starts_with("gemini-3") {
+                    json!({
+                        "responseFormat": {
+                            "text": { "mimeType": "application/json", "schema": schema }
+                        }
+                    })
+                } else {
+                    json!({
+                        "responseMimeType": "application/json",
+                        "responseJsonSchema": schema
+                    })
+                };
+                options.insert("generationConfig".into(), generation_config);
             } else if provider == "anthropic" {
                 options.insert(
                     "output_config".into(),
@@ -656,6 +666,106 @@ fn append_user_instruction(
     Ok(messages)
 }
 
+fn structured_protocol_error(
+    provider: &str,
+    model: &str,
+    message: impl Into<String>,
+    warnings: &[crate::contract::ProviderWarning],
+) -> AikitError {
+    crate::error::ProviderError::new(
+        provider,
+        model,
+        crate::error::ProviderErrorKind::Protocol,
+        message,
+    )
+    .with_warnings(warnings.to_vec())
+    .into()
+}
+
+fn warning_retained_bytes(warning: &crate::contract::ProviderWarning) -> usize {
+    warning
+        .code
+        .len()
+        .saturating_add(warning.message.len())
+        .saturating_add(warning.parameter.as_deref().map_or(0, str::len))
+        .saturating_add(warning.provider.as_deref().map_or(0, str::len))
+        .saturating_add(warning.model.as_deref().map_or(0, str::len))
+}
+
+fn merge_framework_options(target: &mut Map<String, Value>, framework: &Map<String, Value>) {
+    for (key, framework_value) in framework {
+        match (target.get_mut(key), framework_value) {
+            (Some(Value::Object(target)), Value::Object(framework)) => {
+                merge_framework_options(target, framework);
+            }
+            _ => {
+                target.insert(key.clone(), framework_value.clone());
+            }
+        }
+    }
+}
+
+fn clear_framework_owned_structured_output_conflicts(
+    target: &mut Map<String, Value>,
+    framework: &Map<String, Value>,
+) {
+    // OpenAI-compatible providers treat response_format as one discriminated union. Keeping
+    // caller-owned keys from a different variant can make the wire constraint differ from the
+    // schema AIKit validates locally (or make the provider reject the request outright).
+    if framework.contains_key("response_format") {
+        target.remove("response_format");
+    }
+
+    // Anthropic owns only output_config.format for structured output. Preserve unrelated native
+    // controls under output_config while replacing the complete format subtree atomically.
+    if framework
+        .get("output_config")
+        .and_then(Value::as_object)
+        .is_some_and(|output| output.contains_key("format"))
+    {
+        if let Some(output) = target
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+        {
+            output.remove("format");
+        }
+    }
+
+    clear_google_structured_output_conflicts(target, framework);
+}
+
+fn clear_google_structured_output_conflicts(
+    target: &mut Map<String, Value>,
+    framework: &Map<String, Value>,
+) {
+    let Some(framework_generation) = framework.get("generationConfig").and_then(Value::as_object)
+    else {
+        return;
+    };
+    let framework_owns_format = framework_generation.contains_key("responseFormat")
+        || framework_generation.contains_key("responseMimeType")
+        || framework_generation.contains_key("responseSchema")
+        || framework_generation.contains_key("responseJsonSchema");
+    if !framework_owns_format {
+        return;
+    }
+    let Some(target_generation) = target
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for key in [
+        "responseFormat",
+        "responseMimeType",
+        "responseSchema",
+        "responseJsonSchema",
+        "responseModalities",
+    ] {
+        target_generation.remove(key);
+    }
+}
+
 /// [`stream_object_messages`] with structured audit events.
 #[allow(clippy::too_many_arguments)]
 pub fn stream_object_messages_observed(
@@ -668,7 +778,7 @@ pub fn stream_object_messages_observed(
     options: &ObjectOptions,
     audit: Option<&crate::observability::AuditTrail>,
 ) -> ObjectStream {
-    let plan = plan_structured(provider_name, grade, &options.name, schema);
+    let plan = plan_structured(provider_name, model, grade, &options.name, schema);
     let base_messages = match &plan.prompt_suffix {
         Some(s) => append_user_instruction(messages, s.clone()),
         None => validate_object_messages(messages),
@@ -692,6 +802,10 @@ pub fn stream_object_messages_observed(
         let mut last_error = String::new();
         let mut provider_metadata = crate::types::ProviderMetadata::new();
         let mut warnings = Vec::new();
+        // Warnings and provider metadata survive repair attempts, while rejected text/tool
+        // candidates do not. Keep the persistent budget across attempts and clone it for each
+        // attempt so released candidate reservations cannot accumulate indefinitely.
+        let mut persistent_retained = crate::providers::StreamRetentionBudget::default();
         for attempt_index in 0..total_attempts {
             let attempt = attempt_index + 1;
             if let Some(audit) = &audit {
@@ -724,7 +838,8 @@ pub fn stream_object_messages_observed(
             // Framework-owned structured-output fields must win over a conflicting escape hatch;
             // otherwise the result could be labelled NativeConstrained after the caller disabled
             // the native schema mode on the wire.
-            wire_options.extend(plan.options.clone());
+            clear_framework_owned_structured_output_conflicts(&mut wire_options, &plan.options);
+            merge_framework_options(&mut wire_options, &plan.options);
             let req = ProviderRequest {
                 model: model.clone(),
                 messages,
@@ -739,24 +854,37 @@ pub fn stream_object_messages_observed(
             let mut text = String::new();
             let mut names: HashMap<String, String> = HashMap::new();
             let mut tool_inputs: Vec<(String, Value)> = Vec::new();
+            let mut tool_inputs_seen = HashSet::new();
+            let mut stream_started = false;
+            let mut stream_terminal = false;
             let mut stream_error = None;
+            let mut attempt_retained = persistent_retained.clone();
             while let Some(delta) = provider_stream.next().await {
+                if stream_terminal {
+                    stream_error = Some(structured_protocol_error(
+                        &provider_name,
+                        &model,
+                        "provider emitted a structured-output delta after MessageStop",
+                        &warnings,
+                    ));
+                    break;
+                }
                 match &delta {
-                    StreamDelta::TextDelta { text: part } => text.push_str(part),
-                    StreamDelta::ToolCallStart { id, name } => {
-                        names.insert(id.clone(), name.clone());
+                    StreamDelta::Warning { warning } => {
+                        let warning_bytes = warning_retained_bytes(warning);
+                        if !attempt_retained.retain(warning_bytes, 1)
+                            || !persistent_retained.retain(warning_bytes, 1)
+                        {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "structured-output stream exceeded the retained state limit",
+                                &warnings,
+                            ));
+                        } else {
+                            warnings.push(warning.clone());
+                        }
                     }
-                    StreamDelta::ToolCallInput { id, input } => {
-                        let name = names.get(id).cloned().unwrap_or_default();
-                        tool_inputs.push((name, input.clone()));
-                    }
-                    StreamDelta::ProviderMetadata { provider, metadata } => {
-                        provider_metadata
-                            .entry(provider.clone())
-                            .or_default()
-                            .push(metadata.clone());
-                    }
-                    StreamDelta::Warning { warning } => warnings.push(warning.clone()),
                     StreamDelta::Error { message, info } => {
                         stream_error = Some(
                             stream_delta_error(
@@ -768,11 +896,131 @@ pub fn stream_object_messages_observed(
                             .with_provider_warnings(warnings.clone()),
                         );
                     }
+                    StreamDelta::MessageStart { .. } => {
+                        if stream_started {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "provider started the structured-output response more than once",
+                                &warnings,
+                            ));
+                        } else {
+                            stream_started = true;
+                        }
+                    }
+                    _ if !stream_started => {
+                        stream_error = Some(structured_protocol_error(
+                            &provider_name,
+                            &model,
+                            "provider emitted structured output before MessageStart",
+                            &warnings,
+                        ));
+                    }
+                    StreamDelta::TextDelta { text: part } => {
+                        if !attempt_retained.retain(part.len(), 0) {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "structured-output stream exceeded the retained state limit",
+                                &warnings,
+                            ));
+                        } else {
+                            text.push_str(part);
+                        }
+                    }
+                    StreamDelta::ToolCallStart { id, name } => {
+                        if !attempt_retained.retain(id.len().saturating_add(name.len()), 1) {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "structured-output stream exceeded the retained state limit",
+                                &warnings,
+                            ));
+                        } else if names.insert(id.clone(), name.clone()).is_some() {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                format!("provider started structured-output tool call {id} more than once"),
+                                &warnings,
+                            ));
+                        }
+                    }
+                    StreamDelta::ToolCallInput { id, input } => {
+                        if !names.contains_key(id) {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                format!("provider emitted input before starting structured-output tool call {id}"),
+                                &warnings,
+                            ));
+                        } else if !tool_inputs_seen.insert(id.clone()) {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                format!("provider emitted structured-output tool input {id} more than once"),
+                                &warnings,
+                            ));
+                        } else if !attempt_retained.retain_json(input, 1) {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "structured-output stream exceeded the retained state limit",
+                                &warnings,
+                            ));
+                        } else {
+                            let name = names
+                                .get(id)
+                                .expect("tool name exists after ordering validation")
+                                .clone();
+                            tool_inputs.push((name, input.clone()));
+                        }
+                    }
+                    StreamDelta::ProviderMetadata { provider, metadata } => {
+                        let metadata_bytes = crate::providers::json_retained_bytes(metadata)
+                            .saturating_add(provider.len());
+                        if !attempt_retained.retain(metadata_bytes, 1)
+                            || !persistent_retained.retain(metadata_bytes, 1)
+                        {
+                            stream_error = Some(structured_protocol_error(
+                                &provider_name,
+                                &model,
+                                "structured-output stream exceeded the retained state limit",
+                                &warnings,
+                            ));
+                        } else {
+                            provider_metadata
+                                .entry(provider.clone())
+                                .or_default()
+                                .push(metadata.clone());
+                        }
+                    }
+                    StreamDelta::MessageStop { .. } => stream_terminal = true,
                     _ => {}
                 }
                 yield ObjectStreamEvent::Delta { attempt, delta };
                 if stream_error.is_some() {
                     break;
+                }
+            }
+            if stream_error.is_none() && !stream_terminal {
+                stream_error = Some(structured_protocol_error(
+                    &provider_name,
+                    &model,
+                    "provider stream ended before structured-output MessageStop",
+                    &warnings,
+                ));
+            }
+            if stream_error.is_none() {
+                if let Some(id) = names
+                    .keys()
+                    .find(|id| !tool_inputs_seen.contains(id.as_str()))
+                {
+                    stream_error = Some(structured_protocol_error(
+                        &provider_name,
+                        &model,
+                        format!("structured-output tool call {id} ended without input"),
+                        &warnings,
+                    ));
                 }
             }
             if let Some(error) = stream_error {
@@ -955,7 +1203,9 @@ fn strip_fences(s: &str) -> &str {
         let rest = rest.strip_prefix("json").unwrap_or(rest);
         let rest = rest.trim_start_matches(['\n', '\r']);
         if let Some(end) = rest.rfind("```") {
-            return rest[..end].trim();
+            if rest[end + 3..].trim().is_empty() {
+                return rest[..end].trim();
+            }
         }
     }
     t
@@ -1133,7 +1383,71 @@ mod tests {
         }
     }
 
+    struct LargeRepairMock {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for LargeRepairMock {
+        fn name(&self) -> &str {
+            "large-repair-mock"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> AikitResult<BoxStream<'static, StreamDelta>> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let padding = "x".repeat(crate::providers::MAX_STREAM_RETAINED_BYTES / 2 + 4_096);
+            let body = if attempt == 0 {
+                json!({"total": 42, "padding": padding}).to_string()
+            } else {
+                json!({"total": 42, "currency": "USD", "padding": padding}).to_string()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart { model: "m".into() },
+                StreamDelta::TextDelta { text: body },
+                StreamDelta::Warning {
+                    warning: crate::contract::ProviderWarning {
+                        code: "repair_attempt".into(),
+                        message: format!("attempt {}", attempt + 1),
+                        parameter: None,
+                        provider: Some("openai".into()),
+                        model: Some("gpt-x".into()),
+                    },
+                },
+                StreamDelta::ProviderMetadata {
+                    provider: "openai".into(),
+                    metadata: json!({"attempt": attempt + 1}),
+                },
+                StreamDelta::MessageStop {
+                    stop_reason: "end_turn".into(),
+                },
+            ])))
+        }
+    }
+
     struct NeverCalledMock;
+
+    struct FixedStreamMock {
+        calls: Arc<AtomicUsize>,
+        deltas: Vec<StreamDelta>,
+    }
+
+    #[async_trait]
+    impl Provider for FixedStreamMock {
+        fn name(&self) -> &str {
+            "fixed-stream"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> AikitResult<BoxStream<'static, StreamDelta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(self.deltas.clone())))
+        }
+    }
 
     #[async_trait]
     impl Provider for NeverCalledMock {
@@ -1175,6 +1489,7 @@ mod tests {
         ) -> AikitResult<BoxStream<'static, StreamDelta>> {
             *self.options.lock().unwrap() = req.options;
             Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart { model: "m".into() },
                 StreamDelta::TextDelta {
                     text: r#"{"total":1,"currency":"USD"}"#.into(),
                 },
@@ -1197,6 +1512,7 @@ mod tests {
         ) -> AikitResult<BoxStream<'static, StreamDelta>> {
             *self.messages.lock().unwrap() = req.messages;
             Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart { model: "m".into() },
                 StreamDelta::TextDelta {
                     text: r#"{"total":1,"currency":"USD"}"#.into(),
                 },
@@ -1234,6 +1550,7 @@ mod tests {
         // OpenAI → strict json_schema response_format, read from text.
         let p = plan_structured(
             "openai",
+            "gpt-5.6-sol",
             FidelityGrade::NativeConstrained,
             "invoice",
             &schema,
@@ -1243,22 +1560,44 @@ mod tests {
         assert!(matches!(p.source, ResultSource::Text));
         assert!(p.extra_tools.is_empty());
 
-        // Google → generationConfig.responseJsonSchema (JSON Schema, not the older OpenAPI type).
+        // Current Gemini 3 → generationConfig.responseFormat.text.
         let p = plan_structured(
             "google",
+            "gemini-3.5-flash",
             FidelityGrade::NativeConstrained,
             "invoice",
             &schema,
         );
         assert_eq!(
-            p.options["generationConfig"]["responseMimeType"],
+            p.options["generationConfig"]["responseFormat"]["text"]["mimeType"],
             "application/json"
         );
-        assert_eq!(p.options["generationConfig"]["responseJsonSchema"], schema);
+        assert_eq!(
+            p.options["generationConfig"]["responseFormat"]["text"]["schema"],
+            schema
+        );
+
+        // Gemini 2.x retains the previous generateContent JSON-Schema fields.
+        let legacy = plan_structured(
+            "google",
+            "gemini-2.5-pro",
+            FidelityGrade::NativeConstrained,
+            "invoice",
+            &schema,
+        );
+        assert_eq!(
+            legacy.options["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            legacy.options["generationConfig"]["responseJsonSchema"],
+            schema
+        );
 
         // Anthropic → native output_config.format JSON schema, read from text.
         let p = plan_structured(
             "anthropic",
+            "claude-opus-4-8",
             FidelityGrade::NativeConstrained,
             "invoice",
             &schema,
@@ -1271,6 +1610,7 @@ mod tests {
         // DeepSeek → json_object mode + schema pinned into the prompt.
         let p = plan_structured(
             "deepseek",
+            "deepseek-v4-pro",
             FidelityGrade::PromptedAndParsed,
             "invoice",
             &schema,
@@ -1313,7 +1653,18 @@ mod tests {
             "openai".into(),
             Map::from_iter([
                 ("service_tier".into(), json!("flex")),
-                ("response_format".into(), json!({ "type": "text" })),
+                (
+                    "response_format".into(),
+                    json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "hostile",
+                            "strict": false,
+                            "schema": {"not": {}},
+                            "unexpected": true
+                        }
+                    }),
+                ),
             ]),
         );
         let options = ObjectOptions {
@@ -1341,6 +1692,157 @@ mod tests {
             captured["response_format"]["json_schema"]["schema"],
             invoice_schema()
         );
+        assert_eq!(
+            captured["response_format"]["json_schema"]["name"],
+            "respond"
+        );
+        assert_eq!(captured["response_format"]["json_schema"]["strict"], true);
+        assert!(captured["response_format"]["json_schema"]
+            .get("unexpected")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_format_is_replaced_atomically_but_output_controls_survive() {
+        let captured = Arc::new(Mutex::new(Map::new()));
+        let mut provider_options = crate::types::ProviderOptions::new();
+        provider_options.insert(
+            "anthropic".into(),
+            Map::from_iter([(
+                "output_config".into(),
+                json!({
+                    "effort": "high",
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {"not": {}},
+                        "unexpected": true
+                    }
+                }),
+            )]),
+        );
+
+        generate_object(
+            Arc::new(CapturingMock {
+                options: captured.clone(),
+            }),
+            "anthropic",
+            FidelityGrade::NativeConstrained,
+            "claude-test",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions {
+                provider_options,
+                ..ObjectOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured["output_config"]["effort"], "high");
+        assert_eq!(
+            captured["output_config"]["format"],
+            json!({"type": "json_schema", "schema": invoice_schema()})
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_json_object_format_drops_caller_json_schema_variant() {
+        let captured = Arc::new(Mutex::new(Map::new()));
+        let mut provider_options = crate::types::ProviderOptions::new();
+        provider_options.insert(
+            "deepseek".into(),
+            Map::from_iter([
+                ("temperature".into(), json!(0.2)),
+                (
+                    "response_format".into(),
+                    json!({
+                        "type": "json_schema",
+                        "json_schema": {"schema": {"not": {}}}
+                    }),
+                ),
+            ]),
+        );
+
+        generate_object(
+            Arc::new(CapturingMock {
+                options: captured.clone(),
+            }),
+            "deepseek",
+            FidelityGrade::PromptedAndParsed,
+            "deepseek-chat",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions {
+                provider_options,
+                ..ObjectOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured["temperature"], 0.2);
+        assert_eq!(captured["response_format"], json!({"type": "json_object"}));
+    }
+
+    #[tokio::test]
+    async fn google_structured_contract_deep_merges_without_dropping_generation_controls() {
+        let captured = Arc::new(Mutex::new(Map::new()));
+        let mut provider_options = crate::types::ProviderOptions::new();
+        provider_options.insert(
+            "google".into(),
+            Map::from_iter([(
+                "generationConfig".into(),
+                json!({
+                    "temperature": 0.25,
+                    "responseMimeType": "text/plain",
+                    "responseSchema": {"type": "string"},
+                    "responseJsonSchema": {"type": "boolean"},
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "responseFormat": {
+                        "text": {"mimeType": "text/plain", "schema": {"type": "string"}},
+                        "image": {"mimeType": "image/png"},
+                        "audio": {"mimeType": "audio/wav"}
+                    }
+                }),
+            )]),
+        );
+        generate_object(
+            Arc::new(CapturingMock {
+                options: captured.clone(),
+            }),
+            "google",
+            FidelityGrade::NativeConstrained,
+            "gemini-3.5-flash",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions {
+                provider_options,
+                ..ObjectOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured["generationConfig"]["temperature"], 0.25);
+        assert_eq!(
+            captured["generationConfig"]["responseFormat"]["text"]["mimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            captured["generationConfig"]["responseFormat"]["text"]["schema"],
+            invoice_schema()
+        );
+        let generation = captured["generationConfig"].as_object().unwrap();
+        assert!(!generation.contains_key("responseMimeType"));
+        assert!(!generation.contains_key("responseSchema"));
+        assert!(!generation.contains_key("responseJsonSchema"));
+        assert!(!generation.contains_key("responseModalities"));
+        let response_format = generation["responseFormat"].as_object().unwrap();
+        assert_eq!(response_format.len(), 1);
+        assert!(response_format.contains_key("text"));
     }
 
     #[tokio::test]
@@ -1406,6 +1908,13 @@ mod tests {
         .unwrap();
         assert_eq!(got.value["currency"], "GBP");
         assert_eq!(got.fidelity, FidelityGrade::PromptedAndParsed);
+    }
+
+    #[test]
+    fn markdown_fence_with_trailing_prose_is_not_silently_accepted() {
+        let response = "```json\n{\"total\": 42, \"currency\": \"TRY\"}\n```\nextra prose";
+        assert_eq!(strip_fences(response), response);
+        assert!(serde_json::from_str::<Value>(strip_fences(response)).is_err());
     }
 
     #[tokio::test]
@@ -1566,6 +2075,134 @@ mod tests {
             provider_error.warnings[0].parameter.as_deref(),
             Some("future_option")
         );
+    }
+
+    #[tokio::test]
+    async fn valid_json_without_message_stop_is_a_protocol_error_not_a_repair_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = generate_object(
+            Arc::new(FixedStreamMock {
+                calls: calls.clone(),
+                deltas: vec![
+                    StreamDelta::MessageStart { model: "m".into() },
+                    StreamDelta::TextDelta {
+                        text: r#"{"total":42,"currency":"USD"}"#.into(),
+                    },
+                ],
+            }),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == crate::error::ProviderErrorKind::Protocol
+                    && error.message.contains("MessageStop")
+        ));
+    }
+
+    #[tokio::test]
+    async fn forced_tool_input_before_start_is_a_protocol_error_not_a_validation_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = generate_object(
+            Arc::new(FixedStreamMock {
+                calls: calls.clone(),
+                deltas: vec![
+                    StreamDelta::MessageStart { model: "m".into() },
+                    StreamDelta::ToolCallInput {
+                        id: "c1".into(),
+                        input: json!({"total":42,"currency":"USD"}),
+                    },
+                    StreamDelta::MessageStop {
+                        stop_reason: "tool_use".into(),
+                    },
+                ],
+            }),
+            "anthropic",
+            FidelityGrade::ForcedToolCall,
+            "claude-x",
+            "x",
+            &invoice_schema(),
+            &ObjectOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == crate::error::ProviderErrorKind::Protocol
+                    && error.message.contains("before starting")
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_text_retention_is_bounded_across_provider_deltas() {
+        let options = ObjectOptions {
+            max_retries: 0,
+            ..ObjectOptions::default()
+        };
+        let error = generate_object(
+            Arc::new(TextMock(
+                "x".repeat(crate::providers::MAX_STREAM_RETAINED_BYTES + 1),
+            )),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.provider_error(),
+            Some(error)
+                if error.kind == crate::error::ProviderErrorKind::Protocol
+                    && error.message.contains("retained state limit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_candidate_retention_is_released_before_the_repair_attempt() {
+        let provider = Arc::new(LargeRepairMock {
+            calls: AtomicUsize::new(0),
+        });
+        let options = ObjectOptions {
+            max_retries: 1,
+            ..ObjectOptions::default()
+        };
+
+        let object = generate_object(
+            provider.clone(),
+            "openai",
+            FidelityGrade::NativeConstrained,
+            "gpt-x",
+            "x",
+            &invoice_schema(),
+            &options,
+        )
+        .await
+        .expect("each candidate is independently below the retention limit");
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(object.attempts, 2);
+        assert_eq!(
+            object.value["padding"].as_str().unwrap().len(),
+            crate::providers::MAX_STREAM_RETAINED_BYTES / 2 + 4_096
+        );
+        assert_eq!(object.warnings.len(), 2);
+        assert_eq!(object.provider_metadata["openai"].len(), 2);
     }
 
     #[tokio::test]

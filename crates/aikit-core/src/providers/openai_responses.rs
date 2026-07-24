@@ -446,17 +446,17 @@ impl OpenAiResponsesStreamParser {
                     event.get("item_id").and_then(Value::as_str),
                     event.get("delta").and_then(Value::as_str),
                 ) {
-                    let new_call = usize::from(!self.calls.contains_key(item_id));
-                    let bytes =
-                        delta
-                            .len()
-                            .saturating_add(if new_call == 1 { item_id.len() } else { 0 });
-                    if !self.retention.retain(bytes, new_call) {
+                    if !self.calls.contains_key(item_id) {
+                        return self.terminal_protocol_failure(format!(
+                            "OpenAI arguments delta referenced unknown item {item_id}"
+                        ));
+                    }
+                    if !self.retention.retain(delta.len(), 0) {
                         return self.retained_state_failure();
                     }
                     self.calls
-                        .entry(item_id.to_string())
-                        .or_default()
+                        .get_mut(item_id)
+                        .expect("function call existence checked above")
                         .arguments
                         .push_str(delta);
                 }
@@ -511,29 +511,25 @@ impl OpenAiResponsesStreamParser {
                 if let Some(response) = event.get("response") {
                     out.extend(self.absorb_final_response(response));
                 }
+                if self.terminal {
+                    return out;
+                }
                 let code = event
                     .get("response")
                     .and_then(|response| response.get("error"))
                     .and_then(|error| error.get("code").or_else(|| error.get("type")))
                     .and_then(Value::as_str);
-                out.push(super::stream_failure_without_model(
-                    "openai",
-                    openai_stream_error_kind(code),
-                    "OpenAI response failed",
-                ));
-                out.extend(self.complete("error"));
+                out.extend(self.fail(openai_stream_error_kind(code), "OpenAI response failed"));
             }
             "error" => {
                 let code = event
                     .get("error")
                     .and_then(|error| error.get("code").or_else(|| error.get("type")))
                     .and_then(Value::as_str);
-                out.push(super::stream_failure_without_model(
-                    "openai",
+                out.extend(self.fail(
                     openai_stream_error_kind(code),
                     "OpenAI Responses stream reported an error",
                 ));
-                out.extend(self.complete("error"));
             }
             _ => {}
         }
@@ -794,6 +790,29 @@ impl OpenAiResponsesStreamParser {
         out.push(StreamDelta::MessageStop {
             stop_reason: stop_reason.to_string(),
         });
+        out
+    }
+
+    fn fail(
+        &mut self,
+        kind: crate::error::ProviderErrorKind,
+        message: impl Into<String>,
+    ) -> Vec<StreamDelta> {
+        if self.terminal {
+            return Vec::new();
+        }
+        self.terminal = true;
+        self.calls.clear();
+        self.reasoning_emitted.clear();
+        let mut out = Vec::new();
+        if !self.metadata.is_empty() {
+            out.push(StreamDelta::ProviderMetadata {
+                provider: "openai".into(),
+                metadata: Value::Object(std::mem::take(&mut self.metadata)),
+            });
+        }
+        out.push(StreamDelta::Usage(self.usage));
+        out.push(super::stream_failure_without_model("openai", kind, message));
         out
     }
 
@@ -1486,6 +1505,16 @@ mod tests {
     fn many_small_argument_fragments_fail_terminally() {
         let mut parser = OpenAiResponsesStreamParser::new();
         parser.retention = crate::providers::StreamRetentionBudget::with_limits(8, 8);
+        parser.push_event(&json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "i",
+                "call_id": "c",
+                "name": "f",
+                "arguments": ""
+            }
+        }));
         let fragment = json!({
             "type": "response.function_call_arguments.delta",
             "item_id": "i",
@@ -1505,6 +1534,53 @@ mod tests {
         assert!(parser.terminal);
         assert!(parser.calls.is_empty());
         assert!(parser.push_event(&fragment).is_empty());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn argument_delta_before_output_item_is_a_terminal_protocol_failure() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        let out = parser.push_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "missing",
+            "delta": "{}"
+        }));
+        assert!(matches!(
+            out.as_slice(),
+            [StreamDelta::Error { message, info }]
+                if message.contains("unknown item missing")
+                    && info.code == crate::error::ErrorCode::ProviderProtocol
+        ));
+        assert!(parser.terminal);
+    }
+
+    #[test]
+    fn failed_response_ends_with_error_without_a_success_stop() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        let out = parser.push_event(&json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "model": "gpt-5",
+                "status": "failed",
+                "error": {"code": "rate_limit_exceeded"},
+                "usage": {"input_tokens": 3, "output_tokens": 0}
+            }
+        }));
+
+        assert!(matches!(
+            out.first(),
+            Some(StreamDelta::MessageStart { .. })
+        ));
+        assert!(matches!(
+            out.last(),
+            Some(StreamDelta::Error { info, .. })
+                if info.code == crate::error::ErrorCode::ProviderRateLimit && info.retryable
+        ));
+        assert!(!out
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+        assert!(parser.terminal);
         assert!(parser.finish().is_empty());
     }
 

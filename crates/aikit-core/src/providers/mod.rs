@@ -632,6 +632,7 @@ fn provider_option_kind(
         | "inference_geo"
         | "reasoning_format"
         | "route"
+        | "user_id"
         | "cachedContent" => Some(Kind::String),
         "stop" => Some(Kind::StringOrArray),
         "stop_sequences" | "modalities" | "include" | "models" | "transforms" => {
@@ -657,6 +658,7 @@ const GOOGLE_GENERATION_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
     ("responseMimeType", ProviderOptionKind::String),
     ("responseSchema", ProviderOptionKind::Object),
     ("responseJsonSchema", ProviderOptionKind::Object),
+    ("responseFormat", ProviderOptionKind::Object),
     ("presencePenalty", ProviderOptionKind::Number),
     ("frequencyPenalty", ProviderOptionKind::Number),
     ("responseLogprobs", ProviderOptionKind::Boolean),
@@ -696,6 +698,14 @@ const GOOGLE_THINKING_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
 const GOOGLE_IMAGE_CONFIG_FIELDS: &[(&str, ProviderOptionKind)] = &[
     ("aspectRatio", ProviderOptionKind::String),
     ("imageSize", ProviderOptionKind::String),
+];
+
+const GOOGLE_RESPONSE_FORMAT_FIELDS: &[(&str, ProviderOptionKind)] =
+    &[("text", ProviderOptionKind::Object)];
+
+const GOOGLE_RESPONSE_FORMAT_TEXT_FIELDS: &[(&str, ProviderOptionKind)] = &[
+    ("mimeType", ProviderOptionKind::String),
+    ("schema", ProviderOptionKind::Object),
 ];
 
 const OPENAI_RESPONSE_FORMAT_FIELDS: &[(&str, ProviderOptionKind)] = &[
@@ -760,6 +770,9 @@ const ANTHROPIC_THINKING_FIELDS: &[(&str, ProviderOptionKind)] = &[
     ("budget_tokens", ProviderOptionKind::Integer),
 ];
 
+const DEEPSEEK_THINKING_FIELDS: &[(&str, ProviderOptionKind)] =
+    &[("type", ProviderOptionKind::String)];
+
 fn provider_nested_option_fields(
     provider: &str,
     allowed: &[&str],
@@ -774,12 +787,17 @@ fn provider_nested_option_fields(
         ("google", "generationConfig") => Some(GOOGLE_GENERATION_CONFIG_FIELDS),
         ("google", "generationConfig.thinkingConfig") => Some(GOOGLE_THINKING_CONFIG_FIELDS),
         ("google", "generationConfig.imageConfig") => Some(GOOGLE_IMAGE_CONFIG_FIELDS),
+        ("google", "generationConfig.responseFormat") => Some(GOOGLE_RESPONSE_FORMAT_FIELDS),
+        ("google", "generationConfig.responseFormat.text") => {
+            Some(GOOGLE_RESPONSE_FORMAT_TEXT_FIELDS)
+        }
         ("google", "toolConfig") => Some(GOOGLE_TOOL_CONFIG_FIELDS),
         ("google", "toolConfig.functionCallingConfig") => Some(GOOGLE_FUNCTION_CALLING_FIELDS),
         ("openai", "reasoning") if responses_api => Some(OPENAI_REASONING_FIELDS),
         ("openai", "text") if responses_api => Some(OPENAI_TEXT_FIELDS),
         ("openai", "text.format") if responses_api => Some(OPENAI_TEXT_FORMAT_FIELDS),
         ("anthropic", "thinking") => Some(ANTHROPIC_THINKING_FIELDS),
+        ("deepseek", "thinking") => Some(DEEPSEEK_THINKING_FIELDS),
         ("anthropic", "output_config") => Some(ANTHROPIC_OUTPUT_CONFIG_FIELDS),
         ("anthropic", "output_config.format") => Some(ANTHROPIC_OUTPUT_FORMAT_FIELDS),
         ("anthropic", "tool_choice") => Some(ANTHROPIC_TOOL_CHOICE_FIELDS),
@@ -898,10 +916,13 @@ pub(crate) const DEEPSEEK_OPTIONS: &[&str] = &[
     "stop",
     "frequency_penalty",
     "presence_penalty",
+    "thinking",
+    "reasoning_effort",
     "response_format",
     "tool_choice",
     "logprobs",
     "top_logprobs",
+    "user_id",
 ];
 
 pub(crate) fn openai_compatible_options(provider: &str) -> &'static [&'static str] {
@@ -1037,11 +1058,21 @@ pub(crate) fn http_failure(
         body.truncate(end);
         body.push('…');
     }
-    let retry_after_ms = retry_after
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1000));
+    let retry_after_ms = parse_retry_after_ms(retry_after, std::time::SystemTime::now());
     ProviderError::from_http(provider, model, status.as_u16(), retry_after_ms, body).into()
+}
+
+fn parse_retry_after_ms(
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    now: std::time::SystemTime,
+) -> Option<u64> {
+    let value = retry_after?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let delay = retry_at.duration_since(now).unwrap_or_default();
+    Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[async_trait]
@@ -1441,6 +1472,59 @@ mod request_tests {
     }
 
     #[test]
+    fn current_gemini_response_format_is_strict_cataloged_and_nested_typed() {
+        let mut request = ProviderRequest {
+            model: "gemini-3.5-flash".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([(
+                "generationConfig".into(),
+                serde_json::json!({
+                    "responseFormat": {
+                        "text": {"mimeType": "application/json", "schema": {"type": "object"}}
+                    }
+                }),
+            )]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        assert!(request
+            .validated_options_for("google", GOOGLE_OPTIONS)
+            .unwrap()
+            .warnings
+            .is_empty());
+
+        request.options["generationConfig"]["responseFormat"]["text"]["mimeType"] =
+            Value::Bool(true);
+        assert!(matches!(
+            request
+                .validated_options_for("google", GOOGLE_OPTIONS)
+                .unwrap_err()
+                .provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("generationConfig.responseFormat.text.mimeType")
+        ));
+
+        for unsupported in ["image", "audio"] {
+            request.options["generationConfig"]["responseFormat"] =
+                serde_json::json!({ unsupported: {"mimeType": "application/octet-stream"} });
+            assert!(matches!(
+                request
+                    .validated_options_for("google", GOOGLE_OPTIONS)
+                    .unwrap_err()
+                    .provider_error(),
+                Some(error)
+                    if error.kind == ProviderErrorKind::InvalidRequest
+                        && error.message.contains(&format!(
+                            "generationConfig.responseFormat.{unsupported}"
+                        ))
+            ));
+        }
+    }
+
+    #[test]
     fn governed_object_options_validate_recursively_and_opaque_options_require_warn_mode() {
         let mut google = ProviderRequest {
             model: "gemini-test".into(),
@@ -1644,6 +1728,41 @@ mod request_tests {
     }
 
     #[test]
+    fn current_deepseek_v4_controls_are_strict_cataloged_and_nested_typed() {
+        let mut request = ProviderRequest {
+            model: "deepseek-v4-pro".into(),
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: 64,
+            options: Map::from_iter([
+                ("thinking".into(), serde_json::json!({"type": "enabled"})),
+                ("reasoning_effort".into(), Value::String("high".into())),
+                ("user_id".into(), Value::String("tenant-42".into())),
+            ]),
+            provider_options: crate::types::ProviderOptions::new(),
+            compatibility_mode: CompatibilityMode::Strict,
+        };
+        let validated = request
+            .validated_options_for("deepseek", DEEPSEEK_OPTIONS)
+            .unwrap();
+        assert!(validated.warnings.is_empty());
+        assert_eq!(validated.options["thinking"]["type"], "enabled");
+
+        request
+            .options
+            .insert("thinking".into(), serde_json::json!({"mode": "enabled"}));
+        assert!(matches!(
+            request
+                .validated_options_for("deepseek", DEEPSEEK_OPTIONS)
+                .unwrap_err()
+                .provider_error(),
+            Some(error)
+                if error.kind == ProviderErrorKind::InvalidRequest
+                    && error.message.contains("thinking.mode")
+        ));
+    }
+
+    #[test]
     fn sse_buffer_limit_rejects_before_growing_the_buffer() {
         let mut buffer = vec![b'x'; MAX_SSE_BUFFER_BYTES - 1];
         let original_len = buffer.len();
@@ -1651,6 +1770,29 @@ mod request_tests {
         assert_eq!(buffer.len(), original_len);
         assert!(append_sse_chunk(&mut buffer, b"y"));
         assert_eq!(buffer.len(), MAX_SSE_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_dates_without_overflow() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let seconds = reqwest::header::HeaderValue::from_static("7");
+        assert_eq!(
+            parse_retry_after_ms(Some(&seconds), UNIX_EPOCH),
+            Some(7_000)
+        );
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let future = now + Duration::from_secs(3);
+        let date =
+            reqwest::header::HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap();
+        assert_eq!(parse_retry_after_ms(Some(&date), now), Some(3_000));
+
+        let past = reqwest::header::HeaderValue::from_str(&httpdate::fmt_http_date(now)).unwrap();
+        assert_eq!(
+            parse_retry_after_ms(Some(&past), now + Duration::from_secs(1)),
+            Some(0)
+        );
     }
 
     #[test]

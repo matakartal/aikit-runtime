@@ -97,6 +97,7 @@ dependencies = [
  "cap-std",
  "futures",
  "getrandom 0.4.3",
+ "httpdate",
  "jsonschema",
  "libc",
  "opentelemetry",

@@ -221,6 +221,12 @@ impl DeepSeekStreamParser {
         if self.terminal {
             return Vec::new();
         }
+        if let Some(error) = chunk.get("error").filter(|error| error.is_object()) {
+            return self.terminal_failure(
+                super::openai::compatible_stream_error_kind(error),
+                "DeepSeek stream reported an error",
+            );
+        }
         let mut out = Vec::new();
 
         if !self.capture_response_metadata(chunk) {
@@ -478,21 +484,45 @@ impl DeepSeekStreamParser {
     }
 
     fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
-        self.terminal = true;
-        self.reasoning_content.clear();
-        self.tool_calls.clear();
-        self.stop_reason.clear();
-        self.metadata.clear();
-        vec![super::retained_state_failure("deepseek")]
+        self.terminate_with_error(super::retained_state_failure("deepseek"), false)
     }
 
     fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        self.terminal_failure(crate::error::ProviderErrorKind::Protocol, message)
+    }
+
+    fn terminal_failure(
+        &mut self,
+        kind: crate::error::ProviderErrorKind,
+        message: impl Into<String>,
+    ) -> Vec<StreamDelta> {
+        let error = super::stream_failure_without_model("deepseek", kind, message);
+        self.terminate_with_error(error, true)
+    }
+
+    fn terminate_with_error(
+        &mut self,
+        error: StreamDelta,
+        include_metadata: bool,
+    ) -> Vec<StreamDelta> {
         self.terminal = true;
         self.reasoning_content.clear();
         self.tool_calls.clear();
         self.stop_reason.clear();
-        self.metadata.clear();
-        vec![super::protocol_failure("deepseek", message)]
+        let mut out = Vec::new();
+        if include_metadata && !self.metadata.is_empty() {
+            out.push(StreamDelta::ProviderMetadata {
+                provider: "deepseek".into(),
+                metadata: Value::Object(std::mem::take(&mut self.metadata)),
+            });
+        } else {
+            self.metadata.clear();
+        }
+        if self.usage != Usage::default() {
+            out.push(StreamDelta::Usage(std::mem::take(&mut self.usage)));
+        }
+        out.push(error);
+        out
     }
 }
 
@@ -597,12 +627,17 @@ impl Provider for DeepSeekProvider {
                 match chunk {
                     Ok(bytes) => {
                         if !super::append_sse_chunk(&mut buf, &bytes) {
-                            yield super::stream_failure(
-                                "deepseek",
-                                &model,
-                                crate::error::ProviderErrorKind::Protocol,
-                                "DeepSeek SSE event exceeded the size limit",
-                            );
+                            for d in parser.terminate_with_error(
+                                super::stream_failure(
+                                    "deepseek",
+                                    &model,
+                                    crate::error::ProviderErrorKind::Protocol,
+                                    "DeepSeek SSE event exceeded the size limit",
+                                ),
+                                true,
+                            ) {
+                                yield super::with_stream_context(d, "deepseek", &model);
+                            }
                             return;
                         }
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -630,12 +665,17 @@ impl Provider for DeepSeekProvider {
                                         }
                                     }
                                     Err(_) => {
-                                        yield super::stream_failure(
-                                            "deepseek",
-                                            &model,
-                                            crate::error::ProviderErrorKind::Protocol,
-                                            "malformed DeepSeek SSE data",
-                                        );
+                                        for d in parser.terminate_with_error(
+                                            super::stream_failure(
+                                                "deepseek",
+                                                &model,
+                                                crate::error::ProviderErrorKind::Protocol,
+                                                "malformed DeepSeek SSE data",
+                                            ),
+                                            true,
+                                        ) {
+                                            yield super::with_stream_context(d, "deepseek", &model);
+                                        }
                                         return;
                                     }
                                 }
@@ -646,24 +686,34 @@ impl Provider for DeepSeekProvider {
                         }
                     }
                     Err(error) => {
-                        yield super::response_stream_failure(
-                            "deepseek",
-                            &model,
-                            error,
-                            "DeepSeek",
-                        );
+                        for d in parser.terminate_with_error(
+                            super::response_stream_failure(
+                                "deepseek",
+                                &model,
+                                error,
+                                "DeepSeek",
+                            ),
+                            true,
+                        ) {
+                            yield super::with_stream_context(d, "deepseek", &model);
+                        }
                         return;
                     }
                 }
             }
             // `[DONE]` is the protocol commit marker; a clean EOF before it is still truncated.
             if !done {
-                yield super::stream_failure(
-                    "deepseek",
-                    &model,
-                    crate::error::ProviderErrorKind::Protocol,
-                    "DeepSeek stream ended before [DONE]",
-                );
+                for d in parser.terminate_with_error(
+                    super::stream_failure(
+                        "deepseek",
+                        &model,
+                        crate::error::ProviderErrorKind::Protocol,
+                        "DeepSeek stream ended before [DONE]",
+                    ),
+                    true,
+                ) {
+                    yield super::with_stream_context(d, "deepseek", &model);
+                }
             }
         };
         Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
@@ -871,6 +921,23 @@ mod tests {
         .unwrap();
         assert_eq!(request["tool_choice"], "required");
         assert_eq!(request["stream_options"]["include_usage"], true);
+
+        let options = serde_json::Map::from_iter([
+            ("thinking".into(), json!({"type": "enabled"})),
+            ("reasoning_effort".into(), json!("high")),
+            ("user_id".into(), json!("tenant-42")),
+        ]);
+        let request = build_request(
+            "deepseek-v4-pro",
+            100,
+            &[Message::user("hello")],
+            &[],
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(request["thinking"]["type"], "enabled");
+        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(request["user_id"], "tenant-42");
     }
 
     #[test]
@@ -1011,6 +1078,66 @@ mod tests {
         assert!(!out
             .iter()
             .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+    }
+
+    #[test]
+    fn streamed_error_payload_preserves_retryable_classification_and_is_terminal() {
+        let mut parser = DeepSeekStreamParser::new();
+        let out = parser.push_chunk(&json!({
+            "error": {
+                "code": 429,
+                "type": "rate_limit_error",
+                "message": "secret provider detail"
+            }
+        }));
+
+        assert!(matches!(
+            out.as_slice(),
+            [StreamDelta::Error { message, info }]
+                if message == "DeepSeek stream reported an error"
+                    && info.code == crate::error::ErrorCode::ProviderRateLimit
+                    && info.retryable
+        ));
+        assert!(parser.is_terminal());
+        assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn terminal_error_flushes_nonzero_usage_once_before_error() {
+        let mut parser = DeepSeekStreamParser::new();
+        parser.push_chunk(&json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 23, "completion_tokens": 5}
+        }));
+
+        let out = parser.push_chunk(&json!({
+            "error": {"code": 500, "type": "server_error"}
+        }));
+        let usage_index = out
+            .iter()
+            .position(|delta| {
+                matches!(
+                    delta,
+                    StreamDelta::Usage(Usage {
+                        input_tokens: 23,
+                        output_tokens: 5,
+                        ..
+                    })
+                )
+            })
+            .expect("usage must be preserved");
+        let error_index = out
+            .iter()
+            .position(|delta| matches!(delta, StreamDelta::Error { .. }))
+            .expect("terminal error");
+        assert!(usage_index < error_index);
+        assert_eq!(
+            out.iter()
+                .filter(|delta| matches!(delta, StreamDelta::Usage(_)))
+                .count(),
+            1
+        );
+        assert!(parser.finish().is_empty());
     }
 
     #[test]

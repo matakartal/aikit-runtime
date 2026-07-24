@@ -480,10 +480,7 @@ impl OpenAiStreamParser {
     }
 
     fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
-        self.terminal = true;
-        self.tool_calls.clear();
-        self.stop_reason.clear();
-        vec![super::retained_state_failure(&self.provider_name)]
+        self.terminate_with_error(super::retained_state_failure(&self.provider_name))
     }
 
     fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
@@ -495,14 +492,20 @@ impl OpenAiStreamParser {
         kind: crate::error::ProviderErrorKind,
         message: impl Into<String>,
     ) -> Vec<StreamDelta> {
+        let error = super::stream_failure_without_model(&self.provider_name, kind, message);
+        self.terminate_with_error(error)
+    }
+
+    fn terminate_with_error(&mut self, error: StreamDelta) -> Vec<StreamDelta> {
         self.terminal = true;
         self.tool_calls.clear();
         self.stop_reason.clear();
-        vec![super::stream_failure_without_model(
-            &self.provider_name,
-            kind,
-            message,
-        )]
+        let mut out = Vec::new();
+        if self.usage != Usage::default() {
+            out.push(StreamDelta::Usage(std::mem::take(&mut self.usage)));
+        }
+        out.push(error);
+        out
     }
 
     fn absorb_usage(&mut self, u: &Value) {
@@ -530,7 +533,7 @@ impl OpenAiStreamParser {
     }
 }
 
-fn compatible_stream_error_kind(error: &Value) -> crate::error::ProviderErrorKind {
+pub(crate) fn compatible_stream_error_kind(error: &Value) -> crate::error::ProviderErrorKind {
     let status = error
         .get("status")
         .or_else(|| error.get("code"))
@@ -728,12 +731,14 @@ pub(crate) async fn stream_compatible(
             match chunk {
                 Ok(bytes) => {
                     if !super::append_sse_chunk(&mut buf, &bytes) {
-                        yield super::stream_failure(
-                            &provider_name,
-                            &model,
-                            crate::error::ProviderErrorKind::Protocol,
-                            format!("{public_provider_name} SSE event exceeded the size limit"),
-                        );
+                        for d in parser.terminate_with_error(super::stream_failure(
+                                &provider_name,
+                                &model,
+                                crate::error::ProviderErrorKind::Protocol,
+                                format!("{public_provider_name} SSE event exceeded the size limit"),
+                            )) {
+                            yield super::with_stream_context(d, &provider_name, &model);
+                        }
                         return;
                     }
                     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -761,12 +766,14 @@ pub(crate) async fn stream_compatible(
                                     }
                                 }
                                 Err(_) => {
-                                    yield super::stream_failure(
-                                        &provider_name,
-                                        &model,
-                                        crate::error::ProviderErrorKind::Protocol,
-                                        format!("malformed {public_provider_name} SSE data"),
-                                    );
+                                    for d in parser.terminate_with_error(super::stream_failure(
+                                            &provider_name,
+                                            &model,
+                                            crate::error::ProviderErrorKind::Protocol,
+                                            format!("malformed {public_provider_name} SSE data"),
+                                        )) {
+                                        yield super::with_stream_context(d, &provider_name, &model);
+                                    }
                                     return;
                                 }
                             }
@@ -777,12 +784,14 @@ pub(crate) async fn stream_compatible(
                     }
                 }
                 Err(error) => {
-                    yield super::response_stream_failure(
-                        &provider_name,
-                        &model,
-                        error,
-                        &public_provider_name,
-                    );
+                    for d in parser.terminate_with_error(super::response_stream_failure(
+                            &provider_name,
+                            &model,
+                            error,
+                            &public_provider_name,
+                        )) {
+                        yield super::with_stream_context(d, &provider_name, &model);
+                    }
                     return;
                 }
             }
@@ -790,12 +799,14 @@ pub(crate) async fn stream_compatible(
         // `[DONE]` is the Chat Completions commit marker. Never turn a truncated clean EOF
         // into a successful MessageStop.
         if !done {
-            yield super::stream_failure(
-                &provider_name,
-                &model,
-                crate::error::ProviderErrorKind::Protocol,
-                format!("{public_provider_name} stream ended before [DONE]"),
-            );
+            for d in parser.terminate_with_error(super::stream_failure(
+                    &provider_name,
+                    &model,
+                    crate::error::ProviderErrorKind::Protocol,
+                    format!("{public_provider_name} stream ended before [DONE]"),
+                )) {
+                yield super::with_stream_context(d, &provider_name, &model);
+            }
         }
     };
     Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
@@ -1187,6 +1198,32 @@ mod tests {
         assert!(!out
             .iter()
             .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+    }
+
+    #[test]
+    fn terminal_error_flushes_nonzero_usage_once_before_error() {
+        let mut parser = OpenAiStreamParser::new();
+        parser.push_chunk(&json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 17, "completion_tokens": 3}
+        }));
+
+        let out = parser.push_chunk(&json!({
+            "error": {"code": 500, "type": "server_error"}
+        }));
+
+        assert!(matches!(
+            out.as_slice(),
+            [
+                StreamDelta::Usage(Usage {
+                    input_tokens: 17,
+                    output_tokens: 3,
+                    ..
+                }),
+                StreamDelta::Error { .. }
+            ]
+        ));
+        assert!(parser.finish().is_empty());
     }
 
     #[test]

@@ -22,14 +22,18 @@ pub enum StreamEncodingError {
     DeltaBeforeBlockStart { block_id: String },
     #[error("block was started more than once: {block_id}")]
     DuplicateBlockStart { block_id: String },
+    #[error("stream sequence space is exhausted")]
+    SequenceExhausted,
+    #[error("stream block id space is exhausted")]
+    BlockIdExhausted,
 }
 
 /// Stateful encoder because one legacy delta can open a block and emit its first delta.
 #[derive(Debug, Clone)]
 pub struct StreamEventEncoder {
     response_id: String,
-    next_sequence: u64,
-    next_block: u64,
+    next_sequence: Option<u64>,
+    next_block: Option<u64>,
     active_text: Option<String>,
     active_reasoning: Option<String>,
     active_tools: BTreeMap<String, String>,
@@ -42,8 +46,8 @@ impl StreamEventEncoder {
     pub fn new(response_id: impl Into<String>) -> Self {
         Self {
             response_id: response_id.into(),
-            next_sequence: 1,
-            next_block: 1,
+            next_sequence: Some(1),
+            next_block: Some(1),
             active_text: None,
             active_reasoning: None,
             active_tools: BTreeMap::new(),
@@ -54,8 +58,10 @@ impl StreamEventEncoder {
     }
 
     fn emit(&mut self, kind: StreamEventKind) -> StreamEvent {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        let sequence = self
+            .next_sequence
+            .expect("stream event capacity is checked before encoding a delta");
+        self.next_sequence = sequence.checked_add(1);
         StreamEvent {
             event_id: format!("{}-evt-{sequence}", self.response_id),
             sequence,
@@ -63,14 +69,63 @@ impl StreamEventEncoder {
         }
     }
 
-    fn block_id(&mut self, prefix: &str) -> String {
+    fn block_id(&mut self, prefix: &str) -> StreamEncodingResult<String> {
         loop {
-            let id = format!("{}-{prefix}-{}", self.response_id, self.next_block);
-            self.next_block = self.next_block.saturating_add(1);
+            let next_block = self
+                .next_block
+                .ok_or(StreamEncodingError::BlockIdExhausted)?;
+            let id = format!("{}-{prefix}-{next_block}", self.response_id);
+            self.next_block = next_block.checked_add(1);
             if !self.started_blocks.contains(&id) {
-                return id;
+                return Ok(id);
             }
         }
+    }
+
+    fn ensure_sequence_capacity(&self, event_count: usize) -> StreamEncodingResult<()> {
+        if event_count == 0 {
+            return Ok(());
+        }
+        let final_offset =
+            u64::try_from(event_count - 1).map_err(|_| StreamEncodingError::SequenceExhausted)?;
+        if self
+            .next_sequence
+            .and_then(|sequence| sequence.checked_add(final_offset))
+            .is_none()
+        {
+            return Err(StreamEncodingError::SequenceExhausted);
+        }
+        Ok(())
+    }
+
+    fn required_event_slots(&self, delta: &StreamDelta) -> usize {
+        match delta {
+            StreamDelta::TextDelta { .. } => 1 + usize::from(self.active_text.is_none()),
+            StreamDelta::ReasoningDelta { .. } | StreamDelta::ReasoningComplete { .. } => {
+                1 + usize::from(self.active_reasoning.is_none())
+            }
+            StreamDelta::ToolResult { .. } | StreamDelta::Citation { .. } => 2,
+            StreamDelta::MessageStop { .. } | StreamDelta::Error { .. } => {
+                1 + usize::from(self.active_text.is_some())
+                    + usize::from(self.active_reasoning.is_some())
+                    + self.active_tools.len()
+            }
+            _ => 1,
+        }
+    }
+
+    fn requires_generated_block(&self, delta: &StreamDelta) -> bool {
+        matches!(
+            delta,
+            StreamDelta::TextDelta { .. } if self.active_text.is_none()
+        ) || matches!(
+            delta,
+            StreamDelta::ReasoningDelta { .. } | StreamDelta::ReasoningComplete { .. }
+                if self.active_reasoning.is_none()
+        ) || matches!(
+            delta,
+            StreamDelta::ToolResult { .. } | StreamDelta::Citation { .. }
+        )
     }
 
     fn start_block(
@@ -93,7 +148,7 @@ impl StreamEventEncoder {
         if let Some(id) = &self.active_text {
             return Ok(id.clone());
         }
-        let id = self.block_id("text");
+        let id = self.block_id("text")?;
         events.push(self.start_block(id.clone(), StreamBlockKind::Text, None)?);
         self.active_text = Some(id.clone());
         Ok(id)
@@ -103,7 +158,7 @@ impl StreamEventEncoder {
         if let Some(id) = &self.active_reasoning {
             return Ok(id.clone());
         }
-        let id = self.block_id("reasoning");
+        let id = self.block_id("reasoning")?;
         events.push(self.start_block(id.clone(), StreamBlockKind::Reasoning, None)?);
         self.active_reasoning = Some(id.clone());
         Ok(id)
@@ -148,6 +203,11 @@ impl StreamEventEncoder {
                 return Err(StreamEncodingError::ResponseNotStarted);
             }
             _ => {}
+        }
+
+        self.ensure_sequence_capacity(self.required_event_slots(&delta))?;
+        if self.requires_generated_block(&delta) && self.next_block.is_none() {
+            return Err(StreamEncodingError::BlockIdExhausted);
         }
 
         let mut events = Vec::new();
@@ -212,7 +272,7 @@ impl StreamEventEncoder {
                 content,
                 is_error,
             } => {
-                let block_id = self.block_id("tool-result");
+                let block_id = self.block_id("tool-result")?;
                 events.push(self.start_block(
                     block_id.clone(),
                     StreamBlockKind::ToolResult,
@@ -232,7 +292,7 @@ impl StreamEventEncoder {
                 source,
                 metadata,
             } => {
-                let block_id = self.block_id("citation");
+                let block_id = self.block_id("citation")?;
                 events.push(self.start_block(block_id.clone(), StreamBlockKind::Citation, None)?);
                 events.push(self.emit(StreamEventKind::BlockEnd {
                     block_id,
@@ -274,6 +334,9 @@ impl StreamEventEncoder {
             Err(StreamEncodingError::StreamTerminated) => Vec::new(),
             Err(error) => {
                 self.terminated = true;
+                if self.ensure_sequence_capacity(1).is_err() {
+                    return Vec::new();
+                }
                 vec![self.emit(StreamEventKind::Error {
                     message: error.to_string(),
                     info: ErrorInfo::new(ErrorCode::Conflict),
@@ -547,5 +610,77 @@ mod tests {
                 model: "mock-1".into(),
             })
             .is_empty());
+    }
+
+    #[test]
+    fn sequence_exhaustion_never_emits_duplicate_event_ids() {
+        let mut encoder = StreamEventEncoder::new("response-sequence-limit");
+        encoder.next_sequence = Some(u64::MAX);
+
+        let events = encoder
+            .try_push(StreamDelta::MessageStart {
+                model: "mock-1".into(),
+            })
+            .unwrap();
+        assert_eq!(events[0].sequence, u64::MAX);
+        assert_eq!(
+            events[0].event_id,
+            format!("response-sequence-limit-evt-{}", u64::MAX)
+        );
+        assert_eq!(
+            encoder
+                .try_push(StreamDelta::Usage(Default::default()))
+                .unwrap_err(),
+            StreamEncodingError::SequenceExhausted
+        );
+    }
+
+    #[test]
+    fn multi_event_delta_fails_atomically_when_sequence_space_is_too_small() {
+        let mut encoder = StreamEventEncoder::new("response-atomic-limit");
+        encoder
+            .try_push(StreamDelta::MessageStart {
+                model: "mock-1".into(),
+            })
+            .unwrap();
+        encoder.next_sequence = Some(u64::MAX);
+
+        assert_eq!(
+            encoder
+                .try_push(StreamDelta::TextDelta { text: "x".into() })
+                .unwrap_err(),
+            StreamEncodingError::SequenceExhausted
+        );
+        assert!(encoder.active_text.is_none());
+        let usage = encoder
+            .try_push(StreamDelta::Usage(Default::default()))
+            .unwrap();
+        assert_eq!(usage[0].sequence, u64::MAX);
+    }
+
+    #[test]
+    fn block_id_exhaustion_fails_instead_of_reusing_or_spinning() {
+        let mut encoder = StreamEventEncoder::new("response-block-limit");
+        encoder
+            .try_push(StreamDelta::MessageStart {
+                model: "mock-1".into(),
+            })
+            .unwrap();
+        encoder.next_block = Some(u64::MAX);
+
+        let text = encoder
+            .try_push(StreamDelta::TextDelta { text: "x".into() })
+            .unwrap();
+        assert!(matches!(
+            &text[0].kind,
+            StreamEventKind::BlockStart { block_id, .. }
+                if block_id == &format!("response-block-limit-text-{}", u64::MAX)
+        ));
+        assert_eq!(
+            encoder
+                .try_push(StreamDelta::ReasoningDelta { text: "y".into() })
+                .unwrap_err(),
+            StreamEncodingError::BlockIdExhausted
+        );
     }
 }

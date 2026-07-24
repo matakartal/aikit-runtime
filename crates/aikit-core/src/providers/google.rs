@@ -33,6 +33,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// and making `build_request`'s id→function-name lookup attribute a tool result to the WRONG call.
 static NEXT_TOOL_CALL: AtomicU64 = AtomicU64::new(0);
 
+fn next_tool_call_id(counter: &AtomicU64) -> Option<String> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .map(|current| format!("call_{current}"))
+}
+
 /// Build a Gemini `generateContent` request body from canonical inputs. The serialize
 /// counterpart of [`GeminiStreamParser`]. Role mapping:
 ///  - `System` → top-level `systemInstruction: { parts: [{text}] }`.
@@ -459,8 +468,10 @@ impl GeminiStreamParser {
                         .cloned()
                         .unwrap_or_else(|| Value::Object(Default::default()));
                     // Globally-unique id (see NEXT_TOOL_CALL) so multi-turn tool loops never collide.
-                    let n = NEXT_TOOL_CALL.fetch_add(1, Ordering::Relaxed);
-                    let id = format!("call_{n}");
+                    let Some(id) = next_tool_call_id(&NEXT_TOOL_CALL) else {
+                        return self
+                            .terminal_protocol_failure("Gemini tool-call id space is exhausted");
+                    };
                     if let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) {
                         // Keep the signature associated with this exact canonical call id. Gemini
                         // 3 rejects a replay when it is moved onto a synthetic thought part.
@@ -493,6 +504,10 @@ impl GeminiStreamParser {
                     if !text.is_empty() {
                         out.push(StreamDelta::TextDelta { text: text.into() });
                     }
+                } else if part.get("inlineData").is_some() || part.get("fileData").is_some() {
+                    return self.terminal_protocol_failure(
+                        "Gemini returned media output that this text stream cannot represent",
+                    );
                 }
             }
         }
@@ -881,6 +896,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_counter_exhaustion_never_wraps_to_a_duplicate_id() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            next_tool_call_id(&counter),
+            Some(format!("call_{}", u64::MAX - 1))
+        );
+        assert_eq!(next_tool_call_id(&counter), None);
+        assert_eq!(next_tool_call_id(&counter), None);
+    }
+
+    #[test]
     fn build_request_maps_url_and_inline_media_parts() {
         let messages = vec![Message {
             role: Role::User,
@@ -1221,6 +1247,32 @@ mod tests {
             .any(|delta| matches!(delta, StreamDelta::ToolCallStart { .. })));
         assert!(parser.terminal);
         assert!(parser.failed);
+    }
+
+    #[test]
+    fn unsupported_media_output_is_a_terminal_protocol_failure() {
+        for part in [
+            json!({"inlineData": {"mimeType": "image/png", "data": "AQID"}}),
+            json!({"fileData": {"mimeType": "audio/wav", "fileUri": "gs://bucket/audio.wav"}}),
+        ] {
+            let mut parser = GeminiStreamParser::new("gemini-test");
+            let out = parser.push_chunk(&json!({
+                "candidates": [{
+                    "content": {"parts": [part]},
+                    "finishReason": "STOP"
+                }]
+            }));
+            assert!(out.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Error { message, .. }
+                    if message.contains("media output")
+            )));
+            assert!(!out
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+            assert!(parser.failed);
+            assert!(parser.finish().is_empty());
+        }
     }
 
     #[tokio::test]

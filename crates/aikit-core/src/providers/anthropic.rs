@@ -285,12 +285,17 @@ impl Provider for AnthropicProvider {
                 match chunk {
                     Ok(bytes) => {
                         if !super::append_sse_chunk(&mut buf, &bytes) {
-                            yield super::stream_failure(
-                                "anthropic",
-                                &model,
-                                crate::error::ProviderErrorKind::Protocol,
-                                "Anthropic SSE event exceeded the size limit",
-                            );
+                            for d in parser.terminate_with_error(
+                                super::stream_failure(
+                                    "anthropic",
+                                    &model,
+                                    crate::error::ProviderErrorKind::Protocol,
+                                    "Anthropic SSE event exceeded the size limit",
+                                ),
+                                true,
+                            ) {
+                                yield super::with_stream_context(d, "anthropic", &model);
+                            }
                             return;
                         }
                         // Dispatch each complete SSE `data:` line to the parser.
@@ -309,12 +314,17 @@ impl Provider for AnthropicProvider {
                                         }
                                     }
                                     Err(_) => {
-                                        yield super::stream_failure(
-                                            "anthropic",
-                                            &model,
-                                            crate::error::ProviderErrorKind::Protocol,
-                                            "malformed Anthropic SSE data",
-                                        );
+                                        for d in parser.terminate_with_error(
+                                            super::stream_failure(
+                                                "anthropic",
+                                                &model,
+                                                crate::error::ProviderErrorKind::Protocol,
+                                                "malformed Anthropic SSE data",
+                                            ),
+                                            true,
+                                        ) {
+                                            yield super::with_stream_context(d, "anthropic", &model);
+                                        }
                                         return;
                                     }
                                 }
@@ -328,23 +338,33 @@ impl Provider for AnthropicProvider {
                         }
                     }
                     Err(error) => {
-                        yield super::response_stream_failure(
-                            "anthropic",
-                            &model,
-                            error,
-                            "Anthropic",
-                        );
+                        for d in parser.terminate_with_error(
+                            super::response_stream_failure(
+                                "anthropic",
+                                &model,
+                                error,
+                                "Anthropic",
+                            ),
+                            true,
+                        ) {
+                            yield super::with_stream_context(d, "anthropic", &model);
+                        }
                         return;
                     }
                 }
             }
             if !parser.is_terminal() {
-                yield super::stream_failure(
-                    "anthropic",
-                    &model,
-                    crate::error::ProviderErrorKind::Protocol,
-                    "Anthropic stream ended before message_stop",
-                );
+                for d in parser.terminate_with_error(
+                    super::stream_failure(
+                        "anthropic",
+                        &model,
+                        crate::error::ProviderErrorKind::Protocol,
+                        "Anthropic stream ended before message_stop",
+                    ),
+                    true,
+                ) {
+                    yield super::with_stream_context(d, "anthropic", &model);
+                }
             }
         };
         Ok(super::prepend_provider_warnings(Box::pin(out), warnings))
@@ -353,6 +373,8 @@ impl Provider for AnthropicProvider {
 
 /// Per-content-block accumulation state.
 enum BlockState {
+    /// Forward-compatible block whose content has no canonical AIKit representation.
+    Ignored,
     Text,
     Thinking {
         text: String,
@@ -458,7 +480,6 @@ impl AnthropicStreamParser {
                 out
             }
             "error" => {
-                self.terminal = true;
                 let kind = match ev["error"]["type"].as_str() {
                     Some("authentication_error" | "permission_error") => {
                         crate::error::ProviderErrorKind::Authentication
@@ -470,11 +491,12 @@ impl AnthropicStreamParser {
                     }
                     _ => crate::error::ProviderErrorKind::Unknown,
                 };
-                vec![super::stream_failure_without_model(
+                let error = super::stream_failure_without_model(
                     "anthropic",
                     kind,
                     "Anthropic stream reported an error",
-                )]
+                );
+                self.terminate_with_error(error, true)
             }
             // "ping" and anything unknown: no canonical output.
             _ => Vec::new(),
@@ -483,23 +505,22 @@ impl AnthropicStreamParser {
 
     fn on_block_start(&mut self, ev: &Value) -> Vec<StreamDelta> {
         let index = ev["index"].as_u64().unwrap_or(0);
+        if self.blocks.contains_key(&index) {
+            return self.terminal_protocol_failure(format!(
+                "Anthropic content block {index} started more than once"
+            ));
+        }
         let cb = &ev["content_block"];
         match cb.get("type").and_then(Value::as_str) {
             Some("text") => {
-                if !self
-                    .retention
-                    .retain(0, usize::from(!self.blocks.contains_key(&index)))
-                {
+                if !self.retention.retain(0, 1) {
                     return self.retained_state_failure();
                 }
                 self.blocks.insert(index, BlockState::Text);
                 Vec::new()
             }
             Some("thinking") => {
-                if !self
-                    .retention
-                    .retain(0, usize::from(!self.blocks.contains_key(&index)))
-                {
+                if !self.retention.retain(0, 1) {
                     return self.retained_state_failure();
                 }
                 self.blocks.insert(
@@ -513,10 +534,7 @@ impl AnthropicStreamParser {
             }
             Some("redacted_thinking") => {
                 let data = cb["data"].as_str().unwrap_or_default().to_string();
-                if !self
-                    .retention
-                    .retain(data.len(), usize::from(!self.blocks.contains_key(&index)))
-                {
+                if !self.retention.retain(data.len(), 1) {
                     return self.retained_state_failure();
                 }
                 self.blocks
@@ -526,9 +544,14 @@ impl AnthropicStreamParser {
             Some("tool_use") => {
                 let id = cb["id"].as_str().unwrap_or_default().to_string();
                 let name = cb["name"].as_str().unwrap_or_default().to_string();
+                if id.is_empty() || name.is_empty() {
+                    return self.terminal_protocol_failure(
+                        "Anthropic tool_use block is missing its id or name",
+                    );
+                }
                 if !self
                     .retention
-                    .retain(id.len(), usize::from(!self.blocks.contains_key(&index)))
+                    .retain(id.len().saturating_add(name.len()), 1)
                 {
                     return self.retained_state_failure();
                 }
@@ -541,19 +564,41 @@ impl AnthropicStreamParser {
                 );
                 vec![StreamDelta::ToolCallStart { id, name }]
             }
-            _ => Vec::new(),
+            Some(_) => {
+                if !self.retention.retain(0, 1) {
+                    return self.retained_state_failure();
+                }
+                self.blocks.insert(index, BlockState::Ignored);
+                Vec::new()
+            }
+            None => self.terminal_protocol_failure(format!(
+                "Anthropic content block {index} is missing its type"
+            )),
         }
     }
 
     fn on_block_delta(&mut self, ev: &Value) -> Vec<StreamDelta> {
         let index = ev["index"].as_u64().unwrap_or(0);
+        if matches!(self.blocks.get(&index), Some(BlockState::Ignored)) {
+            return Vec::new();
+        }
         let delta = &ev["delta"];
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => {
+                if !matches!(self.blocks.get(&index), Some(BlockState::Text)) {
+                    return self.terminal_protocol_failure(format!(
+                        "Anthropic text delta arrived before text block {index} started"
+                    ));
+                }
                 let text = delta["text"].as_str().unwrap_or_default().to_string();
                 vec![StreamDelta::TextDelta { text }]
             }
             Some("thinking_delta") => {
+                if !matches!(self.blocks.get(&index), Some(BlockState::Thinking { .. })) {
+                    return self.terminal_protocol_failure(format!(
+                        "Anthropic thinking delta arrived before thinking block {index} started"
+                    ));
+                }
                 let chunk = delta["thinking"].as_str().unwrap_or_default();
                 if let Some(BlockState::Thinking { text, .. }) = self.blocks.get_mut(&index) {
                     if !self.retention.retain(chunk.len(), 0) {
@@ -566,6 +611,11 @@ impl AnthropicStreamParser {
                 }]
             }
             Some("signature_delta") => {
+                if !matches!(self.blocks.get(&index), Some(BlockState::Thinking { .. })) {
+                    return self.terminal_protocol_failure(format!(
+                        "Anthropic signature delta arrived before thinking block {index} started"
+                    ));
+                }
                 let sig = delta["signature"].as_str().unwrap_or_default().to_string();
                 if let Some(BlockState::Thinking { signature, .. }) = self.blocks.get_mut(&index) {
                     if !self.retention.retain(sig.len(), 0) {
@@ -576,6 +626,11 @@ impl AnthropicStreamParser {
                 Vec::new()
             }
             Some("input_json_delta") => {
+                if !matches!(self.blocks.get(&index), Some(BlockState::ToolUse { .. })) {
+                    return self.terminal_protocol_failure(format!(
+                        "Anthropic tool input arrived before tool_use block {index} started"
+                    ));
+                }
                 let partial = delta["partial_json"].as_str().unwrap_or_default();
                 if let Some(BlockState::ToolUse { json_buf, .. }) = self.blocks.get_mut(&index) {
                     if !self.retention.retain(partial.len(), 0) {
@@ -586,6 +641,11 @@ impl AnthropicStreamParser {
                 Vec::new()
             }
             Some("citations_delta") => {
+                if !matches!(self.blocks.get(&index), Some(BlockState::Text)) {
+                    return self.terminal_protocol_failure(format!(
+                        "Anthropic citation arrived before text block {index} started"
+                    ));
+                }
                 let citation = delta.get("citation").cloned().unwrap_or(Value::Null);
                 let text = citation
                     .get("cited_text")
@@ -621,10 +681,9 @@ impl AnthropicStreamParser {
                         Ok(input) => vec![StreamDelta::ToolCallInput { id, input }],
                         // Surface the parse failure (with the tool id) rather than run the tool
                         // with garbage `null` input.
-                        Err(_) => vec![super::protocol_failure(
-                            "anthropic",
-                            format!("malformed tool_use input for {id}"),
-                        )],
+                        Err(_) => self.terminal_protocol_failure(format!(
+                            "malformed tool_use input for {id}"
+                        )),
                     }
                 }
             }
@@ -642,7 +701,10 @@ impl AnthropicStreamParser {
                     opaque: Some(Value::String(data)),
                 }]
             }
-            _ => Vec::new(),
+            Some(BlockState::Text | BlockState::Ignored) => Vec::new(),
+            None => self.terminal_protocol_failure(format!(
+                "Anthropic content block {index} stopped before it started"
+            )),
         }
     }
 
@@ -693,19 +755,36 @@ impl AnthropicStreamParser {
     }
 
     fn retained_state_failure(&mut self) -> Vec<StreamDelta> {
-        self.terminal = true;
-        self.blocks.clear();
-        self.stop_reason.clear();
-        self.metadata.clear();
-        vec![super::retained_state_failure("anthropic")]
+        self.terminate_with_error(super::retained_state_failure("anthropic"), false)
     }
 
     fn terminal_protocol_failure(&mut self, message: impl Into<String>) -> Vec<StreamDelta> {
+        let error = super::protocol_failure("anthropic", message);
+        self.terminate_with_error(error, true)
+    }
+
+    fn terminate_with_error(
+        &mut self,
+        error: StreamDelta,
+        include_metadata: bool,
+    ) -> Vec<StreamDelta> {
         self.terminal = true;
         self.blocks.clear();
         self.stop_reason.clear();
-        self.metadata.clear();
-        vec![super::protocol_failure("anthropic", message)]
+        let mut out = Vec::new();
+        if include_metadata && !self.metadata.is_empty() {
+            out.push(StreamDelta::ProviderMetadata {
+                provider: "anthropic".into(),
+                metadata: Value::Object(std::mem::take(&mut self.metadata)),
+            });
+        } else {
+            self.metadata.clear();
+        }
+        if self.usage != Usage::default() {
+            out.push(StreamDelta::Usage(std::mem::take(&mut self.usage)));
+        }
+        out.push(error);
+        out
     }
 }
 
@@ -736,6 +815,11 @@ mod tests {
     #[test]
     fn citations_delta_preserves_provider_metadata() {
         let mut parser = AnthropicStreamParser::new();
+        parser.push_event(&json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }));
         let deltas = parser.push_event(&json!({
             "type": "content_block_delta",
             "index": 0,
@@ -765,6 +849,88 @@ mod tests {
 
     fn drain(parser: &mut AnthropicStreamParser, events: &[Value]) -> Vec<StreamDelta> {
         events.iter().flat_map(|e| parser.push_event(e)).collect()
+    }
+
+    #[test]
+    fn fallback_and_unknown_blocks_close_without_failing_the_stream() {
+        for block_type in ["fallback", "future_content"] {
+            let mut parser = AnthropicStreamParser::new();
+            let deltas = drain(
+                &mut parser,
+                &[
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "model": "claude-test",
+                            "usage": {"input_tokens": 2, "output_tokens": 0}
+                        }
+                    }),
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": block_type}
+                    }),
+                    json!({"type": "content_block_stop", "index": 0}),
+                    json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": 1}
+                    }),
+                    json!({"type": "message_stop"}),
+                ],
+            );
+            assert!(!deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Error { .. })));
+            assert!(deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
+            assert!(parser.is_terminal());
+        }
+    }
+
+    #[test]
+    fn ignored_server_tool_block_ignores_its_input_delta_and_closes_cleanly() {
+        let mut parser = AnthropicStreamParser::new();
+        let deltas = drain(
+            &mut parser,
+            &[
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "model": "claude-test",
+                        "usage": {"input_tokens": 2, "output_tokens": 0}
+                    }
+                }),
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search"
+                    }
+                }),
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"AIKit\"}"}
+                }),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 1}
+                }),
+                json!({"type": "message_stop"}),
+            ],
+        );
+        assert!(!deltas
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::Error { .. })));
+        assert!(deltas
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::MessageStop { .. })));
     }
 
     #[test]
@@ -1038,6 +1204,77 @@ mod tests {
         assert!(!out
             .iter()
             .any(|d| matches!(d, StreamDelta::ToolCallInput { input, .. } if input.is_null())));
+        assert!(p.terminal);
+        assert!(p.push_event(&json!({"type": "message_stop"})).is_empty());
+    }
+
+    #[test]
+    fn tool_input_before_block_start_is_a_terminal_protocol_failure() {
+        let mut parser = AnthropicStreamParser::new();
+        parser.push_event(&json!({
+            "type": "message_start",
+            "message": {
+                "model": "claude-test",
+                "usage": {"input_tokens": 29, "output_tokens": 0}
+            }
+        }));
+        let out = parser.push_event(&json!({
+            "type": "content_block_delta",
+            "index": 7,
+            "delta": {"type": "input_json_delta", "partial_json": "{}"}
+        }));
+        let usage_index = out
+            .iter()
+            .position(|delta| {
+                matches!(
+                    delta,
+                    StreamDelta::Usage(Usage {
+                        input_tokens: 29,
+                        ..
+                    })
+                )
+            })
+            .expect("usage must be preserved");
+        let error_index = out
+            .iter()
+            .position(|delta| {
+                matches!(
+                    delta,
+                    StreamDelta::Error { message, info }
+                        if message.contains("before tool_use block 7 started")
+                            && info.code == crate::error::ErrorCode::ProviderProtocol
+                )
+            })
+            .expect("protocol error");
+        assert!(usage_index < error_index);
+        assert!(parser.terminal);
+    }
+
+    #[test]
+    fn retained_state_failure_flushes_nonzero_usage_before_error() {
+        let mut parser = AnthropicStreamParser::new();
+        parser.usage = Usage {
+            input_tokens: 31,
+            output_tokens: 7,
+            ..Default::default()
+        };
+
+        let out = parser.retained_state_failure();
+
+        assert!(matches!(
+            out.as_slice(),
+            [
+                StreamDelta::Usage(Usage {
+                    input_tokens: 31,
+                    output_tokens: 7,
+                    ..
+                }),
+                StreamDelta::Error { .. }
+            ]
+        ));
+        assert!(parser
+            .push_event(&json!({"type": "message_stop"}))
+            .is_empty());
     }
 
     #[test]
