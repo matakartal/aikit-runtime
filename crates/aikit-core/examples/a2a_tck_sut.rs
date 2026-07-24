@@ -191,8 +191,8 @@ impl A2aDispatchHost for TckDispatchHost {
                 return Ok(A2aDispatchAck::Stopped);
             }
             server
-                .transition_task(
-                    task_id,
+                .transition_dispatch_task(
+                    context,
                     desired,
                     Some("deterministic A2A TCK fixture".into()),
                 )
@@ -203,9 +203,8 @@ impl A2aDispatchHost for TckDispatchHost {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let agent_card = A2aAgentCard {
+fn agent_card(url: &str) -> A2aAgentCard {
+    A2aAgentCard {
         name: "AIKit A2A TCK SUT".into(),
         description: "Ephemeral, credentials-free A2A conformance fixture".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -226,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             security_requirements: Vec::new(),
         }],
         supported_interfaces: vec![A2aAgentInterface {
-            url: SUT_URL.into(),
+            url: url.into(),
             protocol_binding: "JSONRPC".into(),
             protocol_version: "1.0".into(),
             tenant: None,
@@ -235,8 +234,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_output_modes: vec!["text/plain".into(), "application/json".into()],
         security_schemes: BTreeMap::new(),
         security_requirements: Vec::new(),
-    };
-    let config = A2aHttpConfig {
+    }
+}
+
+fn http_config() -> A2aHttpConfig {
+    A2aHttpConfig {
         path: "/".into(),
         allowed_hosts: ["127.0.0.1".into(), "localhost".into()]
             .into_iter()
@@ -245,19 +247,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         blocking_dispatch_timeout: Duration::from_secs(8),
         stream_idle_timeout: Duration::from_secs(2),
         ..A2aHttpConfig::default()
-    };
+    }
+}
 
-    let server = Arc::new(A2aHttpJsonRpcServer::new_owned(
+fn server(url: &str) -> ProtocolResult<Arc<A2aHttpJsonRpcServer>> {
+    Ok(Arc::new(A2aHttpJsonRpcServer::new_owned(
         A2aMapper::new(),
         Arc::new(InMemoryA2aMapperSnapshotStore::default()),
         Arc::new(InMemoryA2aEventStore::default()),
         Arc::new(TckAuthenticator),
         Arc::new(TckDispatchHost),
-        agent_card,
-        config,
-    )?);
+        agent_card(url),
+        http_config(),
+    )?))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let server = server(SUT_URL)?;
     let listener = TcpListener::bind(SUT_ADDRESS).await?;
     eprintln!("AIKit A2A TCK SUT listening at {SUT_URL}");
     server.serve(listener, CancellationToken::new()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    async fn post_jsonrpc(address: SocketAddr, accept: &str, payload: Value) -> String {
+        timeout(Duration::from_secs(4), async {
+            let body = payload.to_string();
+            let request = format!(
+                "POST / HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: {accept}\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        })
+        .await
+        .expect("official-shaped A2A request timed out")
+    }
+
+    #[tokio::test]
+    async fn official_send_and_stream_shapes_settle_the_exact_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let handle = cancellation.handle();
+        let server = server(&format!("http://{address}/")).unwrap();
+        let task = tokio::spawn(server.serve(listener, cancellation));
+
+        let send = post_jsonrpc(
+            address,
+            "application/json",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "Hello from TCK"}],
+                        "messageId": "tck-complete-task-regression-jsonrpc"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(send.starts_with("HTTP/1.1 200"), "{send}");
+        let send_body: Value = serde_json::from_str(send.split_once("\r\n\r\n").unwrap().1)
+            .expect("SendMessage returned invalid JSON");
+        assert_eq!(send_body["jsonrpc"], "2.0");
+        assert_eq!(send_body["id"], 1);
+        assert!(send_body.get("error").is_none(), "{send_body}");
+        assert_eq!(
+            send_body["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+
+        let streaming = post_jsonrpc(
+            address,
+            "text/event-stream",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "SendStreamingMessage",
+                "params": {
+                    "message": {
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "Stream hello from TCK"}],
+                        "messageId": "tck-stream-001-regression-jsonrpc"
+                    }
+                }
+            }),
+        )
+        .await;
+        let (stream_headers, stream_body) = streaming.split_once("\r\n\r\n").unwrap();
+        assert!(stream_headers.contains("Content-Type: text/event-stream"));
+        let events: Vec<Value> = stream_body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|event| serde_json::from_str(event).expect("SSE event was not JSON"))
+            .collect();
+        assert_eq!(events.len(), 2, "{streaming}");
+        assert_eq!(events[0]["jsonrpc"], "2.0");
+        assert_eq!(events[0]["id"], 2);
+        assert_eq!(
+            events[0]["result"]["task"]["status"]["state"],
+            "TASK_STATE_WORKING"
+        );
+        assert_eq!(events[1]["jsonrpc"], "2.0");
+        assert_eq!(events[1]["id"], 2);
+        assert_eq!(
+            events[1]["result"]["statusUpdate"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
 }
