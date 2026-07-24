@@ -45,7 +45,7 @@ flowchart TD
     SCHEMA --> HOOK[PreTool hooks]
     HOOK --> POLICY[Permission and approval]
     POLICY --> RELIABILITY[Reliability rules and revalidation]
-    RELIABILITY --> EXECUTE[Execute once]
+    RELIABILITY --> EXECUTE[One executor invocation for this validated in-process attempt]
     EXECUTE --> POST[PostTool or failure hooks]
     POST --> RECORD[Record result, usage, audit, and session]
     RECORD --> PROVIDER
@@ -97,7 +97,7 @@ The enforcement order is intentionally layered:
 3. authoritative deny/ask/allow policy and optional human approval;
 4. revalidation after every approved rewrite;
 5. reliability prerequisites and usage caps;
-6. exactly one executor call;
+6. one executor invocation for the validated in-process attempt;
 7. PostTool or PostToolFailure hooks, output guardrails, audit, and transcript recording.
 
 An earlier allow never overrides a matching deny. Child agents inherit and may narrow the parent
@@ -150,7 +150,23 @@ are validated against the new schema before dispatch.
 Durable runs use an append-only event log with checkpoint projections. Resume and fork preserve
 activity identity; rewind appends a reverse event instead of deleting history. Activities are
 classified as pure, idempotent, or reconciliation-required, so an ambiguous external effect stops
-for operator reconciliation instead of being presented as exactly-once execution.
+for operator reconciliation instead of being retried or presented as exactly-once execution. The
+in-process driver coordinates state with store compare-and-swap; it is neither a distributed
+coordinator nor an exactly-once guarantee.
+
+Terminal finalization is also durable. Before emitting `RunStopped`, the driver records a
+delivery intent; after every fail-closed audit sink accepts it, the driver records acceptance.
+If the final run CAS then fails, a restart reuses that accepted record and retries only the
+terminal state write, without rerunning provider, tool, or audit work. A crash or failed audit
+delivery between intent and acceptance is ambiguous and requires reconciliation. Cooperative
+cancellation is persisted as `Cancelled` only when no activity is still running and the stop is
+unambiguous; otherwise reconciliation takes precedence.
+
+Explicit audit replay uses a persisted typed envelope bound to the original run id, invocation id,
+sequence, terminal summary, audit configuration, and host delivery identity. `SafeToRetry` can
+therefore replay only the original `RunStopped` after resume; partial delivery becomes ambiguous
+again, and normal hooks/provider/tool execution remains fenced out. Reserved lifecycle records are
+validated at both typed APIs and raw event-log projection boundaries.
 The Temporal adapter is a deterministic SDK-neutral mapping layer; a host still owns the actual
 Temporal worker, history transport, and deployment compatibility.
 

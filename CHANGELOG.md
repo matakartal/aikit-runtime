@@ -51,6 +51,25 @@ All notable changes to this project will be documented in this file. The format 
 - Durable event-sourced runs with checkpoints, activity/idempotency/reconciliation records,
   resume/fork/rewind/cancel, durable approvals, SQLite CAS persistence, and equivalent Python/Node
   `DurableRun` wrappers.
+- Sync-only `DurableRunDriver` integration with the real agent loop: provider/tool starts commit
+  before I/O, outcomes commit before advancement, completed results are reused, and ambiguous
+  provider/tool/audit effects stop for reconciliation under the durable run/audit identity. It is
+  CAS-backed in-process coordination with one executor invocation per validated in-process
+  attempt, not an exactly-once or distributed-execution guarantee.
+- Durability schema v2 prevents newly written failed or cancelled runs from retaining a running
+  activity; v1 snapshots and database rows remain readable until their next write. Cooperative
+  cancellation is persisted as `Cancelled` only for an unambiguous stop with no running activity.
+- Persisted two-phase `RunStopped` delivery: an intent is saved before fail-closed audit delivery
+  and acceptance after every sink accepts. If the terminal CAS later fails, restart reuses that
+  acceptance and retries only terminal persistence; ambiguous audit effects require reconciliation.
+- Exact typed terminal-audit replay binds the original run/invocation/sequence, terminal summary,
+  sink and payload policy, and stable host delivery identity. Explicit `SafeToRetry` never reruns
+  hooks/provider/tool work; partial replay returns to reconciliation. Legacy v1 zero-attempt
+  terminal records require a synthetic attempt and matching typed attestation.
+- Durable activity schedules retain input hashes instead of raw request payloads; verbatim replay
+  results have a configurable 64 MiB hard ceiling and oversized post-effect results enter
+  reconciliation. Repeated attaches keep the logical run id while receiving distinct audit
+  invocation ids.
 - Policy snapshots pinned into append-only run history, four typed HITL approval states, trusted
   expiry clocks, restart-safe resolution, and a persisted legacy-approver bridge that commits
   through `DurableStore` compare-and-swap before exposing state.
@@ -67,6 +86,8 @@ All notable changes to this project will be documented in this file. The format 
   SSE replay, Origin/auth/session/version/Host/Accept enforcement, SQLite CAS persistence,
   restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 and ACP v1 wire
   listeners remain separately tracked parity gates.
+- Canonical A2A `ListTasks` with subject+tenant isolation before filters/counts/cursor pagination,
+  bounded pages, stable ordering, snapshot recovery, and shared Rust/Python/Node mapper surfaces.
 - Optional fail-closed Firecracker lifecycle: immutable hash-pinned host inputs, shell-free jailer
   argv, trusted-path/version/KVM/TAP/netns checks, bounded API startup and cleanup. It is not a
   Bash backend until guest command/workspace transport and Linux escape proof exist.
@@ -144,10 +165,23 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A2A contexts are owner-scoped, so the same wire `context_id` can map to independent sessions in
+  different tenants; message receipts are scoped by subject and tenant as well. Versioned restore
+  migrates pre-scoping alpha keys and rejects inconsistent task, owner, receipt, revision, or
+  sequence relationships before they can overwrite live mapper state.
+- A2A foreign and unknown tasks now produce the same not-found result without disclosing runtime
+  session/run ids. Unknown message-part fields are rejected, and Rust/Python/Node route semantic
+  identity and message validation through the same governed `invalid_request` contract.
+- Protocol validation denials now retain `invalid_request`, while missing principal/scope and
+  unknown task denials preserve their correct unauthorized/forbidden/not-found error classes.
+  Governance envelopes advance to protocol contract version 2 for the new denial value.
 - MCP, A2A, and ACP ownership checks now bind both tenant and subject, closing cross-tenant access
   when two tenants use the same subject identifier.
 - Raw durable events can no longer schedule work or replace state while a run is paused or awaiting
   reconciliation; SQLite loads validate row identity, schema, revision, and serialized history.
+- Durable runtime and approvals now share one state/store/CAS-poison authority. Mismatched policy,
+  tenant, agent, run, ordinary approver, stale no-op state, or a post-CAS write attempt fails closed
+  before later provider/tool work can run.
 - Temporal activity invocations validate queue, timeout, retry, header, identity, and input fields
   against deterministically regenerated state before execution.
 - Stream encoding rejects response/block deltas before start, duplicate starts, and events after a

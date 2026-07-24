@@ -1,6 +1,6 @@
 # Project status
 
-**Snapshot:** 2026-07-20
+**Snapshot:** 2026-07-23
 **Release state:** source-first `v0.3.0-alpha.1` candidate on `main`; not published
 
 The five-phase parity implementation now has a substantially larger local core. This page keeps
@@ -29,6 +29,22 @@ identity, registry ownership, or another operating system.
 - Durable runs use an append-only event log, replay-validated projections, checkpoints,
   activity/idempotency records, reconciliation, approvals, resume/fork/rewind/cancel, and SQLite
   compare-and-swap persistence. Python and Node expose the same `DurableRun` state machine.
+- The real in-process agent loop can attach a Sync-only `DurableRunDriver`: provider/tool activity
+  starts commit before I/O, outcomes commit before the loop advances, completed results are reused,
+  and the durable run id is also the audit/runtime identity. It makes one executor invocation per
+  validated in-process attempt and uses store CAS for local coordination; it is not an exactly-once
+  or distributed guarantee. Ambiguous provider, tool, or audit effects require reconciliation.
+  `RunStopped` persists delivery intent before audit, then acceptance after every fail-closed sink;
+  a later terminal-CAS retry reuses that accepted delivery without rerunning provider/tool/audit
+  work. Operator-approved audit replay is exact and typed: it is bound to the original invocation,
+  sequence, terminal summary, sink configuration and stable delivery identity, and it cannot rerun
+  hooks, provider or tool work. Activity inputs persist as hashes, replay outputs are size-bounded
+  verbatim data, and each normal resume has a distinct audit invocation identity. Async/Exit and a
+  real distributed worker remain open.
+- Durability schema v2 prevents newly written failed or cancelled runs from retaining a running
+  activity. Version 1 snapshots and database rows remain readable and are upgraded on their next
+  write. Cooperative cancellation is persisted as `Cancelled` only when it is unambiguous and no
+  activity remains running; otherwise the run remains available for reconciliation.
 - A feature-gated PostgreSQL store adds transactional row-lock/revision CAS, and the Temporal
   reference adapter deterministically maps activity, retry, idempotency and reconciliation state.
 - Working, episodic, and semantic memory planes preserve provenance and use CAS rather than
@@ -40,8 +56,12 @@ identity, registry ownership, or another operating system.
 - MCP 2025-11-25 has a governed JSON-RPC dispatcher, real stdio and Streamable HTTP listeners,
   bounded SSE replay, restart-safe SQLite CAS, task/dedupe/session persistence and schema-drift
   reapproval. Expired side-effect replay evidence retires its connection namespace instead of
-  reopening a duplicate-execution window. A2A 1.0 and ACP v1 mapping state machines remain; their
-  official wire listeners and external conformance suites are still open.
+  reopening a duplicate-execution window. A2A 1.0 additionally has authenticated subject+tenant
+  ListTasks filtering before bounded cursor pagination, the same mapper in Rust/Python/Node, and a
+  bounded experimental JSON-RPC/SSE listener with artifact/direct-Message output and protected
+  cancellation ingress. Complete timestamp/history and artifact-update coverage remain open. A
+  typed delta-journal contract exists but is not wired into the transport hot path, and the pinned
+  official TCK retains six verified upstream false negatives; ACP v1 remains mapping-only.
 - The optional Firecracker lifecycle validates immutable host inputs, jailer/VMM versions,
   root-protected paths, KVM/TAP/netns prerequisites, API readiness and cleanup. It is not selected
   by Bash until guest command/workspace transport exists, and Linux isolation is not claimed from
@@ -78,9 +98,11 @@ identity, registry ownership, or another operating system.
 - Transparent egress enforcement for arbitrary child processes and Linux root+KVM Firecracker
   boot/escape/TAP proof; the explicit HTTP/browser broker already pins DNS and revalidates every
   redirect hop.
-- PostgreSQL failover/partition proof and a real Temporal SDK worker integration.
-- A2A transport and ACP editor/CLI integration against official examples; external MCP SDK/OAuth
-  conformance.
+- PostgreSQL failover/partition proof and a real Temporal SDK worker integration; Sync-only local
+  coordination does not satisfy this distributed gate.
+- Complete official A2A timestamp/history/artifact-update transport support and wire the typed
+  delta journal into production persistence, plus ACP editor/CLI integration; remove the pinned
+  TCK waivers only when upstream fixes land, and add MCP SDK/OAuth conformance.
 - Longer fuzz/chaos campaigns and multi-platform signing proof.
 - crates.io/PyPI/npm ownership, publication authority, published packages and rollback rehearsal.
 

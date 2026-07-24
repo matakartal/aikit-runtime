@@ -80,11 +80,36 @@ revision CAS, and append-only validation; the Temporal reference adapter maps re
 retry policy, history outcomes, and explicit reconciliation without pretending an SDK worker was
 run locally.
 
+`RunConfig` can attach a Sync-only `DurableRunDriver` to the real agent loop. The driver persists an
+activity start before each provider/tool I/O boundary, persists the observed outcome before the
+loop advances, reuses a completed result on resume, and makes the durable run id authoritative for
+audit/runtime correlation. It does not provide exactly-once execution: a crash after an unsafe
+external effect but before result commit requires reconciliation. Async/Exit modes fail closed.
+
+Durable activity schedules retain deterministic input hashes rather than raw prompts, provider
+options, credentials, or tool arguments. Completed provider/tool output is required for replay and
+is stored verbatim under `DurablePayloadPolicy`; the default and absolute ceiling is 64 MiB per
+result, and an oversized post-effect result moves the activity to reconciliation-required without
+persisting that payload. This is a size boundary, not encryption or redaction. Protect every
+`DurableStore` like transcript storage and configure a lower limit when appropriate. Each attach or
+resume also receives a collision-resistant audit `invocation_id`, while the logical durable
+`run_id` remains stable.
+
 MCP Tasks, A2A and ACP mappings share the governance envelope and cannot directly execute tools.
 MCP 2025-11-25 additionally ships byte-level JSON-RPC dispatch, stdio and Streamable HTTP listeners,
 bounded SSE resume, tenant/principal isolation, request dedupe, SQLite CAS restart recovery, and
-schema-drift reapproval. A2A and ACP remain governed canonical mappings; their official wire
-listeners are not claimed until the core types match the official schemas exactly.
+schema-drift reapproval. The A2A canonical mapper also owner-scopes context/session identity and
+implements authenticated ListTasks filtering before counts, cursor validation and bounded
+pagination in Rust/Python/Node. A bounded experimental JSON-RPC/SSE listener projects Tasks,
+artifacts, direct `Message` responses and durable SSE events, with a separately capacity-bounded
+protected cancellation ingress. It still omits complete timestamp/history and artifact-update
+coverage. The typed delta-journal/checkpoint contract is exposed but not yet wired into the
+transport hot path, which still uses bounded full-snapshot CAS. The pinned official TCK therefore
+keeps its raw six false negatives visible and uses a separate exact-set verification gate rather
+than claiming an unqualified pass. ACP remains mapping-only. The envelope
+operation `tasks/list` is an internal policy/audit key; transports must call the governed mapper and
+explicitly project official DTOs rather than serializing internal records or reading `tasks()`
+directly.
 
 The optional Firecracker lifecycle validates immutable kernel/rootfs/VMM/jailer inputs, constructs
 shell-free jailer arguments, checks trusted paths and Linux prerequisites, waits for the API socket,

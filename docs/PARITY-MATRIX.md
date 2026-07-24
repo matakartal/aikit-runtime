@@ -1,6 +1,6 @@
 # AIKit competitor parity matrix
 
-**Snapshot:** 2026-07-20
+**Snapshot:** 2026-07-23
 **Source candidate:** `v0.3.0-alpha.1` (not published)
 **Rule:** a locally green test is implementation evidence, not live-provider, registry, signing, or
 cross-platform release evidence.
@@ -26,21 +26,25 @@ the commit and re-review the license together.
 | Upstream | Commit | License at pin | Used for |
 |---|---|---|---|
 | [BAML](https://github.com/BoundaryML/baml) | `fe3304335ff13eb6355233b1f96690b6ede7ae09` | Apache-2.0 | canonical core and generated clients |
-| [Pydantic AI](https://github.com/pydantic/pydantic-ai) | `7594270096ff92cbe09ce3fe8e80cb9ede591a08` | MIT | model profiles, output validation, durability/evals |
+| [Pydantic AI](https://github.com/pydantic/pydantic-ai) | `61d751ec55f69804e765509b4e0a35b3cf2b7793` | MIT | model profiles, output validation, durability/evals |
 | [Rig](https://github.com/0xPlaygrounds/rig) | `87f3f5b77a3caeffa10d60225c41e386753bf05e` | MIT | Rust provider contracts |
 | [LiteLLM](https://github.com/BerriAI/litellm) | `bd44c9e305b89526d4c5d773ee39ca935561b9c8` | MIT outside `enterprise/`; enterprise license inside | capability breadth and provider metadata |
 | [Vercel AI SDK](https://github.com/vercel/ai) | `6cd7c74acf0d7ec84dd58a841fc0e20970d6f2e8` | Apache-2.0 | stream lifecycle |
 | [Microsoft Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit) | `d00ccdbf31258db917495ca65fa2ecd9e64461b9` | MIT | scoped policy and governance evidence |
 | [OpenAI Codex](https://github.com/openai/codex) | `678157acaa819d5510adfe359abb5d0392cfe461` | Apache-2.0 | OS containment and approvals |
-| [LangGraph](https://github.com/langchain-ai/langgraph) | `49ae27c2ae983cfb92091b0dea9f7bc37a716479` | MIT | checkpoint, resume, fork and interrupt |
-| [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) | `7c6b1e975f75193ace223a05c6535b8556f93ee4` | MIT | workflow checkpoints |
-| [Agno](https://github.com/agno-agi/agno) | `24dfe73375f4f708a1314a0bb20e5d2b28d797db` | Apache-2.0 | HITL and memory |
+| [LangGraph](https://github.com/langchain-ai/langgraph) | `31f90df3e6b0268fa77fd2d118a917d420b84a68` | MIT | checkpoint, resume, fork and interrupt |
+| [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) | `0796af0c262df77ca7a8d48f907a5de90b1fca4a` | MIT | workflow checkpoints, A2A and Durable Task worker |
+| [Agno](https://github.com/agno-agi/agno) | `1e03b4ef350f7c2706abc553a208e88b3f1e81e1` | Apache-2.0 | AgentOS auth, A2A and HITL |
 | [Letta](https://github.com/letta-ai/letta) | `b76da9092518cbaa2d09042e52fdcbde69243e18` | Apache-2.0 | memory planes and tool rules |
 | [MCP specification](https://github.com/modelcontextprotocol/modelcontextprotocol) | `26897cc322f356487da89113451bd16b520b9288` | transition mix: Apache-2.0/MIT; docs CC-BY-4.0 | tools/resources/prompts/tasks |
-| [A2A](https://github.com/a2aproject/A2A) | `af112d9491c1fd4b2a568ac65755af4a62790490` | Apache-2.0 | remote agent task mapping |
+| [A2A](https://github.com/a2aproject/A2A) | `cfc9d34bc41e368827eb6446d31f912e44f795c5` | Apache-2.0 | remote agent task mapping |
+| [A2A Python SDK](https://github.com/a2aproject/a2a-python) | `3e6fa6a41d64f0581202df214a0515a0b0194832` | Apache-2.0 | authenticated task-list behavior and wire projection |
 | [Zed ACP](https://github.com/agentclientprotocol/agent-client-protocol) | `169194fd4e941c7b1eddee7ca58f5deaf1bcfda0` | Apache-2.0 | editor/CLI adapter |
-| [OpenAI Agents Python](https://github.com/openai/openai-agents-python) | `2fa463571e76dae8ff267622f1018eaf06ffeb9f` | MIT | traces, evals and sandbox expectations |
-| [Google ADK Python](https://github.com/google/adk-python) | `be5828f317c7430411df29974cd9ccfa875e90de` | Apache-2.0 | eval and telemetry structure |
+| [OpenAI Agents Python](https://github.com/openai/openai-agents-python) | `34ab93536750dc3e245a07dfa465c599f1f5697e` | MIT | traces, HITL and resumable state |
+| [OpenAI Agents JavaScript](https://github.com/openai/openai-agents-js) | `d601be6dcea96236b8c5aa9a6f5b4196c070cfb3` | MIT | cross-SDK run-state comparison |
+| [Google ADK Python](https://github.com/google/adk-python) | `f71d9df9179a4d37a54051ffceb6dda5c821e4c4` | Apache-2.0 | A2A, rewind, eval and telemetry structure |
+| [Claude Agent SDK Python](https://github.com/anthropics/claude-agent-sdk-python) | `e6e07f1c9b0542217e1cf4913e96b161a6bf92b2` | MIT | sessions, forks and subprocess trace propagation |
+| [Claude Agent SDK TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) | `dc71e7c4868d6432d883111c425dc6ba7678a614` | Anthropic Commercial Terms; not OSS at pin | API observation only; no source reuse |
 
 ## Phase 1 — canonical contract and eight providers
 
@@ -76,6 +80,7 @@ the commit and re-review the license together.
 | Required behavior | AIKit implementation | Deterministic evidence | Status | Remaining gate |
 |---|---|---|---|---|
 | Append-only event log, checkpoint projection, resume/fork/rewind/cancel | `durability.rs`; replay-validating `RunState`; Python/Node `DurableRun` | 20 focused durability tests and real binding round-trips | `Equivalent` locally | distributed soak tests |
+| Real agent-loop durable coordination | Sync-only `DurableRunDriver`; durable run id owns audit/runtime identity; provider/tool start and outcome use store CAS; completed results are reused | identity, pre-side-effect CAS failure, completed-provider reuse and ambiguous-tool reconciliation tests | `Equivalent` locally for in-process Sync | Async/Exit, real-loop process-crash matrix, provider idempotency guidance and real Temporal worker |
 | `pure/idempotent/reconcile_required`, no false exactly-once claim | stable activity ID/input hash/idempotency; ambiguous effects stop in reconciliation | crash/retry/ambiguous-effect tests | `Stronger` | provider-specific idempotency guidance |
 | Preserve successful sibling writes; rerun failed branch only | activity ledger and branch projection | parallel activity recovery test | `Equivalent` | distributed scheduler implementation |
 | Durable confirmation/input/review/edit-retry approval states | typed durable events plus Python/Node request/resolve/expiry helpers | invalid response, exact timeout, policy drift and restart parity tests | `Equivalent` locally | distributed UI integration |
@@ -93,7 +98,7 @@ the commit and re-review the license together.
 | Image generation, transcription, speech and realtime provider transports | catalog-gated OpenAI HTTP image/transcription/speech/WebRTC contracts plus typed SPIs | five keyless local-socket auth/upload/cancel/error/artifact tests | `Partial` | shipped models remain unsupported without live proof; other provider endpoints and realtime event reconnect transport |
 | MCP tools/resources/prompts/auth/progress/cancel server | MCP 2025-11-25 JSON-RPC dispatcher with stdio and Streamable HTTP, Origin/auth/session/version/Host/Accept enforcement and bounded SSE replay | 33 protocol tests with real socket/subprocess and official-shaped fixtures | `Equivalent` locally | official external SDK/OAuth discovery conformance |
 | Durable MCP Tasks | task/receipt/dedupe/session/SSE state persisted through SQLite CAS; expired side-effect replay evidence retires the old connection namespace fail-closed | restart, duplicate, retention-expiry, cancellation, schema drift and `Last-Event-ID` tests | `Equivalent` locally | PostgreSQL MCP store and official external conformance |
-| A2A 1.0 mapping | `context_id → Session`, `task_id → Run`, dedupe/input-required | protocol tests | `Equivalent` for mapping | HTTP transport, auth and official examples |
+| A2A 1.0 canonical mapping and JSON-RPC/SSE | owner-scoped `context_id → Session`, `task_id → Run`, dedupe/input-required, authenticated ListTasks, artifact/direct-Message projection, protected cancel ingress and Rust/Python/Node mapper surfaces | protocol/binding parity, 75 transport tests, and pinned official TCK raw plus exact-set verification | `Partial` | complete timestamps/history/artifact updates, production journal wiring, authenticated deployment proof, and removal of six pinned upstream TCK waivers |
 | Zed ACP v1 adapter | session/prompt/cancel and runtime event mapping | protocol tests | `Equivalent` for mapping | thin CLI/editor transport and Zed acceptance |
 
 ## Phase 5 — evals, telemetry, hardening and release
@@ -115,7 +120,7 @@ the commit and re-review the license together.
 
 `v1.0` is **not eligible** at this snapshot. Mandatory `Partial/Absent` rows remain, principally:
 schema-generated full SDK declarations, live provider/modality acceptance, Linux microVM/egress proof,
-PostgreSQL failover and a real Temporal worker, A2A/ACP wire transports, external protocol conformance, cross-platform signed artifacts,
+PostgreSQL failover and a real Temporal worker, production A2A journal persistence, ACP wire transport, unwaived external protocol conformance, cross-platform signed artifacts,
 registry publication, and rollback rehearsal.
 
 The local implementation must not turn missing credentials, registry ownership, signing identity,

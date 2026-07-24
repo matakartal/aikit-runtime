@@ -67,6 +67,14 @@ Python and Node expose `DurableRun`; Rust uses `RunState`. Importing a snapshot 
 its event log, so a caller-modified projection is rejected. Every external activity must declare a
 side-effect class and idempotency key where required. AIKit does not promise exactly-once delivery.
 
+Durability schema version 2 prevents newly written failed or cancelled runs from retaining a
+running activity attempt. Version 1 snapshots and SQLite/PostgreSQL rows remain readable: their
+historical events replay with version 1 semantics, then the in-memory state and the next persisted
+write use version 2. Do not rewrite old event versions in place; they identify the validation rules
+under which those append-only events were originally accepted. Cooperative cancellation now writes
+`Cancelled` only when no activity is running and the stop is unambiguous; an ambiguous stop stays
+available for reconciliation instead.
+
 If an external request may have completed before its checkpoint committed, reconcile it explicitly;
 do not retry it blindly. Rewind does not reverse external systems, and fork creates a separate run
 identity.
@@ -74,6 +82,82 @@ identity.
 A durable governed run pins one complete binding: policy snapshot hash, tenant, agent, and run id.
 Restart, approval resolution, and each authorization revalidate that binding. Changing any member
 requires a new run rather than replacing policy or identity beneath an existing approval.
+
+Rust callers can attach `RunState` plus a `DurableStore` with `RunConfig::with_durable_run`, or an
+existing `DurableRunDriver` with `with_durable_driver`. Only `DurabilityMode::Sync` is accepted.
+Provider and tool calls are treated conservatively as reconciliation-required external effects;
+do not infer exactly-once delivery from a completed local test. The driver provides CAS-backed
+in-process coordination and one executor invocation per validated in-process attempt; it is not a
+distributed or exactly-once execution system. Ambiguous provider, tool, or audit effects must be
+reconciled before retry.
+
+Terminal audit delivery is now a persisted two-phase operation: the driver saves a `RunStopped`
+delivery intent before calling the fail-closed audit sink, then saves acceptance after every sink
+accepts. If the final terminal-state CAS fails after acceptance, restart reuses that acceptance and
+retries only the terminal CAS; it does not rerun provider, tool, or audit effects. If delivery is
+ambiguous (including a crash after intent or a sink failure), resolve it through reconciliation
+rather than blindly retrying it.
+
+An operator-approved terminal-audit retry now requires a persisted typed replay envelope. The
+envelope binds the original run, audit invocation, sequence, terminal summary, fail-closed sink
+configuration, payload policy, and host delivery identity. After explicit resume, `SafeToRetry`
+replays only that exact `RunStopped`; it never reruns hooks, providers, tools, or a new audit
+invocation. A partial replay returns to reconciliation. Legacy version 1 terminal records with no
+attempt are not trusted as complete: they require a synthetic reconciliation attempt plus a typed
+attestation that matches the persisted terminal state.
+
+Activity schedule inputs now persist only a deterministic hash. Completed provider/tool results
+remain verbatim replay data; configure their per-result bound with `DurablePayloadPolicy` and apply
+transcript-grade access control, retention, and at-rest protection to the store. A result that
+exceeds the configured limit is not persisted and leaves the effect reconciliation-required.
+
+A durable driver accepts either no human approver or the exact adapter created with
+`with_persisted_durable_driver_approver`; ordinary or separately constructed approvers fail closed
+because they do not share the driver's state, store and CAS-poison authority. `AuditRecord` also
+adds optional `invocation_id`: `(run_id, invocation_id, sequence)` distinguishes repeated attaches
+to one logical run. Legacy serialized records without the field still deserialize, but Rust struct
+literals or exhaustive destructuring must add/ignore the new field.
+
+## Governed A2A mapper
+
+Rust, Python and Node now expose the same canonical `A2aMapper`, including subject+tenant-scoped
+task listing and bounded cursor pagination. Direct Rust callers must pass an `A2aListTasksRequest`;
+Python uses `list_tasks`, and Node uses `listTasks`.
+
+Governance envelopes now use protocol contract version `2`. The new version preserves
+`invalid_request` as a first-class denial code instead of folding malformed identity/message input
+into a generic conflict/forbidden result. Consumers that deserialize the denial enum exhaustively
+must add this value before accepting version 2 envelopes.
+
+Context storage keys are now owner-scoped so two tenants may safely use the same wire `context_id`.
+Message receipts are likewise keyed by subject, tenant and `message_id`, so one tenant cannot
+reserve another tenant's idempotency key. Pre-scoping alpha snapshots remain readable for their
+original owner, but callers must stop treating `A2aMapper::contexts()` or `receipts()` keys as wire
+ids; use `context_session` or `message_receipt` with an authenticated principal.
+
+Mapper snapshots now include `schema_version`. Restore validates task/map keys, generated sequence,
+owner/context relations, globally unique runtime ids, receipt references and revision bounds before
+accepting state. List cursors are bound to one mapper revision and stale cursors are rejected rather
+than producing duplicate/skipped tasks. Node's
+`transitionTask` now returns the updated mapper snapshot, matching Python's `transition_task`.
+
+The experimental Rust A2A network server now caps the complete canonical serialized mapper
+snapshot at 32 MiB. Persisted raw bytes are rejected before decode when they exceed that ceiling.
+Snapshot stores use compare-and-swap against the exact prior `(revision, SHA-256 digest)` and treat
+only an identical revision+digest as already applied. Mapper serialization and store I/O run
+outside the live mapper lock; an accepted commit finishes and installs its exact candidate even if
+the originating request is dropped. Store errors must distinguish definitely-not-applied from an
+unknown outcome. Unknown outcomes are resolved with a linearizable, post-CAS durable-head probe;
+stale replica/cache reads are not valid implementations. An unresolved outcome fail-stops later
+mapper writes and host effects. Use `A2aHttpJsonRpcServer::new_owned`; the
+internal shared-Arc constructor is retained only for crate tests and requires exclusive ownership
+of that Arc.
+
+This full-snapshot server remains bounded and experimental, not production-scale persistence.
+The new typed delta-journal API defines exact commit-token CAS, bounded/paged replay, validated
+checkpoints, restore pins and integrity-bound garbage collection. It is additive and is not yet
+wired into the HTTP transport mutation path, so operators must not treat it as production journal
+persistence. The mapper itself remains transport-neutral and is not an official A2A wire DTO.
 
 ## Governed MCP server
 

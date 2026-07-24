@@ -222,7 +222,7 @@ flowchart TD
     POLICY -->|allow| VALIDATE[Revalidate rewritten input]
     APPROVE -->|deny| DENY
     APPROVE -->|allow / rewrite| VALIDATE
-    VALIDATE --> EXEC[Execute exactly once]
+    VALIDATE --> EXEC[Invoke executor once for this validated in-process attempt]
     EXEC --> POST[PostTool or failure hooks]
     POST --> AUDIT[Record audit + usage + outcome]
     AUDIT --> CONTINUE[Return result to model]
@@ -231,7 +231,9 @@ flowchart TD
 ```
 
 A denied tool never reaches its callback. Approval and hook rewrites are schema-validated again
-before execution.
+before execution. This is not an exactly-once or distributed-execution guarantee: local
+coordination is CAS-backed, and an ambiguous provider, tool, or audit effect must be reconciled
+before it is retried.
 
 ### Example: policy around a host tool
 

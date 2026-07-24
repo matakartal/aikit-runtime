@@ -11,6 +11,7 @@ milestone cannot be mistaken for present behavior.
 |---|---|---|
 | [Architecture](ARCHITECTURE.md) | Builders and reviewers | Component ownership, request lifecycle, state, and trust boundaries. |
 | [Competitor parity matrix](PARITY-MATRIX.md) | Everyone | Exact upstream pins, local evidence, honest gaps, and v1 release gate. |
+| [Competitor source review](COMPETITOR-SOURCE-REVIEW.md) | Builders | Reviewed source patterns, licenses, adopted decisions, and exclusions. |
 | [Feature reference](FEATURES.md) | Builders | Runtime capabilities, fidelity, governance, routing, state, and limits. |
 | [Threat model](THREAT-MODEL.md) | Security reviewers | Guarantees and exclusions for built-in tools and Bash containment. |
 | [Regulatory evidence aids](COMPLIANCE.md) | Risk and audit teams | Honest mapping from runtime evidence to assessor questions; explicitly not legal advice. |
