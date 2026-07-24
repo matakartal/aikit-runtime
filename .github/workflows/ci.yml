@@ -119,7 +119,8 @@ jobs:
           .venv/bin/python crates/aikit-py/tests/evaluate_outcome.py
           .venv/bin/python crates/aikit-py/tests/production_state.py
           .venv/bin/python crates/aikit-py/tests/multimodal_messages.py
-          .venv/bin/mypy --strict crates/aikit-py/tests/typing_contract.py
+          .venv/bin/python crates/aikit-py/tests/a2a_mapper.py
+          .venv/bin/mypy --strict crates/aikit-py/tests/typing_contract.py crates/aikit-py/tests/a2a_mapper.py
       - name: Build Node binding
         run: ./scripts/build-node.sh
       - name: Install pinned Node runtime-test dependency
@@ -141,6 +142,7 @@ jobs:
           node crates/aikit-node/tests/evaluate-outcome.cjs
           node crates/aikit-node/tests/production-state.cjs
           node crates/aikit-node/tests/multimodal-messages.cjs
+          node crates/aikit-node/tests/a2a-mapper.cjs
           npx --yes --package typescript@5.9.3 tsc --noEmit --strict --target ES2020 \
             --module commonjs --moduleResolution node crates/aikit-node/tests/typing.ts
       - name: Canonical three-language parity

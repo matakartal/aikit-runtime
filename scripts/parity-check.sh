@@ -3,9 +3,9 @@
 #
 # Runs the SAME agent-native scenario through Rust, Python, and Node, then asserts all three emit a
 # BYTE-IDENTICAL canonical transcript. Focused modules cover governance, structured streams,
-# RunOptions, state/audit surfaces, subagent session context, and built-in tool containment. Add a
-# future surface by appending its module name below and emitting the same prefixed line in each
-# example.
+# RunOptions, state/audit surfaces, subagent session context, built-in tool containment, and the
+# governed A2A mapper. Add a future surface by appending its module name below and emitting the same
+# prefixed line in each example.
 #
 # Prereqs: `maturin develop` for aikit-py + `./scripts/build-node.sh` for aikit-node.
 set -euo pipefail
@@ -80,7 +80,7 @@ fi
 
 # This array is the conformance registry. It deliberately stays independent of language-specific
 # build logic, so BUILTINS (or any later surface) can be added as one isolated module.
-conformance_modules=(GOVERNANCE STRUCTURED RUN_OPTIONS STATE ORCHESTRATION BUILTINS INPUT)
+conformance_modules=(GOVERNANCE STRUCTURED RUN_OPTIONS STATE ORCHESTRATION BUILTINS INPUT A2A)
 if [ -n "${AIKIT_CONFORMANCE_EXTRA_MODULES:-}" ]; then
   read -r -a extra_modules <<<"$AIKIT_CONFORMANCE_EXTRA_MODULES"
   conformance_modules+=("${extra_modules[@]}")
