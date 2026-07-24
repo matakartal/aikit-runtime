@@ -34,19 +34,48 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
                 )
             }
         };
+        let Some(artifacts) = prepared.artifacts.first() else {
+            return BackendCapability::unavailable(
+                ActiveContainmentBackend::WindowsJob,
+                ContainmentGuarantees::windows_job(),
+                "Windows Job probe has no private diagnostics directory",
+            );
+        };
+        let phase_file = artifacts.path().join("launcher.phase");
+        if let Err(error) = std::fs::write(&phase_file, b"prepared") {
+            return BackendCapability::unavailable(
+                ActiveContainmentBackend::WindowsJob,
+                ContainmentGuarantees::windows_job(),
+                format!("Windows Job probe diagnostics could not initialize: {error}"),
+            );
+        }
+        prepared.environment_overrides.extend([
+            (
+                std::ffi::OsString::from("AIKIT_JOB_PHASE_FILE"),
+                phase_file.clone().into_os_string(),
+            ),
+            (
+                std::ffi::OsString::from("AIKIT_JOB_WAIT_MS"),
+                std::ffi::OsString::from("5000"),
+            ),
+        ]);
         prepared.command.stdin(std::process::Stdio::null());
         prepared.command.stdout(std::process::Stdio::null());
-        // The launcher deliberately passes its standard handles to the suspended child. Waiting
-        // for `output()` would therefore couple capability detection to pipe EOF from every
-        // inherited writer, even after the launcher itself has exited. The probe has no output
-        // contract, so wait only for its process status and keep all three streams non-piped.
+        // The probe has no output contract. Keep its streams non-piped and judge only the launcher
+        // status; native lifecycle diagnostics travel through the private phase file above.
         prepared.command.stderr(std::process::Stdio::null());
         prepared.command.kill_on_drop(true);
         prepared.command.env_clear();
         prepared
             .command
             .envs(prepared.environment_overrides.clone());
-        match tokio::time::timeout(std::time::Duration::from_secs(15), prepared.command.status()).await {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            prepared.command.status(),
+        )
+        .await;
+        let phase = read_launcher_phase(&phase_file);
+        match outcome {
             Ok(Ok(status)) if status.success() => BackendCapability::available(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
@@ -55,19 +84,50 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
             Ok(Ok(status)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
-                format!("Windows Job probe failed with status {status}"),
+                format!("Windows Job probe failed with status {status}; phase={phase}"),
             ),
             Ok(Err(error)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
-                format!("Windows Job probe could not start: {error}"),
+                format!("Windows Job probe could not start: {error}; phase={phase}"),
             ),
             Err(_) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
-                "Windows Job probe timed out",
+                format!("Windows Job probe timed out; phase={phase}"),
             ),
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_launcher_phase(path: &Path) -> &'static str {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return "unreadable";
+    };
+    safe_launcher_phase(&raw)
+}
+
+/// Convert the private launcher marker to a fixed vocabulary before it reaches public capability
+/// detail. Never echo file contents: command and workload environment values must stay private.
+#[cfg(any(target_os = "windows", test))]
+fn safe_launcher_phase(raw: &str) -> &'static str {
+    match raw.trim() {
+        "prepared" => "prepared",
+        "powershell_started" => "powershell_started",
+        "native_type_loaded" => "native_type_loaded",
+        "workload_environment_loaded" => "workload_environment_loaded",
+        "job_create" => "job_create",
+        "job_configure" => "job_configure",
+        "child_create" => "child_create",
+        "child_assign" => "child_assign",
+        "child_resume" => "child_resume",
+        "child_wait" => "child_wait",
+        "child_wait_timed_out" => "child_wait_timed_out",
+        "child_exited" => "child_exited",
+        "cleanup" => "cleanup",
+        "complete" => "complete",
+        _ => "unrecognized",
     }
 }
 
@@ -307,9 +367,11 @@ const WINDOWS_JOB_LAUNCHER: &str = r#"
 $src = @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class AikitJob {
+  const uint WAIT_OBJECT_0 = 0u, WAIT_TIMEOUT = 0x102u, STILL_ACTIVE = 259u, TERMINATION_WAIT_MS = 5000u;
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
   [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; }
@@ -321,19 +383,29 @@ public static class AikitJob {
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
   [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
-  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
-  [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int which);
   static void Check(bool ok, string op) { if (!ok) { int code = Marshal.GetLastWin32Error(); throw new Win32Exception(code, op + " (Win32 " + code + ")"); } }
-  public static int Run(string command, string cwd, string shell, uint processes, ulong memory) {
+  static void Phase(string path, string phase) { if (!String.IsNullOrWhiteSpace(path)) { try { File.WriteAllText(path, phase, Encoding.ASCII); } catch { } } }
+  static void StopChild(IntPtr process) {
+    uint code;
+    if (GetExitCodeProcess(process, out code) && code != STILL_ACTIVE) return;
+    Check(TerminateProcess(process, 1u), "TerminateProcess");
+    uint waited = WaitForSingleObject(process, TERMINATION_WAIT_MS);
+    Check(waited == WAIT_OBJECT_0, "WaitForSingleObject terminated child");
+  }
+  public static int Run(string command, string cwd, string shell, uint processes, ulong memory, uint waitMilliseconds, string phaseFile) {
     if (String.IsNullOrWhiteSpace(cwd)) cwd = Environment.CurrentDirectory;
     if (String.IsNullOrWhiteSpace(shell)) shell = @"C:\Windows\System32\cmd.exe";
     if (cwd.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) cwd = @"\\" + cwd.Substring(8);
     else if (cwd.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) cwd = cwd.Substring(4);
     Environment.CurrentDirectory = cwd;
+    Phase(phaseFile, "job_create");
     IntPtr job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) throw new Win32Exception();
     var limits = new EXTENDED_LIMITS(); limits.BasicLimitInformation.LimitFlags = 0x2000u | 0x8u | 0x200u; limits.BasicLimitInformation.ActiveProcessLimit = processes; limits.JobMemoryLimit = (UIntPtr)memory;
+    Phase(phaseFile, "job_configure");
     bool configured = SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits));
     if (!configured) {
       // Some managed/CI hosts reject a nested job-memory limit even though kill-on-close and
@@ -344,26 +416,59 @@ public static class AikitJob {
     }
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
     PROCESS_INFORMATION pi; var line = new StringBuilder("\"" + shell + "\" /d /s /c \"" + command.Replace("\"", "\\\"") + "\"");
+    Phase(phaseFile, "child_create");
     Check(CreateProcessW(shell, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, null, ref si, out pi), "CreateProcessW");
+    bool childExited = false;
     try {
+      Phase(phaseFile, "child_assign");
       Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject");
-      uint resumed = ResumeThread(pi.hThread); if (resumed == 0xffffffffu) throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
-      uint completed = WaitForSingleObject(pi.hProcess, 0xffffffff); Check(completed == 0u, "WaitForSingleObject child"); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code);
+      Phase(phaseFile, "child_resume");
+      uint resumed = ResumeThread(pi.hThread);
+      if (resumed == 0xffffffffu) throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
+      if (resumed != 1u) throw new InvalidOperationException("ResumeThread returned an unexpected previous suspend count");
+      Phase(phaseFile, "child_wait");
+      uint completed = WaitForSingleObject(pi.hProcess, waitMilliseconds);
+      if (completed == WAIT_TIMEOUT) {
+        Phase(phaseFile, "child_wait_timed_out");
+        StopChild(pi.hProcess);
+        throw new TimeoutException("Windows Job child exceeded its bounded wait");
+      }
+      Check(completed == WAIT_OBJECT_0, "WaitForSingleObject child");
+      uint code; Check(GetExitCodeProcess(pi.hProcess, out code), "GetExitCodeProcess");
+      childExited = true; Phase(phaseFile, "child_exited"); return unchecked((int)code);
     }
     catch {
-      bool terminated = TerminateProcess(pi.hProcess, 1u); uint waited = WaitForSingleObject(pi.hProcess, 5000u);
-      Check(terminated, "TerminateProcess"); Check(waited == 0u, "WaitForSingleObject terminated child"); throw;
+      if (!childExited) StopChild(pi.hProcess);
+      throw;
     }
-    finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); }
+    finally {
+      if (childExited) Phase(phaseFile, "cleanup");
+      CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job);
+      if (childExited) Phase(phaseFile, "complete");
+    }
   }
 }
 '@
+function Set-AikitPhase([string]$phase) {
+  if (![String]::IsNullOrWhiteSpace($phaseFile)) {
+    try { [IO.File]::WriteAllText($phaseFile, $phase, [Text.Encoding]::ASCII) } catch { }
+  }
+}
+$phaseFile = $env:AIKIT_JOB_PHASE_FILE
+Set-AikitPhase 'powershell_started'
 Add-Type -TypeDefinition $src -Language CSharp
+Set-AikitPhase 'native_type_loaded'
 $command = $env:AIKIT_JOB_COMMAND; $cwd = $env:AIKIT_JOB_WORKDIR; $shell = $env:AIKIT_JOB_SHELL
 $processes = [uint32]$env:AIKIT_JOB_PROCESS_LIMIT; $memory = [uint64]$env:AIKIT_JOB_MEMORY_LIMIT
 $environmentFile = $env:AIKIT_JOB_ENV_FILE
+$waitMilliseconds = [uint32]::MaxValue
+$requestedWait = [uint32]0
+if ([uint32]::TryParse($env:AIKIT_JOB_WAIT_MS, [ref]$requestedWait) -and $requestedWait -gt 0) {
+  $waitMilliseconds = $requestedWait
+}
 $env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null; $env:AIKIT_JOB_SHELL = $null
 $env:AIKIT_JOB_PROCESS_LIMIT = $null; $env:AIKIT_JOB_MEMORY_LIMIT = $null; $env:AIKIT_JOB_ENV_FILE = $null
+$env:AIKIT_JOB_PHASE_FILE = $null; $env:AIKIT_JOB_WAIT_MS = $null
 $env:TEMP = $null; $env:TMP = $null
 if (![String]::IsNullOrWhiteSpace($environmentFile)) {
   Get-Content -LiteralPath $environmentFile -Encoding ASCII | ForEach-Object {
@@ -375,7 +480,8 @@ if (![String]::IsNullOrWhiteSpace($environmentFile)) {
   }
   Remove-Item -LiteralPath $environmentFile -Force
 }
-exit [AikitJob]::Run($command, $cwd, $shell, $processes, $memory)
+Set-AikitPhase 'workload_environment_loaded'
+exit [AikitJob]::Run($command, $cwd, $shell, $processes, $memory, $waitMilliseconds, $phaseFile)
 "#;
 
 #[cfg(test)]
@@ -417,9 +523,21 @@ mod tests {
     fn assignment_or_resume_failure_terminates_the_suspended_child() {
         assert!(WINDOWS_JOB_LAUNCHER.contains("static extern bool TerminateProcess"));
         assert!(WINDOWS_JOB_LAUNCHER.contains("resumed == 0xffffffffu"));
-        assert!(WINDOWS_JOB_LAUNCHER.contains("TerminateProcess(pi.hProcess, 1u)"));
-        assert!(WINDOWS_JOB_LAUNCHER.contains("WaitForSingleObject(pi.hProcess, 5000u)"));
-        assert!(WINDOWS_JOB_LAUNCHER.contains("Check(waited == 0u"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("resumed != 1u"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("TerminateProcess(process, 1u)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("WaitForSingleObject(process, TERMINATION_WAIT_MS)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("Check(waited == WAIT_OBJECT_0"));
+    }
+
+    #[test]
+    fn probe_can_bound_child_wait_without_capping_normal_workloads() {
+        assert!(!WINDOWS_JOB_LAUNCHER.contains("WaitForSingleObject(pi.hProcess, 0xffffffff)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("WaitForSingleObject(pi.hProcess, waitMilliseconds)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("$waitMilliseconds = [uint32]::MaxValue"));
+        assert!(!WINDOWS_JOB_LAUNCHER.contains("86400000"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("completed == WAIT_TIMEOUT"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("child_wait_timed_out"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("StopChild(pi.hProcess)"));
     }
 
     #[test]
@@ -431,6 +549,8 @@ mod tests {
             "AIKIT_JOB_PROCESS_LIMIT",
             "AIKIT_JOB_MEMORY_LIMIT",
             "AIKIT_JOB_ENV_FILE",
+            "AIKIT_JOB_PHASE_FILE",
+            "AIKIT_JOB_WAIT_MS",
             "TEMP",
             "TMP",
         ] {
@@ -448,6 +568,16 @@ mod tests {
             .unwrap();
         assert!(add_type < temp_scrub);
         assert!(temp_scrub < workload_environment);
+    }
+
+    #[test]
+    fn launcher_phase_detail_uses_only_fixed_safe_labels() {
+        assert_eq!(safe_launcher_phase("child_wait\n"), "child_wait");
+        assert_eq!(
+            safe_launcher_phase("child_wait_timed_out"),
+            "child_wait_timed_out"
+        );
+        assert_eq!(safe_launcher_phase("secret-command=value"), "unrecognized");
     }
 
     #[test]
