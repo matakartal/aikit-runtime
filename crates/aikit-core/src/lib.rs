@@ -19,7 +19,9 @@ pub mod compaction;
 pub mod contract;
 pub mod credentials;
 pub mod durability;
+pub mod durable_runtime;
 pub mod durable_store;
+pub mod durable_worker;
 pub mod dx;
 pub mod error;
 pub mod eval;
@@ -81,8 +83,15 @@ pub use durability::{
     DurableApprovalStatus, DurableRunStatus, RunCommand, RunEvent, RunEventKind, RunProjection,
     RunState, SideEffectClass, DURABILITY_SCHEMA_VERSION,
 };
+pub use durable_runtime::{
+    DurableActivity, DurablePayloadPolicy, DurableRunDriver, DurableRunDriverError,
+    MAX_DURABLE_COMPLETION_BYTES,
+};
 pub use durable_store::{
     DurableStore, DurableStoreError, DurableStoreResult, InMemoryDurableStore,
+};
+pub use durable_worker::{
+    DurableWorker, DurableWorkerConfig, DurableWorkerError, DurableWorkerOutcome,
 };
 pub use dx::{
     generate_object, generate_object_messages, generate_object_messages_observed,

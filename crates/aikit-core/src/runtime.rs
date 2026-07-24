@@ -50,11 +50,16 @@ pub struct RunConfig {
     pub recorder: crate::session::RunRecorder,
     /// Monotonic cooperative cancellation observed at every side-effect boundary.
     pub cancellation: crate::cancellation::CancellationToken,
+    /// Optional synchronous durable coordinator. When present its run ID is the authoritative
+    /// runtime, audit, and governance identity.
+    pub durable: Option<crate::durable_runtime::DurableRunDriver>,
     /// Absolute deadline inherited from a shared orchestration ledger. Kept private so the only
     /// producer is the ledger's original start time; callers cannot accidentally reset it per
     /// child.
     shared_wall_time_deadline: Option<Instant>,
     invocation_prepared: bool,
+    invocation_error: Option<crate::error::AikitError>,
+    durable_invocation: Option<crate::durable_runtime::DurableInvocationDisposition>,
 }
 
 impl RunConfig {
@@ -74,9 +79,28 @@ impl RunConfig {
             compaction: crate::compaction::CompactionPolicy::default(),
             recorder: crate::session::RunRecorder::default(),
             cancellation: crate::cancellation::CancellationToken::new(),
+            durable: None,
             shared_wall_time_deadline: None,
             invocation_prepared: false,
+            invocation_error: None,
+            durable_invocation: None,
         }
+    }
+
+    /// Attach a caller-supplied durable run state and persistence store.
+    pub fn with_durable_run(
+        mut self,
+        state: crate::durability::RunState,
+        store: Arc<dyn crate::durable_store::DurableStore>,
+    ) -> std::result::Result<Self, crate::durable_runtime::DurableRunDriverError> {
+        self.durable = Some(crate::durable_runtime::DurableRunDriver::new(state, store)?);
+        Ok(self)
+    }
+
+    /// Attach an already-created driver, retaining a clone outside the config for inspection.
+    pub fn with_durable_driver(mut self, driver: crate::durable_runtime::DurableRunDriver) -> Self {
+        self.durable = Some(driver);
+        self
     }
 
     pub(crate) fn enforce_shared_wall_time(&mut self, ledger: &crate::budget::BudgetLedger) {
@@ -90,8 +114,54 @@ impl RunConfig {
         if self.invocation_prepared {
             return;
         }
-        self.audit = self.audit.fresh_run();
-        self.governance = self.governance.fork_for_run();
+        if let Some(durable) = &self.durable {
+            match self.governance.clone().with_durable_driver(durable) {
+                Ok(governance) => self.governance = governance,
+                Err(error) => {
+                    self.invocation_error = Some(crate::error::AikitError::Configuration(format!(
+                        "durable governance attachment failed: {error}"
+                    )));
+                }
+            }
+            if self.invocation_error.is_none() {
+                match durable.invocation_disposition() {
+                    Ok(disposition) => self.durable_invocation = Some(disposition),
+                    Err(error) => self.invocation_error = Some(error.into()),
+                }
+            }
+            if self.invocation_error.is_none() {
+                let prepared_audit = match self.durable_invocation.as_ref() {
+                    Some(
+                        crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(
+                            replay,
+                        ),
+                    ) => Some(self.audit.for_terminal_replay(
+                        replay.audit_run_id.clone(),
+                        replay.invocation_id.clone(),
+                        replay.run_stopped_sequence,
+                        &replay.audit_binding,
+                    )),
+                    Some(_) => Some(
+                        durable
+                            .run_id()
+                            .map_err(crate::error::AikitError::from)
+                            .and_then(|run_id| self.audit.for_run_id(run_id)),
+                    ),
+                    None => None,
+                };
+                if let Some(prepared_audit) = prepared_audit {
+                    match prepared_audit {
+                        Ok(audit) => self.audit = audit,
+                        Err(error) => self.invocation_error = Some(error),
+                    }
+                }
+            }
+        } else {
+            self.audit = self.audit.fresh_run();
+        }
+        if self.invocation_error.is_none() {
+            self.governance = self.governance.fork_for_run();
+        }
         self.invocation_prepared = true;
     }
 }
@@ -153,6 +223,559 @@ struct PendingToolCall {
     id: String,
     name: String,
     input: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableToolOutput {
+    content: String,
+    is_error: bool,
+}
+
+fn durable_provider_input(provider: &str, req: &ProviderRequest) -> serde_json::Value {
+    let transient = serde_json::json!({
+        "provider": provider,
+        "model": &req.model,
+        "messages": &req.messages,
+        "tools": &req.tools,
+        "max_tokens": req.max_tokens,
+        "options": &req.options,
+        "provider_options": &req.provider_options,
+        "compatibility_mode": req.compatibility_mode,
+    });
+    durable_hashed_input(&transient)
+}
+
+/// Durable activity definitions retain only a deterministic input hash. Raw prompts, provider
+/// options, credentials, and tool arguments stay out of the append-only activity schedule.
+fn durable_hashed_input(input: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "input_hash": crate::durability::stable_input_hash(input),
+    })
+}
+
+fn finalize_ambiguous_durable_activity(
+    durable: Option<&crate::durable_runtime::DurableRunDriver>,
+    attempt: Option<&(String, u32)>,
+    reason: &'static str,
+) -> crate::error::Result<()> {
+    if let (Some(durable), Some((activity_id, attempt))) = (durable, attempt) {
+        durable
+            .fail_activity(activity_id, *attempt, reason, false, true)
+            .map(|_| ())
+            .map_err(crate::error::AikitError::from)?;
+    }
+    Ok(())
+}
+
+fn fail_unstarted_durable_activity(
+    durable: Option<&crate::durable_runtime::DurableRunDriver>,
+    attempt: Option<&(String, u32)>,
+    reason: &'static str,
+) -> crate::error::Result<()> {
+    if let (Some(durable), Some((activity_id, attempt))) = (durable, attempt) {
+        durable
+            .fail_activity(activity_id, *attempt, reason, false, false)
+            .map(|_| ())
+            .map_err(crate::error::AikitError::from)?;
+    }
+    Ok(())
+}
+
+fn persist_durable_terminal(
+    durable: &crate::durable_runtime::DurableRunDriver,
+    receipt: &crate::durable_runtime::DurableRunStoppedReceipt,
+) -> Result<(), crate::durable_runtime::DurableRunDriverError> {
+    durable.finalize_run_stopped_receipt(receipt)
+}
+
+fn durable_run_stopped_replay(
+    cfg: &RunConfig,
+    kind: crate::durable_runtime::DurableRunStoppedAuditKind,
+    terminal_receipt: crate::durable_runtime::DurableRunStoppedReceipt,
+    audit_turns: usize,
+    audit_reason: impl Into<String>,
+) -> crate::error::Result<(
+    crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope,
+    crate::observability::PreparedAuditRecord,
+)> {
+    let invocation_id = cfg.audit.invocation_id().ok_or_else(|| {
+        crate::error::AikitError::Configuration(
+            "durable terminal audit is missing its invocation identity".into(),
+        )
+    })?;
+    let audit_reason = audit_reason.into();
+    let prepared = cfg
+        .audit
+        .prepare_event(crate::observability::AuditEvent::RunStopped {
+            turns: audit_turns,
+            reason: audit_reason.clone(),
+        })?;
+    Ok((
+        crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope::new(
+            kind,
+            terminal_receipt,
+            cfg.audit.run_id(),
+            invocation_id,
+            prepared.sequence(),
+            audit_turns,
+            audit_reason,
+            cfg.audit.replay_binding(),
+        ),
+        prepared,
+    ))
+}
+
+fn retry_reconciled_terminal_audit(
+    cfg: &RunConfig,
+    replay: crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope,
+) -> Vec<StreamDelta> {
+    use crate::observability::AuditEvent;
+
+    let mut deltas = Vec::new();
+    let Some(durable) = cfg.durable.as_ref() else {
+        let error = crate::error::AikitError::Configuration(
+            "terminal audit replay requires a durable driver".into(),
+        );
+        deltas.push(StreamDelta::from_error(&error));
+        cfg.recorder.complete(
+            replay.terminal_receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            "durable_commit_failure",
+        );
+        return deltas;
+    };
+
+    let retry = match durable.begin_terminal_audit_retry(&replay) {
+        Ok(retry) => retry,
+        Err(error) => {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                replay.terminal_receipt.usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    };
+
+    if let Err(error) = cfg.audit.emit(AuditEvent::RunStopped {
+        turns: replay.audit_turns,
+        reason: replay.audit_reason.clone(),
+    }) {
+        deltas.push(StreamDelta::from_error(&error));
+        let mut recorded_reason = "audit_failure";
+        if let Err(error) = durable.fail_terminal_audit_retry(&retry) {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            recorded_reason = "durable_commit_failure";
+        }
+        cfg.recorder.complete(
+            replay.terminal_receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            recorded_reason,
+        );
+        return deltas;
+    }
+
+    if let Err(error) = durable.complete_terminal_audit_retry(&retry) {
+        let error = crate::error::AikitError::from(error);
+        deltas.push(StreamDelta::from_error(&error));
+        cfg.recorder.complete(
+            replay.terminal_receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            "durable_commit_failure",
+        );
+        return deltas;
+    }
+
+    if let Err(error) = persist_durable_terminal(durable, &replay.terminal_receipt) {
+        let error = crate::error::AikitError::from(error);
+        deltas.push(StreamDelta::from_error(&error));
+        cfg.recorder.complete(
+            replay.terminal_receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            "durable_commit_failure",
+        );
+    } else {
+        cfg.recorder.complete(
+            replay.terminal_receipt.usage,
+            recorded_terminal_status(&replay.terminal_receipt.reason),
+            replay.terminal_receipt.reason.clone(),
+        );
+    }
+    deltas
+}
+
+struct DurableInvocationLifecycleAttempt {
+    invocation_id: String,
+    activity_id: String,
+    attempt: u32,
+}
+
+fn resolve_durable_activity_boundary(
+    durable: &crate::durable_runtime::DurableRunDriver,
+    error: crate::durable_runtime::DurableRunDriverError,
+    active_invocation_id: Option<&str>,
+) -> Result<crate::durable_runtime::DurableInvocationDisposition, crate::error::AikitError> {
+    if !matches!(
+        error,
+        crate::durable_runtime::DurableRunDriverError::TerminalRecoveryRequired { .. }
+    ) {
+        return Err(error.into());
+    }
+
+    let disposition = match active_invocation_id {
+        Some(invocation_id) => {
+            durable.invocation_disposition_for_active_lifecycle(invocation_id)?
+        }
+        None => durable.invocation_disposition()?,
+    };
+    match disposition {
+        crate::durable_runtime::DurableInvocationDisposition::Execute => {
+            Err(crate::error::AikitError::Conflict(
+                "terminal audit state disappeared while resolving an activity boundary".into(),
+            ))
+        }
+        disposition => Ok(disposition),
+    }
+}
+
+fn close_superseded_durable_invocation(
+    cfg: &RunConfig,
+    lifecycle: &DurableInvocationLifecycleAttempt,
+    stopped_turns: usize,
+    receipt: crate::durable_runtime::DurableRunStoppedReceipt,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+    let Some(durable) = cfg.durable.as_ref() else {
+        let error = crate::error::AikitError::Configuration(
+            "durable terminal receipt exists without a durable driver".into(),
+        );
+        deltas.push(StreamDelta::from_error(&error));
+        cfg.recorder.complete(
+            receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            "durable_commit_failure",
+        );
+        return deltas;
+    };
+    match durable.close_active_lifecycle_from_matching_completed_canonical_replay(
+        &lifecycle.activity_id,
+        lifecycle.attempt,
+    ) {
+        Ok(true) => {
+            if let Err(error) = persist_durable_terminal(durable, &receipt) {
+                let error = crate::error::AikitError::from(error);
+                deltas.push(StreamDelta::from_error(&error));
+                cfg.recorder.complete(
+                    receipt.usage,
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_commit_failure",
+                );
+            } else {
+                cfg.recorder.complete(
+                    receipt.usage,
+                    recorded_terminal_status(&receipt.reason),
+                    receipt.reason,
+                );
+            }
+            return deltas;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                receipt.usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    }
+    let (replay, prepared_audit) = match durable_run_stopped_replay(
+        cfg,
+        crate::durable_runtime::DurableRunStoppedAuditKind::Recovery,
+        receipt.clone(),
+        stopped_turns,
+        "superseded_by_durable_terminal_receipt",
+    ) {
+        Ok(replay) => replay,
+        Err(error) => {
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                receipt.usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    };
+    let recovery_attempt = match durable.begin_recovery_run_stopped_audit(&replay) {
+        Ok(crate::durable_runtime::DurableActivity::Execute {
+            activity_id,
+            attempt,
+            ..
+        }) => Some((activity_id, attempt)),
+        Ok(crate::durable_runtime::DurableActivity::ReuseCompleted { .. }) => None,
+        Err(error) => {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                receipt.usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    };
+
+    let mut lifecycle_closed = false;
+    if let Some((activity_id, attempt)) = recovery_attempt {
+        match cfg.audit.emit_prepared(prepared_audit) {
+            Ok(()) => {
+                if let Err(error) = durable
+                    .complete_recovery_run_stopped_audit_and_invocation_lifecycle(
+                        &activity_id,
+                        attempt,
+                        &lifecycle.activity_id,
+                        lifecycle.attempt,
+                        &replay,
+                    )
+                {
+                    let error = crate::error::AikitError::from(error);
+                    deltas.push(StreamDelta::from_error(&error));
+                    cfg.recorder.complete(
+                        receipt.usage,
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_commit_failure",
+                    );
+                    return deltas;
+                }
+                lifecycle_closed = true;
+            }
+            Err(error) => {
+                deltas.push(StreamDelta::from_error(&error));
+                if let Err(marker_error) = durable
+                    .fail_recovery_run_stopped_audit_and_invocation_lifecycle(
+                        &activity_id,
+                        attempt,
+                        &lifecycle.activity_id,
+                        lifecycle.attempt,
+                    )
+                {
+                    let marker_error = crate::error::AikitError::from(marker_error);
+                    deltas.push(StreamDelta::from_error(&marker_error));
+                }
+                cfg.recorder.complete(
+                    receipt.usage,
+                    crate::session::RunTerminalStatus::Failed,
+                    "audit_failure",
+                );
+                return deltas;
+            }
+        }
+    }
+
+    if !lifecycle_closed {
+        if let Err(error) = durable.complete_invocation_lifecycle_with_replay(
+            &lifecycle.activity_id,
+            lifecycle.attempt,
+            &replay,
+        ) {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                receipt.usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    }
+
+    if let Err(error) = persist_durable_terminal(durable, &receipt) {
+        let error = crate::error::AikitError::from(error);
+        deltas.push(StreamDelta::from_error(&error));
+        cfg.recorder.complete(
+            receipt.usage,
+            crate::session::RunTerminalStatus::Failed,
+            "durable_commit_failure",
+        );
+    } else {
+        let status = recorded_terminal_status(&receipt.reason);
+        cfg.recorder.complete(receipt.usage, status, receipt.reason);
+    }
+    deltas
+}
+
+fn close_nonexecuting_durable_invocation(
+    cfg: &RunConfig,
+    lifecycle: &DurableInvocationLifecycleAttempt,
+    stopped_turns: usize,
+    usage: Usage,
+    disposition: crate::durable_runtime::DurableInvocationDisposition,
+) -> Vec<StreamDelta> {
+    let mut deltas = Vec::new();
+    let closure_reason = match &disposition {
+        crate::durable_runtime::DurableInvocationDisposition::ReconcileRequired { .. } => {
+            "durable_reconciliation_required"
+        }
+        crate::durable_runtime::DurableInvocationDisposition::AlreadyTerminal { .. } => {
+            "superseded_by_durable_terminal_state"
+        }
+        crate::durable_runtime::DurableInvocationDisposition::AwaitingResume { .. } => {
+            "durable_awaiting_resume"
+        }
+        crate::durable_runtime::DurableInvocationDisposition::Execute => "durable_state_error",
+        crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(_) => {
+            unreachable!("terminal receipts use recovery closure protocol")
+        }
+        crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(_) => {
+            unreachable!("terminal audit retries do not open a RunStarted lifecycle")
+        }
+    };
+    let (replay, prepared_audit) = match durable_run_stopped_replay(
+        cfg,
+        crate::durable_runtime::DurableRunStoppedAuditKind::Direct,
+        crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: stopped_turns,
+            reason: closure_reason.into(),
+            usage,
+        },
+        stopped_turns,
+        closure_reason,
+    ) {
+        Ok(replay) => replay,
+        Err(error) => {
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_commit_failure",
+            );
+            return deltas;
+        }
+    };
+    let mut audit_closed = match cfg.audit.emit_prepared(prepared_audit) {
+        Ok(()) => true,
+        Err(error) => {
+            deltas.push(StreamDelta::from_error(&error));
+            false
+        }
+    };
+    if let Some(durable) = cfg.durable.as_ref() {
+        let lifecycle_result = if audit_closed {
+            durable.complete_invocation_lifecycle_with_replay(
+                &lifecycle.activity_id,
+                lifecycle.attempt,
+                &replay,
+            )
+        } else {
+            durable.fail_invocation_lifecycle(&lifecycle.activity_id, lifecycle.attempt)
+        };
+        if let Err(error) = lifecycle_result {
+            let error = crate::error::AikitError::from(error);
+            deltas.push(StreamDelta::from_error(&error));
+            audit_closed = false;
+        }
+    }
+
+    match disposition {
+        crate::durable_runtime::DurableInvocationDisposition::ReconcileRequired { reason } => {
+            let error = crate::error::AikitError::Conflict(format!(
+                "durable run requires explicit reconciliation: {reason}"
+            ));
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_reconciliation_required",
+            );
+        }
+        crate::durable_runtime::DurableInvocationDisposition::AlreadyTerminal {
+            status,
+            reason,
+        } => {
+            let (recorded_status, fallback_reason) = match status {
+                crate::durability::DurableRunStatus::Completed => (
+                    crate::session::RunTerminalStatus::Completed,
+                    "durable_already_completed",
+                ),
+                crate::durability::DurableRunStatus::Failed => (
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_already_failed",
+                ),
+                crate::durability::DurableRunStatus::Cancelled => (
+                    crate::session::RunTerminalStatus::Cancelled,
+                    "durable_already_cancelled",
+                ),
+                crate::durability::DurableRunStatus::Running
+                | crate::durability::DurableRunStatus::Paused
+                | crate::durability::DurableRunStatus::ReconcileRequired => {
+                    unreachable!("only terminal durable statuses are classified as terminal")
+                }
+            };
+            cfg.recorder.complete(
+                usage,
+                if audit_closed {
+                    recorded_status
+                } else {
+                    crate::session::RunTerminalStatus::Failed
+                },
+                if audit_closed {
+                    reason.unwrap_or_else(|| fallback_reason.into())
+                } else {
+                    "audit_failure".into()
+                },
+            );
+        }
+        crate::durable_runtime::DurableInvocationDisposition::AwaitingResume { reason } => {
+            let detail = reason
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let error = crate::error::AikitError::Conflict(format!(
+                "durable run became paused and requires an explicit resume{detail}"
+            ));
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_awaiting_resume",
+            );
+        }
+        crate::durable_runtime::DurableInvocationDisposition::Execute => {
+            let error = crate::error::AikitError::Conflict(
+                "durable activity boundary did not resolve to a safe disposition".into(),
+            );
+            deltas.push(StreamDelta::from_error(&error));
+            cfg.recorder.complete(
+                usage,
+                crate::session::RunTerminalStatus::Failed,
+                "durable_state_error",
+            );
+        }
+        crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(_) => {
+            unreachable!("terminal receipts use recovery closure protocol")
+        }
+        crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(_) => {
+            unreachable!("terminal audit retries do not open a RunStarted lifecycle")
+        }
+    }
+    deltas
+}
+
+fn recorded_terminal_status(reason: &str) -> crate::session::RunTerminalStatus {
+    match reason {
+        "end_turn" | "stop" => crate::session::RunTerminalStatus::Completed,
+        "budget_exceeded" | "budget_configuration_error" => {
+            crate::session::RunTerminalStatus::BudgetExceeded
+        }
+        "max_turns" => crate::session::RunTerminalStatus::MaxTurns,
+        "approval_interrupted" | "cancelled" => crate::session::RunTerminalStatus::Cancelled,
+        _ => crate::session::RunTerminalStatus::Failed,
+    }
 }
 
 // Provider `max_tokens` is a request hint, not a trustworthy memory boundary. Keep enough room
@@ -499,20 +1122,347 @@ pub fn run_agent(
         use crate::governance::{Authorization, AuthorizationContext};
         use crate::observability::AuditEvent;
 
+        // Every returned stream owns a coherent invocation outcome, including failures that occur
+        // before audit identity is allocated or RunStarted is emitted.
+        cfg.recorder.begin(cfg.messages.clone());
+
+        // A cloned in-process driver may back several independently-created configs. Claim it
+        // before preparing audit identity so a losing sibling emits neither RunStarted nor hooks.
+        let _durable_invocation_claim = if let Some(durable) = cfg.durable.as_ref() {
+            match durable.claim_invocation() {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    let error = crate::error::AikitError::from(error);
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        Usage::default(),
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_invocation_already_active",
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // Invocation-local identity and human approval state: cloned options may run concurrently,
         // but neither audit sequence nor AllowTool grants can bleed into a sibling invocation.
         cfg.prepare_invocation();
+        // High-level fallback wiring may have prepared this config earlier. Revalidate the durable
+        // disposition at the last boundary before RunStarted so a receipt committed in between
+        // turns this invocation into terminal-only recovery instead of opening an unmatched span.
+        if cfg.invocation_error.is_none() {
+            if let Some(durable) = &cfg.durable {
+                match durable.invocation_disposition() {
+                    Ok(disposition) => {
+                        match &disposition {
+                            crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(
+                                replay,
+                            ) => {
+                                match cfg.audit.for_terminal_replay(
+                                    replay.audit_run_id.clone(),
+                                    replay.invocation_id.clone(),
+                                    replay.run_stopped_sequence,
+                                    &replay.audit_binding,
+                                ) {
+                                    Ok(audit) => cfg.audit = audit,
+                                    Err(error) => cfg.invocation_error = Some(error),
+                                }
+                            }
+                            crate::durable_runtime::DurableInvocationDisposition::Execute => {
+                                match durable.run_id() {
+                                    Ok(run_id)
+                                        if cfg.audit.run_id() == run_id
+                                            && cfg.audit.invocation_id().is_some() => {}
+                                    Ok(_) => {
+                                        cfg.invocation_error = Some(
+                                            crate::error::AikitError::Configuration(
+                                                "durable audit identity changed before RunStarted"
+                                                    .into(),
+                                            ),
+                                        );
+                                    }
+                                    Err(error) => cfg.invocation_error = Some(error.into()),
+                                }
+                            }
+                            _ => {}
+                        }
+                        cfg.durable_invocation = Some(disposition);
+                    }
+                    Err(error) => cfg.invocation_error = Some(error.into()),
+                }
+            }
+        }
+        if let Some(error) = cfg.invocation_error.take() {
+            yield StreamDelta::from_error(&error);
+            cfg.recorder.complete(
+                Usage::default(),
+                crate::session::RunTerminalStatus::Failed,
+                "durable_invocation_preflight_failed",
+            );
+            return;
+        }
+        match cfg
+            .durable_invocation
+            .take()
+            .unwrap_or(crate::durable_runtime::DurableInvocationDisposition::Execute)
+        {
+            crate::durable_runtime::DurableInvocationDisposition::Execute => {}
+            crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(replay) => {
+                for delta in retry_reconciled_terminal_audit(&cfg, replay) {
+                    yield delta;
+                }
+                return;
+            }
+            crate::durable_runtime::DurableInvocationDisposition::AwaitingResume { reason } => {
+                let detail = reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default();
+                let error = crate::error::AikitError::Conflict(format!(
+                    "durable run is paused and requires an explicit resume{detail}"
+                ));
+                yield StreamDelta::from_error(&error);
+                cfg.recorder.complete(
+                    Usage::default(),
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_awaiting_resume",
+                );
+                return;
+            }
+            crate::durable_runtime::DurableInvocationDisposition::ReconcileRequired { reason } => {
+                let error = crate::error::AikitError::Conflict(format!(
+                    "durable run requires explicit reconciliation: {reason}"
+                ));
+                yield StreamDelta::from_error(&error);
+                cfg.recorder.complete(
+                    Usage::default(),
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_reconciliation_required",
+                );
+                return;
+            }
+            crate::durable_runtime::DurableInvocationDisposition::AlreadyTerminal {
+                status,
+                reason,
+            } => {
+                let (recorded_status, fallback_reason) = match status {
+                    crate::durability::DurableRunStatus::Completed => (
+                        crate::session::RunTerminalStatus::Completed,
+                        "durable_already_completed",
+                    ),
+                    crate::durability::DurableRunStatus::Failed => (
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_already_failed",
+                    ),
+                    crate::durability::DurableRunStatus::Cancelled => (
+                        crate::session::RunTerminalStatus::Cancelled,
+                        "durable_already_cancelled",
+                    ),
+                    crate::durability::DurableRunStatus::Running
+                    | crate::durability::DurableRunStatus::Paused
+                    | crate::durability::DurableRunStatus::ReconcileRequired => unreachable!(
+                        "only terminal durable statuses are classified as already terminal"
+                    ),
+                };
+                cfg.recorder.complete(
+                    Usage::default(),
+                    recorded_status,
+                    reason.unwrap_or_else(|| fallback_reason.into()),
+                );
+                return;
+            }
+            crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(receipt) => {
+                let Some(durable) = cfg.durable.as_ref() else {
+                    let error = crate::error::AikitError::Configuration(
+                        "durable terminal receipt exists without a durable driver".into(),
+                    );
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        receipt.usage,
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_commit_failure",
+                    );
+                    return;
+                };
+                if let Err(error) = persist_durable_terminal(durable, &receipt) {
+                    let error = crate::error::AikitError::from(error);
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        receipt.usage,
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_commit_failure",
+                    );
+                } else {
+                    let status = recorded_terminal_status(&receipt.reason);
+                    cfg.recorder
+                        .complete(receipt.usage, status, receipt.reason);
+                }
+                return;
+            }
+        }
+
+        // Persist an invocation-level fence before RunStarted can reach an external sink. The
+        // fence remains running until the matching RunStopped is accepted, so any later CAS or
+        // audit double-fault remains visible to restart even when a narrower recovery marker could
+        // not be written.
+        let durable_invocation_lifecycle = if let Some(durable) = cfg.durable.as_ref() {
+            let Some(invocation_id) = cfg.audit.invocation_id().map(str::to_string) else {
+                let error = crate::error::AikitError::Configuration(
+                    "durable invocation is missing its audit invocation identity".into(),
+                );
+                yield StreamDelta::from_error(&error);
+                cfg.recorder.complete(
+                    Usage::default(),
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_invocation_preflight_failed",
+                );
+                return;
+            };
+            let lifecycle = match durable.begin_invocation_lifecycle(&invocation_id) {
+                Ok(crate::durable_runtime::DurableActivity::Execute {
+                    activity_id,
+                    attempt,
+                    ..
+                }) => DurableInvocationLifecycleAttempt {
+                    invocation_id,
+                    activity_id,
+                    attempt,
+                },
+                Ok(crate::durable_runtime::DurableActivity::ReuseCompleted { .. }) => {
+                    let error = crate::error::AikitError::Conflict(
+                        "durable invocation lifecycle identity was unexpectedly reused".into(),
+                    );
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        Usage::default(),
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_invocation_preflight_failed",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let error = crate::error::AikitError::from(error);
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        Usage::default(),
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_invocation_preflight_failed",
+                    );
+                    return;
+                }
+            };
+
+            // Close the last cross-process race between the initial classification and fence CAS.
+            // A receipt written by an older runtime is finalized without opening an audit span.
+            match durable
+                .invocation_disposition_for_active_lifecycle(&lifecycle.invocation_id)
+            {
+                Ok(crate::durable_runtime::DurableInvocationDisposition::Execute) => {}
+                Ok(crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(receipt)) => {
+                    if let Err(error) = durable.complete_unstarted_invocation_lifecycle(
+                        &lifecycle.activity_id,
+                        lifecycle.attempt,
+                    ) {
+                        let error = crate::error::AikitError::from(error);
+                        yield StreamDelta::from_error(&error);
+                        cfg.recorder.complete(
+                            receipt.usage,
+                            crate::session::RunTerminalStatus::Failed,
+                            "durable_commit_failure",
+                        );
+                        return;
+                    }
+                    if let Err(error) = persist_durable_terminal(durable, &receipt) {
+                        let error = crate::error::AikitError::from(error);
+                        yield StreamDelta::from_error(&error);
+                        cfg.recorder.complete(
+                            receipt.usage,
+                            crate::session::RunTerminalStatus::Failed,
+                            "durable_commit_failure",
+                        );
+                    } else {
+                        cfg.recorder.complete(
+                            receipt.usage,
+                            recorded_terminal_status(&receipt.reason),
+                            receipt.reason,
+                        );
+                    }
+                    return;
+                }
+                Ok(disposition) => {
+                    // RunStarted has not been attempted, so this fence can be closed
+                    // non-ambiguously even when the concurrent state change itself requires
+                    // reconciliation or an explicit resume.
+                    if let Err(error) = durable.complete_unstarted_invocation_lifecycle(
+                        &lifecycle.activity_id,
+                        lifecycle.attempt,
+                    ) {
+                        let error = crate::error::AikitError::from(error);
+                        yield StreamDelta::from_error(&error);
+                        cfg.recorder.complete(
+                            Usage::default(),
+                            crate::session::RunTerminalStatus::Failed,
+                            "durable_commit_failure",
+                        );
+                        return;
+                    }
+                    let reason = match disposition {
+                        crate::durable_runtime::DurableInvocationDisposition::AwaitingResume { .. } => {
+                            "durable_awaiting_resume"
+                        }
+                        crate::durable_runtime::DurableInvocationDisposition::ReconcileRequired { .. } => {
+                            "durable_reconciliation_required"
+                        }
+                        crate::durable_runtime::DurableInvocationDisposition::AlreadyTerminal { .. } => {
+                            "durable_already_terminal"
+                        }
+                        crate::durable_runtime::DurableInvocationDisposition::RetryTerminalAudit(_) => {
+                            "durable_terminal_audit_retry_required"
+                        }
+                        crate::durable_runtime::DurableInvocationDisposition::Execute
+                        | crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(_) => {
+                            unreachable!("handled above")
+                        }
+                    };
+                    let error = crate::error::AikitError::Conflict(format!(
+                        "durable invocation changed state before RunStarted: {reason}"
+                    ));
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        Usage::default(),
+                        crate::session::RunTerminalStatus::Failed,
+                        reason,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let error = crate::error::AikitError::from(error);
+                    yield StreamDelta::from_error(&error);
+                    cfg.recorder.complete(
+                        Usage::default(),
+                        crate::session::RunTerminalStatus::Failed,
+                        "durable_invocation_preflight_failed",
+                    );
+                    return;
+                }
+            }
+            Some(lifecycle)
+        } else {
+            None
+        };
+
         let run_id = cfg.audit.run_id().to_string();
         let validator_result = compile_tool_validators(&cfg.tools);
         let mut tool_validators = HashMap::new();
         let advertised_tools: HashSet<String> = cfg.tools.iter().map(|tool| tool.name.clone()).collect();
-        cfg.recorder.begin(cfg.messages.clone());
         let mut turn = 0usize;
         let mut total_usage = Usage::default();
         let mut terminal_reason = "end_turn".to_string();
         let mut budget = None;
         let mut can_run = true;
         let mut budget_error_emitted = false;
+        let mut durable_boundary_stop = None;
         let retained_token_hint = cfg.max_tokens.saturating_mul(
             u64::try_from(cfg.max_turns.max(1)).unwrap_or(u64::MAX),
         );
@@ -524,6 +1474,18 @@ pub fn run_agent(
             terminal_reason = "audit_failure".into();
             can_run = false;
             yield StreamDelta::from_error(&error);
+            if let (Some(durable), Some(lifecycle)) =
+                (cfg.durable.as_ref(), durable_invocation_lifecycle.as_ref())
+            {
+                if let Err(commit_error) = durable.fail_invocation_lifecycle(
+                    &lifecycle.activity_id,
+                    lifecycle.attempt,
+                ) {
+                    terminal_reason = "durable_commit_failure".into();
+                    let commit_error = crate::error::AikitError::from(commit_error);
+                    yield StreamDelta::from_error(&commit_error);
+                }
+            }
         }
 
         if can_run {
@@ -710,20 +1672,103 @@ pub fn run_agent(
                 compatibility_mode: cfg.compatibility_mode,
             };
 
-            let provider_result = tokio::select! {
-                biased;
-                trigger = wait_for_termination(
-                    &cfg.cancellation,
-                    cfg.shared_wall_time_deadline,
-                ) => {
-                    terminal_reason = trigger.terminal_reason().into();
-                    break 'agent;
+            let mut durable_provider_attempt = None;
+            let reused_provider_deltas = if let Some(durable) = &cfg.durable {
+                match durable.begin_activity(
+                    &format!("provider-stream-v1:{}", provider.name()),
+                    &format!("turn-{turn}"),
+                    durable_provider_input(provider.name(), &req),
+                    crate::durability::SideEffectClass::ReconcileRequired,
+                    None,
+                ) {
+                    Ok(crate::durable_runtime::DurableActivity::Execute {
+                        activity_id,
+                        attempt,
+                        ..
+                    }) => {
+                        durable_provider_attempt = Some((activity_id, attempt));
+                        None
+                    }
+                    Ok(crate::durable_runtime::DurableActivity::ReuseCompleted {
+                        output,
+                        ..
+                    }) => match serde_json::from_value::<Vec<StreamDelta>>(output) {
+                        Ok(deltas) => Some(deltas),
+                        Err(error) => {
+                            terminal_reason = "durable_state_error".into();
+                            let error = crate::error::AikitError::Conflict(format!(
+                                "recorded provider activity output is invalid: {error}"
+                            ));
+                            yield StreamDelta::from_error(&error);
+                            break 'agent;
+                        }
+                    },
+                    Err(error) => {
+                        match resolve_durable_activity_boundary(
+                            durable,
+                            error,
+                            durable_invocation_lifecycle
+                                .as_ref()
+                                .map(|lifecycle| lifecycle.invocation_id.as_str()),
+                        ) {
+                            Ok(disposition) => {
+                                durable_boundary_stop = Some(disposition);
+                                break 'agent;
+                            }
+                            Err(error) => {
+                                terminal_reason = "durable_state_error".into();
+                                yield StreamDelta::from_error(&error);
+                                break 'agent;
+                            }
+                        }
+                    }
                 }
-                result = provider.stream(req) => result,
+            } else {
+                None
             };
-            let mut inner = match provider_result {
-                Ok(s) => s,
-                Err(e) => {
+
+            let mut inner = if let Some(deltas) = reused_provider_deltas {
+                futures::stream::iter(deltas).boxed()
+            } else {
+                let provider_result = tokio::select! {
+                    biased;
+                    trigger = wait_for_termination(
+                        &cfg.cancellation,
+                        cfg.shared_wall_time_deadline,
+                    ) => {
+                        terminal_reason = trigger.terminal_reason().into();
+                        if let Err(error) = finalize_ambiguous_durable_activity(
+                            cfg.durable.as_ref(),
+                            durable_provider_attempt.as_ref(),
+                            "provider dispatch was cancelled before its outcome was committed",
+                        ) {
+                            terminal_reason = "durable_commit_failure".into();
+                            yield StreamDelta::from_error(&error);
+                        }
+                        break 'agent;
+                    }
+                    result = provider.stream(req) => result,
+                };
+                match provider_result {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        if let (Some(durable), Some((activity_id, attempt))) =
+                            (&cfg.durable, durable_provider_attempt.as_ref())
+                        {
+                            let safe_error = e.info().message;
+                            if let Err(error) = durable.fail_activity(
+                                activity_id,
+                                *attempt,
+                                safe_error,
+                                false,
+                                true,
+                            ) {
+                                terminal_reason = "durable_commit_failure".into();
+                                let error = crate::error::AikitError::from(error);
+                                yield StreamDelta::from_error(&error);
+                                break 'agent;
+                            }
+                        }
                     let public_error = e.info().message;
                     let failure = run_failure_hooks(
                         &cfg.governance.hooks,
@@ -749,6 +1794,7 @@ pub fn run_agent(
                     };
                     yield StreamDelta::error_with_info(failure.message, info);
                     break 'agent;
+                    }
                 }
             };
 
@@ -766,6 +1812,9 @@ pub fn run_agent(
             // state, redacted_thinking). Dropping them breaks extended-thinking + tool-use loops.
             let mut reasoning: Vec<(String, Option<String>, Option<serde_json::Value>)> = Vec::new();
             let mut citations: Vec<(String, Option<String>, Option<serde_json::Value>)> = Vec::new();
+            let mut durable_provider_deltas = durable_provider_attempt
+                .as_ref()
+                .map(|_| Vec::<StreamDelta>::new());
             loop {
                 let next_delta = tokio::select! {
                     biased;
@@ -774,6 +1823,14 @@ pub fn run_agent(
                         cfg.shared_wall_time_deadline,
                     ) => {
                         terminal_reason = trigger.terminal_reason().into();
+                        if let Err(error) = finalize_ambiguous_durable_activity(
+                            cfg.durable.as_ref(),
+                            durable_provider_attempt.as_ref(),
+                            "provider stream was cancelled before its outcome was committed",
+                        ) {
+                            terminal_reason = "durable_commit_failure".into();
+                            yield StreamDelta::from_error(&error);
+                        }
                         break 'agent;
                     }
                     delta = inner.next() => delta,
@@ -781,6 +1838,9 @@ pub fn run_agent(
                 let Some(delta) = next_delta else {
                     break;
                 };
+                if let Some(deltas) = &mut durable_provider_deltas {
+                    deltas.push(delta.clone());
+                }
                 if let Err(message) = retained_output.charge_delta(&delta) {
                     let info = crate::error::ErrorInfo::new(
                         crate::error::ErrorCode::ProviderProtocol,
@@ -872,6 +1932,42 @@ pub fn run_agent(
                     stream_error = Some((error.to_string(), error.info()));
                     yield StreamDelta::from_error(&error);
                     break;
+                }
+            }
+
+            if let (Some(durable), Some((activity_id, attempt))) =
+                (&cfg.durable, durable_provider_attempt.as_ref())
+            {
+                let durable_result = if stream_error.is_some() {
+                    let safe_message = stream_error
+                        .as_ref()
+                        .map(|(_, info)| info.message.clone())
+                        .unwrap_or_else(|| "provider stream failed".into());
+                    durable
+                        .fail_activity(activity_id, *attempt, safe_message, false, true)
+                        .map(|_| ())
+                        .map_err(crate::error::AikitError::from)
+                } else {
+                    serde_json::to_value(
+                        durable_provider_deltas
+                            .as_ref()
+                            .expect("executing durable provider records output"),
+                    )
+                        .map_err(|error| {
+                            crate::error::AikitError::Conflict(format!(
+                                "provider activity output cannot be serialized: {error}"
+                            ))
+                        })
+                        .and_then(|output| {
+                            durable
+                                .complete_activity(activity_id, *attempt, output)
+                                .map_err(crate::error::AikitError::from)
+                        })
+                };
+                if let Err(error) = durable_result {
+                    terminal_reason = "durable_commit_failure".into();
+                    yield StreamDelta::from_error(&error);
+                    break 'agent;
                 }
             }
 
@@ -1332,134 +2428,323 @@ pub fn run_agent(
                             terminal_reason = "audit_failure".into();
                             yield StreamDelta::from_error(&error);
                             break 'agent;
-                        } else if let Err(error) = cfg.audit.emit(AuditEvent::ToolStarted {
-                            turn,
-                            tool_use_id: call.id.clone(),
-                            tool: call.name.clone(),
-                            input: cfg.audit.capture_value(&effective),
-                        }) {
-                            terminal_reason = "audit_failure".into();
-                            yield StreamDelta::from_error(&error);
-                            break 'agent;
                         } else {
-                            if let Some(trigger) = current_termination(
-                                &cfg.cancellation,
-                                cfg.shared_wall_time_deadline,
-                            ) {
-                                terminal_reason = trigger.terminal_reason().into();
-                                break 'agent;
-                            }
-                            let started = Instant::now();
-                            let execution = tokio::select! {
-                                biased;
-                                trigger = wait_for_termination(
-                                    &cfg.cancellation,
-                                    cfg.shared_wall_time_deadline,
-                                ) => {
-                                    terminal_reason = trigger.terminal_reason().into();
-                                    break 'agent;
-                                }
-                                result = executor.execute(&call.name, effective.clone()) => result,
-                            };
-                            match execution {
-                                Ok(raw_output) => {
-                                    let output_was_oversized =
-                                        raw_output.len() > MAX_SINGLE_TOOL_RESULT_BYTES;
-                                    let raw_output = if output_was_oversized {
-                                        format!(
-                                            "tool '{}' output exceeded {} bytes and was discarded",
-                                            call.name, MAX_SINGLE_TOOL_RESULT_BYTES
-                                        )
-                                    } else {
-                                        raw_output
-                                    };
-                                    let duration_ms = started.elapsed().as_millis();
-                                    let post = tokio::select! {
-                                        biased;
-                                        trigger = wait_for_termination(
-                                            &cfg.cancellation,
-                                            cfg.shared_wall_time_deadline,
-                                        ) => {
-                                            terminal_reason = trigger.terminal_reason().into();
-                                            break 'agent;
-                                        }
-                                        post = cfg.governance.hooks.run_post_tool_use(PostToolUseContext {
-                                            run_id: run_id.clone(),
-                                            turn,
-                                            tool_use_id: call.id.clone(),
-                                            tool: call.name.clone(),
-                                            input: effective.clone(),
-                                            output: raw_output.clone(),
-                                            duration_ms,
-                                        }) => post,
-                                    };
-                                    if let Err(error) = cfg.audit.emit(AuditEvent::HookCompleted {
-                                        turn,
-                                        phase: "post_tool_use".into(),
-                                        tool: Some(call.name.clone()),
-                                        outcome: match &post {
-                                            PostToolOutcome::Continue => "continue",
-                                            PostToolOutcome::RewriteOutput(_) => "rewrite_output",
-                                            PostToolOutcome::MarkError(_) => "mark_error",
-                                        }.into(),
-                                    }) {
-                                        // The tool side effect already completed. Fail closed and
-                                        // never advance to another tool or model turn.
-                                        terminal_reason = "audit_failure".into();
-                                        yield StreamDelta::from_error(&error);
-                                        break 'agent;
+                            let mut durable_tool_attempt = None;
+                            let reused_tool_output = if let Some(durable) = &cfg.durable {
+                                match durable.begin_activity(
+                                    &format!("tool-v1:{}", call.name),
+                                    &format!("turn-{turn}:{}", call.id),
+                                    durable_hashed_input(&serde_json::json!({
+                                        "tool": &call.name,
+                                        "input": &effective,
+                                    })),
+                                    crate::durability::SideEffectClass::ReconcileRequired,
+                                    None,
+                                ) {
+                                    Ok(crate::durable_runtime::DurableActivity::Execute {
+                                        activity_id,
+                                        attempt,
+                                        ..
+                                    }) => {
+                                        durable_tool_attempt = Some((activity_id, attempt));
+                                        None
                                     }
-                                    match post {
-                                        PostToolOutcome::Continue => {
-                                            (raw_output, output_was_oversized, Some(effective))
-                                        }
-                                        PostToolOutcome::RewriteOutput(output) => {
-                                            (output, false, Some(effective))
-                                        }
-                                        PostToolOutcome::MarkError(error) => {
-                                            let failure = run_failure_hooks(
-                                                &cfg.governance.hooks,
-                                                &cfg.audit,
-                                                FailureContext {
-                                                    run_id: run_id.clone(),
-                                                    turn,
-                                                    stage: FailureStage::PostToolUse,
-                                                    tool_use_id: Some(call.id.clone()),
-                                                    tool: Some(call.name.clone()),
-                                                    error,
-                                                },
-                                                false,
-                                            ).await;
-                                            if let Some(error) = failure.audit_error {
-                                                terminal_reason = "audit_failure".into();
+                                    Ok(crate::durable_runtime::DurableActivity::ReuseCompleted {
+                                        output,
+                                        ..
+                                    }) => {
+                                        match serde_json::from_value::<DurableToolOutput>(output) {
+                                            Ok(output) => Some(output),
+                                            Err(error) => {
+                                                terminal_reason = "durable_state_error".into();
+                                                let error = crate::error::AikitError::Conflict(
+                                                    format!(
+                                                        "recorded tool activity output is invalid: {error}"
+                                                    ),
+                                                );
                                                 yield StreamDelta::from_error(&error);
                                                 break 'agent;
                                             }
-                                            (failure.message, true, Some(effective))
+                                        }
+                                    }
+                                    Err(error) => {
+                                        match resolve_durable_activity_boundary(
+                                            durable,
+                                            error,
+                                            durable_invocation_lifecycle
+                                                .as_ref()
+                                                .map(|lifecycle| lifecycle.invocation_id.as_str()),
+                                        ) {
+                                            Ok(disposition) => {
+                                                durable_boundary_stop = Some(disposition);
+                                                break 'agent;
+                                            }
+                                            Err(error) => {
+                                                terminal_reason = "durable_state_error".into();
+                                                yield StreamDelta::from_error(&error);
+                                                break 'agent;
+                                            }
                                         }
                                     }
                                 }
-                                Err(error) => {
-                                    let failure = run_failure_hooks(
-                                        &cfg.governance.hooks,
-                                        &cfg.audit,
-                                        FailureContext {
-                                            run_id: run_id.clone(),
+                            } else {
+                                None
+                            };
+
+                            if let Err(error) = cfg.audit.emit(AuditEvent::ToolStarted {
+                                turn,
+                                tool_use_id: call.id.clone(),
+                                tool: call.name.clone(),
+                                input: cfg.audit.capture_value(&effective),
+                            }) {
+                                terminal_reason = "audit_failure".into();
+                                if let Err(commit_error) = fail_unstarted_durable_activity(
+                                    cfg.durable.as_ref(),
+                                    durable_tool_attempt.as_ref(),
+                                    "tool start audit failed before execution",
+                                ) {
+                                    terminal_reason = "durable_commit_failure".into();
+                                    yield StreamDelta::from_error(&commit_error);
+                                }
+                                yield StreamDelta::from_error(&error);
+                                break 'agent;
+                            }
+
+                            if let Some(output) = reused_tool_output {
+                                (output.content, output.is_error, Some(effective))
+                            } else {
+                                if let Some(trigger) = current_termination(
+                                    &cfg.cancellation,
+                                    cfg.shared_wall_time_deadline,
+                                ) {
+                                    terminal_reason = trigger.terminal_reason().into();
+                                    if let Err(error) = finalize_ambiguous_durable_activity(
+                                        cfg.durable.as_ref(),
+                                        durable_tool_attempt.as_ref(),
+                                        "tool dispatch was cancelled before execution completed",
+                                    ) {
+                                        terminal_reason = "durable_commit_failure".into();
+                                        yield StreamDelta::from_error(&error);
+                                    }
+                                    break 'agent;
+                                }
+                                let started = Instant::now();
+                                let execution = tokio::select! {
+                                    biased;
+                                    trigger = wait_for_termination(
+                                        &cfg.cancellation,
+                                        cfg.shared_wall_time_deadline,
+                                    ) => {
+                                        terminal_reason = trigger.terminal_reason().into();
+                                        if let Err(error) = finalize_ambiguous_durable_activity(
+                                            cfg.durable.as_ref(),
+                                            durable_tool_attempt.as_ref(),
+                                            "tool execution was cancelled before its outcome was committed",
+                                        ) {
+                                            terminal_reason = "durable_commit_failure".into();
+                                            yield StreamDelta::from_error(&error);
+                                        }
+                                        break 'agent;
+                                    }
+                                    result = executor.execute(&call.name, effective.clone()) => result,
+                                };
+                                let result = match execution {
+                                    Ok(raw_output) => {
+                                        let output_was_oversized =
+                                            raw_output.len() > MAX_SINGLE_TOOL_RESULT_BYTES;
+                                        let raw_output = if output_was_oversized {
+                                            format!(
+                                                "tool '{}' output exceeded {} bytes and was discarded",
+                                                call.name, MAX_SINGLE_TOOL_RESULT_BYTES
+                                            )
+                                        } else {
+                                            raw_output
+                                        };
+                                        let duration_ms = started.elapsed().as_millis();
+                                        let post = tokio::select! {
+                                            biased;
+                                            trigger = wait_for_termination(
+                                                &cfg.cancellation,
+                                                cfg.shared_wall_time_deadline,
+                                            ) => {
+                                                terminal_reason = trigger.terminal_reason().into();
+                                                if let Err(error) = finalize_ambiguous_durable_activity(
+                                                    cfg.durable.as_ref(),
+                                                    durable_tool_attempt.as_ref(),
+                                                    "tool post-processing was cancelled after dispatch",
+                                                ) {
+                                                    terminal_reason = "durable_commit_failure".into();
+                                                    yield StreamDelta::from_error(&error);
+                                                }
+                                                break 'agent;
+                                            }
+                                            post = cfg.governance.hooks.run_post_tool_use(PostToolUseContext {
+                                                run_id: run_id.clone(),
+                                                turn,
+                                                tool_use_id: call.id.clone(),
+                                                tool: call.name.clone(),
+                                                input: effective.clone(),
+                                                output: raw_output.clone(),
+                                                duration_ms,
+                                            }) => post,
+                                        };
+                                        if let Err(error) = cfg.audit.emit(AuditEvent::HookCompleted {
                                             turn,
-                                            stage: FailureStage::ToolExecution,
-                                            tool_use_id: Some(call.id.clone()),
+                                            phase: "post_tool_use".into(),
                                             tool: Some(call.name.clone()),
-                                            error: error.to_string(),
-                                        },
-                                        false,
-                                    ).await;
-                                    if let Some(error) = failure.audit_error {
-                                        terminal_reason = "audit_failure".into();
+                                            outcome: match &post {
+                                                PostToolOutcome::Continue => "continue",
+                                                PostToolOutcome::RewriteOutput(_) => "rewrite_output",
+                                                PostToolOutcome::MarkError(_) => "mark_error",
+                                            }.into(),
+                                        }) {
+                                            // The tool side effect already completed. Fail closed and
+                                            // never advance to another tool or model turn.
+                                            terminal_reason = "audit_failure".into();
+                                            if let Err(commit_error) =
+                                                finalize_ambiguous_durable_activity(
+                                                    cfg.durable.as_ref(),
+                                                    durable_tool_attempt.as_ref(),
+                                                    "tool audit failed after dispatch",
+                                                )
+                                            {
+                                                terminal_reason = "durable_commit_failure".into();
+                                                yield StreamDelta::from_error(&commit_error);
+                                            }
+                                            yield StreamDelta::from_error(&error);
+                                            break 'agent;
+                                        }
+                                        match post {
+                                            PostToolOutcome::Continue => {
+                                                (raw_output, output_was_oversized, Some(effective))
+                                            }
+                                            PostToolOutcome::RewriteOutput(output) => {
+                                                (output, false, Some(effective))
+                                            }
+                                            PostToolOutcome::MarkError(error) => {
+                                                let failure = run_failure_hooks(
+                                                    &cfg.governance.hooks,
+                                                    &cfg.audit,
+                                                    FailureContext {
+                                                        run_id: run_id.clone(),
+                                                        turn,
+                                                        stage: FailureStage::PostToolUse,
+                                                        tool_use_id: Some(call.id.clone()),
+                                                        tool: Some(call.name.clone()),
+                                                        error,
+                                                    },
+                                                    false,
+                                                ).await;
+                                                if let Some(error) = failure.audit_error {
+                                                    terminal_reason = "audit_failure".into();
+                                                    if let Err(commit_error) =
+                                                        finalize_ambiguous_durable_activity(
+                                                            cfg.durable.as_ref(),
+                                                            durable_tool_attempt.as_ref(),
+                                                            "tool failure audit failed after dispatch",
+                                                        )
+                                                    {
+                                                        terminal_reason =
+                                                            "durable_commit_failure".into();
+                                                        yield StreamDelta::from_error(&commit_error);
+                                                    }
+                                                    yield StreamDelta::from_error(&error);
+                                                    break 'agent;
+                                                }
+                                                (failure.message, true, Some(effective))
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let (Some(durable), Some((activity_id, attempt))) =
+                                            (&cfg.durable, durable_tool_attempt.as_ref())
+                                        {
+                                            if let Err(commit_error) = durable.fail_activity(
+                                                activity_id,
+                                                *attempt,
+                                                "tool execution failed after dispatch",
+                                                false,
+                                                true,
+                                            ) {
+                                                terminal_reason = "durable_commit_failure".into();
+                                                let commit_error =
+                                                    crate::error::AikitError::from(commit_error);
+                                                yield StreamDelta::from_error(&commit_error);
+                                                break 'agent;
+                                            }
+                                            terminal_reason =
+                                                "durable_reconciliation_required".into();
+                                            let error = crate::error::AikitError::Conflict(
+                                                format!(
+                                                    "tool '{}' may have produced an external effect; reconciliation is required",
+                                                    call.name
+                                                ),
+                                            );
+                                            yield StreamDelta::from_error(&error);
+                                            break 'agent;
+                                        }
+                                        let failure = run_failure_hooks(
+                                            &cfg.governance.hooks,
+                                            &cfg.audit,
+                                            FailureContext {
+                                                run_id: run_id.clone(),
+                                                turn,
+                                                stage: FailureStage::ToolExecution,
+                                                tool_use_id: Some(call.id.clone()),
+                                                tool: Some(call.name.clone()),
+                                                error: error.to_string(),
+                                            },
+                                            false,
+                                        ).await;
+                                        if let Some(error) = failure.audit_error {
+                                            terminal_reason = "audit_failure".into();
+                                            yield StreamDelta::from_error(&error);
+                                            break 'agent;
+                                        }
+                                        (failure.message, true, Some(effective))
+                                    }
+                                };
+
+                                if let (Some(durable), Some((activity_id, attempt))) =
+                                    (&cfg.durable, durable_tool_attempt.as_ref())
+                                {
+                                    let output = DurableToolOutput {
+                                        content: result.0.clone(),
+                                        is_error: result.1,
+                                    };
+                                    let output = match serde_json::to_value(output) {
+                                        Ok(output) => output,
+                                        Err(error) => {
+                                            terminal_reason = "durable_state_error".into();
+                                            if let Err(commit_error) =
+                                                finalize_ambiguous_durable_activity(
+                                                    cfg.durable.as_ref(),
+                                                    durable_tool_attempt.as_ref(),
+                                                    "tool output serialization failed after dispatch",
+                                                )
+                                            {
+                                                terminal_reason = "durable_commit_failure".into();
+                                                yield StreamDelta::from_error(&commit_error);
+                                            }
+                                            let error = crate::error::AikitError::Conflict(
+                                                format!(
+                                                    "tool activity output cannot be serialized: {error}"
+                                                ),
+                                            );
+                                            yield StreamDelta::from_error(&error);
+                                            break 'agent;
+                                        }
+                                    };
+                                    if let Err(error) =
+                                        durable.complete_activity(activity_id, *attempt, output)
+                                    {
+                                        terminal_reason = "durable_commit_failure".into();
+                                        let error = crate::error::AikitError::from(error);
                                         yield StreamDelta::from_error(&error);
                                         break 'agent;
                                     }
-                                    (failure.message, true, Some(effective))
                                 }
+                                result
                             }
                         }
                     }
@@ -1520,6 +2805,47 @@ pub fn run_agent(
         }
         }
 
+        if let Some(disposition) = durable_boundary_stop {
+            let stopped_turns = turn.min(cfg.max_turns);
+            let Some(lifecycle) = durable_invocation_lifecycle.as_ref() else {
+                let error = crate::error::AikitError::Conflict(
+                    "durable activity boundary has no persisted invocation lifecycle fence"
+                        .into(),
+                );
+                yield StreamDelta::from_error(&error);
+                cfg.recorder.complete(
+                    total_usage,
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_commit_failure",
+                );
+                return;
+            };
+            let disposition = match disposition {
+                crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(receipt) => {
+                    for delta in close_superseded_durable_invocation(
+                        &cfg,
+                        lifecycle,
+                        stopped_turns,
+                        receipt,
+                    ) {
+                        yield delta;
+                    }
+                    return;
+                }
+                disposition => disposition,
+            };
+            for delta in close_nonexecuting_durable_invocation(
+                &cfg,
+                lifecycle,
+                stopped_turns,
+                total_usage,
+                disposition,
+            ) {
+                yield delta;
+            }
+            return;
+        }
+
         if terminal_reason == "budget_exceeded" && !budget_error_emitted {
             let failure = run_failure_hooks(
                 &cfg.governance.hooks,
@@ -1564,24 +2890,211 @@ pub fn run_agent(
             terminal_reason = "hook_failure".into();
             yield StreamDelta::from_error(&error);
         }
-        if let Err(error) = cfg.audit.emit(AuditEvent::RunStopped {
-            turns: turn.min(cfg.max_turns),
+        let stopped_turns = turn.min(cfg.max_turns);
+        let terminal_receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: stopped_turns,
+            reason: terminal_reason.clone(),
+            usage: total_usage,
+        };
+        let mut durable_terminal_ready = terminal_reason != "durable_commit_failure";
+
+        if let Some(durable) = &cfg.durable {
+            let Some(lifecycle) = durable_invocation_lifecycle.as_ref() else {
+                let error = crate::error::AikitError::Conflict(
+                    "durable RunStarted has no persisted invocation lifecycle fence".into(),
+                );
+                yield StreamDelta::from_error(&error);
+                cfg.recorder.complete(
+                    total_usage,
+                    crate::session::RunTerminalStatus::Failed,
+                    "durable_commit_failure",
+                );
+                return;
+            };
+            if durable.is_poisoned() {
+                terminal_reason = "durable_commit_failure".into();
+                durable_terminal_ready = false;
+            }
+            let already_reconciling = matches!(
+                durable.snapshot(),
+                Ok(state)
+                    if state.status()
+                        == crate::durability::DurableRunStatus::ReconcileRequired
+            );
+            if !durable_terminal_ready || already_reconciling {
+                // An earlier ambiguous effect or durable commit error prevents terminal state.
+                // Still make a best-effort direct RunStopped delivery so accepting sinks do not
+                // retain an unmatched RunStarted. The open/ambiguous lifecycle fence remains the
+                // durable authority that forces reconciliation after any partial fan-out.
+                durable_terminal_ready = false;
+                if let Err(error) = cfg.audit.emit(AuditEvent::RunStopped {
+                    turns: stopped_turns,
+                    reason: terminal_reason.clone(),
+                }) {
+                    terminal_reason = "audit_failure".into();
+                    yield StreamDelta::from_error(&error);
+                }
+            }
+            if durable_terminal_ready {
+                let (replay, prepared_audit) = match durable_run_stopped_replay(
+                    &cfg,
+                    crate::durable_runtime::DurableRunStoppedAuditKind::Canonical,
+                    terminal_receipt.clone(),
+                    stopped_turns,
+                    terminal_reason.clone(),
+                ) {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        terminal_reason = "durable_commit_failure".into();
+                        yield StreamDelta::from_error(&error);
+                        if let Err(audit_error) = cfg.audit.emit(AuditEvent::RunStopped {
+                            turns: stopped_turns,
+                            reason: terminal_reason.clone(),
+                        }) {
+                            terminal_reason = "audit_failure".into();
+                            yield StreamDelta::from_error(&audit_error);
+                        }
+                        cfg.recorder.complete(
+                            total_usage,
+                            crate::session::RunTerminalStatus::Failed,
+                            terminal_reason.clone(),
+                        );
+                        return;
+                    }
+                };
+                match durable.begin_invocation_run_stopped_audit(&replay) {
+                    Ok(crate::durable_runtime::DurableActivity::Execute {
+                        activity_id,
+                        attempt,
+                        ..
+                    }) => {
+                        match cfg.audit.emit_prepared(prepared_audit) {
+                            Ok(()) => {
+                                if let Err(error) = durable
+                                    .complete_run_stopped_audit_and_invocation_lifecycle(
+                                        &activity_id,
+                                        attempt,
+                                        &lifecycle.activity_id,
+                                        lifecycle.attempt,
+                                        &replay,
+                                    )
+                                {
+                                    durable_terminal_ready = false;
+                                    terminal_reason = "durable_commit_failure".into();
+                                    let error = crate::error::AikitError::from(error);
+                                    yield StreamDelta::from_error(&error);
+                                }
+                            }
+                            Err(error) => {
+                                durable_terminal_ready = false;
+                                terminal_reason = "audit_failure".into();
+                                yield StreamDelta::from_error(&error);
+                                if let Err(error) = durable
+                                    .fail_run_stopped_audit_and_invocation_lifecycle(
+                                        &activity_id,
+                                        attempt,
+                                        &lifecycle.activity_id,
+                                        lifecycle.attempt,
+                                    )
+                                {
+                                    terminal_reason = "durable_commit_failure".into();
+                                    let error = crate::error::AikitError::from(error);
+                                    yield StreamDelta::from_error(&error);
+                                }
+                            }
+                        }
+                    }
+                    Ok(crate::durable_runtime::DurableActivity::ReuseCompleted { output, .. }) => {
+                        match serde_json::from_value::<
+                            crate::durable_runtime::DurableRunStoppedReceipt,
+                        >(output) {
+                            Ok(receipt) => {
+                                for delta in close_superseded_durable_invocation(
+                                    &cfg,
+                                    lifecycle,
+                                    stopped_turns,
+                                    receipt,
+                                ) {
+                                    yield delta;
+                                }
+                            }
+                            Err(error) => {
+                                let error = crate::error::AikitError::Conflict(format!(
+                                    "persisted RunStopped receipt is invalid: {error}"
+                                ));
+                                yield StreamDelta::from_error(&error);
+                                if let Err(audit_error) = cfg.audit.emit(AuditEvent::RunStopped {
+                                    turns: stopped_turns,
+                                    reason: "durable_commit_failure".into(),
+                                }) {
+                                    yield StreamDelta::from_error(&audit_error);
+                                }
+                                cfg.recorder.complete(
+                                    total_usage,
+                                    crate::session::RunTerminalStatus::Failed,
+                                    "durable_commit_failure",
+                                );
+                            }
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        match resolve_durable_activity_boundary(
+                            durable,
+                            error,
+                            durable_invocation_lifecycle
+                                .as_ref()
+                                .map(|lifecycle| lifecycle.invocation_id.as_str()),
+                        ) {
+                            Ok(crate::durable_runtime::DurableInvocationDisposition::FinalizeTerminal(receipt)) => {
+                                for delta in close_superseded_durable_invocation(
+                                    &cfg,
+                                    lifecycle,
+                                    stopped_turns,
+                                    receipt,
+                                ) {
+                                    yield delta;
+                                }
+                                return;
+                            }
+                            Ok(disposition) => {
+                                for delta in close_nonexecuting_durable_invocation(
+                                    &cfg,
+                                    lifecycle,
+                                    stopped_turns,
+                                    total_usage,
+                                    disposition,
+                                ) {
+                                    yield delta;
+                                }
+                                return;
+                            }
+                            Err(error) => {
+                                durable_terminal_ready = false;
+                                terminal_reason = "durable_commit_failure".into();
+                                yield StreamDelta::from_error(&error);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if durable_terminal_ready {
+                let durable_result = persist_durable_terminal(durable, &terminal_receipt);
+                if let Err(error) = durable_result {
+                    terminal_reason = "durable_commit_failure".into();
+                    let error = crate::error::AikitError::from(error);
+                    yield StreamDelta::from_error(&error);
+                }
+            }
+        } else if let Err(error) = cfg.audit.emit(AuditEvent::RunStopped {
+            turns: stopped_turns,
             reason: terminal_reason.clone(),
         }) {
             terminal_reason = "audit_failure".into();
             yield StreamDelta::from_error(&error);
         }
-        let status = match terminal_reason.as_str() {
-            "end_turn" | "stop" => crate::session::RunTerminalStatus::Completed,
-            "budget_exceeded" | "budget_configuration_error" => {
-                crate::session::RunTerminalStatus::BudgetExceeded
-            }
-            "max_turns" => crate::session::RunTerminalStatus::MaxTurns,
-            "approval_interrupted" | "cancelled" => {
-                crate::session::RunTerminalStatus::Cancelled
-            }
-            _ => crate::session::RunTerminalStatus::Failed,
-        };
+        let status = recorded_terminal_status(&terminal_reason);
         cfg.recorder
             .complete(total_usage, status, terminal_reason);
     }
@@ -1590,6 +3103,7 @@ pub fn run_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable_store::DurableStore as _;
     use crate::providers::{Provider, ProviderRequest};
     use crate::tools::ToolExecutor;
     use crate::types::ToolSpec;
@@ -1673,6 +3187,1713 @@ mod tests {
         }
     }
 
+    struct CountingStopProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingStopProvider {
+        fn name(&self) -> &str {
+            "counting-stop"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart {
+                    model: "durable-model".into(),
+                },
+                StreamDelta::TextDelta {
+                    text: "done".into(),
+                },
+                StreamDelta::MessageStop {
+                    stop_reason: "end_turn".into(),
+                },
+            ])))
+        }
+    }
+
+    struct CountingToolProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingToolProvider {
+        fn name(&self) -> &str {
+            "counting-tool"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamDelta::MessageStart {
+                    model: "durable-model".into(),
+                },
+                StreamDelta::ToolCallStart {
+                    id: "call-1".into(),
+                    name: "write".into(),
+                },
+                StreamDelta::ToolCallInput {
+                    id: "call-1".into(),
+                    input: serde_json::json!({"value": 1}),
+                },
+                StreamDelta::MessageStop {
+                    stop_reason: "tool_use".into(),
+                },
+            ])))
+        }
+    }
+
+    struct BlockingProvider {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for BlockingProvider {
+        fn name(&self) -> &str {
+            "blocking-provider"
+        }
+
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> crate::error::Result<BoxStream<'static, StreamDelta>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            futures::future::pending().await
+        }
+    }
+
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingTool {
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+        ) -> crate::error::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(crate::error::AikitError::ToolExecution(
+                    "uncertain external write".into(),
+                ))
+            } else {
+                Ok("written".into())
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TerminalReceiptTrigger {
+        RunStarted,
+        PermissionDecision,
+    }
+
+    impl TerminalReceiptTrigger {
+        fn matches(self, event: &crate::observability::AuditEvent) -> bool {
+            matches!(
+                (self, event),
+                (
+                    Self::RunStarted,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                ) | (
+                    Self::PermissionDecision,
+                    crate::observability::AuditEvent::PermissionDecision { .. }
+                )
+            )
+        }
+    }
+
+    struct CommitTerminalReceiptOnAuditEvent {
+        records: Arc<crate::observability::InMemoryAuditSink>,
+        driver: crate::durable_runtime::DurableRunDriver,
+        receipt: crate::durable_runtime::DurableRunStoppedReceipt,
+        audit_binding: crate::observability::AuditReplayBinding,
+        trigger: TerminalReceiptTrigger,
+        committed: AtomicBool,
+    }
+
+    fn test_replay_binding(
+        sink_count: usize,
+        failure_mode: crate::observability::AuditFailureMode,
+    ) -> crate::observability::AuditReplayBinding {
+        crate::observability::AuditReplayBinding {
+            schema_version: 1,
+            delivery_id: None,
+            sink_count,
+            payload_policy: crate::observability::AuditPayloadPolicy::MetadataOnly,
+            failure_mode,
+            max_preview_bytes: 4096,
+        }
+    }
+
+    impl crate::observability::AuditSink for CommitTerminalReceiptOnAuditEvent {
+        fn record(
+            &self,
+            record: &crate::observability::AuditRecord,
+        ) -> std::result::Result<(), String> {
+            crate::observability::AuditSink::record(self.records.as_ref(), record)?;
+            if self.trigger.matches(&record.event) && !self.committed.swap(true, Ordering::SeqCst) {
+                let replay = crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope::new(
+                    crate::durable_runtime::DurableRunStoppedAuditKind::Canonical,
+                    self.receipt.clone(),
+                    record.run_id.clone(),
+                    record.effective_invocation_id(),
+                    record.sequence.saturating_add(1),
+                    self.receipt.turns,
+                    self.receipt.reason.clone(),
+                    self.audit_binding.clone(),
+                );
+                let activity = self
+                    .driver
+                    .begin_invocation_run_stopped_audit(&replay)
+                    .map_err(|error| error.to_string())?;
+                let crate::durable_runtime::DurableActivity::Execute {
+                    activity_id,
+                    attempt,
+                    ..
+                } = activity
+                else {
+                    return Err("terminal receipt injection unexpectedly reused an activity".into());
+                };
+                crate::observability::AuditSink::record(
+                    self.records.as_ref(),
+                    &crate::observability::AuditRecord {
+                        run_id: record.run_id.clone(),
+                        invocation_id: record.invocation_id.clone(),
+                        parent_run_id: record.parent_run_id.clone(),
+                        run_label: record.run_label.clone(),
+                        sequence: replay.run_stopped_sequence,
+                        unix_ms: record.unix_ms,
+                        event: crate::observability::AuditEvent::RunStopped {
+                            turns: self.receipt.turns,
+                            reason: self.receipt.reason.clone(),
+                        },
+                    },
+                )?;
+                self.driver
+                    .complete_activity(
+                        &activity_id,
+                        attempt,
+                        serde_json::to_value(&self.receipt).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    struct FailNthCasStore {
+        inner: crate::durable_store::InMemoryDurableStore,
+        fail_at: usize,
+        calls: AtomicUsize,
+    }
+
+    impl FailNthCasStore {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                inner: crate::durable_store::InMemoryDurableStore::default(),
+                fail_at,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::durable_store::DurableStore for FailNthCasStore {
+        fn create(
+            &self,
+            state: &crate::durability::RunState,
+        ) -> crate::durable_store::DurableStoreResult<()> {
+            self.inner.create(state)
+        }
+
+        fn load(
+            &self,
+            run_id: &str,
+        ) -> crate::durable_store::DurableStoreResult<crate::durability::RunState> {
+            self.inner.load(run_id)
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+        ) -> crate::durable_store::DurableStoreResult<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_at {
+                return Err(crate::durable_store::DurableStoreError::Io(
+                    "planned CAS failure".into(),
+                ));
+            }
+            self.inner.compare_and_swap(expected_sequence, replacement)
+        }
+    }
+
+    fn durable_tool_spec() -> ToolSpec {
+        ToolSpec {
+            name: "write".into(),
+            description: "write an external value".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"]
+            }),
+        }
+    }
+
+    async fn drain(stream: impl Stream<Item = StreamDelta>) -> Vec<StreamDelta> {
+        futures::pin_mut!(stream);
+        let mut deltas = Vec::new();
+        while let Some(delta) = stream.next().await {
+            deltas.push(delta);
+        }
+        deltas
+    }
+
+    #[tokio::test]
+    async fn durable_run_id_is_the_runtime_and_audit_identity() {
+        let audit_sink = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::durability::RunState::new(
+            "session",
+            "authoritative-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::durable_runtime::DurableRunDriver::new(state, store.clone()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit_sink.clone());
+
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let records = audit_sink.records();
+        assert!(!records.is_empty());
+        assert!(records
+            .iter()
+            .all(|record| record.run_id == "authoritative-run"));
+        let stored = store.load("authoritative-run").unwrap();
+        assert_eq!(
+            stored.status(),
+            crate::durability::DurableRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_is_not_called_when_pre_side_effect_cas_fails() {
+        // The invocation lifecycle fence is CAS 1; fail provider scheduling at CAS 2.
+        let store = Arc::new(FailNthCasStore::new(2));
+        let state = crate::durability::RunState::new(
+            "session",
+            "provider-cas-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_run(state, store.clone())
+            .unwrap();
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Conflict
+        )));
+        let lifecycle = audit
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+        assert!(matches!(
+            &lifecycle[1].event,
+            crate::observability::AuditEvent::RunStopped { reason, .. }
+                if reason == "durable_commit_failure"
+        ));
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Failed
+        );
+        assert_eq!(
+            outcome.stop_reason.as_deref(),
+            Some("durable_commit_failure")
+        );
+        assert_eq!(
+            store.load("provider-cas-run").unwrap().status(),
+            crate::DurableRunStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_run_started_and_failed_fence_update_still_attempts_run_stopped() {
+        // CAS 1 opens the lifecycle fence. Fail CAS 2 while recording that RunStarted fan-out was
+        // ambiguous; the runtime must still attempt a direct matching RunStopped.
+        let store = Arc::new(FailNthCasStore::new(2));
+        let state = crate::RunState::new(
+            "session",
+            "run-started-fence-double-fault",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let accepted = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_run(state, store.clone())
+            .unwrap();
+        cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(accepted.clone())
+            .with_sink(Arc::new(FailOnAuditEvent("run_started")))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed);
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Audit
+        )));
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("planned CAS failure")
+        )));
+        let lifecycle = accepted
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+        assert!(matches!(
+            &lifecycle[1].event,
+            crate::observability::AuditEvent::RunStopped { reason, .. }
+                if reason == "durable_commit_failure"
+        ));
+        assert_eq!(
+            recorder.outcome().stop_reason.as_deref(),
+            Some("durable_commit_failure")
+        );
+        assert_eq!(
+            store
+                .load("run-started-fence-double-fault")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::Running
+        );
+
+        let restarted = crate::DurableRunDriver::new(
+            store.load("run-started-fence-double-fault").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        let retry_audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let mut retry_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        retry_cfg.audit = crate::observability::AuditTrail::new().with_sink(retry_audit.clone());
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            retry_cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(retry_audit.records().is_empty());
+        assert_eq!(
+            store
+                .load("run-started-fence-double-fault")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_is_not_called_when_its_pre_side_effect_cas_fails() {
+        // The lifecycle fence and provider start/completion consume CAS calls 1..=3.
+        let store = Arc::new(FailNthCasStore::new(4));
+        let state = crate::durability::RunState::new(
+            "session",
+            "tool-cas-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_run(state, store)
+            .unwrap();
+        cfg.tools = vec![durable_tool_spec()];
+
+        drain(run_agent(
+            Arc::new(CountingToolProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_provider_activity_is_reused_without_provider_execution() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::durability::RunState::new(
+            "session",
+            "provider-reuse-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::durable_runtime::DurableRunDriver::new(state, store.clone()).unwrap();
+        let cfg = RunConfig::new("durable-model", vec![Message::user("hello")]);
+        let req = ProviderRequest {
+            model: cfg.model.clone(),
+            messages: cfg.messages.clone(),
+            tools: cfg.tools.clone(),
+            max_tokens: cfg.max_tokens,
+            options: cfg.options.clone(),
+            provider_options: cfg.provider_options.clone(),
+            compatibility_mode: cfg.compatibility_mode,
+        };
+        let activity = driver
+            .begin_activity(
+                "provider-stream-v1:counting-stop",
+                "turn-1",
+                durable_provider_input("counting-stop", &req),
+                crate::durability::SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap();
+        let crate::durable_runtime::DurableActivity::Execute {
+            activity_id,
+            attempt,
+            ..
+        } = activity
+        else {
+            panic!("fresh provider activity must execute");
+        };
+        let recorded = vec![
+            StreamDelta::MessageStart {
+                model: "durable-model".into(),
+            },
+            StreamDelta::TextDelta {
+                text: "recorded".into(),
+            },
+            StreamDelta::MessageStop {
+                stop_reason: "end_turn".into(),
+            },
+        ];
+        driver
+            .complete_activity(
+                &activity_id,
+                attempt,
+                serde_json::to_value(&recorded).unwrap(),
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg.with_durable_driver(driver),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(deltas
+            .iter()
+            .any(|delta| matches!(delta, StreamDelta::TextDelta { text } if text == "recorded")));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_tool_failure_requires_reconciliation() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::durability::RunState::new(
+            "session",
+            "ambiguous-tool-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_run(state, store.clone())
+            .unwrap();
+        cfg.tools = vec![durable_tool_spec()];
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingToolProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: true,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("ambiguous-tool-run").unwrap().status(),
+            crate::durability::DurableRunStatus::ReconcileRequired
+        );
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("reconciliation")
+        )));
+    }
+
+    #[tokio::test]
+    async fn governed_durable_run_rejects_default_governance_before_provider_io() {
+        let policy = crate::governance::PolicySnapshot::seal(crate::governance::PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: crate::governance::PolicyEffect::Deny,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let bound = crate::governance::Governance::default().with_policy_snapshot(policy);
+        let state = bound
+            .start_durable_run(
+                "session",
+                "deny-default-bypass",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_run(
+                state,
+                Arc::new(crate::durable_store::InMemoryDurableStore::default()),
+            )
+            .unwrap();
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Configuration
+        )));
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Failed
+        );
+        assert_eq!(
+            outcome.stop_reason.as_deref(),
+            Some("durable_invocation_preflight_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_policy_tenant_or_agent_is_rejected_before_provider_io() {
+        let deny = crate::governance::PolicySnapshot::seal(crate::governance::PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: crate::governance::PolicyEffect::Deny,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let allow = crate::governance::PolicySnapshot::seal(crate::governance::PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: crate::governance::PolicyEffect::Allow,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let bound = crate::governance::Governance::default()
+            .with_policy_snapshot(deny.clone())
+            .with_policy_identity(Some("tenant-a".into()), Some("agent-a".into()));
+        let candidates = [
+            crate::governance::Governance::default()
+                .with_policy_snapshot(allow)
+                .with_policy_identity(Some("tenant-a".into()), Some("agent-a".into())),
+            crate::governance::Governance::default()
+                .with_policy_snapshot(deny.clone())
+                .with_policy_identity(Some("tenant-b".into()), Some("agent-a".into())),
+            crate::governance::Governance::default()
+                .with_policy_snapshot(deny)
+                .with_policy_identity(Some("tenant-a".into()), Some("agent-b".into())),
+        ];
+
+        for (index, governance) in candidates.into_iter().enumerate() {
+            let run_id = format!("identity-mismatch-{index}");
+            let state = bound
+                .start_durable_run("session", &run_id, crate::DurabilityMode::Sync)
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+                .with_durable_run(
+                    state,
+                    Arc::new(crate::durable_store::InMemoryDurableStore::default()),
+                )
+                .unwrap();
+            cfg.governance = governance;
+
+            drain(run_agent(
+                Arc::new(CountingStopProvider {
+                    calls: calls.clone(),
+                }),
+                Arc::new(EchoTool),
+                cfg,
+            ))
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "case {index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_completion_cas_failure_stays_resumable_and_reconciles_on_restart() {
+        // Lifecycle fence and provider start are CAS 1..=2; fail provider completion at CAS 3.
+        let store = Arc::new(FailNthCasStore::new(3));
+        let state = crate::RunState::new(
+            "session",
+            "provider-completion-cas",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            RunConfig::new("durable-model", vec![Message::user("hello")])
+                .with_durable_driver(driver.clone()),
+        ))
+        .await;
+
+        assert!(driver.is_poisoned());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("provider-completion-cas").unwrap().status(),
+            crate::DurableRunStatus::Running
+        );
+
+        let restarted = crate::DurableRunDriver::new(
+            store.load("provider-completion-cas").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            RunConfig::new("durable-model", vec![Message::user("hello")])
+                .with_durable_driver(restarted),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("provider-completion-cas").unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_retry_reuses_delivered_audit_without_rerunning_provider() {
+        // Lifecycle fence, provider start/completion, audit intent, and the atomic audit/fence
+        // completion are CAS calls 1..=5. Fail only terminal CAS after both receipts are persisted.
+        let store = Arc::new(FailNthCasStore::new(6));
+        let state =
+            crate::RunState::new("session", "terminal-cas-retry", crate::DurabilityMode::Sync)
+                .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver.clone());
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert!(driver.is_poisoned());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("terminal-cas-retry").unwrap().status(),
+            crate::DurableRunStatus::Running
+        );
+
+        let restarted =
+            crate::DurableRunDriver::new(store.load("terminal-cas-retry").unwrap(), store.clone())
+                .unwrap();
+        let audit_records_before_retry = audit.records();
+        let retry_recorder = crate::session::RunRecorder::default();
+        let mut restarted_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        restarted_cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        restarted_cfg.recorder = retry_recorder.clone();
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            restarted_cfg,
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("terminal-cas-retry").unwrap().status(),
+            crate::DurableRunStatus::Completed
+        );
+        assert_eq!(
+            retry_recorder.outcome().terminal_status,
+            crate::session::RunTerminalStatus::Completed
+        );
+        assert_eq!(
+            audit.records(),
+            audit_records_before_retry,
+            "receipt-only terminal retry must not open an unmatched audit invocation"
+        );
+        let lifecycle = audit_records_before_retry
+            .iter()
+            .filter_map(|record| match record.event {
+                crate::observability::AuditEvent::RunStarted { .. } => {
+                    Some(("started", record.effective_invocation_id().to_string()))
+                }
+                crate::observability::AuditEvent::RunStopped { .. } => {
+                    Some(("stopped", record.effective_invocation_id().to_string()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(lifecycle[0].0, "started");
+        assert_eq!(lifecycle[1].0, "stopped");
+        assert_eq!(lifecycle[0].1, lifecycle[1].1);
+        assert_eq!(
+            audit
+                .records()
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.event,
+                        crate::observability::AuditEvent::RunStopped { .. }
+                    )
+                })
+                .count(),
+            1,
+            "the persisted delivery receipt must suppress duplicate RunStopped delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_run_stopped_delivery_requires_reconciliation_before_restart_work() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "run-stopped-delivery-crash",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        assert!(matches!(
+            driver.begin_run_stopped_audit(&receipt).unwrap(),
+            crate::durable_runtime::DurableActivity::Execute { .. }
+        ));
+        drop(driver);
+
+        let restarted = crate::DurableRunDriver::new(
+            store.load("run-stopped-delivery-crash").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("explicit reconciliation")
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert!(audit.records().is_empty());
+        assert_eq!(
+            store.load("run-stopped-delivery-crash").unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn preprepared_execute_is_revalidated_before_run_started() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "preprepared-terminal-receipt",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver.clone());
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        cfg.prepare_invocation();
+        assert!(matches!(
+            cfg.durable_invocation.as_ref(),
+            Some(crate::durable_runtime::DurableInvocationDisposition::Execute)
+        ));
+
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let crate::durable_runtime::DurableActivity::Execute {
+            activity_id,
+            attempt,
+            ..
+        } = driver.begin_run_stopped_audit(&receipt).unwrap()
+        else {
+            panic!("fresh terminal audit intent must execute");
+        };
+        driver
+            .complete_run_stopped_audit(&activity_id, attempt, receipt)
+            .unwrap();
+
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(audit.records().is_empty());
+        assert_eq!(
+            store.load("preprepared-terminal-receipt").unwrap().status(),
+            crate::DurableRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_durable_run_waits_for_resume_without_audit_hooks_or_io() {
+        use crate::governance::hooks::{HookDispatcher, PromptHookOutcome};
+        use crate::governance::Governance;
+
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let mut state = crate::RunState::new(
+            "session",
+            "paused-awaiting-resume",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        state
+            .pause("operator-pause", "waiting for operator")
+            .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_hooks = Arc::new(AtomicUsize::new(0));
+        let stop_hooks = Arc::new(AtomicUsize::new(0));
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let recorder = crate::session::RunRecorder::default();
+
+        let mut hooks = HookDispatcher::new();
+        let prompt_hook_calls = prompt_hooks.clone();
+        hooks.on_user_prompt_submit(move |_| {
+            prompt_hook_calls.fetch_add(1, Ordering::SeqCst);
+            PromptHookOutcome::Continue
+        });
+        let stop_hook_calls = stop_hooks.clone();
+        hooks.on_stop(move |_| {
+            stop_hook_calls.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.tools = vec![durable_tool_spec()];
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        cfg.governance = Governance::new(Default::default(), hooks);
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. }
+                if message.contains("paused") && message.contains("explicit resume")
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prompt_hooks.load(Ordering::SeqCst), 0);
+        assert_eq!(stop_hooks.load(Ordering::SeqCst), 0);
+        assert!(audit.records().is_empty());
+        let stored = store.load("paused-awaiting-resume").unwrap();
+        assert_eq!(stored.status(), crate::DurableRunStatus::Paused);
+        assert_eq!(
+            stored.projection().pause_reason.as_deref(),
+            Some("waiting for operator")
+        );
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Failed
+        );
+        assert_eq!(
+            outcome.stop_reason.as_deref(),
+            Some("durable_awaiting_resume")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_driver_rejects_a_second_runtime_before_run_started() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "shared-driver-single-invocation",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store).unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+
+        let mut first_cfg = RunConfig::new("durable-model", vec![Message::user("first")])
+            .with_durable_driver(driver.clone());
+        first_cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        let cancel_first = first_cfg.cancellation.handle();
+        let first_provider = Arc::new(BlockingProvider {
+            calls: provider_calls.clone(),
+            started: started.clone(),
+        });
+        let first = tokio::spawn(async move {
+            drain(run_agent(first_provider, Arc::new(EchoTool), first_cfg)).await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("first provider should start");
+
+        let mut second_cfg = RunConfig::new("durable-model", vec![Message::user("second")])
+            .with_durable_driver(driver);
+        let second_recorder = crate::session::RunRecorder::default();
+        second_cfg.audit = crate::observability::AuditTrail::new().with_sink(audit.clone());
+        second_cfg.recorder = second_recorder.clone();
+        let second_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            second_cfg,
+        ))
+        .await;
+
+        assert!(second_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. }
+                if message.contains("another in-process invocation")
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let second_outcome = second_recorder.outcome();
+        assert_eq!(
+            second_outcome.terminal_status,
+            crate::session::RunTerminalStatus::Failed
+        );
+        assert_eq!(
+            second_outcome.stop_reason.as_deref(),
+            Some("durable_invocation_already_active")
+        );
+        assert_eq!(
+            audit
+                .records()
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                ))
+                .count(),
+            1,
+            "the rejected sibling must not open an audit lifecycle"
+        );
+
+        cancel_first.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), first)
+            .await
+            .expect("first invocation should stop after cancellation")
+            .unwrap();
+        let lifecycle = audit
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_committed_after_run_started_blocks_provider_and_closes_lifecycle() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "receipt-after-disposition",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 4,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let records = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let race_sink = Arc::new(CommitTerminalReceiptOnAuditEvent {
+            records: records.clone(),
+            driver: driver.clone(),
+            receipt,
+            audit_binding: test_replay_binding(
+                1,
+                crate::observability::AuditFailureMode::BestEffort,
+            ),
+            trigger: TerminalReceiptTrigger::RunStarted,
+            committed: AtomicBool::new(false),
+        });
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.tools = vec![durable_tool_spec()];
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(race_sink.clone());
+        cfg.recorder = recorder.clone();
+
+        drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(race_sink.committed.load(Ordering::SeqCst));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load("receipt-after-disposition").unwrap().status(),
+            crate::DurableRunStatus::Completed
+        );
+        let lifecycle = records
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert!(matches!(
+            lifecycle[0].event,
+            crate::observability::AuditEvent::RunStarted { .. }
+        ));
+        assert!(matches!(
+            &lifecycle[1].event,
+            crate::observability::AuditEvent::RunStopped { reason, .. }
+                if reason == "end_turn"
+        ));
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Completed
+        );
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn matching_canonical_receipt_skips_redundant_recovery_run_stopped() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "recovery-run-stopped-rejected",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let accepted = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let race_sink = Arc::new(CommitTerminalReceiptOnAuditEvent {
+            records: accepted.clone(),
+            driver: driver.clone(),
+            receipt,
+            audit_binding: test_replay_binding(
+                2,
+                crate::observability::AuditFailureMode::FailClosed,
+            ),
+            trigger: TerminalReceiptTrigger::RunStarted,
+            committed: AtomicBool::new(false),
+        });
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(race_sink)
+            .with_sink(Arc::new(FailOnAuditEvent("run_stopped")))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed);
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(!deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Audit
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .load("recovery-run-stopped-rejected")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::Completed
+        );
+        let outcome = recorder.outcome();
+        assert_eq!(
+            outcome.terminal_status,
+            crate::session::RunTerminalStatus::Completed
+        );
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        let lifecycle = accepted
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+
+        let restarted = crate::DurableRunDriver::new(
+            store.load("recovery-run-stopped-rejected").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        let retry_audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let mut retry_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        retry_cfg.audit = crate::observability::AuditTrail::new().with_sink(retry_audit.clone());
+        let retry_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            retry_cfg,
+        ))
+        .await;
+
+        assert!(retry_deltas.is_empty());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(retry_audit.records().is_empty());
+        assert_eq!(
+            store
+                .load("recovery-run-stopped-rejected")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_canonical_lifecycle_close_cas_failure_emits_no_extra_stop() {
+        // CAS 1 opens the invocation fence. The RunStarted race writes the canonical terminal
+        // intent/receipt at CAS 2/3. Fail CAS 4 while closing the matching lifecycle; the accepted
+        // canonical RunStopped remains the only stop event and restart must reconcile the fence.
+        let store = Arc::new(FailNthCasStore::new(4));
+        let state = crate::RunState::new(
+            "session",
+            "recovery-marker-and-audit-double-fault",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let accepted = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let race_sink = Arc::new(CommitTerminalReceiptOnAuditEvent {
+            records: accepted.clone(),
+            driver: driver.clone(),
+            receipt,
+            audit_binding: test_replay_binding(
+                2,
+                crate::observability::AuditFailureMode::FailClosed,
+            ),
+            trigger: TerminalReceiptTrigger::RunStarted,
+            committed: AtomicBool::new(false),
+        });
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let recorder = crate::session::RunRecorder::default();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(race_sink)
+            .with_sink(Arc::new(FailOnAuditEvent("run_stopped")))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed);
+        cfg.recorder = recorder.clone();
+
+        let deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("planned CAS failure")
+        )));
+        assert!(!deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Audit
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .load("recovery-marker-and-audit-double-fault")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::Running,
+            "the failed marker CAS must not terminalize from the older receipt"
+        );
+        assert_eq!(
+            recorder.outcome().stop_reason.as_deref(),
+            Some("durable_commit_failure")
+        );
+        let lifecycle = accepted
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert!(matches!(
+            lifecycle[0].event,
+            crate::observability::AuditEvent::RunStarted { .. }
+        ));
+        assert!(matches!(
+            &lifecycle[1].event,
+            crate::observability::AuditEvent::RunStopped { reason, .. }
+                if reason == "end_turn"
+        ));
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+
+        let restarted = crate::DurableRunDriver::new(
+            store
+                .load("recovery-marker-and-audit-double-fault")
+                .unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        let retry_audit = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let mut retry_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        retry_cfg.audit = crate::observability::AuditTrail::new().with_sink(retry_audit.clone());
+        let retry_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(EchoTool),
+            retry_cfg,
+        ))
+        .await;
+
+        assert!(retry_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("explicit reconciliation")
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert!(retry_audit.records().is_empty());
+        assert_eq!(
+            store
+                .load("recovery-marker-and-audit-double-fault")
+                .unwrap()
+                .status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_at_tool_boundary_never_emits_a_false_tool_start() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new(
+            "session",
+            "receipt-at-tool-boundary",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let records = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let race_sink = Arc::new(CommitTerminalReceiptOnAuditEvent {
+            records: records.clone(),
+            driver: driver.clone(),
+            receipt,
+            audit_binding: test_replay_binding(
+                1,
+                crate::observability::AuditFailureMode::BestEffort,
+            ),
+            trigger: TerminalReceiptTrigger::PermissionDecision,
+            committed: AtomicBool::new(false),
+        });
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.tools = vec![durable_tool_spec()];
+        cfg.audit = crate::observability::AuditTrail::new().with_sink(race_sink.clone());
+
+        drain(run_agent(
+            Arc::new(CountingToolProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(race_sink.committed.load(Ordering::SeqCst));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load("receipt-at-tool-boundary").unwrap().status(),
+            crate::DurableRunStatus::Completed
+        );
+        let records = records.records();
+        assert!(records.iter().any(|record| matches!(
+            record.event,
+            crate::observability::AuditEvent::PermissionDecision { .. }
+        )));
+        assert!(!records.iter().any(|record| matches!(
+            record.event,
+            crate::observability::AuditEvent::ToolStarted { .. }
+                | crate::observability::AuditEvent::ToolCompleted { .. }
+        )));
+        let lifecycle = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    crate::observability::AuditEvent::RunStarted { .. }
+                        | crate::observability::AuditEvent::RunStopped { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(
+            lifecycle[0].effective_invocation_id(),
+            lifecycle[1].effective_invocation_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_completion_cas_failure_does_not_rerun_provider_or_tool_after_restart() {
+        // Lifecycle fence, provider start/completion, and tool start are CAS 1..=4.
+        let store = Arc::new(FailNthCasStore::new(5));
+        let state = crate::RunState::new(
+            "session",
+            "tool-completion-cas",
+            crate::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver.clone());
+        cfg.tools = vec![durable_tool_spec()];
+
+        drain(run_agent(
+            Arc::new(CountingToolProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(driver.is_poisoned());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("tool-completion-cas").unwrap().status(),
+            crate::DurableRunStatus::Running
+        );
+
+        let restarted =
+            crate::DurableRunDriver::new(store.load("tool-completion-cas").unwrap(), store.clone())
+                .unwrap();
+        let mut restarted_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        restarted_cfg.tools = vec![durable_tool_spec()];
+        drain(run_agent(
+            Arc::new(CountingToolProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            restarted_cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("tool-completion-cas").unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_reconciles_started_provider_without_persisting_request_secrets() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state =
+            crate::RunState::new("session", "cancelled-provider", crate::DurabilityMode::Sync)
+                .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut cfg = RunConfig::new(
+            "durable-model",
+            vec![Message::user("credential sk-request-secret")],
+        )
+        .with_durable_driver(driver);
+        cfg.options
+            .insert("api_key".into(), serde_json::json!("sk-option-secret"));
+        let cancellation = cfg.cancellation.handle();
+        let observer_store = store.clone();
+        let observer_started = started.clone();
+        let observer = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                observer_started.notified(),
+            )
+            .await
+            .expect("provider should start");
+            let running = observer_store.load("cancelled-provider").unwrap();
+            let serialized = serde_json::to_string(&running).unwrap();
+            assert!(!serialized.contains("sk-request-secret"));
+            assert!(!serialized.contains("sk-option-secret"));
+            assert!(serialized.contains("input_hash"));
+            cancellation.cancel();
+        });
+
+        drain(run_agent(
+            Arc::new(BlockingProvider {
+                calls: calls.clone(),
+                started,
+            }),
+            Arc::new(EchoTool),
+            cfg,
+        ))
+        .await;
+        observer.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("cancelled-provider").unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+    }
+
     struct StartupFailureProvider;
 
     #[async_trait]
@@ -1728,6 +4949,7 @@ mod tests {
             record: &crate::observability::AuditRecord,
         ) -> std::result::Result<(), String> {
             let matches = match (&record.event, self.0) {
+                (crate::observability::AuditEvent::RunStarted { .. }, "run_started") => true,
                 (crate::observability::AuditEvent::Usage { .. }, "usage") => true,
                 (crate::observability::AuditEvent::HookCompleted { phase, .. }, "post_hook") => {
                     phase == "post_tool_use"
@@ -2339,6 +5561,7 @@ mod tests {
         let stop_reasons = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let audit_sink = Arc::new(InMemoryAuditSink::default());
         let recorder = crate::session::RunRecorder::default();
+        let durable_store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
 
         let mut hooks = HookDispatcher::new();
         let seen_failures = failure_calls.clone();
@@ -2362,24 +5585,49 @@ mod tests {
             calls: executor_calls.clone(),
             last_input: Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
         });
-        let mut cfg = RunConfig::new("m", vec![Message::user("hi")]);
-        cfg.tools = vec![advertised("Bash")];
-        cfg.audit = AuditTrail::new().with_sink(audit_sink.clone());
-        cfg.recorder = recorder.clone();
-        cfg.governance = Governance::new(
+        let policy = crate::governance::PolicySnapshot::seal(crate::governance::PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: crate::governance::PolicyEffect::Allow,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let governance = Governance::new(
             PermissionEngine::with_rules(
                 PermissionMode::Allow,
                 vec![Rule::ask("Bash").named("ask-bash")],
             ),
             hooks,
         )
-        .with_approver(Arc::new(RuntimeApprover {
-            decision: ApprovalDecision::Deny {
-                message: "operator stopped the run".into(),
-                interrupt: true,
-            },
-            calls: approval_calls.clone(),
-        }));
+        .with_policy_snapshot(policy);
+        let durable_state = governance
+            .start_durable_run(
+                "session",
+                "approval-interrupted",
+                crate::durability::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let durable_driver =
+            crate::durable_runtime::DurableRunDriver::new(durable_state, durable_store.clone())
+                .unwrap();
+        let governance = governance
+            .with_persisted_durable_driver_approver(
+                Arc::new(RuntimeApprover {
+                    decision: ApprovalDecision::Deny {
+                        message: "operator stopped the run".into(),
+                        interrupt: true,
+                    },
+                    calls: approval_calls.clone(),
+                }),
+                &durable_driver,
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let mut cfg =
+            RunConfig::new("m", vec![Message::user("hi")]).with_durable_driver(durable_driver);
+        cfg.tools = vec![advertised("Bash")];
+        cfg.audit = AuditTrail::new().with_sink(audit_sink.clone());
+        cfg.recorder = recorder.clone();
+        cfg.governance = governance;
 
         let stream = run_agent(provider, executor, cfg);
         futures::pin_mut!(stream);
@@ -2412,13 +5660,17 @@ mod tests {
         let outcome = recorder.outcome();
         assert_eq!(outcome.terminal_status, RunTerminalStatus::Cancelled);
         assert_eq!(outcome.stop_reason.as_deref(), Some("approval_interrupted"));
+        assert_eq!(
+            durable_store.load("approval-interrupted").unwrap().status(),
+            crate::durability::DurableRunStatus::Cancelled
+        );
 
         let records = audit_sink.records();
         assert!(records.iter().any(|record| matches!(
             &record.event,
             AuditEvent::PermissionDecision { decision, source, .. }
                 if decision == "ask_denied_interrupt"
-                    && source == "human_approval:ask-bash"
+                    && source.contains("human_approval:ask-bash")
         )));
         assert!(records.iter().any(|record| matches!(
             &record.event,
@@ -2431,6 +5683,130 @@ mod tests {
         assert!(!records
             .iter()
             .any(|record| matches!(record.event, AuditEvent::ToolStarted { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_worker_governed_ask_keeps_the_fence_and_executes_once() {
+        use crate::durable_worker::{DurableWorker, DurableWorkerConfig, DurableWorkerOutcome};
+        use crate::governance::hooks::HookDispatcher;
+        use crate::governance::permissions::{PermissionEngine, PermissionMode, Rule};
+        use crate::governance::{ApprovalDecision, Governance};
+
+        let run_id = "worker-governed-ask";
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let provider_requests = Arc::new(AtomicUsize::new(0));
+        let approval_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(CountingSingleToolProvider {
+            tool: "Bash".into(),
+            input: serde_json::json!({ "command": "git status" }),
+            requests: provider_requests.clone(),
+        });
+        let executor: Arc<dyn ToolExecutor> = Arc::new(RecordingExecutor {
+            calls: executor_calls.clone(),
+            last_input: Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+        });
+        let policy = crate::governance::PolicySnapshot::seal(crate::governance::PolicyDocument {
+            schema_version: crate::governance::GOVERNANCE_CONTRACT_VERSION,
+            default_effect: crate::governance::PolicyEffect::Allow,
+            rules: Vec::new(),
+        })
+        .unwrap();
+        let governance = Governance::new(
+            PermissionEngine::with_rules(
+                PermissionMode::Allow,
+                vec![Rule::ask("Bash").named("ask-bash")],
+            ),
+            HookDispatcher::new(),
+        )
+        .with_policy_snapshot(policy);
+        let state = governance
+            .start_durable_run("session", run_id, crate::durability::DurabilityMode::Sync)
+            .unwrap();
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        store.create(&state).unwrap();
+        let worker = DurableWorker::new(
+            store.clone(),
+            DurableWorkerConfig::new("governed-worker").unwrap(),
+        )
+        .unwrap();
+        let callback_calls = approval_calls.clone();
+
+        let outcome = worker
+            .run(
+                run_id,
+                crate::cancellation::CancellationToken::new(),
+                move |driver, cancellation| async move {
+                    let governance = governance
+                        .with_persisted_durable_driver_approver(
+                            Arc::new(RuntimeApprover {
+                                decision: ApprovalDecision::allow(None),
+                                calls: callback_calls,
+                            }),
+                            &driver,
+                            std::time::Duration::from_secs(1),
+                        )
+                        .unwrap();
+                    let mut cfg = RunConfig::new("m", vec![Message::user("hi")])
+                        .with_durable_driver(driver.clone());
+                    cfg.tools = vec![advertised("Bash")];
+                    cfg.governance = governance;
+                    cfg.cancellation = cancellation;
+
+                    let stream = run_agent(provider, executor, cfg);
+                    futures::pin_mut!(stream);
+                    let mut errors = Vec::new();
+                    while let Some(delta) = stream.next().await {
+                        if let StreamDelta::Error { message, .. } = delta {
+                            errors.push(message);
+                        }
+                    }
+                    assert!(errors.is_empty(), "unexpected runtime errors: {errors:?}");
+                    assert!(!driver.is_poisoned());
+                    driver.snapshot().unwrap().status()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DurableWorkerOutcome::Executed {
+                value: crate::durability::DurableRunStatus::Completed,
+                ..
+            }
+        ));
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_requests.load(Ordering::SeqCst), 2);
+
+        let persisted = store.load(run_id).unwrap();
+        assert_eq!(
+            persisted.status(),
+            crate::durability::DurableRunStatus::Completed
+        );
+        assert!(persisted.worker_lease().is_none());
+        assert_eq!(
+            persisted
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    crate::durability::RunEventKind::ApprovalRequested { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            persisted
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    crate::durability::RunEventKind::ApprovalResolved { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2889,8 +6265,17 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_run_stopped_audit_cannot_record_completed() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::durability::RunState::new(
+            "session",
+            "rejected-run-stopped",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
         let recorder = crate::session::RunRecorder::default();
-        let mut cfg = RunConfig::new("mock-1", vec![Message::user("hi")]);
+        let mut cfg = RunConfig::new("mock-1", vec![Message::user("hi")])
+            .with_durable_run(state, store.clone())
+            .unwrap();
         cfg.audit = fail_closed_on("run_stopped");
         cfg.recorder = recorder.clone();
         let stream = run_agent(
@@ -2915,6 +6300,468 @@ mod tests {
             crate::session::RunTerminalStatus::Failed
         );
         assert_eq!(outcome.stop_reason.as_deref(), Some("audit_failure"));
+        assert_eq!(
+            store.load("rejected-run-stopped").unwrap().status(),
+            crate::durability::DurableRunStatus::ReconcileRequired,
+            "a rejected or partially delivered audit record must never leave durable success"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_run_stopped_fanout_is_not_retried_after_restart() {
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::durability::RunState::new(
+            "session",
+            "partial-run-stopped",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let audit = crate::observability::AuditTrail::new()
+            .with_sink(accepted.clone())
+            .with_sink(Arc::new(FailOnAuditEvent("run_stopped")))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed);
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.tools = vec![durable_tool_spec()];
+        cfg.audit = audit.clone();
+
+        drain(run_agent(
+            Arc::new(CountingSingleToolProvider {
+                tool: "write".into(),
+                input: serde_json::json!({"value": 1}),
+                requests: provider_calls.clone(),
+            }),
+            Arc::new(RecordingExecutor {
+                calls: tool_calls.clone(),
+                last_input: Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load("partial-run-stopped").unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+        let records_after_partial_delivery = accepted.records();
+        assert_eq!(
+            records_after_partial_delivery
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.event,
+                        crate::observability::AuditEvent::RunStarted { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            records_after_partial_delivery
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.event,
+                        crate::observability::AuditEvent::RunStopped { .. }
+                    )
+                })
+                .count(),
+            1,
+            "the first sink accepted RunStopped before the second sink rejected it"
+        );
+
+        let restarted =
+            crate::DurableRunDriver::new(store.load("partial-run-stopped").unwrap(), store.clone())
+                .unwrap();
+        let retry_recorder = crate::session::RunRecorder::default();
+        let mut retry_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        retry_cfg.tools = vec![durable_tool_spec()];
+        retry_cfg.audit = audit;
+        retry_cfg.recorder = retry_recorder.clone();
+        let retry_deltas = drain(run_agent(
+            Arc::new(CountingSingleToolProvider {
+                tool: "write".into(),
+                input: serde_json::json!({"value": 1}),
+                requests: provider_calls.clone(),
+            }),
+            Arc::new(RecordingExecutor {
+                calls: tool_calls.clone(),
+                last_input: Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+            }),
+            retry_cfg,
+        ))
+        .await;
+
+        assert!(retry_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("explicit reconciliation")
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(accepted.records(), records_after_partial_delivery);
+        assert_eq!(
+            retry_recorder.outcome().stop_reason.as_deref(),
+            Some("durable_reconciliation_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciled_run_stopped_replays_exact_terminal_event_only_after_resume() {
+        let run_id = "reconciled-terminal-audit-replay";
+        let delivery_id = "terminal-ledger-v1";
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new("session", run_id, crate::DurabilityMode::Sync).unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let unreached = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let initial_audit = crate::observability::AuditTrail::new()
+            .with_sink(Arc::new(FailOnAuditEvent("run_stopped")))
+            .with_sink(unreached.clone())
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let mut cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(driver);
+        cfg.audit = initial_audit;
+
+        let first_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            cfg,
+        ))
+        .await;
+
+        assert!(first_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Audit
+        )));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        let mut reconciled = store.load(run_id).unwrap();
+        assert_eq!(
+            reconciled.status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+        let expected_sequence = reconciled.events().last().map_or(0, |event| event.sequence);
+        let canonical = reconciled
+            .projection()
+            .activities
+            .values()
+            .find(|record| {
+                record.definition.stable_step_id
+                    == crate::durability::RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+            })
+            .cloned()
+            .expect("canonical terminal audit marker must exist");
+        let replay_value = canonical
+            .definition
+            .input
+            .get("replay")
+            .cloned()
+            .expect("typed replay envelope must be persisted");
+        let replay: crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope =
+            serde_json::from_value(replay_value.clone()).unwrap();
+        let lifecycle = reconciled
+            .projection()
+            .activities
+            .values()
+            .find(|record| {
+                record.definition.stable_step_id
+                    == crate::durability::RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+                    && record.definition.logical_key == replay.invocation_id
+            })
+            .cloned()
+            .expect("matching invocation lifecycle must exist");
+        reconciled
+            .reconcile_activity(
+                "terminal-audit-safe-to-retry",
+                &canonical.definition.activity_id,
+                crate::ActivityReconciliation::SafeToRetry,
+            )
+            .unwrap();
+        reconciled
+            .reconcile_activity(
+                "terminal-lifecycle-replay-authorized",
+                &lifecycle.definition.activity_id,
+                crate::ActivityReconciliation::Completed {
+                    output: serde_json::json!({
+                        "status": "terminal_replay_authorized",
+                        "replay": replay_value,
+                    }),
+                },
+            )
+            .unwrap();
+        assert_eq!(reconciled.status(), crate::DurableRunStatus::Paused);
+        store
+            .compare_and_swap(expected_sequence, &reconciled)
+            .unwrap();
+
+        let paused_sink = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let paused_cfg_audit = crate::observability::AuditTrail::new()
+            .with_sink(paused_sink.clone())
+            .with_sink(Arc::new(crate::observability::InMemoryAuditSink::default()))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        let paused_driver =
+            crate::DurableRunDriver::new(store.load(run_id).unwrap(), store.clone()).unwrap();
+        let mut paused_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(paused_driver);
+        paused_cfg.audit = paused_cfg_audit;
+        let paused_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            paused_cfg,
+        ))
+        .await;
+        assert!(paused_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("explicit resume")
+        )));
+        assert!(paused_sink.records().is_empty());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+
+        let mut resumed = store.load(run_id).unwrap();
+        let expected_sequence = resumed.events().last().map_or(0, |event| event.sequence);
+        resumed
+            .apply_command(crate::RunCommand::Resume {
+                command_id: "resume-terminal-audit-replay".into(),
+                approvals: Vec::new(),
+            })
+            .unwrap();
+        store.compare_and_swap(expected_sequence, &resumed).unwrap();
+
+        let replay_sink = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let replay_recorder = crate::session::RunRecorder::default();
+        let replay_driver =
+            crate::DurableRunDriver::new(store.load(run_id).unwrap(), store.clone()).unwrap();
+        let mut replay_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(replay_driver);
+        replay_cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(replay_sink.clone())
+            .with_sink(Arc::new(crate::observability::InMemoryAuditSink::default()))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        replay_cfg.recorder = replay_recorder.clone();
+        let replay_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            replay_cfg,
+        ))
+        .await;
+
+        assert!(replay_deltas.is_empty());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        let records = replay_sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, replay.audit_run_id);
+        assert_eq!(
+            records[0].invocation_id.as_deref(),
+            Some(replay.invocation_id.as_str())
+        );
+        assert_eq!(records[0].sequence, replay.run_stopped_sequence);
+        assert!(matches!(
+            &records[0].event,
+            crate::observability::AuditEvent::RunStopped { turns, reason }
+                if *turns == replay.audit_turns && reason == &replay.audit_reason
+        ));
+        assert_eq!(
+            store.load(run_id).unwrap().status(),
+            crate::DurableRunStatus::Completed
+        );
+        assert_eq!(
+            replay_recorder.outcome().terminal_status,
+            crate::session::RunTerminalStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_reconciled_terminal_replay_returns_to_reconciliation_without_blind_retry() {
+        let run_id = "partial-reconciled-terminal-replay";
+        let delivery_id = "partial-terminal-ledger-v1";
+        let store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let state = crate::RunState::new("session", run_id, crate::DurabilityMode::Sync).unwrap();
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let template = crate::observability::AuditTrail::new()
+            .with_sink(Arc::new(crate::observability::InMemoryAuditSink::default()))
+            .with_sink(Arc::new(crate::observability::InMemoryAuditSink::default()))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        let invocation_audit = template.for_run_id(run_id).unwrap();
+        let invocation_id = invocation_audit.invocation_id().unwrap().to_string();
+        let crate::durable_runtime::DurableActivity::Execute {
+            activity_id: lifecycle_id,
+            attempt: lifecycle_attempt,
+            ..
+        } = driver.begin_invocation_lifecycle(&invocation_id).unwrap()
+        else {
+            panic!("fresh invocation lifecycle must execute");
+        };
+        let receipt = crate::durable_runtime::DurableRunStoppedReceipt {
+            turns: 1,
+            reason: "end_turn".into(),
+            usage: Usage::default(),
+        };
+        let replay = crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope::new(
+            crate::durable_runtime::DurableRunStoppedAuditKind::Canonical,
+            receipt,
+            run_id,
+            invocation_id,
+            2,
+            1,
+            "end_turn",
+            template.replay_binding(),
+        );
+        let crate::durable_runtime::DurableActivity::Execute {
+            activity_id: audit_id,
+            attempt: audit_attempt,
+            ..
+        } = driver.begin_invocation_run_stopped_audit(&replay).unwrap()
+        else {
+            panic!("fresh canonical terminal marker must execute");
+        };
+        driver
+            .fail_run_stopped_audit_and_invocation_lifecycle(
+                &audit_id,
+                audit_attempt,
+                &lifecycle_id,
+                lifecycle_attempt,
+            )
+            .unwrap();
+
+        let mut reconciled = store.load(run_id).unwrap();
+        let expected_sequence = reconciled.events().last().map_or(0, |event| event.sequence);
+        reconciled
+            .reconcile_activity(
+                "partial-replay-safe-to-retry",
+                &audit_id,
+                crate::ActivityReconciliation::SafeToRetry,
+            )
+            .unwrap();
+        reconciled
+            .reconcile_activity(
+                "partial-replay-lifecycle-authorized",
+                &lifecycle_id,
+                crate::ActivityReconciliation::Completed {
+                    output: serde_json::json!({
+                        "status": "terminal_replay_authorized",
+                        "replay": replay,
+                    }),
+                },
+            )
+            .unwrap();
+        store
+            .compare_and_swap(expected_sequence, &reconciled)
+            .unwrap();
+        let mut resumed = store.load(run_id).unwrap();
+        let expected_sequence = resumed.events().last().map_or(0, |event| event.sequence);
+        resumed
+            .apply_command(crate::RunCommand::Resume {
+                command_id: "resume-partial-replay".into(),
+                approvals: Vec::new(),
+            })
+            .unwrap();
+        store.compare_and_swap(expected_sequence, &resumed).unwrap();
+
+        let accepted = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let replay_driver =
+            crate::DurableRunDriver::new(store.load(run_id).unwrap(), store.clone()).unwrap();
+        let mut replay_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(replay_driver);
+        replay_cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(accepted.clone())
+            .with_sink(Arc::new(FailOnAuditEvent("run_stopped")))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        let replay_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            replay_cfg,
+        ))
+        .await;
+
+        assert!(replay_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { info, .. }
+                if info.code == crate::error::ErrorCode::Audit
+        )));
+        assert_eq!(accepted.records().len(), 1);
+        assert!(matches!(
+            accepted.records()[0].event,
+            crate::observability::AuditEvent::RunStopped { .. }
+        ));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load(run_id).unwrap().status(),
+            crate::DurableRunStatus::ReconcileRequired
+        );
+
+        let retry_sink = Arc::new(crate::observability::InMemoryAuditSink::default());
+        let restarted =
+            crate::DurableRunDriver::new(store.load(run_id).unwrap(), store.clone()).unwrap();
+        let mut retry_cfg = RunConfig::new("durable-model", vec![Message::user("hello")])
+            .with_durable_driver(restarted);
+        retry_cfg.audit = crate::observability::AuditTrail::new()
+            .with_sink(retry_sink.clone())
+            .with_sink(Arc::new(crate::observability::InMemoryAuditSink::default()))
+            .with_failure_mode(crate::observability::AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id(delivery_id)
+            .unwrap();
+        let retry_deltas = drain(run_agent(
+            Arc::new(CountingStopProvider {
+                calls: provider_calls.clone(),
+            }),
+            Arc::new(CountingTool {
+                calls: tool_calls.clone(),
+                fail: false,
+            }),
+            retry_cfg,
+        ))
+        .await;
+        assert!(retry_deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Error { message, .. } if message.contains("explicit reconciliation")
+        )));
+        assert!(retry_sink.records().is_empty());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2983,11 +6830,20 @@ mod tests {
         let recorder = crate::session::RunRecorder::default();
         let token = crate::cancellation::CancellationToken::new();
         token.cancel();
+        let durable_store = Arc::new(crate::durable_store::InMemoryDurableStore::default());
+        let durable_state = crate::durability::RunState::new(
+            "session",
+            "pre-cancelled",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
 
         let mut hooks = HookDispatcher::new();
         let seen = stopped.clone();
         hooks.on_stop(move |ctx| seen.lock().unwrap().push(ctx.reason.clone()));
-        let mut cfg = RunConfig::new("primary", vec![Message::user("hi")]);
+        let mut cfg = RunConfig::new("primary", vec![Message::user("hi")])
+            .with_durable_run(durable_state, durable_store.clone())
+            .unwrap();
         cfg.cancellation = token;
         cfg.recorder = recorder.clone();
         cfg.audit = AuditTrail::new().with_sink(audit.clone());
@@ -3019,6 +6875,10 @@ mod tests {
         let outcome = recorder.outcome();
         assert_eq!(outcome.terminal_status, RunTerminalStatus::Cancelled);
         assert_eq!(outcome.stop_reason.as_deref(), Some("cancelled"));
+        assert_eq!(
+            durable_store.load("pre-cancelled").unwrap().status(),
+            crate::durability::DurableRunStatus::Cancelled
+        );
         assert!(audit.records().iter().any(|record| matches!(
             &record.event,
             AuditEvent::RunStopped { reason, .. } if reason == "cancelled"

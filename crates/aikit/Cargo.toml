@@ -20,6 +20,7 @@ name = "aikit"
 [features]
 default = []
 opentelemetry = ["aikit-core/opentelemetry"]
+postgres-store = ["aikit-core/postgres-store"]
 
 [dependencies]
 aikit-core.workspace = true

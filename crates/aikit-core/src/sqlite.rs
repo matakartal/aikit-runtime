@@ -1,8 +1,13 @@
 //! Transactional, cross-process local persistence for memory and resumable sessions.
 
-use crate::durability::{RunState, DURABILITY_SCHEMA_VERSION};
+use crate::durability::{
+    is_supported_durability_schema_version, RunState, DURABILITY_SCHEMA_VERSION,
+    MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION,
+};
 use crate::durable_store::{
-    validate_append_only, DurableStore, DurableStoreError, DurableStoreResult,
+    reject_unvalidated_approval_resolutions, system_worker_lease_clock_unix_ms,
+    validate_append_only, validate_approval_resolution_deadline, validate_worker_lease_fence,
+    DurableStore, DurableStoreError, DurableStoreLeaseAuthority, DurableStoreResult,
 };
 use crate::memory::{MemoryEntry, MemoryQuery, MemoryStore};
 use crate::session::{
@@ -460,23 +465,35 @@ fn decode_durable_row(
     let schema_version = u32::try_from(schema_version).map_err(|_| {
         DurableStoreError::Invalid("invalid SQLite durability schema version".into())
     })?;
-    if schema_version != DURABILITY_SCHEMA_VERSION {
+    if !is_supported_durability_schema_version(schema_version) {
         return Err(DurableStoreError::Invalid(format!(
-            "unsupported SQLite durability schema {schema_version}; expected {DURABILITY_SCHEMA_VERSION}"
+            "unsupported SQLite durability schema {schema_version}; supported range is {MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION}..={DURABILITY_SCHEMA_VERSION}"
         )));
     }
-    let state: RunState = serde_json::from_str(&json)
+    let serialized: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
+    let serialized_schema_version = serialized
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            DurableStoreError::Invalid(
+                "serialized durable run has an invalid schema version".into(),
+            )
+        })?;
+    if serialized_schema_version != schema_version {
+        return Err(DurableStoreError::Invalid(
+            "SQLite schema version does not match serialized run state".into(),
+        ));
+    }
+    let state: RunState = serde_json::from_value(serialized)
         .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
     if state.run_id() != requested_run_id {
         return Err(DurableStoreError::Invalid(
             "SQLite row key does not match serialized run ID".into(),
         ));
     }
-    if state.schema_version() != schema_version {
-        return Err(DurableStoreError::Invalid(
-            "SQLite schema version does not match serialized run state".into(),
-        ));
-    }
+    debug_assert_eq!(state.schema_version(), DURABILITY_SCHEMA_VERSION);
     if durable_revision(&state) != revision {
         return Err(DurableStoreError::Invalid(
             "SQLite revision does not match serialized event log".into(),
@@ -529,24 +546,72 @@ impl DurableStore for SqliteDurableStore {
         decode_durable_row(run_id, row_run_id, revision, schema_version, json)
     }
 
+    fn worker_lease_clock_unix_ms(&self) -> DurableStoreResult<u64> {
+        let _connection = self
+            .connection
+            .lock()
+            .map_err(|_| DurableStoreError::Io("SQLite mutex poisoned".into()))?;
+        system_worker_lease_clock_unix_ms()
+    }
+
+    fn supports_atomic_approval_resolution(&self) -> bool {
+        true
+    }
+
     fn compare_and_swap(
         &self,
         expected_sequence: u64,
         replacement: &RunState,
     ) -> DurableStoreResult<()> {
-        let expected = durable_revision_sql(expected_sequence)?;
-        let replacement_revision = durable_revision_sql(durable_revision(replacement))?;
-        let replacement_schema = durable_schema_sql(replacement.schema_version())?;
-        let replacement_json = serde_json::to_string(replacement)
-            .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| DurableStoreError::Io("SQLite mutex poisoned".into()))?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| DurableStoreError::Io(error.to_string()))?;
-        let current: Option<(String, i64, i64, String)> = transaction
+        sqlite_durable_compare_and_swap(self, expected_sequence, replacement, None, None)
+    }
+
+    fn compare_and_swap_fenced(
+        &self,
+        expected_sequence: u64,
+        replacement: &RunState,
+        authority: &DurableStoreLeaseAuthority,
+    ) -> DurableStoreResult<()> {
+        sqlite_durable_compare_and_swap(self, expected_sequence, replacement, Some(authority), None)
+    }
+
+    fn compare_and_swap_approval_resolution(
+        &self,
+        expected_sequence: u64,
+        replacement: &RunState,
+        approval_id: &str,
+        authority: Option<&DurableStoreLeaseAuthority>,
+    ) -> DurableStoreResult<()> {
+        sqlite_durable_compare_and_swap(
+            self,
+            expected_sequence,
+            replacement,
+            authority,
+            Some(approval_id),
+        )
+    }
+}
+
+fn sqlite_durable_compare_and_swap(
+    store: &SqliteDurableStore,
+    expected_sequence: u64,
+    replacement: &RunState,
+    authority: Option<&DurableStoreLeaseAuthority>,
+    approval_id: Option<&str>,
+) -> DurableStoreResult<()> {
+    let expected = durable_revision_sql(expected_sequence)?;
+    let replacement_revision = durable_revision_sql(durable_revision(replacement))?;
+    let replacement_schema = durable_schema_sql(replacement.schema_version())?;
+    let replacement_json = serde_json::to_string(replacement)
+        .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
+    let mut connection = store
+        .connection
+        .lock()
+        .map_err(|_| DurableStoreError::Io("SQLite mutex poisoned".into()))?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| DurableStoreError::Io(error.to_string()))?;
+    let current: Option<(String, i64, i64, String)> = transaction
             .query_row(
                 "SELECT run_id,revision,schema_version,state_json FROM aikit_durable_runs WHERE run_id=?1",
                 params![replacement.run_id()],
@@ -554,48 +619,54 @@ impl DurableStore for SqliteDurableStore {
             )
             .optional()
             .map_err(|error| DurableStoreError::Io(error.to_string()))?;
-        let Some((row_run_id, actual_sql, current_schema, current_json)) = current else {
-            return Err(DurableStoreError::NotFound {
-                run_id: replacement.run_id().into(),
-            });
-        };
-        let actual = u64::try_from(actual_sql).map_err(|_| {
-            DurableStoreError::Invalid("negative durable revision in SQLite".into())
-        })?;
-        if actual != expected_sequence {
-            return Err(DurableStoreError::Conflict {
-                run_id: replacement.run_id().into(),
-                expected: expected_sequence,
-                actual,
-            });
+    let Some((row_run_id, actual_sql, current_schema, current_json)) = current else {
+        return Err(DurableStoreError::NotFound {
+            run_id: replacement.run_id().into(),
+        });
+    };
+    let actual = u64::try_from(actual_sql)
+        .map_err(|_| DurableStoreError::Invalid("negative durable revision in SQLite".into()))?;
+    if actual != expected_sequence {
+        return Err(DurableStoreError::Conflict {
+            run_id: replacement.run_id().into(),
+            expected: expected_sequence,
+            actual,
+        });
+    }
+    let current = decode_durable_row(
+        replacement.run_id(),
+        row_run_id,
+        actual_sql,
+        current_schema,
+        current_json,
+    )?;
+    let now_unix_ms = system_worker_lease_clock_unix_ms()?;
+    validate_worker_lease_fence(&current, replacement, authority, now_unix_ms)?;
+    validate_append_only(&current, replacement)?;
+    match approval_id {
+        Some(approval_id) => {
+            validate_approval_resolution_deadline(&current, replacement, approval_id, now_unix_ms)?
         }
-        let current = decode_durable_row(
-            replacement.run_id(),
-            row_run_id,
-            actual_sql,
-            current_schema,
-            current_json,
-        )?;
-        validate_append_only(&current, replacement)?;
+        None => reject_unvalidated_approval_resolutions(&current, replacement)?,
+    }
 
-        let updated = transaction
+    let updated = transaction
             .execute(
                 "UPDATE aikit_durable_runs SET revision=?1,schema_version=?2,state_json=?3 WHERE run_id=?4 AND revision=?5",
                 params![replacement_revision, replacement_schema, replacement_json, replacement.run_id(), expected],
             )
             .map_err(|error| DurableStoreError::Io(error.to_string()))?;
-        if updated == 1 {
-            transaction
-                .commit()
-                .map_err(|error| DurableStoreError::Io(error.to_string()))?;
-            return Ok(());
-        }
-        Err(DurableStoreError::Conflict {
-            run_id: replacement.run_id().into(),
-            expected: expected_sequence,
-            actual,
-        })
+    if updated == 1 {
+        transaction
+            .commit()
+            .map_err(|error| DurableStoreError::Io(error.to_string()))?;
+        return Ok(());
     }
+    Err(DurableStoreError::Conflict {
+        run_id: replacement.run_id().into(),
+        expected: expected_sequence,
+        actual,
+    })
 }
 
 pub struct SqliteSessionStore {
@@ -1122,6 +1193,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::{
+        ApprovalResolution, DurableApprovalKind, DurableApprovalRequest, DurableApprovalStatus,
+        RunCommand,
+    };
     use crate::types::Message;
     use serde_json::json;
 
@@ -1188,6 +1263,115 @@ mod tests {
             Err(DurableStoreError::Conflict { .. })
         ));
         assert_eq!(second.load("run-1").unwrap(), winner);
+    }
+
+    #[test]
+    fn sqlite_durable_cas_atomically_enforces_worker_lease_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable-lease-fence.db");
+        let store = SqliteDurableStore::open(&path).unwrap();
+        let initial = crate::durability::RunState::new(
+            "session-1",
+            "leased-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        store.create(&initial).unwrap();
+        let now = store.worker_lease_clock_unix_ms().unwrap();
+        let mut claimed = initial.clone();
+        claimed
+            .claim_worker_lease("worker-a", "lease-a", now, now + 60_000)
+            .unwrap();
+        store
+            .compare_and_swap(durable_revision(&initial), &claimed)
+            .unwrap();
+        let expected = durable_revision(&claimed);
+
+        let mut ordinary = claimed.clone();
+        ordinary
+            .replace_state("unfenced", json!({"forged": true}))
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap(expected, &ordinary),
+            Err(DurableStoreError::WorkerLeaseRequired { .. })
+        ));
+        assert_eq!(store.load("leased-run").unwrap(), claimed);
+
+        let mut forged_release = claimed.clone();
+        forged_release
+            .release_worker_lease("worker-a", "lease-a", now + 1)
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap(expected, &forged_release),
+            Err(DurableStoreError::WorkerLeaseRequired { .. })
+        ));
+        assert_eq!(store.load("leased-run").unwrap(), claimed);
+
+        let wrong = DurableStoreLeaseAuthority::new("worker-a", "wrong-token");
+        assert!(matches!(
+            store.compare_and_swap_fenced(expected, &ordinary, &wrong),
+            Err(DurableStoreError::WorkerLeaseConflict { .. })
+        ));
+        let authority = DurableStoreLeaseAuthority::new("worker-a", "lease-a");
+        store
+            .compare_and_swap_fenced(expected, &ordinary, &authority)
+            .unwrap();
+        assert_eq!(store.load("leased-run").unwrap(), ordinary);
+    }
+
+    #[test]
+    fn sqlite_typed_approval_requires_atomic_cas_and_rejects_a_late_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable-approval-deadline.db");
+        let store = SqliteDurableStore::open(&path).unwrap();
+        let mut pending = crate::durability::RunState::new(
+            "session-1",
+            "approval-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        let approval_id = pending
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "publish".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::Confirmation,
+                prompt: "Publish?".into(),
+                payload: json!({}),
+                policy_snapshot_hash: None,
+                governance_binding: None,
+                requested_at_unix_ms: 1,
+                expires_at_unix_ms: 2,
+            })
+            .unwrap();
+        store.create(&pending).unwrap();
+        let revision = durable_revision(&pending);
+        let mut stale_allow = pending.clone();
+        stale_allow
+            .apply_command_at(
+                RunCommand::Resume {
+                    command_id: "stale-allow".into(),
+                    approvals: vec![ApprovalResolution {
+                        approval_id: approval_id.clone(),
+                        approved: true,
+                        response: None,
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.compare_and_swap(revision, &stale_allow),
+            Err(DurableStoreError::ApprovalResolutionGuardRequired { .. })
+        ));
+        assert!(matches!(
+            store.compare_and_swap_approval_resolution(revision, &stale_allow, &approval_id, None,),
+            Err(DurableStoreError::ApprovalExpired { .. })
+        ));
+        assert_eq!(
+            store.load("approval-run").unwrap().projection().approvals[&approval_id].status,
+            DurableApprovalStatus::Pending
+        );
     }
 
     #[test]
@@ -1312,11 +1496,48 @@ mod tests {
         assert_eq!(
             store.load(initial.run_id()).unwrap_err(),
             DurableStoreError::Invalid(format!(
-                "unsupported SQLite durability schema {}; expected {}",
+                "unsupported SQLite durability schema {}; supported range is {}..={}",
                 DURABILITY_SCHEMA_VERSION + 1,
+                MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION,
                 DURABILITY_SCHEMA_VERSION
             ))
         );
+    }
+
+    #[test]
+    fn sqlite_durable_load_migrates_v1_row_metadata_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable-v1-migration.db");
+        let store = SqliteDurableStore::open(&path).unwrap();
+        let initial = crate::durability::RunState::new(
+            "legacy-session",
+            "legacy-run",
+            crate::durability::DurabilityMode::Sync,
+        )
+        .unwrap();
+        store.create(&initial).unwrap();
+
+        let mut legacy = serde_json::to_value(&initial).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        for event in legacy["events"].as_array_mut().unwrap() {
+            event["schema_version"] = serde_json::json!(1);
+        }
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE aikit_durable_runs SET schema_version=1,state_json=?1 WHERE run_id=?2",
+                params![serde_json::to_string(&legacy).unwrap(), initial.run_id()],
+            )
+            .unwrap();
+
+        let migrated = store.load(initial.run_id()).unwrap();
+        assert_eq!(migrated.schema_version(), DURABILITY_SCHEMA_VERSION);
+        assert!(migrated
+            .events()
+            .iter()
+            .all(|event| event.schema_version == 1));
     }
 
     #[test]

@@ -17,7 +17,30 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
 static JSONL_APPEND_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+fn secure_invocation_id() -> Result<String> {
+    let counter = NEXT_INVOCATION_ID.fetch_add(1, Ordering::Relaxed);
+    let unix_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|error| {
+        AikitError::Audit(format!(
+            "secure audit invocation identity is unavailable: {error}"
+        ))
+    })?;
+    let random_suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        "inv-{}-{unix_nanos}-{counter}-{random_suffix}",
+        std::process::id()
+    ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,7 +194,8 @@ fn now_unix_ms() -> u128 {
 }
 
 /// Whether audit payloads contain tool inputs/results or metadata only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuditPayloadPolicy {
     /// Safest default: record names, decisions, sizes, and errors but not arbitrary tool data.
     MetadataOnly,
@@ -181,7 +205,8 @@ pub enum AuditPayloadPolicy {
 }
 
 /// What to do when an audit sink cannot persist a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuditFailureMode {
     /// Continue the run. Appropriate for development telemetry.
     BestEffort,
@@ -297,6 +322,10 @@ pub enum AuditEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub run_id: String,
+    /// Collision-resistant execution attempt within one logical run. Durable attachment requires
+    /// operating-system entropy before `(run_id, invocation_id, sequence)` is emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -307,9 +336,44 @@ pub struct AuditRecord {
     pub event: AuditEvent,
 }
 
+impl AuditRecord {
+    /// Stable per-invocation correlation. Legacy and non-durable records use their already-unique
+    /// run ID; durable resumes carry an explicit invocation ID.
+    pub fn effective_invocation_id(&self) -> &str {
+        self.invocation_id.as_deref().unwrap_or(&self.run_id)
+    }
+}
+
+/// One sequence-reserved audit record that can be durably described before sink delivery.
+///
+/// Keeping the record opaque prevents terminal-audit callers from reading the counter and later
+/// emitting a different sequence after another clone has advanced it.
+pub(crate) struct PreparedAuditRecord(AuditRecord);
+
+impl PreparedAuditRecord {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.0.sequence
+    }
+}
+
 /// Destination for audit records.
 pub trait AuditSink: Send + Sync {
     fn record(&self, record: &AuditRecord) -> std::result::Result<(), String>;
+}
+
+/// Persisted audit-delivery policy for an explicitly authorized terminal replay.
+///
+/// `delivery_id` is supplied by the host and identifies the same logical sink set across process
+/// restarts. Safe automatic replay is rejected when that stable identity was not configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuditReplayBinding {
+    pub schema_version: u32,
+    pub delivery_id: Option<String>,
+    pub sink_count: usize,
+    pub payload_policy: AuditPayloadPolicy,
+    pub failure_mode: AuditFailureMode,
+    pub max_preview_bytes: usize,
 }
 
 /// Cloneable dispatcher configuration. A plain clone intentionally preserves identity for helper
@@ -317,6 +381,7 @@ pub trait AuditSink: Send + Sync {
 #[derive(Clone)]
 pub struct AuditTrail {
     run_id: String,
+    invocation_id: Option<String>,
     parent_run_id: Option<String>,
     run_label: Option<String>,
     next_sequence: Arc<AtomicU64>,
@@ -324,6 +389,7 @@ pub struct AuditTrail {
     payload_policy: AuditPayloadPolicy,
     failure_mode: AuditFailureMode,
     max_preview_bytes: usize,
+    durable_replay_delivery_id: Option<String>,
 }
 
 impl Default for AuditTrail {
@@ -337,6 +403,7 @@ impl AuditTrail {
         let id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
         AuditTrail {
             run_id: format!("run-{}-{id}", std::process::id()),
+            invocation_id: None,
             parent_run_id: None,
             run_label: None,
             next_sequence: Arc::new(AtomicU64::new(1)),
@@ -344,6 +411,7 @@ impl AuditTrail {
             payload_policy: AuditPayloadPolicy::MetadataOnly,
             failure_mode: AuditFailureMode::BestEffort,
             max_preview_bytes: 4096,
+            durable_replay_delivery_id: None,
         }
     }
 
@@ -362,12 +430,33 @@ impl AuditTrail {
         self
     }
 
+    /// Bind terminal-only durable replay to the host's stable logical audit destination set.
+    ///
+    /// The same identifier, sink count, failure mode, and payload policy must be configured after
+    /// restart. Without an explicit identifier, ambiguous terminal delivery can still be
+    /// reconciled as completed, but cannot be automatically replayed as SafeToRetry.
+    pub fn with_durable_replay_delivery_id(
+        mut self,
+        delivery_id: impl Into<String>,
+    ) -> crate::error::Result<Self> {
+        let delivery_id = delivery_id.into();
+        if delivery_id.is_empty() || delivery_id.chars().any(char::is_control) {
+            return Err(crate::error::AikitError::Configuration(
+                "durable audit replay delivery ID cannot be empty or contain control characters"
+                    .into(),
+            ));
+        }
+        self.durable_replay_delivery_id = Some(delivery_id);
+        Ok(self)
+    }
+
     /// Create an independently sequenced child run that preserves the same sinks, payload policy,
     /// and failure mode while recording an explicit parent relationship.
     pub fn child(&self, label: impl Into<String>) -> Self {
         let id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
         AuditTrail {
             run_id: format!("run-{}-{id}", std::process::id()),
+            invocation_id: None,
             parent_run_id: Some(self.run_id.clone()),
             run_label: Some(label.into()),
             next_sequence: Arc::new(AtomicU64::new(1)),
@@ -375,6 +464,7 @@ impl AuditTrail {
             payload_policy: self.payload_policy,
             failure_mode: self.failure_mode,
             max_preview_bytes: self.max_preview_bytes,
+            durable_replay_delivery_id: self.durable_replay_delivery_id.clone(),
         }
     }
 
@@ -385,6 +475,7 @@ impl AuditTrail {
         let id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
         AuditTrail {
             run_id: format!("run-{}-{id}", std::process::id()),
+            invocation_id: None,
             parent_run_id: self.parent_run_id.clone(),
             run_label: self.run_label.clone(),
             next_sequence: Arc::new(AtomicU64::new(1)),
@@ -392,11 +483,108 @@ impl AuditTrail {
             payload_policy: self.payload_policy,
             failure_mode: self.failure_mode,
             max_preview_bytes: self.max_preview_bytes,
+            durable_replay_delivery_id: self.durable_replay_delivery_id.clone(),
         }
+    }
+
+    /// Start an independently sequenced invocation with a runtime-owned durable identity.
+    ///
+    /// This is crate-private because arbitrary audit-ID replacement would make unrelated
+    /// invocations share an identity. The durable runtime calls it only with a validated
+    /// [`crate::durability::RunState`] identifier.
+    pub(crate) fn for_run_id(&self, run_id: impl Into<String>) -> crate::error::Result<Self> {
+        let run_id = run_id.into();
+        if run_id.is_empty() || run_id.chars().any(char::is_control) {
+            return Err(crate::error::AikitError::Configuration(
+                "audit run_id cannot be empty or contain control characters".into(),
+            ));
+        }
+        Ok(AuditTrail {
+            run_id,
+            invocation_id: Some(secure_invocation_id()?),
+            parent_run_id: self.parent_run_id.clone(),
+            run_label: self.run_label.clone(),
+            next_sequence: Arc::new(AtomicU64::new(1)),
+            sinks: self.sinks.clone(),
+            payload_policy: self.payload_policy,
+            failure_mode: self.failure_mode,
+            max_preview_bytes: self.max_preview_bytes,
+            durable_replay_delivery_id: self.durable_replay_delivery_id.clone(),
+        })
+    }
+
+    /// Restore the exact durable audit identity needed to retry one terminal event.
+    ///
+    /// The caller must supply values already persisted by the durable lifecycle fence. Unlike
+    /// [`Self::for_run_id`], this does not allocate a new invocation or reset its sequence. Keeping
+    /// this crate-private prevents ordinary callers from impersonating an existing audit stream.
+    pub(crate) fn for_terminal_replay(
+        &self,
+        run_id: impl Into<String>,
+        invocation_id: impl Into<String>,
+        next_sequence: u64,
+        expected_binding: &AuditReplayBinding,
+    ) -> crate::error::Result<Self> {
+        let run_id = run_id.into();
+        if run_id.is_empty() || run_id.chars().any(char::is_control) {
+            return Err(crate::error::AikitError::Configuration(
+                "audit run_id cannot be empty or contain control characters".into(),
+            ));
+        }
+        let invocation_id = invocation_id.into();
+        if invocation_id.is_empty() || invocation_id.chars().any(char::is_control) {
+            return Err(crate::error::AikitError::Configuration(
+                "audit invocation_id cannot be empty or contain control characters".into(),
+            ));
+        }
+        if next_sequence == 0 {
+            return Err(crate::error::AikitError::Configuration(
+                "audit next_sequence must be at least 1".into(),
+            ));
+        }
+        let actual_binding = self.replay_binding();
+        if &actual_binding != expected_binding
+            || actual_binding.failure_mode != AuditFailureMode::FailClosed
+            || actual_binding.sink_count == 0
+            || actual_binding.delivery_id.is_none()
+        {
+            return Err(crate::error::AikitError::Configuration(
+                "durable terminal replay audit delivery binding does not match the persisted fail-closed policy"
+                    .into(),
+            ));
+        }
+
+        Ok(AuditTrail {
+            run_id,
+            invocation_id: Some(invocation_id),
+            parent_run_id: self.parent_run_id.clone(),
+            run_label: self.run_label.clone(),
+            next_sequence: Arc::new(AtomicU64::new(next_sequence)),
+            sinks: self.sinks.clone(),
+            payload_policy: self.payload_policy,
+            failure_mode: self.failure_mode,
+            max_preview_bytes: self.max_preview_bytes,
+            durable_replay_delivery_id: self.durable_replay_delivery_id.clone(),
+        })
     }
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    pub fn invocation_id(&self) -> Option<&str> {
+        self.invocation_id.as_deref()
+    }
+
+    pub(crate) fn replay_binding(&self) -> AuditReplayBinding {
+        AuditReplayBinding {
+            schema_version: 1,
+            delivery_id: self.durable_replay_delivery_id.clone(),
+            sink_count: self.sinks.len(),
+            payload_policy: self.payload_policy,
+            failure_mode: self.failure_mode,
+            max_preview_bytes: self.max_preview_bytes,
+        }
     }
 
     pub fn captures_payloads(&self) -> bool {
@@ -419,16 +607,21 @@ impl AuditTrail {
     }
 
     pub fn emit(&self, event: AuditEvent) -> Result<()> {
-        if self.sinks.is_empty() {
-            if self.failure_mode == AuditFailureMode::FailClosed {
-                return Err(AikitError::Audit(
-                    "audit is fail-closed but no audit sink is configured".into(),
-                ));
-            }
-            return Ok(());
+        let prepared = self.prepare_event(event)?;
+        self.emit_prepared(prepared)
+    }
+
+    /// Reserve the exact sequence and timestamp that will be delivered for an audit event.
+    /// Durable callers persist the reserved sequence before attempting the external sink effect.
+    pub(crate) fn prepare_event(&self, event: AuditEvent) -> Result<PreparedAuditRecord> {
+        if self.sinks.is_empty() && self.failure_mode == AuditFailureMode::FailClosed {
+            return Err(AikitError::Audit(
+                "audit is fail-closed but no audit sink is configured".into(),
+            ));
         }
-        let record = AuditRecord {
+        Ok(PreparedAuditRecord(AuditRecord {
             run_id: self.run_id.clone(),
+            invocation_id: self.invocation_id.clone(),
             parent_run_id: self.parent_run_id.clone(),
             run_label: self.run_label.clone(),
             sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
@@ -437,7 +630,21 @@ impl AuditTrail {
                 .unwrap_or_default()
                 .as_millis(),
             event,
-        };
+        }))
+    }
+
+    /// Deliver a previously reserved record without allocating a second sequence.
+    pub(crate) fn emit_prepared(&self, prepared: PreparedAuditRecord) -> Result<()> {
+        let record = prepared.0;
+        if record.run_id != self.run_id
+            || record.invocation_id != self.invocation_id
+            || record.parent_run_id != self.parent_run_id
+            || record.run_label != self.run_label
+        {
+            return Err(AikitError::Audit(
+                "prepared audit record does not belong to this audit trail".into(),
+            ));
+        }
         for sink in &self.sinks {
             if let Err(error) = sink.record(&record) {
                 if self.failure_mode == AuditFailureMode::FailClosed {
@@ -579,7 +786,7 @@ impl AuditSink for JsonlAuditSink {
 /// shutting down its tracer provider/exporter; a library must never replace global telemetry.
 #[cfg(feature = "opentelemetry")]
 pub struct OpenTelemetryAuditSink {
-    spans: Mutex<HashMap<String, opentelemetry::global::BoxedSpan>>,
+    spans: Mutex<HashMap<(String, String), opentelemetry::global::BoxedSpan>>,
 }
 
 #[cfg(feature = "opentelemetry")]
@@ -601,6 +808,10 @@ impl AuditSink for OpenTelemetryAuditSink {
             .spans
             .lock()
             .map_err(|_| "OpenTelemetry span mutex poisoned".to_string())?;
+        let span_key = (
+            record.run_id.clone(),
+            record.effective_invocation_id().to_owned(),
+        );
         match &record.event {
             AuditEvent::RunStarted { model } => {
                 let tracer = global::tracer("aikit");
@@ -610,11 +821,15 @@ impl AuditSink for OpenTelemetryAuditSink {
                 let mut span = tracer.start("invoke_agent");
                 span.set_attribute(KeyValue::new("gen_ai.operation.name", "invoke_agent"));
                 span.set_attribute(KeyValue::new("aikit.run_id", record.run_id.clone()));
+                span.set_attribute(KeyValue::new(
+                    "aikit.invocation_id",
+                    record.effective_invocation_id().to_owned(),
+                ));
                 span.set_attribute(KeyValue::new("gen_ai.request.model", model.clone()));
-                spans.insert(record.run_id.clone(), span);
+                spans.insert(span_key, span);
             }
             AuditEvent::RunStopped { turns, reason } => {
-                if let Some(mut span) = spans.remove(&record.run_id) {
+                if let Some(mut span) = spans.remove(&span_key) {
                     span.set_attribute(KeyValue::new("aikit.turns", *turns as i64));
                     span.set_attribute(KeyValue::new("aikit.stop_reason", reason.clone()));
                     span.add_event(
@@ -628,7 +843,7 @@ impl AuditSink for OpenTelemetryAuditSink {
                 }
             }
             event => {
-                if let Some(span) = spans.get_mut(&record.run_id) {
+                if let Some(span) = spans.get_mut(&span_key) {
                     let (name, attrs) = otel_event(event, record.sequence);
                     span.add_event(name, attrs);
                 }
@@ -1109,5 +1324,200 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(sequences, vec![1, 2]);
         }
+    }
+
+    #[test]
+    fn durable_run_identity_preserves_audit_policy_and_resets_sequence() {
+        let sink = Arc::new(InMemoryAuditSink::default());
+        let configured = AuditTrail::new()
+            .with_sink(sink.clone())
+            .with_payload_policy(AuditPayloadPolicy::Full)
+            .with_failure_mode(AuditFailureMode::FailClosed);
+        configured
+            .emit(AuditEvent::RunStarted {
+                model: "original".into(),
+            })
+            .unwrap();
+
+        let first = configured.for_run_id("durable-run").unwrap();
+        let second = configured.for_run_id("durable-run").unwrap();
+        assert_eq!(first.run_id(), "durable-run");
+        assert_eq!(second.run_id(), "durable-run");
+        assert_ne!(first.invocation_id(), second.invocation_id());
+        assert!(first.captures_payloads());
+        first
+            .emit(AuditEvent::RunStarted {
+                model: "durable-1".into(),
+            })
+            .unwrap();
+        first
+            .emit(AuditEvent::RunStopped {
+                turns: 1,
+                reason: "done".into(),
+            })
+            .unwrap();
+        second
+            .emit(AuditEvent::RunStarted {
+                model: "durable-2".into(),
+            })
+            .unwrap();
+        second
+            .emit(AuditEvent::RunStopped {
+                turns: 1,
+                reason: "done".into(),
+            })
+            .unwrap();
+
+        let records = sink.records();
+        let durable_records = records
+            .iter()
+            .filter(|record| record.run_id == "durable-run")
+            .collect::<Vec<_>>();
+        assert_eq!(durable_records.len(), 4);
+        assert_ne!(
+            durable_records[0].invocation_id,
+            durable_records[2].invocation_id
+        );
+        assert_eq!(
+            durable_records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 1, 2]
+        );
+        assert!(configured.for_run_id("\n").is_err());
+    }
+
+    #[test]
+    fn terminal_replay_restores_exact_identity_sequence_and_configuration() {
+        let sink = Arc::new(InMemoryAuditSink::default());
+        let parent = AuditTrail::new();
+        let configured = parent
+            .child("durable-child")
+            .with_sink(sink.clone())
+            .with_payload_policy(AuditPayloadPolicy::Full)
+            .with_failure_mode(AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id("compliance-ledger-v1")
+            .unwrap();
+        let binding = configured.replay_binding();
+
+        let replay = configured
+            .for_terminal_replay("durable-run", "persisted-invocation", 41, &binding)
+            .unwrap();
+        assert_eq!(replay.run_id(), "durable-run");
+        assert_eq!(replay.invocation_id(), Some("persisted-invocation"));
+        assert_eq!(replay.parent_run_id.as_deref(), Some(parent.run_id()));
+        assert_eq!(replay.run_label.as_deref(), Some("durable-child"));
+        assert_eq!(replay.payload_policy, AuditPayloadPolicy::Full);
+        assert_eq!(replay.failure_mode, AuditFailureMode::FailClosed);
+        assert_eq!(replay.max_preview_bytes, configured.max_preview_bytes);
+
+        replay
+            .emit(AuditEvent::RunStopped {
+                turns: 7,
+                reason: "durable_terminal_replay".into(),
+            })
+            .unwrap();
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "durable-run");
+        assert_eq!(
+            records[0].invocation_id.as_deref(),
+            Some("persisted-invocation")
+        );
+        assert_eq!(records[0].sequence, 41);
+        assert_eq!(records[0].parent_run_id.as_deref(), Some(parent.run_id()));
+        assert_eq!(records[0].run_label.as_deref(), Some("durable-child"));
+
+        let different_destination = configured
+            .clone()
+            .with_durable_replay_delivery_id("different-ledger-v1")
+            .unwrap();
+        assert!(different_destination
+            .for_terminal_replay("durable-run", "persisted-invocation", 41, &binding)
+            .is_err());
+        let different_sink_set = configured
+            .clone()
+            .with_sink(Arc::new(InMemoryAuditSink::default()));
+        assert!(different_sink_set
+            .for_terminal_replay("durable-run", "persisted-invocation", 41, &binding)
+            .is_err());
+    }
+
+    #[test]
+    fn terminal_replay_rejects_invalid_identity_or_sequence() {
+        let configured = AuditTrail::new()
+            .with_sink(Arc::new(InMemoryAuditSink::default()))
+            .with_failure_mode(AuditFailureMode::FailClosed)
+            .with_durable_replay_delivery_id("test-ledger-v1")
+            .unwrap();
+        let binding = configured.replay_binding();
+
+        for (run_id, invocation_id, next_sequence, expected_field) in [
+            ("", "invocation", 1, "run_id"),
+            ("run\n", "invocation", 1, "run_id"),
+            ("run", "", 1, "invocation_id"),
+            ("run", "invocation\0", 1, "invocation_id"),
+            ("run", "invocation", 0, "next_sequence"),
+        ] {
+            let error = configured
+                .for_terminal_replay(run_id, invocation_id, next_sequence, &binding)
+                .err()
+                .expect("invalid replay identity must fail");
+            assert!(
+                matches!(error, AikitError::Configuration(message) if message.contains(expected_field)),
+                "unexpected validation result for {expected_field}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_audit_record_uses_run_id_as_effective_invocation() {
+        let record: AuditRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "legacy-run",
+            "sequence": 1,
+            "unix_ms": 0,
+            "type": "run_started",
+            "model": "legacy-model"
+        }))
+        .unwrap();
+        assert_eq!(record.invocation_id, None);
+        assert_eq!(record.effective_invocation_id(), "legacy-run");
+    }
+
+    #[test]
+    fn prepared_audit_record_keeps_its_reserved_sequence_when_a_clone_emits_first() {
+        let sink = Arc::new(InMemoryAuditSink::default());
+        let trail = AuditTrail::new().with_sink(sink.clone());
+        let prepared = trail
+            .prepare_event(AuditEvent::RunStopped {
+                turns: 2,
+                reason: "reserved-terminal".into(),
+            })
+            .unwrap();
+        assert_eq!(prepared.sequence(), 1);
+
+        let concurrent_component = trail.clone();
+        concurrent_component
+            .emit(AuditEvent::RunStarted {
+                model: "component".into(),
+            })
+            .unwrap();
+        trail.emit_prepared(prepared).unwrap();
+
+        let records = sink.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 2);
+        assert_eq!(records[1].sequence, 1);
+        assert!(matches!(records[1].event, AuditEvent::RunStopped { .. }));
+        let sequences = records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences.len(),
+            std::collections::BTreeSet::<u64>::from_iter(sequences.clone()).len()
+        );
     }
 }

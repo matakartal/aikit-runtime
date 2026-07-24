@@ -13,10 +13,12 @@ use aikit::{
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
 use serde_json::{json, Map, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const TOOL_NAME: &str = "aikit_live_probe";
+const TEXT_MARKER: &str = "AIKIT_SMOKE_OK";
+const TOOL_MARKER: &str = "AIKIT_LIVE_TOOL";
 
 struct SmokeTarget {
     provider: &'static str,
@@ -124,11 +126,16 @@ impl Provider for FirstTurnToolChoiceProvider {
 #[derive(Default)]
 struct CountingExecutor {
     calls: AtomicUsize,
+    saw_expected_token: AtomicBool,
 }
 
 impl CountingExecutor {
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn saw_expected_token(&self) -> bool {
+        self.saw_expected_token.load(Ordering::SeqCst)
     }
 }
 
@@ -136,6 +143,10 @@ impl CountingExecutor {
 impl ToolExecutor for CountingExecutor {
     async fn execute(&self, name: &str, input: Value) -> aikit::Result<String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_expected_token.store(
+            input.get("token").and_then(Value::as_str) == Some(TOOL_MARKER),
+            Ordering::SeqCst,
+        );
         Ok(json!({ "tool": name, "input": input, "status": "ok" }).to_string())
     }
 }
@@ -230,14 +241,23 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 async fn assert_text(agent: &Agent, target: &SmokeTarget, model: &str) {
     let generated = agent
-        .generate_text("Reply briefly with the token AIKIT_SMOKE_OK.", model, 64)
+        .generate_text(
+            &format!("Reply briefly with the token {TEXT_MARKER}."),
+            model,
+            64,
+        )
         .await
         .unwrap_or_else(|error| panic!("{} text smoke failed: {error}", target.provider));
     assert!(
-        !generated.text.trim().is_empty(),
-        "{} returned an empty successful text response",
+        contains_marker(&generated.text, TEXT_MARKER),
+        "{} returned text without the required live-smoke marker",
         target.provider
     );
+}
+
+fn contains_marker(text: &str, marker: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|part| part == marker)
 }
 
 async fn assert_object(agent: &Agent, target: &SmokeTarget, model: &str) {
@@ -285,7 +305,9 @@ async fn assert_tool_round_trip(agent: &Agent, target: &SmokeTarget, model: &str
     let mut config = RunConfig::new(
         model,
         vec![Message::user(
-            "Call aikit_live_probe with token AIKIT_LIVE_TOOL. After receiving its result, reply briefly.",
+            format!(
+                "Call aikit_live_probe with token {TOOL_MARKER}. After receiving its result, reply briefly."
+            ),
         )],
     );
     config.tools = vec![tool_spec()];
@@ -363,7 +385,20 @@ async fn assert_tool_round_trip(agent: &Agent, target: &SmokeTarget, model: &str
             "{} allowed tool should execute exactly once before replay",
             target.provider
         );
+        assert!(
+            executor.saw_expected_token(),
+            "{} allowed tool call did not preserve the required token argument",
+            target.provider
+        );
     }
+}
+
+#[test]
+fn live_markers_require_exact_tokens() {
+    assert!(contains_marker("AIKIT_SMOKE_OK", TEXT_MARKER));
+    assert!(contains_marker("Result: AIKIT_SMOKE_OK.", TEXT_MARKER));
+    assert!(!contains_marker("AIKIT_SMOKE_OKAY", TEXT_MARKER));
+    assert!(!contains_marker("", TEXT_MARKER));
 }
 
 fn tool_spec() -> ToolSpec {

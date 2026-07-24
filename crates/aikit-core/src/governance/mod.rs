@@ -178,6 +178,8 @@ pub struct DurableToolApprover {
     timeout: Duration,
     approval_gate: Arc<tokio::sync::Mutex<()>>,
     store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+    poison: Option<Arc<std::sync::atomic::AtomicBool>>,
+    worker_lease: Option<crate::durable_store::DurableStoreLeaseAuthority>,
 }
 
 impl DurableToolApprover {
@@ -187,7 +189,7 @@ impl DurableToolApprover {
         policy_snapshot: &PolicySnapshot,
         timeout: Duration,
     ) -> Result<Self, DurableApproverError> {
-        Self::new_inner(legacy, run, policy_snapshot, timeout, None)
+        Self::new_inner(legacy, run, policy_snapshot, timeout, None, None, None)
     }
 
     /// Construct an adapter that commits every request/resolution through the durable store CAS
@@ -199,7 +201,32 @@ impl DurableToolApprover {
         timeout: Duration,
         store: Arc<dyn crate::durable_store::DurableStore>,
     ) -> Result<Self, DurableApproverError> {
-        Self::new_inner(legacy, run, policy_snapshot, timeout, Some(store))
+        Self::new_inner(
+            legacy,
+            run,
+            policy_snapshot,
+            timeout,
+            Some(store),
+            None,
+            None,
+        )
+    }
+
+    fn new_persisted_for_driver(
+        legacy: Arc<dyn ToolApprover>,
+        driver: &crate::durable_runtime::DurableRunDriver,
+        policy_snapshot: &PolicySnapshot,
+        timeout: Duration,
+    ) -> Result<Self, DurableApproverError> {
+        Self::new_inner(
+            legacy,
+            driver.state_handle(),
+            policy_snapshot,
+            timeout,
+            Some(driver.store_handle()),
+            Some(driver.poison_handle()),
+            driver.worker_lease_authority(),
+        )
     }
 
     fn new_inner(
@@ -208,6 +235,8 @@ impl DurableToolApprover {
         policy_snapshot: &PolicySnapshot,
         timeout: Duration,
         store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+        poison: Option<Arc<std::sync::atomic::AtomicBool>>,
+        worker_lease: Option<crate::durable_store::DurableStoreLeaseAuthority>,
     ) -> Result<Self, DurableApproverError> {
         if timeout.is_zero() || timeout.as_millis() == 0 {
             return Err(DurableApproverError::InvalidTimeout);
@@ -245,6 +274,16 @@ impl DurableToolApprover {
                     "persisted run does not match the supplied run state".into(),
                 ));
             }
+            store.worker_lease_clock_unix_ms().map_err(|error| {
+                DurableApproverError::Store(format!(
+                    "trusted approval clock is unavailable: {error}"
+                ))
+            })?;
+            if !store.supports_atomic_approval_resolution() {
+                return Err(DurableApproverError::Store(
+                    "store does not provide atomic approval resolution".into(),
+                ));
+            }
         }
         drop(guard);
         Ok(Self {
@@ -254,6 +293,8 @@ impl DurableToolApprover {
             timeout,
             approval_gate: Arc::new(tokio::sync::Mutex::new(())),
             store,
+            poison,
+            worker_lease,
         })
     }
 
@@ -272,24 +313,118 @@ impl DurableToolApprover {
         &self,
         current: &mut crate::durability::RunState,
         candidate: crate::durability::RunState,
-    ) -> Result<(), String> {
+        approval_id: Option<&str>,
+    ) -> Result<(), crate::durable_store::DurableStoreError> {
         if let Some(store) = &self.store {
             let expected_sequence = current.events().last().map_or(0, |event| event.sequence);
-            store
-                .compare_and_swap(expected_sequence, &candidate)
-                .map_err(|error| error.to_string())?;
+            let persisted = match approval_id {
+                Some(approval_id) => store.compare_and_swap_approval_resolution(
+                    expected_sequence,
+                    &candidate,
+                    approval_id,
+                    self.worker_lease.as_ref(),
+                ),
+                None => match &self.worker_lease {
+                    Some(authority) => {
+                        store.compare_and_swap_fenced(expected_sequence, &candidate, authority)
+                    }
+                    None => store.compare_and_swap(expected_sequence, &candidate),
+                },
+            };
+            if let Err(error) = persisted {
+                let definite_expiry_without_write = matches!(
+                    (&error, approval_id),
+                    (
+                        crate::durable_store::DurableStoreError::ApprovalExpired {
+                            run_id,
+                            approval_id: expired_id,
+                            observed_at_unix_ms,
+                        },
+                        Some(expected_id),
+                    ) if run_id == current.run_id()
+                        && expired_id == expected_id
+                        && current
+                            .projection()
+                            .approvals
+                            .get(expected_id)
+                            .and_then(|approval| approval.expires_at_unix_ms)
+                            .is_some_and(|expires_at| *observed_at_unix_ms >= expires_at)
+                        && candidate
+                            .projection()
+                            .approvals
+                            .get(expected_id)
+                            .is_some_and(|approval| {
+                                approval.status
+                                    == crate::durability::DurableApprovalStatus::Approved
+                            })
+                );
+                if !definite_expiry_without_write {
+                    if let Some(poison) = &self.poison {
+                        poison.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                return Err(error);
+            }
         }
         *current = candidate;
         Ok(())
+    }
+
+    fn verify_current(&self, current: &crate::durability::RunState) -> Result<(), String> {
+        if self
+            .poison
+            .as_ref()
+            .is_some_and(|poison| poison.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err("durable driver is poisoned; reload state before approval".into());
+        }
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        match store.load(current.run_id()) {
+            Ok(stored) if stored == *current => Ok(()),
+            Ok(_) => {
+                if let Some(poison) = &self.poison {
+                    poison.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err("durable approval state no longer matches the store".into())
+            }
+            Err(error) => {
+                if let Some(poison) = &self.poison {
+                    poison.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(format!(
+                    "durable approval store could not be loaded: {error}"
+                ))
+            }
+        }
+    }
+
+    fn approval_clock_unix_ms(&self) -> Result<u64, String> {
+        let Some(store) = &self.store else {
+            return unix_time_ms();
+        };
+        store.worker_lease_clock_unix_ms().map_err(|error| {
+            format!("durable approval trusted store clock is unavailable: {error}")
+        })
     }
 }
 
 #[async_trait]
 impl ToolApprover for DurableToolApprover {
     async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision {
+        if self
+            .poison
+            .as_ref()
+            .is_some_and(|poison| poison.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Self::fail_closed(
+                "durable driver is poisoned; reload state before requesting approval",
+            );
+        }
         let _gate = self.approval_gate.lock().await;
         let request_for_callback = request.clone();
-        let requested_at_unix_ms = match unix_time_ms() {
+        let requested_at_unix_ms = match self.approval_clock_unix_ms() {
             Ok(now) => now,
             Err(message) => return Self::fail_closed(message),
         };
@@ -306,6 +441,9 @@ impl ToolApprover for DurableToolApprover {
                 Ok(run) => run,
                 Err(_) => return Self::fail_closed("durable approval state is unavailable"),
             };
+            if let Err(error) = self.verify_current(&run) {
+                return Self::fail_closed(error);
+            }
             if run.run_id() != request.run_id {
                 return Self::fail_closed(format!(
                     "approval run `{}` does not match durable run `{}`",
@@ -372,7 +510,7 @@ impl ToolApprover for DurableToolApprover {
                     expires_at_unix_ms: proposed_expiry,
                 }) {
                     Ok(approval_id) => {
-                        if let Err(error) = self.commit_candidate(&mut run, candidate) {
+                        if let Err(error) = self.commit_candidate(&mut run, candidate, None) {
                             return Self::fail_closed(format!(
                                 "durable approval request could not be committed: {error}"
                             ));
@@ -418,17 +556,18 @@ impl ToolApprover for DurableToolApprover {
         let resolved_at_unix_ms = if timed_out {
             expires_at_unix_ms
         } else {
-            match unix_time_ms() {
+            match self.approval_clock_unix_ms() {
                 Ok(now) => now,
                 Err(message) => return Self::fail_closed(message),
             }
         };
-        let durable_status = self.run.lock().map_err(|_| ()).and_then(|mut run| {
+        let durable_outcome = self.run.lock().map_err(|_| ()).and_then(|mut run| {
+            let command_id = format!("approval:{approval_id}");
             let mut candidate = run.clone();
             candidate
                 .apply_command_at(
                     crate::durability::RunCommand::Resume {
-                        command_id: format!("approval:{approval_id}"),
+                        command_id: command_id.clone(),
                         approvals: vec![crate::durability::ApprovalResolution {
                             approval_id: approval_id.clone(),
                             approved,
@@ -438,19 +577,67 @@ impl ToolApprover for DurableToolApprover {
                     resolved_at_unix_ms,
                 )
                 .map_err(|_| ())?;
-            let status = candidate.projection().approvals[&approval_id].status;
-            self.commit_candidate(&mut run, candidate).map_err(|_| ())?;
-            Ok(status)
+            let resolved = &candidate.projection().approvals[&approval_id];
+            let outcome = (resolved.status, resolved.timed_out);
+            match self.commit_candidate(&mut run, candidate, Some(&approval_id)) {
+                Ok(()) => Ok(outcome),
+                Err(crate::durable_store::DurableStoreError::ApprovalExpired {
+                    run_id: expired_run_id,
+                    approval_id: expired_id,
+                    observed_at_unix_ms,
+                }) if expired_run_id == run.run_id()
+                    && expired_id == approval_id
+                    && outcome == (crate::durability::DurableApprovalStatus::Approved, false)
+                    && run
+                        .projection()
+                        .approvals
+                        .get(&approval_id)
+                        .and_then(|approval| approval.expires_at_unix_ms)
+                        .is_some_and(|expires_at| observed_at_unix_ms >= expires_at)
+                    && self.poison.as_ref().is_none_or(|poison| {
+                        !poison.load(std::sync::atomic::Ordering::Acquire)
+                    }) =>
+                {
+                    let mut timeout_candidate = run.clone();
+                    if timeout_candidate
+                        .apply_command_at(
+                            crate::durability::RunCommand::Resume {
+                                command_id,
+                                approvals: vec![crate::durability::ApprovalResolution {
+                                    approval_id: approval_id.clone(),
+                                    approved: false,
+                                    response: Some(serde_json::json!({
+                                        "reason": "approval_timeout"
+                                    })),
+                                }],
+                            },
+                            observed_at_unix_ms,
+                        )
+                        .is_err()
+                    {
+                        if let Some(poison) = &self.poison {
+                            poison.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        return Err(());
+                    }
+                    let resolved = &timeout_candidate.projection().approvals[&approval_id];
+                    let outcome = (resolved.status, resolved.timed_out);
+                    self.commit_candidate(&mut run, timeout_candidate, Some(&approval_id))
+                        .map_err(|_| ())?;
+                    Ok(outcome)
+                }
+                Err(_) => Err(()),
+            }
         });
-        match durable_status {
-            Ok(crate::durability::DurableApprovalStatus::Approved) => decision,
-            Ok(crate::durability::DurableApprovalStatus::Rejected) if approved => {
+        match durable_outcome {
+            Ok((crate::durability::DurableApprovalStatus::Approved, false)) => decision,
+            Ok((crate::durability::DurableApprovalStatus::Rejected, true)) => {
                 ApprovalDecision::deny("approval timed out")
             }
-            Ok(crate::durability::DurableApprovalStatus::Rejected) => decision,
-            Ok(crate::durability::DurableApprovalStatus::Pending) | Err(()) => {
-                Self::fail_closed("durable approval resolution could not be recorded")
-            }
+            Ok((crate::durability::DurableApprovalStatus::Rejected, false)) => decision,
+            Ok((crate::durability::DurableApprovalStatus::Pending, _))
+            | Ok((crate::durability::DurableApprovalStatus::Approved, true))
+            | Err(()) => Self::fail_closed("durable approval resolution could not be recorded"),
         }
     }
 }
@@ -596,6 +783,14 @@ impl ApprovedPermissionSet {
 
 /// The governance bundle threaded through the agent loop: enforcing hooks + a permission engine.
 /// The default is fully permissive (allow-all, no hooks) so ungoverned agents behave as before.
+#[derive(Clone)]
+struct DurableApproverAuthority {
+    run: Arc<Mutex<crate::durability::RunState>>,
+    store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+    poison: Option<Arc<std::sync::atomic::AtomicBool>>,
+    worker_lease: Option<crate::durable_store::DurableStoreLeaseAuthority>,
+}
+
 #[derive(Default, Clone)]
 pub struct Governance {
     pub permissions: PermissionEngine,
@@ -607,6 +802,8 @@ pub struct Governance {
     agent_id: Option<String>,
     durable_binding: Option<GovernanceBinding>,
     durable_run: Option<Arc<Mutex<crate::durability::RunState>>>,
+    durable_store: Option<Arc<dyn crate::durable_store::DurableStore>>,
+    durable_approver_authority: Option<DurableApproverAuthority>,
     durable_bindings: Arc<RwLock<BTreeMap<String, GovernanceBinding>>>,
     binding_violation: Option<String>,
 }
@@ -627,6 +824,8 @@ impl Governance {
             agent_id: None,
             durable_binding: None,
             durable_run: None,
+            durable_store: None,
+            durable_approver_authority: None,
             durable_bindings: Arc::new(RwLock::new(BTreeMap::new())),
             binding_violation: None,
         }
@@ -638,6 +837,7 @@ impl Governance {
                 Some("durable approver cannot be replaced after governance binding".into());
         }
         self.approver = Some(approver);
+        self.durable_approver_authority = None;
         self
     }
 
@@ -648,20 +848,28 @@ impl Governance {
         run: Arc<Mutex<crate::durability::RunState>>,
         timeout: Duration,
     ) -> Result<Self, DurableApproverError> {
+        self.ensure_run_authority(&run)?;
+        if self.durable_store.is_some() {
+            return Err(DurableApproverError::Store(
+                "cannot replace a persisted durable authority with an in-memory approver".into(),
+            ));
+        }
         let snapshot = self
             .policy_snapshot
             .as_ref()
             .ok_or(DurableApproverError::MissingPolicySnapshot)?;
         let binding = self.validate_run_binding(&run)?;
+        let durable_approver = DurableToolApprover::new(approver, run.clone(), snapshot, timeout)?;
         self.register_durable_binding(&binding)?;
-        self.approver = Some(Arc::new(DurableToolApprover::new(
-            approver,
-            run.clone(),
-            snapshot,
-            timeout,
-        )?));
+        self.approver = Some(Arc::new(durable_approver));
         self.durable_binding = Some(binding);
-        self.durable_run = Some(run);
+        self.durable_run = Some(run.clone());
+        self.durable_approver_authority = Some(DurableApproverAuthority {
+            run,
+            store: None,
+            poison: None,
+            worker_lease: None,
+        });
         Ok(self)
     }
 
@@ -673,21 +881,99 @@ impl Governance {
         timeout: Duration,
         store: Arc<dyn crate::durable_store::DurableStore>,
     ) -> Result<Self, DurableApproverError> {
+        self.ensure_run_authority(&run)?;
+        self.ensure_store_authority(&store)?;
         let snapshot = self
             .policy_snapshot
             .as_ref()
             .ok_or(DurableApproverError::MissingPolicySnapshot)?;
         let binding = self.validate_run_binding(&run)?;
-        self.register_durable_binding(&binding)?;
-        self.approver = Some(Arc::new(DurableToolApprover::new_persisted(
+        let durable_approver = DurableToolApprover::new_persisted(
             approver,
             run.clone(),
             snapshot,
             timeout,
-            store,
-        )?));
+            store.clone(),
+        )?;
+        self.register_durable_binding(&binding)?;
+        self.approver = Some(Arc::new(durable_approver));
         self.durable_binding = Some(binding);
-        self.durable_run = Some(run);
+        self.durable_run = Some(run.clone());
+        self.durable_store = Some(store.clone());
+        self.durable_approver_authority = Some(DurableApproverAuthority {
+            run,
+            store: Some(store),
+            poison: None,
+            worker_lease: None,
+        });
+        Ok(self)
+    }
+
+    /// Attach governance to the exact state and store authority owned by a durable runtime.
+    /// Governed state must match policy hash, tenant, agent, and run identity exactly. A run and
+    /// governance configuration with no policy on either side remains ungoverned.
+    pub fn with_durable_driver(
+        mut self,
+        driver: &crate::durable_runtime::DurableRunDriver,
+    ) -> Result<Self, DurableApproverError> {
+        let run = driver.state_handle();
+        let store = driver.store_handle();
+        self.ensure_run_authority(&run)?;
+        self.ensure_store_authority(&store)?;
+        self.ensure_driver_approver_authority(driver)?;
+
+        let run_binding = run
+            .lock()
+            .map_err(|_| DurableApproverError::StateUnavailable)?
+            .governance_binding()
+            .cloned();
+        match (run_binding.is_some(), self.policy_snapshot.is_some()) {
+            (true, true) => {
+                self = self.with_durable_run(run.clone())?;
+            }
+            (true, false) => return Err(DurableApproverError::MissingPolicySnapshot),
+            (false, true) => return Err(DurableApproverError::MissingGovernanceBinding),
+            (false, false) => {
+                if self.durable_binding.is_some()
+                    || self.tenant_id.is_some()
+                    || self.agent_id.is_some()
+                    || self.binding_violation.is_some()
+                {
+                    return Err(DurableApproverError::BindingMismatch(
+                        "ungoverned durable run received partially configured governance identity"
+                            .into(),
+                    ));
+                }
+                self.durable_run = Some(run.clone());
+            }
+        }
+        self.durable_store = Some(store);
+        Ok(self)
+    }
+
+    /// Install a durable callback approver that shares the driver's exact state, store, and CAS
+    /// poison authority. No copied `RunState` is introduced.
+    pub fn with_persisted_durable_driver_approver(
+        mut self,
+        approver: Arc<dyn ToolApprover>,
+        driver: &crate::durable_runtime::DurableRunDriver,
+        timeout: Duration,
+    ) -> Result<Self, DurableApproverError> {
+        let durable_approver = {
+            let snapshot = self
+                .policy_snapshot
+                .as_ref()
+                .ok_or(DurableApproverError::MissingPolicySnapshot)?;
+            DurableToolApprover::new_persisted_for_driver(approver, driver, snapshot, timeout)?
+        };
+        self.approver = Some(Arc::new(durable_approver));
+        self.durable_approver_authority = Some(DurableApproverAuthority {
+            run: driver.state_handle(),
+            store: Some(driver.store_handle()),
+            poison: Some(driver.poison_handle()),
+            worker_lease: driver.worker_lease_authority(),
+        });
+        self = self.with_durable_driver(driver)?;
         Ok(self)
     }
 
@@ -697,6 +983,7 @@ impl Governance {
         mut self,
         run: Arc<Mutex<crate::durability::RunState>>,
     ) -> Result<Self, DurableApproverError> {
+        self.ensure_run_authority(&run)?;
         let binding = self.validate_run_binding(&run)?;
         self.register_durable_binding(&binding)?;
         self.durable_binding = Some(binding);
@@ -809,6 +1096,8 @@ impl Governance {
             agent_id: self.agent_id.clone(),
             durable_binding: self.durable_binding.clone(),
             durable_run: self.durable_run.clone(),
+            durable_store: self.durable_store.clone(),
+            durable_approver_authority: self.durable_approver_authority.clone(),
             durable_bindings: self.durable_bindings.clone(),
             binding_violation: self.binding_violation.clone(),
         }
@@ -849,6 +1138,70 @@ impl Governance {
             )));
         }
         Ok(actual)
+    }
+
+    fn ensure_run_authority(
+        &self,
+        run: &Arc<Mutex<crate::durability::RunState>>,
+    ) -> Result<(), DurableApproverError> {
+        if self
+            .durable_run
+            .as_ref()
+            .is_some_and(|existing| !Arc::ptr_eq(existing, run))
+        {
+            return Err(DurableApproverError::BindingMismatch(
+                "governance is already attached to a different durable state authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_store_authority(
+        &self,
+        store: &Arc<dyn crate::durable_store::DurableStore>,
+    ) -> Result<(), DurableApproverError> {
+        if self
+            .durable_store
+            .as_ref()
+            .is_some_and(|existing| !Arc::ptr_eq(existing, store))
+        {
+            return Err(DurableApproverError::Store(
+                "governance is already attached to a different durable store authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_driver_approver_authority(
+        &self,
+        driver: &crate::durable_runtime::DurableRunDriver,
+    ) -> Result<(), DurableApproverError> {
+        if self.approver.is_none() {
+            return Ok(());
+        }
+        let Some(authority) = &self.durable_approver_authority else {
+            return Err(DurableApproverError::BindingMismatch(
+                "durable driver cannot use an ordinary approver; install the driver-backed durable approver"
+                    .into(),
+            ));
+        };
+        let same_run = Arc::ptr_eq(&authority.run, &driver.state_handle());
+        let same_store = authority
+            .store
+            .as_ref()
+            .is_some_and(|store| Arc::ptr_eq(store, &driver.store_handle()));
+        let same_poison = authority
+            .poison
+            .as_ref()
+            .is_some_and(|poison| Arc::ptr_eq(poison, &driver.poison_handle()));
+        let same_worker_lease = authority.worker_lease == driver.worker_lease_authority();
+        if !same_run || !same_store || !same_poison || !same_worker_lease {
+            return Err(DurableApproverError::BindingMismatch(
+                "durable approver does not share the driver's exact state, store, poison, and worker lease authority"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn register_durable_binding(
@@ -1289,9 +1642,14 @@ impl Governance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_store::{DurableStore, InMemoryDurableStore};
+    use crate::durable_store::{
+        reject_unvalidated_approval_resolutions, validate_append_only,
+        validate_approval_resolution_deadline, validate_worker_lease_fence, DurableStore,
+        DurableStoreError, DurableStoreLeaseAuthority, InMemoryDurableStore,
+    };
     use permissions::{PermissionMode, Rule};
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn snapshot(effect: PolicyEffect) -> PolicySnapshot {
         PolicySnapshot::seal(PolicyDocument {
@@ -1300,6 +1658,206 @@ mod tests {
             rules: Vec::new(),
         })
         .unwrap()
+    }
+
+    struct ManualClockDurableStore {
+        state: Mutex<crate::durability::RunState>,
+        now_unix_ms: AtomicU64,
+        approval_resolution_cas_clock_unix_ms: AtomicU64,
+        reject_next_timeout_resolution_as_expired: std::sync::atomic::AtomicBool,
+    }
+
+    impl ManualClockDurableStore {
+        fn new(state: crate::durability::RunState, now_unix_ms: u64) -> Self {
+            Self {
+                state: Mutex::new(state),
+                now_unix_ms: AtomicU64::new(now_unix_ms),
+                approval_resolution_cas_clock_unix_ms: AtomicU64::new(0),
+                reject_next_timeout_resolution_as_expired: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+            }
+        }
+
+        fn set_clock(&self, now_unix_ms: u64) {
+            self.now_unix_ms.store(now_unix_ms, Ordering::SeqCst);
+        }
+
+        fn advance_clock_inside_next_approval_resolution_cas(&self, now_unix_ms: u64) {
+            self.approval_resolution_cas_clock_unix_ms
+                .store(now_unix_ms, Ordering::SeqCst);
+        }
+
+        fn reject_next_timeout_resolution_as_expired(&self) {
+            self.reject_next_timeout_resolution_as_expired
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn compare_and_swap_inner(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+            authority: Option<&DurableStoreLeaseAuthority>,
+            approval_id: Option<&str>,
+        ) -> Result<(), DurableStoreError> {
+            let mut current = self.state.lock().unwrap();
+            let actual = current.events().last().map_or(0, |event| event.sequence);
+            if actual != expected_sequence {
+                return Err(DurableStoreError::Conflict {
+                    run_id: replacement.run_id().into(),
+                    expected: expected_sequence,
+                    actual,
+                });
+            }
+            let forced_clock = approval_id.map_or(0, |_| {
+                self.approval_resolution_cas_clock_unix_ms
+                    .swap(0, Ordering::SeqCst)
+            });
+            if forced_clock != 0 {
+                self.now_unix_ms.store(forced_clock, Ordering::SeqCst);
+            }
+            let now_unix_ms = self.now_unix_ms.load(Ordering::SeqCst);
+            validate_worker_lease_fence(&current, replacement, authority, now_unix_ms)?;
+            validate_append_only(&current, replacement)?;
+            match approval_id {
+                Some(approval_id) => {
+                    validate_approval_resolution_deadline(
+                        &current,
+                        replacement,
+                        approval_id,
+                        now_unix_ms,
+                    )?;
+                    if replacement
+                        .projection()
+                        .approvals
+                        .get(approval_id)
+                        .is_some_and(|approval| {
+                            approval.status == crate::durability::DurableApprovalStatus::Rejected
+                        })
+                        && self
+                            .reject_next_timeout_resolution_as_expired
+                            .swap(false, Ordering::SeqCst)
+                    {
+                        return Err(DurableStoreError::ApprovalExpired {
+                            run_id: current.run_id().into(),
+                            approval_id: approval_id.into(),
+                            observed_at_unix_ms: now_unix_ms,
+                        });
+                    }
+                }
+                None => reject_unvalidated_approval_resolutions(&current, replacement)?,
+            }
+            *current = replacement.clone();
+            Ok(())
+        }
+    }
+
+    impl DurableStore for ManualClockDurableStore {
+        fn create(&self, state: &crate::durability::RunState) -> Result<(), DurableStoreError> {
+            Err(DurableStoreError::AlreadyExists {
+                run_id: state.run_id().into(),
+            })
+        }
+
+        fn load(&self, run_id: &str) -> Result<crate::durability::RunState, DurableStoreError> {
+            let state = self.state.lock().unwrap();
+            if state.run_id() != run_id {
+                return Err(DurableStoreError::NotFound {
+                    run_id: run_id.into(),
+                });
+            }
+            Ok(state.clone())
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+        ) -> Result<(), DurableStoreError> {
+            self.compare_and_swap_inner(expected_sequence, replacement, None, None)
+        }
+
+        fn worker_lease_clock_unix_ms(&self) -> Result<u64, DurableStoreError> {
+            Ok(self.now_unix_ms.load(Ordering::SeqCst))
+        }
+
+        fn supports_atomic_approval_resolution(&self) -> bool {
+            true
+        }
+
+        fn compare_and_swap_fenced(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+            authority: &DurableStoreLeaseAuthority,
+        ) -> Result<(), DurableStoreError> {
+            self.compare_and_swap_inner(expected_sequence, replacement, Some(authority), None)
+        }
+
+        fn compare_and_swap_approval_resolution(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+            approval_id: &str,
+            authority: Option<&DurableStoreLeaseAuthority>,
+        ) -> Result<(), DurableStoreError> {
+            self.compare_and_swap_inner(
+                expected_sequence,
+                replacement,
+                authority,
+                Some(approval_id),
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct ClocklessDurableStore {
+        inner: InMemoryDurableStore,
+    }
+
+    impl DurableStore for ClocklessDurableStore {
+        fn create(&self, state: &crate::durability::RunState) -> Result<(), DurableStoreError> {
+            self.inner.create(state)
+        }
+
+        fn load(&self, run_id: &str) -> Result<crate::durability::RunState, DurableStoreError> {
+            self.inner.load(run_id)
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+        ) -> Result<(), DurableStoreError> {
+            self.inner.compare_and_swap(expected_sequence, replacement)
+        }
+    }
+
+    #[derive(Default)]
+    struct ClockOnlyDurableStore {
+        inner: InMemoryDurableStore,
+    }
+
+    impl DurableStore for ClockOnlyDurableStore {
+        fn create(&self, state: &crate::durability::RunState) -> Result<(), DurableStoreError> {
+            self.inner.create(state)
+        }
+
+        fn load(&self, run_id: &str) -> Result<crate::durability::RunState, DurableStoreError> {
+            self.inner.load(run_id)
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected_sequence: u64,
+            replacement: &crate::durability::RunState,
+        ) -> Result<(), DurableStoreError> {
+            self.inner.compare_and_swap(expected_sequence, replacement)
+        }
+
+        fn worker_lease_clock_unix_ms(&self) -> Result<u64, DurableStoreError> {
+            self.inner.worker_lease_clock_unix_ms()
+        }
     }
 
     #[tokio::test]
@@ -2066,6 +2624,81 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn persisted_adapter_rejects_a_store_without_a_trusted_clock() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run(
+                "session",
+                "clockless-persisted-run",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let run = Arc::new(Mutex::new(initial.clone()));
+        let store = Arc::new(ClocklessDurableStore::default());
+        store.create(&initial).unwrap();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = base.with_persisted_durable_approver(
+            Arc::new(FixedApprover {
+                decision: ApprovalDecision::allow(None),
+                calls: callback_calls.clone(),
+            }),
+            run.clone(),
+            Duration::from_secs(1),
+            store.clone(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DurableApproverError::Store(ref message))
+                if message.contains("trusted approval clock is unavailable")
+                    && message.contains("does not provide a trusted worker lease clock")
+        ));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*run.lock().unwrap(), initial);
+        assert_eq!(store.load("clockless-persisted-run").unwrap(), initial);
+    }
+
+    #[test]
+    fn persisted_adapter_rejects_a_store_without_atomic_resolution_capability() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run(
+                "session",
+                "non-atomic-persisted-run",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let run = Arc::new(Mutex::new(initial.clone()));
+        let store = Arc::new(ClockOnlyDurableStore::default());
+        store.create(&initial).unwrap();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = base.with_persisted_durable_approver(
+            Arc::new(FixedApprover {
+                decision: ApprovalDecision::allow(None),
+                calls: callback_calls.clone(),
+            }),
+            run.clone(),
+            Duration::from_secs(1),
+            store.clone(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DurableApproverError::Store(ref message))
+                if message.contains("does not provide atomic approval resolution")
+        ));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*run.lock().unwrap(), initial);
+        assert_eq!(store.load("non-atomic-persisted-run").unwrap(), initial);
+    }
+
     #[tokio::test]
     async fn persisted_adapter_commits_request_and_resolution_through_store_cas() {
         let policy = snapshot(PolicyEffect::Ask);
@@ -2160,6 +2793,435 @@ mod tests {
         assert!(matches!(report.authorization, Authorization::Denied { .. }));
         assert_eq!(*run.lock().unwrap(), initial);
         assert_eq!(store.load("conflict-run").unwrap(), competing);
+    }
+
+    #[tokio::test]
+    async fn driver_accepts_only_approver_with_the_same_poison_authority() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let state = base
+            .start_durable_run(
+                "session",
+                "driver-approver-run",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let store = Arc::new(InMemoryDurableStore::default());
+        let driver = crate::DurableRunDriver::new(state, store.clone()).unwrap();
+        let callback = || {
+            Arc::new(DelayedApprover {
+                delay: Duration::ZERO,
+                decision: ApprovalDecision::allow(None),
+            }) as Arc<dyn ToolApprover>
+        };
+
+        assert!(matches!(
+            base.clone()
+                .with_approver(callback())
+                .with_durable_driver(&driver),
+            Err(DurableApproverError::BindingMismatch(_))
+        ));
+
+        let separately_persisted = base
+            .clone()
+            .with_persisted_durable_approver(
+                callback(),
+                driver.state_handle(),
+                Duration::from_secs(1),
+                driver.store_handle(),
+            )
+            .unwrap();
+        assert!(matches!(
+            separately_persisted.with_durable_driver(&driver),
+            Err(DurableApproverError::BindingMismatch(_))
+        ));
+
+        let governance = base
+            .with_persisted_durable_driver_approver(callback(), &driver, Duration::from_secs(1))
+            .unwrap();
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "driver-approver-run".into(),
+                turn: 1,
+                tool_use_id: "driver-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({"url": "https://example.com"}),
+            })
+            .await;
+        assert!(matches!(report.authorization, Authorization::Allowed(_)));
+        assert_eq!(
+            driver.snapshot().unwrap(),
+            store.load("driver-approver-run").unwrap()
+        );
+
+        let mut competing = store.load("driver-approver-run").unwrap();
+        let expected_sequence = competing.events().last().unwrap().sequence;
+        competing
+            .replace_state("other-worker", json!({"revision": 2}))
+            .unwrap();
+        store
+            .compare_and_swap(expected_sequence, &competing)
+            .unwrap();
+        let stale_report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "driver-approver-run".into(),
+                turn: 1,
+                tool_use_id: "stale-driver-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({"url": "https://other.example.com"}),
+            })
+            .await;
+        assert!(stale_report.interrupt);
+        assert!(matches!(
+            stale_report.authorization,
+            Authorization::Denied { .. }
+        ));
+        assert!(driver.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn skewed_failover_rejects_allow_after_the_store_deadline() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy.clone());
+        let mut state = base
+            .start_durable_run(
+                "session",
+                "skewed-failover-approval",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let binding = state.governance_binding().unwrap().clone();
+        let store_clock = unix_time_ms().unwrap().saturating_add(60_000);
+        let approval_id = state
+            .request_typed_approval(crate::durability::DurableApprovalRequest {
+                logical_key: "late-call".into(),
+                activity_id: None,
+                kind: crate::durability::DurableApprovalKind::Confirmation,
+                prompt: "Allow tool `network.fetch`?".into(),
+                payload: json!({
+                    "turn": 1,
+                    "tool_use_id": "late-call",
+                    "tool": "network.fetch",
+                    "input": {"url": "https://example.com"},
+                }),
+                policy_snapshot_hash: Some(policy.hash().into()),
+                governance_binding: Some(binding),
+                requested_at_unix_ms: store_clock,
+                expires_at_unix_ms: store_clock + 50,
+            })
+            .unwrap();
+        let store = Arc::new(ManualClockDurableStore::new(state, store_clock));
+
+        let crashed = crate::DurableRunDriver::new(
+            store.load("skewed-failover-approval").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        crashed
+            .claim_worker_lease("worker-a", "lease-a", store_clock, store_clock + 25)
+            .unwrap();
+        drop(crashed);
+
+        let recovered_at = store_clock + 100;
+        store.set_clock(recovered_at);
+        let recovered = crate::DurableRunDriver::new(
+            store.load("skewed-failover-approval").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        assert!(recovered
+            .claim_worker_lease("worker-b", "lease-b", recovered_at, recovered_at + 10_000,)
+            .unwrap());
+        let recovered = recovered.bind_worker_lease("worker-b", "lease-b").unwrap();
+
+        struct CountingAllowApprover(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl ToolApprover for CountingAllowApprover {
+            async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ApprovalDecision::allow(None)
+            }
+        }
+
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let governance = base
+            .with_persisted_durable_driver_approver(
+                Arc::new(CountingAllowApprover(callback_calls.clone())),
+                &recovered,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "skewed-failover-approval".into(),
+                turn: 1,
+                tool_use_id: "late-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({"url": "https://example.com"}),
+            })
+            .await;
+
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+        assert!(!recovered.is_poisoned());
+        let snapshot = recovered.snapshot().unwrap();
+        let approval = &snapshot.projection().approvals[&approval_id];
+        assert_eq!(
+            approval.status,
+            crate::durability::DurableApprovalStatus::Rejected
+        );
+        assert!(approval.timed_out);
+        assert_eq!(snapshot, store.load("skewed-failover-approval").unwrap());
+
+        store.set_clock(recovered_at + 1);
+        recovered.release_worker_lease(recovered_at + 1).unwrap();
+        assert!(store
+            .load("skewed-failover-approval")
+            .unwrap()
+            .worker_lease()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn clock_advance_inside_resolution_cas_rejects_late_allow() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run(
+                "session",
+                "atomic-approval-deadline",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let store_clock = 1_000_000;
+        let store = Arc::new(ManualClockDurableStore::new(initial, store_clock));
+        let driver = crate::DurableRunDriver::new(
+            store.load("atomic-approval-deadline").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        assert!(!driver
+            .claim_worker_lease("worker-a", "lease-a", store_clock, store_clock + 10_000,)
+            .unwrap());
+        let driver = driver.bind_worker_lease("worker-a", "lease-a").unwrap();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let governance = base
+            .with_persisted_durable_driver_approver(
+                Arc::new(FixedApprover {
+                    decision: ApprovalDecision::allow(None),
+                    calls: callback_calls.clone(),
+                }),
+                &driver,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+
+        // The request and post-callback timestamp reads both observe the pre-deadline value. The
+        // backend clock advances only after the resolution CAS owns its lock, reproducing the
+        // otherwise tiny read-then-CAS race deterministically.
+        store.advance_clock_inside_next_approval_resolution_cas(store_clock + 51);
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "atomic-approval-deadline".into(),
+                turn: 1,
+                tool_use_id: "atomic-late-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({"url": "https://example.com"}),
+            })
+            .await;
+
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
+        assert!(!driver.is_poisoned());
+        let local = driver.snapshot().unwrap();
+        let persisted = store.load("atomic-approval-deadline").unwrap();
+        assert_eq!(local, persisted);
+        let approval = persisted.projection().approvals.values().next().unwrap();
+        assert_eq!(
+            approval.status,
+            crate::durability::DurableApprovalStatus::Rejected
+        );
+        assert!(approval.timed_out);
+        assert_eq!(
+            persisted
+                .events()
+                .iter()
+                .filter(|event| matches!(event.kind, crate::RunEventKind::ApprovalResolved { .. }))
+                .count(),
+            1
+        );
+        driver.release_worker_lease(store_clock + 52).unwrap();
+        assert!(!driver.is_poisoned());
+        assert!(store
+            .load("atomic-approval-deadline")
+            .unwrap()
+            .worker_lease()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_timeout_retry_poisons_the_leased_driver() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run(
+                "session",
+                "atomic-timeout-retry-failure",
+                crate::DurabilityMode::Sync,
+            )
+            .unwrap();
+        let store_clock = 2_000_000;
+        let store = Arc::new(ManualClockDurableStore::new(initial, store_clock));
+        let driver = crate::DurableRunDriver::new(
+            store.load("atomic-timeout-retry-failure").unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        assert!(!driver
+            .claim_worker_lease("worker-a", "lease-a", store_clock, store_clock + 10_000,)
+            .unwrap());
+        let driver = driver.bind_worker_lease("worker-a", "lease-a").unwrap();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let governance = base
+            .with_persisted_durable_driver_approver(
+                Arc::new(FixedApprover {
+                    decision: ApprovalDecision::allow(None),
+                    calls: callback_calls.clone(),
+                }),
+                &driver,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+
+        store.advance_clock_inside_next_approval_resolution_cas(store_clock + 51);
+        store.reject_next_timeout_resolution_as_expired();
+        let report = governance
+            .authorize_detailed_with_context(AuthorizationContext {
+                run_id: "atomic-timeout-retry-failure".into(),
+                turn: 1,
+                tool_use_id: "retry-failure-call".into(),
+                tool: "network.fetch".into(),
+                input: json!({"url": "https://example.com"}),
+            })
+            .await;
+
+        assert!(report.interrupt);
+        assert!(matches!(report.authorization, Authorization::Denied { .. }));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
+        assert!(driver.is_poisoned());
+        let persisted = store.load("atomic-timeout-retry-failure").unwrap();
+        assert_eq!(
+            persisted
+                .projection()
+                .approvals
+                .values()
+                .next()
+                .unwrap()
+                .status,
+            crate::durability::DurableApprovalStatus::Pending
+        );
+        assert!(matches!(
+            driver.release_worker_lease(store_clock + 52),
+            Err(crate::DurableRunDriverError::Poisoned)
+        ));
+        assert!(store
+            .load("atomic-timeout-retry-failure")
+            .unwrap()
+            .worker_lease()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn denial_after_deadline_matches_the_durable_timeout_replay() {
+        let policy = snapshot(PolicyEffect::Ask);
+        let base = Governance::new(PermissionEngine::default(), HookDispatcher::new())
+            .with_policy_snapshot(policy);
+        let initial = base
+            .start_durable_run("session", "late-denial-replay", crate::DurabilityMode::Sync)
+            .unwrap();
+        let run = Arc::new(Mutex::new(initial.clone()));
+        let store_clock = 3_000_000;
+        let store = Arc::new(ManualClockDurableStore::new(initial, store_clock));
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+
+        struct AdvanceThenDeny {
+            store: Arc<ManualClockDurableStore>,
+            now_unix_ms: u64,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ToolApprover for AdvanceThenDeny {
+            async fn approve(&self, _request: ApprovalRequest) -> ApprovalDecision {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.store.set_clock(self.now_unix_ms);
+                ApprovalDecision::Deny {
+                    message: "operator denied".into(),
+                    interrupt: true,
+                }
+            }
+        }
+
+        let governance = base
+            .clone()
+            .with_persisted_durable_approver(
+                Arc::new(AdvanceThenDeny {
+                    store: store.clone(),
+                    now_unix_ms: store_clock + 51,
+                    calls: callback_calls.clone(),
+                }),
+                run.clone(),
+                Duration::from_millis(50),
+                store.clone(),
+            )
+            .unwrap();
+        let context = || AuthorizationContext {
+            run_id: "late-denial-replay".into(),
+            turn: 1,
+            tool_use_id: "late-denial-call".into(),
+            tool: "network.fetch".into(),
+            input: json!({"url": "https://example.com"}),
+        };
+        let first = governance.authorize_detailed_with_context(context()).await;
+        assert_eq!(
+            first.authorization,
+            Authorization::Denied {
+                message: "approval timed out".into(),
+                interrupt: false,
+            }
+        );
+        let approval = run
+            .lock()
+            .unwrap()
+            .projection()
+            .approvals
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(approval.timed_out);
+
+        let replay = base
+            .with_persisted_durable_approver(
+                Arc::new(FixedApprover {
+                    decision: ApprovalDecision::allow(None),
+                    calls: callback_calls.clone(),
+                }),
+                run,
+                Duration::from_millis(50),
+                store,
+            )
+            .unwrap()
+            .authorize_detailed_with_context(context())
+            .await;
+        assert_eq!(replay.authorization, first.authorization);
+        assert_eq!(replay.interrupt, first.interrupt);
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

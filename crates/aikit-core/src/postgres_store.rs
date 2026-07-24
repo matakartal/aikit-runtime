@@ -7,11 +7,16 @@
 
 #![cfg(feature = "postgres-store")]
 
-use crate::durability::{RunState, DURABILITY_SCHEMA_VERSION};
-use crate::durable_store::{
-    validate_append_only, DurableStore, DurableStoreError, DurableStoreResult,
+use crate::durability::{
+    is_supported_durability_schema_version, RunState, DURABILITY_SCHEMA_VERSION,
+    MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION,
 };
-use postgres::{Client, NoTls};
+use crate::durable_store::{
+    reject_unvalidated_approval_resolutions, validate_append_only,
+    validate_approval_resolution_deadline, validate_worker_lease_fence, DurableStore,
+    DurableStoreError, DurableStoreLeaseAuthority, DurableStoreResult,
+};
+use postgres::{Client, GenericClient, NoTls};
 use std::sync::{Mutex, MutexGuard};
 
 const CREATE_DURABLE_RUNS_TABLE: &str = r#"
@@ -109,75 +114,136 @@ impl DurableStore for PostgresDurableStore {
         )
     }
 
+    fn worker_lease_clock_unix_ms(&self) -> DurableStoreResult<u64> {
+        postgres_worker_lease_clock_unix_ms(&mut *self.client()?)
+    }
+
+    fn supports_atomic_approval_resolution(&self) -> bool {
+        true
+    }
+
     fn compare_and_swap(
         &self,
         expected_sequence: u64,
         replacement: &RunState,
     ) -> DurableStoreResult<()> {
-        let expected = revision_to_postgres(expected_sequence)?;
-        let replacement_revision = revision_to_postgres(last_sequence(replacement))?;
-        let replacement_schema = schema_version_to_postgres(replacement.schema_version())?;
-        let replacement_json = serialize_state(replacement)?;
-        let mut client = self.client()?;
-        let mut transaction = client.transaction().map_err(postgres_io)?;
+        postgres_compare_and_swap(self, expected_sequence, replacement, None, None)
+    }
 
-        // The row lock keeps the validation and conditional update in one serializable critical
-        // section even when different AIKit processes race on the same durable run.
-        let row = transaction
-            .query_opt(
-                "SELECT revision,schema_version,state_json FROM aikit_durable_runs \
+    fn compare_and_swap_fenced(
+        &self,
+        expected_sequence: u64,
+        replacement: &RunState,
+        authority: &DurableStoreLeaseAuthority,
+    ) -> DurableStoreResult<()> {
+        postgres_compare_and_swap(self, expected_sequence, replacement, Some(authority), None)
+    }
+
+    fn compare_and_swap_approval_resolution(
+        &self,
+        expected_sequence: u64,
+        replacement: &RunState,
+        approval_id: &str,
+        authority: Option<&DurableStoreLeaseAuthority>,
+    ) -> DurableStoreResult<()> {
+        postgres_compare_and_swap(
+            self,
+            expected_sequence,
+            replacement,
+            authority,
+            Some(approval_id),
+        )
+    }
+}
+
+fn postgres_compare_and_swap(
+    store: &PostgresDurableStore,
+    expected_sequence: u64,
+    replacement: &RunState,
+    authority: Option<&DurableStoreLeaseAuthority>,
+    approval_id: Option<&str>,
+) -> DurableStoreResult<()> {
+    let expected = revision_to_postgres(expected_sequence)?;
+    let replacement_revision = revision_to_postgres(last_sequence(replacement))?;
+    let replacement_schema = schema_version_to_postgres(replacement.schema_version())?;
+    let replacement_json = serialize_state(replacement)?;
+    let mut client = store.client()?;
+    let mut transaction = client.transaction().map_err(postgres_io)?;
+
+    // The row lock keeps the validation and conditional update in one serializable critical
+    // section even when different AIKit processes race on the same durable run.
+    let row = transaction
+        .query_opt(
+            "SELECT revision,schema_version,state_json FROM aikit_durable_runs \
                  WHERE run_id=$1 FOR UPDATE",
-                &[&replacement.run_id()],
-            )
-            .map_err(postgres_io)?;
-        let Some(row) = row else {
-            transaction.rollback().map_err(postgres_io)?;
-            return Err(DurableStoreError::NotFound {
-                run_id: replacement.run_id().into(),
-            });
-        };
-        let actual_sql = row.get::<_, i64>(0);
-        let actual = revision_from_postgres(actual_sql)?;
-        if actual != expected_sequence {
-            transaction.rollback().map_err(postgres_io)?;
-            return Err(DurableStoreError::Conflict {
-                run_id: replacement.run_id().into(),
-                expected: expected_sequence,
-                actual,
-            });
+            &[&replacement.run_id()],
+        )
+        .map_err(postgres_io)?;
+    let Some(row) = row else {
+        transaction.rollback().map_err(postgres_io)?;
+        return Err(DurableStoreError::NotFound {
+            run_id: replacement.run_id().into(),
+        });
+    };
+    let actual_sql = row.get::<_, i64>(0);
+    let actual = revision_from_postgres(actual_sql)?;
+    if actual != expected_sequence {
+        transaction.rollback().map_err(postgres_io)?;
+        return Err(DurableStoreError::Conflict {
+            run_id: replacement.run_id().into(),
+            expected: expected_sequence,
+            actual,
+        });
+    }
+    let current = decode_row(
+        replacement.run_id(),
+        actual_sql,
+        row.get::<_, i32>(1),
+        row.get::<_, String>(2),
+    )?;
+    let now_unix_ms = postgres_worker_lease_clock_unix_ms(&mut transaction)?;
+    validate_worker_lease_fence(&current, replacement, authority, now_unix_ms)?;
+    validate_append_only(&current, replacement)?;
+    match approval_id {
+        Some(approval_id) => {
+            validate_approval_resolution_deadline(&current, replacement, approval_id, now_unix_ms)?
         }
-        let current = decode_row(
-            replacement.run_id(),
-            actual_sql,
-            row.get::<_, i32>(1),
-            row.get::<_, String>(2),
-        )?;
-        validate_append_only(&current, replacement)?;
+        None => reject_unvalidated_approval_resolutions(&current, replacement)?,
+    }
 
-        let updated = transaction
-            .execute(
-                "UPDATE aikit_durable_runs \
+    let updated = transaction
+        .execute(
+            "UPDATE aikit_durable_runs \
                  SET revision=$1,schema_version=$2,state_json=$3,updated_at=CURRENT_TIMESTAMP \
                  WHERE run_id=$4 AND revision=$5",
-                &[
-                    &replacement_revision,
-                    &replacement_schema,
-                    &replacement_json,
-                    &replacement.run_id(),
-                    &expected,
-                ],
-            )
-            .map_err(postgres_io)?;
-        if updated != 1 {
-            transaction.rollback().map_err(postgres_io)?;
-            return Err(DurableStoreError::Conflict {
-                run_id: replacement.run_id().into(),
-                expected: expected_sequence,
-                actual,
-            });
-        }
-        transaction.commit().map_err(postgres_io)
+            &[
+                &replacement_revision,
+                &replacement_schema,
+                &replacement_json,
+                &replacement.run_id(),
+                &expected,
+            ],
+        )
+        .map_err(postgres_io)?;
+    if updated != 1 {
+        transaction.rollback().map_err(postgres_io)?;
+        return Err(DurableStoreError::Conflict {
+            run_id: replacement.run_id().into(),
+            expected: expected_sequence,
+            actual,
+        });
     }
+    transaction.commit().map_err(postgres_io)
+}
+
+fn postgres_worker_lease_clock_unix_ms(client: &mut impl GenericClient) -> DurableStoreResult<u64> {
+    let row = client
+        .query_one(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .map_err(postgres_io)?;
+    revision_from_postgres(row.get::<_, i64>(0))
 }
 
 fn decode_row(
@@ -189,13 +255,30 @@ fn decode_row(
     let revision = revision_from_postgres(revision)?;
     let schema_version = u32::try_from(schema_version)
         .map_err(|_| DurableStoreError::Invalid("negative PostgreSQL schema version".into()))?;
-    if schema_version != DURABILITY_SCHEMA_VERSION {
+    if !is_supported_durability_schema_version(schema_version) {
         return Err(DurableStoreError::Invalid(format!(
-            "unsupported PostgreSQL durability schema {schema_version}; expected {DURABILITY_SCHEMA_VERSION}"
+            "unsupported PostgreSQL durability schema {schema_version}; supported range is {MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION}..={DURABILITY_SCHEMA_VERSION}"
         )));
     }
-    let state: RunState = serde_json::from_str(&json)
+    let serialized: serde_json::Value = serde_json::from_str(&json)
         .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
+    let serialized_schema_version = serialized
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            DurableStoreError::Invalid(
+                "serialized durable run has an invalid schema version".into(),
+            )
+        })?;
+    if serialized_schema_version != schema_version {
+        return Err(DurableStoreError::Invalid(
+            "PostgreSQL schema version does not match serialized run state".into(),
+        ));
+    }
+    let state: RunState = serde_json::from_value(serialized)
+        .map_err(|error| DurableStoreError::Invalid(error.to_string()))?;
+    debug_assert_eq!(state.schema_version(), DURABILITY_SCHEMA_VERSION);
     if state.run_id() != run_id {
         return Err(DurableStoreError::Invalid(
             "PostgreSQL row key does not match serialized run ID".into(),
@@ -277,6 +360,29 @@ mod tests {
     }
 
     #[test]
+    fn postgres_decode_migrates_v1_row_metadata_and_snapshot() {
+        let initial = RunState::new("legacy-session", "legacy-run", DurabilityMode::Sync).unwrap();
+        let mut legacy = serde_json::to_value(&initial).unwrap();
+        legacy["schema_version"] = json!(1);
+        for event in legacy["events"].as_array_mut().unwrap() {
+            event["schema_version"] = json!(1);
+        }
+
+        let migrated = decode_row(
+            initial.run_id(),
+            1,
+            1,
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(migrated.schema_version(), DURABILITY_SCHEMA_VERSION);
+        assert!(migrated
+            .events()
+            .iter()
+            .all(|event| event.schema_version == 1));
+    }
+
+    #[test]
     #[ignore = "requires AIKIT_TEST_POSTGRES_URL pointing to a disposable PostgreSQL database"]
     fn postgres_store_enforces_cross_connection_cas() {
         let url = std::env::var("AIKIT_TEST_POSTGRES_URL")
@@ -308,6 +414,36 @@ mod tests {
             Err(DurableStoreError::Conflict { .. })
         ));
         assert_eq!(second.load(&run_id).unwrap(), winner);
+
+        let now = first.worker_lease_clock_unix_ms().unwrap();
+        let mut claimed = winner.clone();
+        claimed
+            .claim_worker_lease("worker-a", "lease-a", now, now + 60_000)
+            .unwrap();
+        first
+            .compare_and_swap(last_sequence(&winner), &claimed)
+            .unwrap();
+        let claimed_revision = last_sequence(&claimed);
+        let mut ordinary = claimed.clone();
+        ordinary
+            .replace_state("unfenced", json!({"forged": true}))
+            .unwrap();
+        assert!(matches!(
+            first.compare_and_swap(claimed_revision, &ordinary),
+            Err(DurableStoreError::WorkerLeaseRequired { .. })
+        ));
+        assert_eq!(first.load(&run_id).unwrap(), claimed);
+
+        let wrong = DurableStoreLeaseAuthority::new("worker-a", "wrong-token");
+        assert!(matches!(
+            first.compare_and_swap_fenced(claimed_revision, &ordinary, &wrong),
+            Err(DurableStoreError::WorkerLeaseConflict { .. })
+        ));
+        let authority = DurableStoreLeaseAuthority::new("worker-a", "lease-a");
+        first
+            .compare_and_swap_fenced(claimed_revision, &ordinary, &authority)
+            .unwrap();
+        assert_eq!(first.load(&run_id).unwrap(), ordinary);
         first.delete_run_for_test(&run_id).unwrap();
     }
 

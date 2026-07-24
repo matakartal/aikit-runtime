@@ -11,8 +11,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Schema version for serialized durable run state and events.
-pub const DURABILITY_SCHEMA_VERSION: u32 = 1;
+/// Schema version for serialized durable run state and newly emitted events.
+///
+/// Version 2 makes terminal failure and cancellation events fail closed while an activity attempt
+/// is still running. Version 1 logs remain readable with their original replay semantics and are
+/// migrated to a version 2 [`RunState`] when loaded.
+pub const DURABILITY_SCHEMA_VERSION: u32 = 2;
+pub(crate) const MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION: u32 = 1;
+
+pub(crate) const RUNTIME_RUN_STOPPED_AUDIT_STEP_ID: &str = "runtime-run-stopped-audit-v2";
+pub(crate) const RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID: &str = "runtime-run-stopped-audit-v1";
+pub(crate) const RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID: &str =
+    "runtime-recovery-run-stopped-audit-v1";
+pub(crate) const RUNTIME_INVOCATION_LIFECYCLE_STEP_ID: &str = "runtime-invocation-lifecycle-v1";
+
+const TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION: u32 = 2;
+
+/// Upper bound for one distributed worker lease. Long-running work stays owned through bounded
+/// heartbeat renewals instead of creating an effectively permanent claim.
+pub const MAX_DURABLE_WORKER_LEASE_MS: u64 = 60 * 60 * 1_000;
+
+pub(crate) const fn is_supported_durability_schema_version(schema_version: u32) -> bool {
+    schema_version >= MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION
+        && schema_version <= DURABILITY_SCHEMA_VERSION
+}
 
 /// Controls when a coordinator is allowed to acknowledge progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +263,21 @@ pub struct ApprovalResolution {
     pub response: Option<Value>,
 }
 
+/// Owner-bound, expiring execution claim materialized from the durable event log.
+///
+/// `lease_id` is a fencing token, not a promise of exactly-once execution. If a worker disappears,
+/// a later owner may recover the expired claim; existing activity semantics then decide whether
+/// work is safely retryable or requires explicit reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableWorkerLease {
+    pub owner_id: String,
+    pub lease_id: String,
+    pub acquired_at_unix_ms: u64,
+    pub heartbeat_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
 /// Materialized active branch derived from the event log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunProjection {
@@ -252,6 +289,8 @@ pub struct RunProjection {
     pub artifacts: BTreeMap<String, Vec<ArtifactMetadata>>,
     pub current_checkpoint_id: Option<String>,
     pub pause_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_lease: Option<DurableWorkerLease>,
 }
 
 impl RunProjection {
@@ -265,6 +304,7 @@ impl RunProjection {
             artifacts: BTreeMap::new(),
             current_checkpoint_id: None,
             pause_reason: None,
+            worker_lease: None,
         }
     }
 
@@ -324,6 +364,23 @@ pub enum RunEventKind {
     },
     StateReplaced {
         state: Value,
+    },
+    WorkerLeaseClaimed {
+        owner_id: String,
+        lease_id: String,
+        claimed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    },
+    WorkerLeaseRenewed {
+        owner_id: String,
+        lease_id: String,
+        renewed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    },
+    WorkerLeaseReleased {
+        owner_id: String,
+        lease_id: String,
+        released_at_unix_ms: u64,
     },
     ActivityScheduled {
         definition: ActivityDefinition,
@@ -543,6 +600,15 @@ pub enum DurabilityError {
     RunNotExecuting { status: DurableRunStatus },
     #[error("run is waiting for reconciliation")]
     RunRequiresReconciliation,
+    #[error(
+        "durable worker lease is held by `{owner_id}` until unix millisecond {expires_at_unix_ms}"
+    )]
+    WorkerLeaseHeld {
+        owner_id: String,
+        expires_at_unix_ms: u64,
+    },
+    #[error("durable worker `{owner_id}` no longer owns the active lease")]
+    WorkerLeaseLost { owner_id: String },
     #[error("invalid durable event: {reason}")]
     InvalidEvent { reason: String },
 }
@@ -589,16 +655,26 @@ impl<'de> Deserialize<'de> for RunState {
         use serde::de::Error as _;
 
         let serialized = SerializedRunState::deserialize(deserializer)?;
-        if serialized.schema_version != DURABILITY_SCHEMA_VERSION {
+        if !is_supported_durability_schema_version(serialized.schema_version) {
             return Err(D::Error::custom(format!(
-                "unsupported durability schema version {}; expected {}",
-                serialized.schema_version, DURABILITY_SCHEMA_VERSION
+                "unsupported durability schema version {}; supported range is {}..={}",
+                serialized.schema_version,
+                MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION,
+                DURABILITY_SCHEMA_VERSION
             )));
+        }
+        if serialized
+            .events
+            .iter()
+            .any(|event| event.schema_version > serialized.schema_version)
+        {
+            return Err(D::Error::custom(
+                "durable event schema version exceeds serialized run state schema version",
+            ));
         }
         let replayed = RunState::from_events(serialized.events.clone())
             .map_err(|error| D::Error::custom(error.to_string()))?;
-        if replayed.schema_version != serialized.schema_version
-            || replayed.session_id != serialized.session_id
+        if replayed.session_id != serialized.session_id
             || replayed.run_id != serialized.run_id
             || replayed.durability != serialized.durability
             || replayed.parent_run_id != serialized.parent_run_id
@@ -700,6 +776,9 @@ impl RunState {
     }
 
     /// Rebuild and validate a run exclusively from its append-only event log.
+    ///
+    /// Version 1 events are replayed with version 1 transition semantics and migrated in memory;
+    /// any event subsequently emitted by the returned state uses the current schema version.
     pub fn from_events(events: impl IntoIterator<Item = RunEvent>) -> DurabilityResult<Self> {
         let events: Vec<RunEvent> = events.into_iter().collect();
         let first = events.first().ok_or(DurabilityError::MissingRunStart)?;
@@ -725,7 +804,7 @@ impl RunState {
             RunProjection::root(&first.run_id),
         );
         for event in events {
-            state.append_event(event)?;
+            state.append_replayed_event(event)?;
         }
         Ok(state)
     }
@@ -794,6 +873,104 @@ impl RunState {
         self.projection.status
     }
 
+    pub fn worker_lease(&self) -> Option<&DurableWorkerLease> {
+        self.projection.worker_lease.as_ref()
+    }
+
+    /// Claim an unowned or expired distributed-worker lease.
+    ///
+    /// Returns `true` when this claim recovered an expired owner. The event is still only a
+    /// fencing boundary: an interrupted unsafe activity remains reconciliation-required. A
+    /// terminal run may also be claimed for audit reconciliation and stale-lease cleanup; its
+    /// terminal status still prevents provider or tool work from starting.
+    pub(crate) fn claim_worker_lease(
+        &mut self,
+        owner_id: &str,
+        lease_id: &str,
+        claimed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> DurabilityResult<bool> {
+        validate_identifier("worker_owner_id", owner_id)?;
+        validate_identifier("worker_lease_id", lease_id)?;
+        validate_worker_lease_window(claimed_at_unix_ms, expires_at_unix_ms)?;
+        let recovered = self.projection.worker_lease.is_some();
+        self.emit(
+            stable_identifier(
+                "event",
+                &[
+                    &self.run_id,
+                    "worker_lease_claimed",
+                    lease_id,
+                    &claimed_at_unix_ms.to_string(),
+                ],
+            ),
+            RunEventKind::WorkerLeaseClaimed {
+                owner_id: owner_id.to_string(),
+                lease_id: lease_id.to_string(),
+                claimed_at_unix_ms,
+                expires_at_unix_ms,
+            },
+        )?;
+        Ok(recovered)
+    }
+
+    pub(crate) fn renew_worker_lease(
+        &mut self,
+        owner_id: &str,
+        lease_id: &str,
+        renewed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> DurabilityResult<()> {
+        validate_identifier("worker_owner_id", owner_id)?;
+        validate_identifier("worker_lease_id", lease_id)?;
+        validate_worker_lease_window(renewed_at_unix_ms, expires_at_unix_ms)?;
+        self.emit(
+            stable_identifier(
+                "event",
+                &[
+                    &self.run_id,
+                    "worker_lease_renewed",
+                    lease_id,
+                    &renewed_at_unix_ms.to_string(),
+                ],
+            ),
+            RunEventKind::WorkerLeaseRenewed {
+                owner_id: owner_id.to_string(),
+                lease_id: lease_id.to_string(),
+                renewed_at_unix_ms,
+                expires_at_unix_ms,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn release_worker_lease(
+        &mut self,
+        owner_id: &str,
+        lease_id: &str,
+        released_at_unix_ms: u64,
+    ) -> DurabilityResult<()> {
+        validate_identifier("worker_owner_id", owner_id)?;
+        validate_identifier("worker_lease_id", lease_id)?;
+        self.emit(
+            stable_identifier(
+                "event",
+                &[
+                    &self.run_id,
+                    "worker_lease_released",
+                    lease_id,
+                    &released_at_unix_ms.to_string(),
+                ],
+            ),
+            RunEventKind::WorkerLeaseReleased {
+                owner_id: owner_id.to_string(),
+                lease_id: lease_id.to_string(),
+                released_at_unix_ms,
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn next_sequence(&self) -> u64 {
         self.events
             .last()
@@ -808,6 +985,29 @@ impl RunState {
                 actual: event.schema_version,
             });
         }
+        self.append_validated_event(event)
+    }
+
+    fn append_replayed_event(&mut self, event: RunEvent) -> DurabilityResult<AppendOutcome> {
+        if !is_supported_durability_schema_version(event.schema_version) {
+            return Err(DurabilityError::UnsupportedSchema {
+                expected: DURABILITY_SCHEMA_VERSION,
+                actual: event.schema_version,
+            });
+        }
+        if self
+            .events
+            .last()
+            .is_some_and(|previous| previous.schema_version > event.schema_version)
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "durability event schema versions must be monotonic".into(),
+            });
+        }
+        self.append_validated_event(event)
+    }
+
+    fn append_validated_event(&mut self, event: RunEvent) -> DurabilityResult<AppendOutcome> {
         validate_identifier("event_id", &event.event_id)?;
         if event.run_id != self.run_id {
             return Err(DurabilityError::WrongRun {
@@ -863,6 +1063,48 @@ impl RunState {
         if self.projection.status.is_terminal() {
             return Err(DurabilityError::TerminalRun {
                 status: self.projection.status,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_reserved_audit_lifecycle_closed(&self) -> DurabilityResult<()> {
+        let open = self.projection.activities.values().find(|record| {
+            if !is_reserved_audit_activity(record) {
+                return false;
+            }
+            match record.definition.stable_step_id.as_str() {
+                RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID => {
+                    !self.projection.activities.values().any(|bridge| {
+                        bridge.completed_output().is_some_and(|output| {
+                            validate_legacy_terminal_resolution(
+                                &self.projection.activities,
+                                bridge,
+                                output,
+                            )
+                            .is_ok()
+                                && bridge
+                                    .definition
+                                    .input
+                                    .get("legacy_resolution")
+                                    .and_then(|source| source.get("source_activity_id"))
+                                    .and_then(Value::as_str)
+                                    == Some(record.definition.activity_id.as_str())
+                        })
+                    })
+                }
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                | RUNTIME_INVOCATION_LIFECYCLE_STEP_ID => record.completed_output().is_none(),
+                _ => false,
+            }
+        });
+        if let Some(record) = open {
+            return Err(DurabilityError::InvalidEvent {
+                reason: format!(
+                    "run cannot become terminal while reserved audit activity `{}` is unresolved",
+                    record.definition.activity_id
+                ),
             });
         }
         Ok(())
@@ -1173,6 +1415,24 @@ impl RunState {
     ) -> DurabilityResult<ActivityDecision> {
         self.ensure_active()?;
         let error = error.into();
+        if is_reserved_audit_activity(self.activity(activity_id)?) {
+            let reason = format!("reserved audit activity requires reconciliation: {error}");
+            self.emit(
+                stable_identifier(
+                    "event",
+                    &[activity_id, &attempt.to_string(), "reconcile_required"],
+                ),
+                RunEventKind::ActivityReconciliationRequired {
+                    activity_id: activity_id.to_string(),
+                    attempt,
+                    reason: reason.clone(),
+                },
+            )?;
+            return Ok(ActivityDecision::ReconcileRequired {
+                activity_id: activity_id.to_string(),
+                reason,
+            });
+        }
         self.emit(
             stable_identifier("event", &[activity_id, &attempt.to_string(), "failed"]),
             RunEventKind::ActivityAttemptFailed {
@@ -1212,6 +1472,91 @@ impl RunState {
         }
     }
 
+    /// Quarantine a reserved schedule that was persisted without its first attempt.
+    ///
+    /// This transition remains valid while paused or already reconciling, so an incomplete raw
+    /// prefix cannot strand the driver before an operator-visible reconciliation record exists.
+    pub(crate) fn quarantine_unstarted_reserved_activity(
+        &mut self,
+        activity_id: &str,
+        reason: impl Into<String>,
+    ) -> DurabilityResult<()> {
+        let record = self.activity(activity_id)?;
+        if !is_reserved_audit_activity(record) || !record.attempts.is_empty() {
+            return Err(invalid_activity(
+                activity_id,
+                "only an unstarted reserved audit activity can be quarantined".into(),
+            ));
+        }
+        let terminal_legacy_orphan = self.projection.status.is_terminal()
+            && record.definition.stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID;
+        if !terminal_legacy_orphan {
+            self.ensure_active()?;
+        }
+        let reason = reason.into();
+        self.emit(
+            stable_identifier("event", &[activity_id, "1", "orphan_reconcile_required"]),
+            RunEventKind::ActivityReconciliationRequired {
+                activity_id: activity_id.to_string(),
+                attempt: 1,
+                reason,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Quarantine an unsafe activity attempt that only a migrated v1 terminal history can carry.
+    ///
+    /// Current-schema terminal transitions reject running activities. Requiring both the exact
+    /// v1 schedule and v1 attempt-start provenance keeps this exception migration-only while
+    /// allowing an operator to reconcile an otherwise permanently wedged legacy run.
+    pub(crate) fn quarantine_terminal_legacy_running_activity(
+        &mut self,
+        activity_id: &str,
+        reason: impl Into<String>,
+    ) -> DurabilityResult<()> {
+        if !self.projection.status.is_terminal() {
+            return Err(invalid_activity(
+                activity_id,
+                "legacy terminal quarantine requires a terminal run".into(),
+            ));
+        }
+        let record = self.activity(activity_id)?;
+        let attempt = record
+            .latest_attempt()
+            .ok_or_else(|| invalid_activity(activity_id, "activity has not started".into()))?;
+        if is_reserved_audit_activity(record)
+            || record.definition.side_effect_class != SideEffectClass::ReconcileRequired
+            || attempt.status != ActivityAttemptStatus::Running
+            || !self.activity_attempt_has_v1_provenance(activity_id, attempt.attempt)
+        {
+            return Err(invalid_activity(
+                activity_id,
+                "only a v1-provenanced terminal reconciliation-required running attempt can be quarantined"
+                    .into(),
+            ));
+        }
+        let attempt = attempt.attempt;
+        let terminal_status = self.projection.status;
+        self.emit(
+            stable_identifier(
+                "event",
+                &[
+                    activity_id,
+                    &attempt.to_string(),
+                    "legacy_terminal_quarantine",
+                ],
+            ),
+            RunEventKind::ActivityReconciliationRequired {
+                activity_id: activity_id.to_string(),
+                attempt,
+                reason: reason.into(),
+            },
+        )?;
+        debug_assert_eq!(self.projection.status, terminal_status);
+        Ok(())
+    }
+
     /// Record an explicit operator/integration reconciliation.
     pub fn reconcile_activity(
         &mut self,
@@ -1220,8 +1565,28 @@ impl RunState {
         resolution: ActivityReconciliation,
     ) -> DurabilityResult<AppendOutcome> {
         validate_identifier("reconciliation_id", reconciliation_id)?;
-        let attempt = self
-            .activity(activity_id)?
+        let record = self.activity(activity_id)?.clone();
+        let lifecycle_schedule_sequence = (record.definition.stable_step_id
+            == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID)
+            .then(|| {
+                self.events.iter().find_map(|event| match &event.kind {
+                    RunEventKind::ActivityScheduled { definition }
+                        if definition.activity_id == activity_id =>
+                    {
+                        Some(event.sequence)
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
+        validate_reserved_audit_reconciliation(
+            &self.run_id,
+            &self.projection.activities,
+            &record,
+            &resolution,
+            lifecycle_schedule_sequence,
+        )?;
+        let attempt = record
             .latest_attempt()
             .ok_or_else(|| DurabilityError::InvalidActivityTransition {
                 activity_id: activity_id.to_string(),
@@ -1507,6 +1872,7 @@ impl RunState {
     pub fn complete_run(&mut self, completion_id: &str) -> DurabilityResult<AppendOutcome> {
         validate_identifier("completion_id", completion_id)?;
         self.ensure_active()?;
+        self.ensure_reserved_audit_lifecycle_closed()?;
         self.emit(
             stable_identifier("event", &[&self.run_id, "complete", completion_id]),
             RunEventKind::RunCompleted,
@@ -1520,6 +1886,7 @@ impl RunState {
     ) -> DurabilityResult<AppendOutcome> {
         validate_identifier("failure_id", failure_id)?;
         self.ensure_active()?;
+        self.ensure_reserved_audit_lifecycle_closed()?;
         self.emit(
             stable_identifier("event", &[&self.run_id, "fail", failure_id]),
             RunEventKind::RunFailed {
@@ -1755,7 +2122,7 @@ impl RunState {
         new_branch_id: String,
         command_id: &str,
     ) -> DurabilityResult<RunState> {
-        let projection = fork_projection(&checkpoint, &new_branch_id);
+        let projection = fork_projection(&checkpoint, new_run_id, &new_branch_id);
         let mut forked = RunState::blank(
             self.session_id.clone(),
             new_run_id.to_string(),
@@ -1859,6 +2226,7 @@ impl RunState {
             return Err(DurabilityError::DuplicateEventConflict { event_id });
         }
         self.ensure_active()?;
+        self.ensure_reserved_audit_lifecycle_closed()?;
         let outcome = self.emit(event_id, RunEventKind::RunCancelled { reason })?;
         Ok(CommandOutcome::Cancelled {
             sequence: append_sequence(outcome),
@@ -1945,7 +2313,8 @@ impl RunState {
                     }
                     self.parent_run_id = Some(source_run_id.clone());
                     self.durability = *durability;
-                    self.projection = fork_projection(source_checkpoint, new_branch_id);
+                    self.projection =
+                        fork_projection(source_checkpoint, &self.run_id, new_branch_id);
                     self.checkpoints.insert(
                         source_checkpoint.checkpoint_id.clone(),
                         (**source_checkpoint).clone(),
@@ -2006,6 +2375,96 @@ impl RunState {
                 self.ensure_executing()?;
                 self.projection.state = state.clone();
             }
+            RunEventKind::WorkerLeaseClaimed {
+                owner_id,
+                lease_id,
+                claimed_at_unix_ms,
+                expires_at_unix_ms,
+            } => {
+                if event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "distributed worker leases require durability schema v2".into(),
+                    });
+                }
+                validate_identifier("worker_owner_id", owner_id)?;
+                validate_identifier("worker_lease_id", lease_id)?;
+                validate_worker_lease_window(*claimed_at_unix_ms, *expires_at_unix_ms)?;
+                if let Some(existing) = &self.projection.worker_lease {
+                    if existing.expires_at_unix_ms > *claimed_at_unix_ms {
+                        return Err(DurabilityError::WorkerLeaseHeld {
+                            owner_id: existing.owner_id.clone(),
+                            expires_at_unix_ms: existing.expires_at_unix_ms,
+                        });
+                    }
+                }
+                self.projection.worker_lease = Some(DurableWorkerLease {
+                    owner_id: owner_id.clone(),
+                    lease_id: lease_id.clone(),
+                    acquired_at_unix_ms: *claimed_at_unix_ms,
+                    heartbeat_at_unix_ms: *claimed_at_unix_ms,
+                    expires_at_unix_ms: *expires_at_unix_ms,
+                });
+            }
+            RunEventKind::WorkerLeaseRenewed {
+                owner_id,
+                lease_id,
+                renewed_at_unix_ms,
+                expires_at_unix_ms,
+            } => {
+                if event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "distributed worker leases require durability schema v2".into(),
+                    });
+                }
+                validate_identifier("worker_owner_id", owner_id)?;
+                validate_identifier("worker_lease_id", lease_id)?;
+                validate_worker_lease_window(*renewed_at_unix_ms, *expires_at_unix_ms)?;
+                let existing = self.projection.worker_lease.as_mut().ok_or_else(|| {
+                    DurabilityError::WorkerLeaseLost {
+                        owner_id: owner_id.clone(),
+                    }
+                })?;
+                if existing.owner_id != *owner_id
+                    || existing.lease_id != *lease_id
+                    || existing.expires_at_unix_ms <= *renewed_at_unix_ms
+                    || existing.heartbeat_at_unix_ms > *renewed_at_unix_ms
+                    || *expires_at_unix_ms <= existing.expires_at_unix_ms
+                {
+                    return Err(DurabilityError::WorkerLeaseLost {
+                        owner_id: owner_id.clone(),
+                    });
+                }
+                existing.heartbeat_at_unix_ms = *renewed_at_unix_ms;
+                existing.expires_at_unix_ms = *expires_at_unix_ms;
+            }
+            RunEventKind::WorkerLeaseReleased {
+                owner_id,
+                lease_id,
+                released_at_unix_ms,
+            } => {
+                if event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "distributed worker leases require durability schema v2".into(),
+                    });
+                }
+                validate_identifier("worker_owner_id", owner_id)?;
+                validate_identifier("worker_lease_id", lease_id)?;
+                let existing = self.projection.worker_lease.as_ref().ok_or_else(|| {
+                    DurabilityError::WorkerLeaseLost {
+                        owner_id: owner_id.clone(),
+                    }
+                })?;
+                if existing.owner_id != *owner_id
+                    || existing.lease_id != *lease_id
+                    || existing.expires_at_unix_ms <= *released_at_unix_ms
+                    || *released_at_unix_ms < existing.heartbeat_at_unix_ms
+                {
+                    return Err(DurabilityError::WorkerLeaseLost {
+                        owner_id: owner_id.clone(),
+                    });
+                }
+                self.projection.worker_lease = None;
+            }
             RunEventKind::ActivityScheduled { definition } => {
                 self.ensure_executing()?;
                 if stable_input_hash(&definition.input) != definition.input_hash {
@@ -2036,6 +2495,75 @@ impl RunState {
                         reason: "activity was scheduled twice".into(),
                     });
                 }
+                if event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    if matches!(
+                        definition.stable_step_id.as_str(),
+                        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                            | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                            | RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+                    ) {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason:
+                                "v2 reserved audit activities cannot be introduced by a v1 event"
+                                    .into(),
+                        });
+                    }
+                    if definition.stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID {
+                        let expected_activity_id = stable_identifier(
+                            "activity",
+                            &[
+                                &self.run_id,
+                                &self.projection.branch_id,
+                                RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID,
+                                "terminal",
+                            ],
+                        );
+                        let duplicate = self.projection.activities.values().any(|record| {
+                            record.definition.stable_step_id
+                                == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+                        });
+                        if definition.activity_id != expected_activity_id
+                            || definition.logical_key != "terminal"
+                            || definition.side_effect_class != SideEffectClass::ReconcileRequired
+                            || definition.idempotency_key.is_some()
+                            || duplicate
+                        {
+                            return Err(DurabilityError::InvalidEvent {
+                                reason: "legacy RunStopped audit activity has a non-canonical or duplicate definition"
+                                    .into(),
+                            });
+                        }
+                    }
+                }
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    let definition_is_reserved = matches!(
+                        definition.stable_step_id.as_str(),
+                        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                            | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                            | RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+                    );
+                    if !definition_is_reserved
+                        && self.projection.activities.values().any(|record| {
+                            matches!(
+                                record.definition.stable_step_id.as_str(),
+                                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                                    | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                            ) && is_reserved_audit_activity(record)
+                        })
+                    {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason:
+                                "ordinary work cannot be scheduled after a terminal audit marker"
+                                    .into(),
+                        });
+                    }
+                    validate_reserved_audit_schedule(
+                        &self.run_id,
+                        &self.projection.branch_id,
+                        &self.projection.activities,
+                        definition,
+                    )?;
+                }
                 self.projection.activities.insert(
                     definition.activity_id.clone(),
                     ActivityRecord {
@@ -2049,6 +2577,28 @@ impl RunState {
                 attempt,
             } => {
                 self.ensure_executing()?;
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    let record = self.activity(activity_id)?.clone();
+                    if !is_reserved_audit_activity(&record)
+                        && self.projection.activities.values().any(|candidate| {
+                            matches!(
+                                candidate.definition.stable_step_id.as_str(),
+                                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                                    | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                            ) && is_reserved_audit_activity(candidate)
+                        })
+                    {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason: "ordinary work cannot start after a terminal audit marker"
+                                .into(),
+                        });
+                    }
+                    validate_reserved_audit_attempt_start(
+                        &self.run_id,
+                        &self.projection.activities,
+                        &record,
+                    )?;
+                }
                 let sequence = event.sequence;
                 let record = self.activity_mut(activity_id)?;
                 let expected = record.attempts.len() as u32 + 1;
@@ -2096,6 +2646,15 @@ impl RunState {
                         reason: format!("activity `{activity_id}` output hash is invalid"),
                     });
                 }
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    let record = self.activity(activity_id)?.clone();
+                    validate_reserved_audit_attempt_completion(
+                        &self.run_id,
+                        &self.projection.activities,
+                        &record,
+                        output,
+                    )?;
+                }
                 let sequence = event.sequence;
                 let attempt_state = self.running_attempt_mut(activity_id, *attempt)?;
                 attempt_state.status = ActivityAttemptStatus::Completed;
@@ -2111,6 +2670,15 @@ impl RunState {
                 effect_ambiguous,
             } => {
                 self.ensure_active()?;
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    let record = self.activity(activity_id)?.clone();
+                    if is_reserved_audit_activity(&record) {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason: "reserved audit failures must transition directly to reconciliation-required"
+                                .into(),
+                        });
+                    }
+                }
                 let sequence = event.sequence;
                 let attempt_state = self.running_attempt_mut(activity_id, *attempt)?;
                 attempt_state.status = ActivityAttemptStatus::Failed;
@@ -2124,9 +2692,61 @@ impl RunState {
                 attempt,
                 reason,
             } => {
-                self.ensure_active()?;
+                let terminal_legacy_orphan = event.schema_version
+                    >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION
+                    && self.projection.status.is_terminal()
+                    && *attempt == 1
+                    && self.activity(activity_id).is_ok_and(|record| {
+                        record.definition.stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+                            && is_reserved_audit_activity(record)
+                            && record.attempts.is_empty()
+                    });
+                let terminal_legacy_running = event.schema_version
+                    >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION
+                    && self.projection.status.is_terminal()
+                    && self.activity(activity_id).is_ok_and(|record| {
+                        !is_reserved_audit_activity(record)
+                            && record.definition.side_effect_class
+                                == SideEffectClass::ReconcileRequired
+                            && record.latest_attempt().is_some_and(|candidate| {
+                                candidate.attempt == *attempt
+                                    && candidate.status == ActivityAttemptStatus::Running
+                            })
+                            && self.activity_attempt_has_v1_provenance(activity_id, *attempt)
+                    });
+                let terminal_legacy_migration = terminal_legacy_orphan || terminal_legacy_running;
+                if !terminal_legacy_migration {
+                    self.ensure_active()?;
+                }
                 let sequence = event.sequence;
                 let record = self.activity_mut(activity_id)?;
+                if record.attempts.is_empty() {
+                    if event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION
+                        || *attempt != 1
+                        || !is_reserved_audit_activity(record)
+                    {
+                        return Err(invalid_activity(
+                            activity_id,
+                            "attempt was not found".into(),
+                        ));
+                    }
+                    record.attempts.push(ActivityAttempt {
+                        attempt: *attempt,
+                        status: ActivityAttemptStatus::ReconcileRequired,
+                        started_sequence: sequence,
+                        finished_sequence: Some(sequence),
+                        output: None,
+                        output_hash: None,
+                        error: Some(reason.clone()),
+                        retryable: false,
+                        effect_ambiguous: true,
+                    });
+                    if !terminal_legacy_migration {
+                        self.projection.status = DurableRunStatus::ReconcileRequired;
+                        self.projection.pause_reason = Some(reason.clone());
+                    }
+                    return Ok(());
+                }
                 let attempt_state = record
                     .attempts
                     .iter_mut()
@@ -2145,15 +2765,69 @@ impl RunState {
                 attempt_state.finished_sequence = Some(sequence);
                 attempt_state.error = Some(reason.clone());
                 attempt_state.effect_ambiguous = true;
-                self.projection.status = DurableRunStatus::ReconcileRequired;
-                self.projection.pause_reason = Some(reason.clone());
+                if !terminal_legacy_migration {
+                    self.projection.status = DurableRunStatus::ReconcileRequired;
+                    self.projection.pause_reason = Some(reason.clone());
+                }
             }
             RunEventKind::ActivityReconciled {
                 activity_id,
                 attempt,
                 resolution,
             } => {
+                let record = self.activity(activity_id)?.clone();
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    let lifecycle_schedule_sequence = (record.definition.stable_step_id
+                        == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID)
+                        .then(|| {
+                            self.events.iter().find_map(|prior| match &prior.kind {
+                                RunEventKind::ActivityScheduled { definition }
+                                    if definition.activity_id == *activity_id =>
+                                {
+                                    Some(prior.sequence)
+                                }
+                                _ => None,
+                            })
+                        })
+                        .flatten();
+                    validate_reserved_audit_reconciliation(
+                        &self.run_id,
+                        &self.projection.activities,
+                        &record,
+                        resolution,
+                        lifecycle_schedule_sequence,
+                    )?;
+                }
                 let previous_run_status = self.projection.status;
+                let terminal_legacy_attestation = previous_run_status.is_terminal()
+                    && record.definition.stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+                    && record
+                        .latest_attempt()
+                        .is_some_and(|attempt| attempt.status != ActivityAttemptStatus::Completed)
+                    && matches!(resolution, ActivityReconciliation::Completed { .. });
+                if terminal_legacy_attestation {
+                    let ActivityReconciliation::Completed { output } = resolution else {
+                        unreachable!("terminal legacy attestation is completion-only")
+                    };
+                    let attestation: crate::durable_runtime::DurableLegacyRunStoppedResolutionEnvelope =
+                        serde_json::from_value(output.clone()).map_err(|_| {
+                            DurabilityError::InvalidEvent {
+                                reason: "terminal legacy RunStopped attestation is malformed"
+                                    .into(),
+                            }
+                        })?;
+                    let attested_status = match attestation.terminal_receipt.reason.as_str() {
+                        "end_turn" | "stop" => DurableRunStatus::Completed,
+                        "approval_interrupted" | "cancelled" => DurableRunStatus::Cancelled,
+                        _ => DurableRunStatus::Failed,
+                    };
+                    if attested_status != previous_run_status {
+                        return Err(DurabilityError::InvalidEvent {
+                            reason: "terminal legacy RunStopped attestation contradicts the persisted terminal status"
+                                .into(),
+                        });
+                    }
+                }
                 let sequence = event.sequence;
                 let attempt_state = self
                     .activity_mut(activity_id)?
@@ -2161,7 +2835,9 @@ impl RunState {
                     .iter_mut()
                     .find(|candidate| candidate.attempt == *attempt)
                     .ok_or_else(|| invalid_activity(activity_id, "attempt was not found".into()))?;
-                if attempt_state.status != ActivityAttemptStatus::ReconcileRequired {
+                if attempt_state.status != ActivityAttemptStatus::ReconcileRequired
+                    && !terminal_legacy_attestation
+                {
                     return Err(invalid_activity(
                         activity_id,
                         "attempt is not awaiting reconciliation".into(),
@@ -2208,7 +2884,7 @@ impl RunState {
                         reason: format!("approval `{approval_id}` was requested twice"),
                     });
                 }
-                let decoded = decode_approval_payload(payload)?;
+                let decoded = decode_approval_payload(payload, event.schema_version)?;
                 if let Some(policy_hash) = decoded.policy_snapshot_hash.as_deref() {
                     validate_policy_hash(policy_hash)?;
                 }
@@ -2282,7 +2958,8 @@ impl RunState {
                         approval_id: approval_id.clone(),
                     });
                 }
-                let decoded = decode_resolution_payload(approval, *approved, response)?;
+                let decoded =
+                    decode_resolution_payload(approval, *approved, response, event.schema_version)?;
                 approval.status = if *approved {
                     DurableApprovalStatus::Approved
                 } else {
@@ -2381,39 +3058,40 @@ impl RunState {
                 self.ensure_active()?;
                 let checkpoint = self.checkpoint_by_id(checkpoint_id)?.clone();
                 self.require_reconciled_after(checkpoint.event_sequence, *side_effects_reconciled)?;
-                self.projection = checkpoint.projection;
-                self.projection.branch_id = new_branch_id.clone();
-                self.projection.current_checkpoint_id = Some(checkpoint_id.clone());
+                self.projection = fork_projection(&checkpoint, &self.run_id, new_branch_id);
                 self.projection.status = DurableRunStatus::Paused;
                 self.projection.pause_reason = Some(format!("rewound to `{checkpoint_id}`"));
             }
             RunEventKind::RunCompleted => {
                 self.ensure_active()?;
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    self.ensure_reserved_audit_lifecycle_closed()?;
+                }
                 if !self.projection.pending_approval_ids().is_empty() {
                     return Err(DurabilityError::PendingApprovals);
                 }
                 if self.has_reconciliation_pending() {
                     return Err(DurabilityError::RunRequiresReconciliation);
                 }
-                if self.projection.activities.values().any(|record| {
-                    record
-                        .latest_attempt()
-                        .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::Running)
-                }) {
-                    return Err(DurabilityError::InvalidEvent {
-                        reason: "run cannot complete while an activity is running".into(),
-                    });
-                }
+                self.ensure_no_running_activities("complete")?;
                 self.projection.status = DurableRunStatus::Completed;
                 self.projection.pause_reason = None;
             }
             RunEventKind::RunFailed { error } => {
                 self.ensure_active()?;
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    self.ensure_reserved_audit_lifecycle_closed()?;
+                    self.ensure_no_running_activities("fail")?;
+                }
                 self.projection.status = DurableRunStatus::Failed;
                 self.projection.pause_reason = Some(error.clone());
             }
             RunEventKind::RunCancelled { reason } => {
                 self.ensure_active()?;
+                if event.schema_version >= TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION {
+                    self.ensure_reserved_audit_lifecycle_closed()?;
+                    self.ensure_no_running_activities("cancel")?;
+                }
                 self.projection.status = DurableRunStatus::Cancelled;
                 self.projection.pause_reason = reason.clone();
             }
@@ -2429,6 +3107,29 @@ impl RunState {
             .ok_or_else(|| DurabilityError::ActivityNotFound {
                 activity_id: activity_id.to_string(),
             })
+    }
+
+    fn ensure_no_running_activities(&self, transition: &str) -> DurabilityResult<()> {
+        let activity_ids = self
+            .projection
+            .activities
+            .values()
+            .filter(|record| {
+                record
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.status == ActivityAttemptStatus::Running)
+            })
+            .map(|record| record.definition.activity_id.clone())
+            .collect::<Vec<_>>();
+        if activity_ids.is_empty() {
+            return Ok(());
+        }
+        Err(DurabilityError::InvalidEvent {
+            reason: format!(
+                "run cannot {transition} while activities are running: {activity_ids:?}"
+            ),
+        })
     }
 
     fn running_attempt_mut(
@@ -2458,6 +3159,29 @@ impl RunState {
                 .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::ReconcileRequired)
         })
     }
+
+    fn activity_attempt_has_v1_provenance(&self, activity_id: &str, attempt: u32) -> bool {
+        let scheduled = self.events.iter().any(|event| {
+            event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION
+                && matches!(
+                    &event.kind,
+                    RunEventKind::ActivityScheduled { definition }
+                        if definition.activity_id == activity_id
+                )
+        });
+        let started = self.events.iter().any(|event| {
+            event.schema_version < TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION
+                && matches!(
+                    &event.kind,
+                    RunEventKind::ActivityAttemptStarted {
+                        activity_id: candidate,
+                        attempt: candidate_attempt,
+                        ..
+                    } if candidate == activity_id && *candidate_attempt == attempt
+                )
+        });
+        scheduled && started
+    }
 }
 
 fn append_sequence(outcome: AppendOutcome) -> u64 {
@@ -2466,11 +3190,56 @@ fn append_sequence(outcome: AppendOutcome) -> u64 {
     }
 }
 
-fn fork_projection(checkpoint: &Checkpoint, new_branch_id: &str) -> RunProjection {
+fn fork_projection(
+    checkpoint: &Checkpoint,
+    destination_run_id: &str,
+    new_branch_id: &str,
+) -> RunProjection {
     let mut projection = checkpoint.projection.clone();
+    // Audit delivery markers are bound to one run/branch/invocation identity. Carrying them into a
+    // fork or rewind can either strand the new branch on the old identity or falsely terminalize
+    // it from an earlier branch's receipt. Strip the whole reserved stable-step namespace rather
+    // than only well-formed markers: imported `ForkedFrom` checkpoints are public replay input,
+    // and a malformed reserved record must not survive merely because its envelope is invalid.
+    // The source event log remains the authority for those external effects; the new branch opens
+    // a fresh lifecycle if it executes again.
+    let destination_terminal_activity_id = stable_identifier(
+        "activity",
+        &[
+            destination_run_id,
+            new_branch_id,
+            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+            "terminal",
+        ],
+    );
+    projection.activities.retain(|activity_id, record| {
+        let reserved_step = matches!(
+            record.definition.stable_step_id.as_str(),
+            RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+                | RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+                | RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+        );
+        // The canonical terminal identity is fixed for the destination run and branch. Remove an
+        // imported map-key or definition-ID squatter even when it lies about its stable step;
+        // otherwise the valid terminal schedule would deterministically collide with it forever.
+        let destination_terminal_identity_squatter = activity_id
+            == &destination_terminal_activity_id
+            || record.definition.activity_id == destination_terminal_activity_id;
+        !reserved_step && !destination_terminal_identity_squatter
+    });
+    // Execution claims are bound to the source run and branch. A fork or rewind always starts
+    // unowned; ordinary completed activity results remain reusable through their own records.
+    projection.worker_lease = None;
     projection.branch_id = new_branch_id.to_string();
     projection.current_checkpoint_id = Some(checkpoint.checkpoint_id.clone());
-    if projection.status == DurableRunStatus::ReconcileRequired {
+    if projection.status == DurableRunStatus::ReconcileRequired
+        && projection.activities.values().any(|record| {
+            record
+                .latest_attempt()
+                .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::ReconcileRequired)
+        })
+    {
         return projection;
     }
     if projection.pending_approval_ids().is_empty() {
@@ -2499,7 +3268,10 @@ struct DecodedApprovalPayload {
     expires_at_unix_ms: Option<u64>,
 }
 
-fn decode_approval_payload(payload: &Value) -> DurabilityResult<DecodedApprovalPayload> {
+fn decode_approval_payload(
+    payload: &Value,
+    event_schema_version: u32,
+) -> DurabilityResult<DecodedApprovalPayload> {
     let Some(envelope) = payload
         .as_object()
         .and_then(|object| object.get(DURABLE_APPROVAL_ENVELOPE_KEY))
@@ -2519,9 +3291,9 @@ fn decode_approval_payload(payload: &Value) -> DurabilityResult<DecodedApprovalP
                 reason: format!("invalid durable approval envelope: {error}"),
             }
         })?;
-    if envelope.schema_version != DURABILITY_SCHEMA_VERSION {
+    if envelope.schema_version != event_schema_version {
         return Err(DurabilityError::UnsupportedSchema {
-            expected: DURABILITY_SCHEMA_VERSION,
+            expected: event_schema_version,
             actual: envelope.schema_version,
         });
     }
@@ -2550,6 +3322,7 @@ fn decode_resolution_payload(
     approval: &DurableApproval,
     approved: bool,
     response: &Option<Value>,
+    event_schema_version: u32,
 ) -> DurabilityResult<DecodedResolutionPayload> {
     if approval.expires_at_unix_ms.is_none() {
         return Ok(DecodedResolutionPayload {
@@ -2573,9 +3346,9 @@ fn decode_resolution_payload(
                 reason: format!("invalid resolution envelope: {error}"),
             }
         })?;
-    if envelope.schema_version != DURABILITY_SCHEMA_VERSION {
+    if envelope.schema_version != event_schema_version {
         return Err(DurabilityError::UnsupportedSchema {
-            expected: DURABILITY_SCHEMA_VERSION,
+            expected: event_schema_version,
             actual: envelope.schema_version,
         });
     }
@@ -2687,10 +3460,1107 @@ fn retry_is_safe(definition: &ActivityDefinition, effect_ambiguous: bool) -> boo
                 .is_some_and(|key| !key.is_empty()))
 }
 
+fn validate_reserved_audit_schedule(
+    run_id: &str,
+    branch_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    definition: &ActivityDefinition,
+) -> DurabilityResult<()> {
+    let stable_step_id = definition.stable_step_id.as_str();
+    if stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "new v2 runs cannot schedule the quarantined v1 RunStopped audit activity"
+                .into(),
+        });
+    }
+    if !matches!(
+        stable_step_id,
+        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+            | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+            | RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+    ) {
+        return Ok(());
+    }
+    let expected_activity_id = stable_identifier(
+        "activity",
+        &[run_id, branch_id, stable_step_id, &definition.logical_key],
+    );
+    if definition.activity_id != expected_activity_id
+        || definition.side_effect_class != SideEffectClass::ReconcileRequired
+        || definition.idempotency_key.is_some()
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "reserved audit activity has a non-canonical durable definition".into(),
+        });
+    }
+    let duplicate = activities.values().any(|record| {
+        record.definition.stable_step_id == stable_step_id
+            && match stable_step_id {
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID => record.definition.logical_key == "terminal",
+                _ => record.definition.logical_key == definition.logical_key,
+            }
+            && is_reserved_audit_activity(record)
+    });
+    if duplicate {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "reserved audit activity identity was scheduled more than once".into(),
+        });
+    }
+
+    match stable_step_id {
+        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID => {
+            if definition.logical_key != "terminal" {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "canonical terminal audit must use the reserved terminal logical key"
+                        .into(),
+                });
+            }
+            if definition.input.get("legacy_resolution").is_some() {
+                validate_legacy_resolution_source(activities, definition)
+            } else {
+                validate_terminal_audit_schedule_input(activities, definition, "canonical", run_id)
+            }
+        }
+        RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID => {
+            validate_terminal_audit_schedule_input(activities, definition, "recovery", run_id)
+        }
+        RUNTIME_INVOCATION_LIFECYCLE_STEP_ID => {
+            let input =
+                definition
+                    .input
+                    .as_object()
+                    .ok_or_else(|| DurabilityError::InvalidEvent {
+                        reason: "invocation lifecycle input must be an object".into(),
+                    })?;
+            if input.len() != 3
+                || input.get("schema_version").and_then(Value::as_u64) != Some(1)
+                || input.get("audit_run_id").and_then(Value::as_str) != Some(run_id)
+                || input.get("invocation_id").and_then(Value::as_str)
+                    != Some(definition.logical_key.as_str())
+                || definition.logical_key.is_empty()
+                || definition.logical_key.chars().any(char::is_control)
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "invocation lifecycle durable identity is malformed".into(),
+                });
+            }
+            Ok(())
+        }
+        _ => unreachable!("reserved step filtered above"),
+    }
+}
+
+fn validate_terminal_audit_schedule_input(
+    activities: &BTreeMap<String, ActivityRecord>,
+    definition: &ActivityDefinition,
+    kind: &str,
+    run_id: &str,
+) -> DurabilityResult<()> {
+    let input = definition
+        .input
+        .as_object()
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "terminal audit input must be an object".into(),
+        })?;
+    if input.len() != 2 {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit input must contain only replay and expected output hash".into(),
+        });
+    }
+    let replay = input
+        .get("replay")
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "terminal audit input is missing its replay envelope".into(),
+        })?;
+    validate_replay_value(replay, kind)?;
+    if replay.get("audit_run_id").and_then(Value::as_str) != Some(run_id) {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay does not belong to the durable run".into(),
+        });
+    }
+    let invocation_id = replay
+        .get("invocation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "terminal audit replay has an invalid invocation identity".into(),
+        })?;
+    if kind == "recovery" && invocation_id != definition.logical_key {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "recovery terminal audit logical key does not match its invocation".into(),
+        });
+    }
+    let matching_lifecycles = activities
+        .values()
+        .filter(|record| {
+            record.definition.stable_step_id == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+                && is_reserved_audit_activity(record)
+                && record.definition.logical_key == invocation_id
+                && record
+                    .definition
+                    .input
+                    .get("audit_run_id")
+                    .and_then(Value::as_str)
+                    == Some(run_id)
+                && record
+                    .latest_attempt()
+                    .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::Running)
+        })
+        .count();
+    if matching_lifecycles != 1 {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit schedule requires one exact active invocation lifecycle".into(),
+        });
+    }
+    let matching_lifecycle_id = activities.values().find_map(|record| {
+        (record.definition.stable_step_id == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+            && is_reserved_audit_activity(record)
+            && record.definition.logical_key == invocation_id
+            && record
+                .latest_attempt()
+                .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::Running))
+        .then_some(record.definition.activity_id.as_str())
+    });
+    if activities.values().any(|record| {
+        record.definition.activity_id.as_str() != matching_lifecycle_id.unwrap_or_default()
+            && record
+                .latest_attempt()
+                .is_some_and(|attempt| attempt.status == ActivityAttemptStatus::Running)
+    }) {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit schedule is blocked by another running activity".into(),
+        });
+    }
+    let expected_output = if kind == "recovery" {
+        serde_json::json!({"accepted": true})
+    } else {
+        replay
+            .get("terminal_receipt")
+            .cloned()
+            .ok_or_else(|| DurabilityError::InvalidEvent {
+                reason: "canonical terminal audit replay has no terminal receipt".into(),
+            })?
+    };
+    if input.get("expected_output_hash").and_then(Value::as_str)
+        != Some(stable_input_hash(&expected_output).as_str())
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit delivery intent has an invalid expected output hash".into(),
+        });
+    }
+    if kind == "recovery"
+        && !activities.values().any(|record| {
+            if record.definition.stable_step_id != RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+                || record.definition.logical_key != "terminal"
+            {
+                return false;
+            }
+            let Some(output) = record.completed_output() else {
+                return false;
+            };
+            if record.definition.input.get("legacy_resolution").is_some() {
+                let Ok(resolution) = serde_json::from_value::<
+                    crate::durable_runtime::DurableLegacyRunStoppedResolutionEnvelope,
+                >(output.clone()) else {
+                    return false;
+                };
+                validate_legacy_terminal_resolution(activities, record, output).is_ok()
+                    && serde_json::to_value(resolution.terminal_receipt)
+                        .ok()
+                        .as_ref()
+                        == replay.get("terminal_receipt")
+            } else {
+                record
+                    .definition
+                    .input
+                    .get("replay")
+                    .and_then(|source| source.get("invocation_id"))
+                    .and_then(Value::as_str)
+                    != Some(invocation_id)
+                    && validate_reserved_audit_completion_output(record, output).is_ok()
+                    && Some(output) == replay.get("terminal_receipt")
+            }
+        })
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "recovery terminal audit requires the exact completed canonical receipt".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_legacy_resolution_source(
+    activities: &BTreeMap<String, ActivityRecord>,
+    definition: &ActivityDefinition,
+) -> DurabilityResult<()> {
+    let input = definition
+        .input
+        .as_object()
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution input must be an object".into(),
+        })?;
+    let source_value =
+        input
+            .get("legacy_resolution")
+            .ok_or_else(|| DurabilityError::InvalidEvent {
+                reason: "legacy terminal resolution input is missing its source binding".into(),
+            })?;
+    let source: crate::durable_runtime::DurableLegacyRunStoppedResolutionSource =
+        serde_json::from_value(source_value.clone()).map_err(|_| {
+            DurabilityError::InvalidEvent {
+                reason: "legacy terminal resolution source binding is malformed".into(),
+            }
+        })?;
+    if input.len() != 1
+        || source.schema_version
+            != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_SCHEMA_VERSION
+        || source.kind != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_KIND
+        || source.source_activity_id.is_empty()
+        || source.source_activity_id.chars().any(char::is_control)
+        || source.source_attempt == 0
+        || source.source_started_sequence == 0
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution source binding is malformed".into(),
+        });
+    }
+    let legacy = activities
+        .get(&source.source_activity_id)
+        .filter(|record| {
+            record.definition.stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+                && record.definition.logical_key == "terminal"
+        })
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution source activity was not found".into(),
+        })?;
+    let attempt = legacy
+        .latest_attempt()
+        .filter(|attempt| {
+            attempt.attempt == source.source_attempt
+                && attempt.started_sequence == source.source_started_sequence
+        })
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution source attempt does not match".into(),
+        })?;
+    let source_matches = match source.source_output_hash.as_deref() {
+        Some(expected_hash) => {
+            attempt.status == ActivityAttemptStatus::Completed
+                && attempt.output_hash.as_deref() == Some(expected_hash)
+                && attempt.output.as_ref().map(stable_input_hash).as_deref() == Some(expected_hash)
+        }
+        None => {
+            matches!(
+                attempt.status,
+                ActivityAttemptStatus::Failed | ActivityAttemptStatus::Cancelled
+            ) && attempt.output.is_none()
+                && attempt.output_hash.is_none()
+        }
+    };
+    if !source_matches {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution source fingerprint does not match".into(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn is_reserved_audit_activity(record: &ActivityRecord) -> bool {
+    match record.definition.stable_step_id.as_str() {
+        RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID => record.definition.logical_key == "terminal",
+        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID => {
+            record.definition.logical_key == "terminal"
+                && (record.definition.input.get("replay").is_some()
+                    || record.definition.input.get("legacy_resolution").is_some())
+        }
+        RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID => {
+            record.definition.input.get("replay").is_some()
+        }
+        RUNTIME_INVOCATION_LIFECYCLE_STEP_ID => {
+            record
+                .definition
+                .input
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                == Some(1)
+                && record
+                    .definition
+                    .input
+                    .get("invocation_id")
+                    .and_then(Value::as_str)
+                    == Some(record.definition.logical_key.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn validate_reserved_audit_completion_output(
+    record: &ActivityRecord,
+    output: &Value,
+) -> DurabilityResult<()> {
+    let stable_step_id = record.definition.stable_step_id.as_str();
+    if stable_step_id != RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+        && stable_step_id != RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+    {
+        return Ok(());
+    }
+    if stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+        && record.definition.logical_key != "terminal"
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "canonical terminal audit must use the reserved terminal logical key".into(),
+        });
+    }
+    if stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+        && record.definition.input.get("legacy_resolution").is_some()
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason:
+                "legacy terminal audit bridge is completion-only through explicit reconciliation"
+                    .into(),
+        });
+    }
+    let expected_hash = record
+        .definition
+        .input
+        .get("expected_output_hash")
+        .or_else(|| {
+            (stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID)
+                .then(|| record.definition.input.get("input_hash"))
+                .flatten()
+        })
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "reserved terminal audit is missing its expected output hash".into(),
+        })?;
+    if stable_input_hash(output) != expected_hash {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "reserved terminal audit completion does not match its delivery intent".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_reserved_audit_attempt_start(
+    run_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    record: &ActivityRecord,
+) -> DurabilityResult<()> {
+    if !is_reserved_audit_activity(record) {
+        return Ok(());
+    }
+    match record.definition.stable_step_id.as_str() {
+        RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID => Err(DurabilityError::InvalidEvent {
+            reason: "quarantined v1 RunStopped audit cannot start a new v2 attempt".into(),
+        }),
+        RUNTIME_INVOCATION_LIFECYCLE_STEP_ID => {
+            if record
+                .definition
+                .input
+                .get("audit_run_id")
+                .and_then(Value::as_str)
+                != Some(run_id)
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "invocation lifecycle attempt does not belong to the durable run"
+                        .into(),
+                });
+            }
+            Ok(())
+        }
+        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+            if record.definition.input.get("legacy_resolution").is_some() =>
+        {
+            validate_legacy_resolution_source(activities, &record.definition)
+        }
+        RUNTIME_RUN_STOPPED_AUDIT_STEP_ID | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID => {
+            let kind = if record.definition.stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID {
+                "canonical"
+            } else {
+                "recovery"
+            };
+            if record.attempts.is_empty() {
+                return validate_terminal_audit_schedule_input(
+                    activities,
+                    &record.definition,
+                    kind,
+                    run_id,
+                );
+            }
+            validate_terminal_replay_input(record, kind == "recovery", run_id)?;
+            let replay = record.definition.input.get("replay");
+            let invocation_id = replay
+                .and_then(|value| value.get("invocation_id"))
+                .and_then(Value::as_str);
+            let authorized = activities.values().any(|lifecycle| {
+                lifecycle.definition.stable_step_id == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID
+                    && is_reserved_audit_activity(lifecycle)
+                    && Some(lifecycle.definition.logical_key.as_str()) == invocation_id
+                    && lifecycle.completed_output().is_some_and(|output| {
+                        output.get("status").and_then(Value::as_str)
+                            == Some("terminal_replay_authorized")
+                            && output.get("replay") == replay
+                            && validate_lifecycle_reconciliation_output(
+                                run_id, activities, lifecycle, output,
+                            )
+                            .is_ok()
+                    })
+            });
+            if !authorized {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "terminal audit retry has no exact authorized lifecycle closure".into(),
+                });
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_lifecycle_not_started_output(
+    run_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    record: &ActivityRecord,
+    output: &Value,
+    boundary_sequence: u64,
+    require_synthetic_orphan: bool,
+) -> DurabilityResult<()> {
+    let expected_run_id = record
+        .definition
+        .input
+        .get("audit_run_id")
+        .and_then(Value::as_str);
+    let expected_invocation_id = record
+        .definition
+        .input
+        .get("invocation_id")
+        .and_then(Value::as_str);
+    let exact_shape = output.as_object().is_some_and(|object| object.len() == 3);
+    let linked_terminal_marker = activities.values().any(|candidate| {
+        matches!(
+            candidate.definition.stable_step_id.as_str(),
+            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+        ) && candidate
+            .definition
+            .input
+            .get("replay")
+            .and_then(|replay| replay.get("invocation_id"))
+            .and_then(Value::as_str)
+            == expected_invocation_id
+    });
+    let post_fence_attempt = activities.values().any(|candidate| {
+        candidate.definition.activity_id != record.definition.activity_id
+            && candidate
+                .attempts
+                .iter()
+                .any(|attempt| attempt.started_sequence > boundary_sequence)
+    });
+    let synthetic_orphan = record.latest_attempt().is_some_and(|attempt| {
+        attempt.status == ActivityAttemptStatus::ReconcileRequired
+            && attempt.finished_sequence == Some(attempt.started_sequence)
+    });
+    if !exact_shape
+        || expected_run_id != Some(run_id)
+        || output.get("audit_run_id").and_then(Value::as_str) != expected_run_id
+        || output.get("invocation_id").and_then(Value::as_str) != expected_invocation_id
+        || linked_terminal_marker
+        || post_fence_attempt
+        || (require_synthetic_orphan && !synthetic_orphan)
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason:
+                "unstarted invocation lifecycle completion has invalid identity or post-fence work"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_reserved_audit_attempt_completion(
+    run_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    record: &ActivityRecord,
+    output: &Value,
+) -> DurabilityResult<()> {
+    let stable_step_id = record.definition.stable_step_id.as_str();
+    if !is_reserved_audit_activity(record) {
+        return Ok(());
+    }
+    if stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "quarantined v1 RunStopped audit cannot receive a new v2 completion".into(),
+        });
+    }
+    if stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+        || stable_step_id == RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+    {
+        return validate_reserved_audit_completion_output(record, output);
+    }
+    if stable_step_id != RUNTIME_INVOCATION_LIFECYCLE_STEP_ID {
+        return Ok(());
+    }
+    match output.get("status").and_then(Value::as_str) {
+        Some("not_started") => {
+            let boundary_sequence = record
+                .latest_attempt()
+                .map(|attempt| attempt.started_sequence)
+                .ok_or_else(|| DurabilityError::InvalidEvent {
+                    reason: "unstarted invocation lifecycle has no durable attempt".into(),
+                })?;
+            validate_lifecycle_not_started_output(
+                run_id,
+                activities,
+                record,
+                output,
+                boundary_sequence,
+                false,
+            )
+        }
+        Some("audit_closed") => {
+            validate_lifecycle_reconciliation_output(run_id, activities, record, output)
+        }
+        Some("terminal_replay_authorized") => Err(DurabilityError::InvalidEvent {
+            reason: "terminal replay authorization requires an ActivityReconciled event".into(),
+        }),
+        _ => Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle completion has an unsupported outcome".into(),
+        }),
+    }
+}
+
+fn validate_reserved_audit_reconciliation(
+    run_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    record: &ActivityRecord,
+    resolution: &ActivityReconciliation,
+    lifecycle_schedule_sequence: Option<u64>,
+) -> DurabilityResult<()> {
+    let stable_step_id = record.definition.stable_step_id.as_str();
+    let reserved = is_reserved_audit_activity(record);
+    let is_terminal_audit = reserved && stable_step_id == RUNTIME_RUN_STOPPED_AUDIT_STEP_ID;
+    let is_recovery_audit =
+        reserved && stable_step_id == RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID;
+    let is_lifecycle = reserved && stable_step_id == RUNTIME_INVOCATION_LIFECYCLE_STEP_ID;
+    let is_legacy = reserved && stable_step_id == RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID;
+    if !is_terminal_audit && !is_recovery_audit && !is_lifecycle && !is_legacy {
+        return Ok(());
+    }
+
+    if is_legacy {
+        return match resolution {
+            ActivityReconciliation::Completed { output } => {
+                validate_legacy_source_attestation(record, output)
+            }
+            ActivityReconciliation::SafeToRetry | ActivityReconciliation::Cancelled => {
+                Err(DurabilityError::InvalidEvent {
+                    reason: "quarantined v1 RunStopped audit accepts only a typed completed operator attestation"
+                        .into(),
+                })
+            }
+        };
+    }
+
+    match resolution {
+        ActivityReconciliation::Cancelled => Err(DurabilityError::InvalidEvent {
+            reason: format!(
+                "reserved fail-closed audit activity `{}` cannot be reconciled as cancelled",
+                record.definition.activity_id
+            ),
+        }),
+        ActivityReconciliation::SafeToRetry if is_lifecycle => {
+            Err(DurabilityError::InvalidEvent {
+                reason: "invocation audit lifecycle reconciliation is completion-only; reconcile the external RunStopped outcome explicitly"
+                    .into(),
+            })
+        }
+        ActivityReconciliation::SafeToRetry => {
+            validate_terminal_replay_input(record, is_recovery_audit, run_id)
+        }
+        ActivityReconciliation::Completed { output } if is_lifecycle => {
+            if output.get("status").and_then(Value::as_str) == Some("not_started") {
+                let boundary_sequence = lifecycle_schedule_sequence.ok_or_else(|| {
+                    DurabilityError::InvalidEvent {
+                        reason: "orphan invocation lifecycle schedule boundary was not found"
+                            .into(),
+                    }
+                })?;
+                validate_lifecycle_not_started_output(
+                    run_id,
+                    activities,
+                    record,
+                    output,
+                    boundary_sequence,
+                    true,
+                )
+            } else {
+                validate_lifecycle_reconciliation_output(run_id, activities, record, output)
+            }
+        }
+        ActivityReconciliation::Completed { output }
+            if is_terminal_audit
+                && record.definition.input.get("legacy_resolution").is_some() =>
+        {
+            validate_legacy_terminal_resolution(activities, record, output)
+        }
+        ActivityReconciliation::Completed { output } => {
+            validate_reserved_audit_completion_output(record, output)
+        }
+    }
+}
+
+fn validate_legacy_source_attestation(
+    source: &ActivityRecord,
+    output: &Value,
+) -> DurabilityResult<()> {
+    let attempt = source
+        .latest_attempt()
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy RunStopped source has no attempt to attest".into(),
+        })?;
+    let resolution: crate::durable_runtime::DurableLegacyRunStoppedResolutionEnvelope =
+        serde_json::from_value(output.clone()).map_err(|_| DurabilityError::InvalidEvent {
+            reason: "legacy RunStopped source attestation is malformed".into(),
+        })?;
+    let expected_output_hash = None;
+    if source.definition.stable_step_id != RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID
+        || source.definition.logical_key != "terminal"
+        || attempt.status == ActivityAttemptStatus::Completed
+        || resolution.schema_version
+            != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_SCHEMA_VERSION
+        || resolution.kind != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_KIND
+        || resolution.source_activity_id != source.definition.activity_id
+        || resolution.source_attempt != attempt.attempt
+        || resolution.source_started_sequence != attempt.started_sequence
+        || resolution.source_output_hash != expected_output_hash
+        || resolution.terminal_receipt.reason.is_empty()
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "legacy RunStopped source attestation does not match its durable attempt"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_legacy_terminal_resolution(
+    activities: &BTreeMap<String, ActivityRecord>,
+    bridge: &ActivityRecord,
+    output: &Value,
+) -> DurabilityResult<()> {
+    if bridge.definition.stable_step_id != RUNTIME_RUN_STOPPED_AUDIT_STEP_ID
+        || bridge.definition.logical_key != "terminal"
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution must use the canonical terminal bridge".into(),
+        });
+    }
+    validate_legacy_resolution_source(activities, &bridge.definition)?;
+    let source: crate::durable_runtime::DurableLegacyRunStoppedResolutionSource = bridge
+        .definition
+        .input
+        .get("legacy_resolution")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution bridge has a malformed source binding".into(),
+        })?;
+    let resolution: crate::durable_runtime::DurableLegacyRunStoppedResolutionEnvelope =
+        serde_json::from_value(output.clone()).map_err(|_| DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution envelope is malformed".into(),
+        })?;
+    if resolution.schema_version
+        != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_SCHEMA_VERSION
+        || resolution.kind != crate::durable_runtime::LEGACY_RUN_STOPPED_RESOLUTION_KIND
+        || resolution.source_activity_id != source.source_activity_id
+        || resolution.source_attempt != source.source_attempt
+        || resolution.source_started_sequence != source.source_started_sequence
+        || resolution.source_output_hash != source.source_output_hash
+        || resolution.terminal_receipt.reason.is_empty()
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "legacy terminal resolution does not match its accepted source receipt".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_terminal_replay_input(
+    record: &ActivityRecord,
+    recovery: bool,
+    run_id: &str,
+) -> DurabilityResult<()> {
+    let replay_value = record
+        .definition
+        .input
+        .get("replay")
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "legacy/hash-only terminal audit intent cannot be retried automatically; reconcile it as Completed with the exact accepted output"
+                .into(),
+        })?;
+    let replay = replay_value
+        .as_object()
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "reserved audit replay envelope must be an object".into(),
+        })?;
+    let valid_schema = replay.get("schema_version").and_then(Value::as_u64) == Some(1);
+    let valid_run_id = replay
+        .get("audit_run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            value == run_id && !value.is_empty() && !value.chars().any(char::is_control)
+        });
+    let invocation_id = replay.get("invocation_id").and_then(Value::as_str);
+    let valid_invocation_id = invocation_id
+        .is_some_and(|value| !value.is_empty() && !value.chars().any(char::is_control));
+    let valid_sequence = replay
+        .get("run_stopped_sequence")
+        .and_then(Value::as_u64)
+        .is_some_and(|sequence| sequence > 0);
+    let valid_receipt = replay.get("terminal_receipt").is_some_and(Value::is_object);
+    let valid_audit_reason = replay
+        .get("audit_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty());
+    let valid_audit_turns = replay.get("audit_turns").and_then(Value::as_u64).is_some();
+    let valid_kind = replay.get("kind").and_then(Value::as_str)
+        == Some(if recovery { "recovery" } else { "canonical" });
+    let logical_key_matches = if recovery {
+        invocation_id.is_some_and(|value| value == record.definition.logical_key)
+    } else {
+        record.definition.logical_key == "terminal"
+    };
+    if !valid_schema
+        || !valid_run_id
+        || !valid_invocation_id
+        || !valid_sequence
+        || !valid_receipt
+        || !valid_audit_reason
+        || !valid_audit_turns
+        || !valid_kind
+        || !logical_key_matches
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: format!(
+                "reserved audit replay envelope is invalid for `{}`",
+                record.definition.activity_id
+            ),
+        });
+    }
+    validate_replay_value(
+        replay_value,
+        if recovery { "recovery" } else { "canonical" },
+    )?;
+    let expected_output = if recovery {
+        serde_json::json!({"accepted": true})
+    } else {
+        replay
+            .get("terminal_receipt")
+            .cloned()
+            .ok_or_else(|| DurabilityError::InvalidEvent {
+                reason: "terminal audit replay is missing its terminal receipt".into(),
+            })?
+    };
+    let expected_hash = record
+        .definition
+        .input
+        .get("expected_output_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "typed terminal audit replay is missing its expected output hash".into(),
+        })?;
+    if stable_input_hash(&expected_output) != expected_hash {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay expected output hash is invalid".into(),
+        });
+    }
+    validate_audit_replay_binding(replay_value, true)?;
+    Ok(())
+}
+
+fn validate_lifecycle_reconciliation_output(
+    run_id: &str,
+    activities: &BTreeMap<String, ActivityRecord>,
+    record: &ActivityRecord,
+    output: &Value,
+) -> DurabilityResult<()> {
+    let expected_run_id = record
+        .definition
+        .input
+        .get("audit_run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle is missing its durable audit run identity".into(),
+        })?;
+    if expected_run_id != run_id {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle audit identity does not match its durable run".into(),
+        });
+    }
+    let expected_invocation_id = record
+        .definition
+        .input
+        .get("invocation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle is missing its durable audit invocation identity".into(),
+        })?;
+    let status = output.get("status").and_then(Value::as_str);
+    let identity = match status {
+        Some("audit_closed" | "terminal_replay_authorized") => output
+            .get("replay")
+            .ok_or_else(|| {
+            DurabilityError::InvalidEvent {
+                reason: "closed invocation lifecycle reconciliation requires a replay envelope"
+                    .into(),
+            }
+        })?,
+        _ => {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "ambiguous invocation lifecycle reconciliation requires an explicit audit_closed outcome"
+                    .into(),
+            })
+        }
+    };
+    let actual_run_id = identity.get("audit_run_id").and_then(Value::as_str);
+    let actual_invocation_id = identity.get("invocation_id").and_then(Value::as_str);
+    if actual_run_id != Some(expected_run_id)
+        || actual_invocation_id != Some(expected_invocation_id)
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle reconciliation identity does not match its durable fence"
+                .into(),
+        });
+    }
+    let kind = identity
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle replay is missing its delivery kind".into(),
+        })?;
+    if !matches!(kind, "canonical" | "recovery" | "direct") {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle replay has an unsupported delivery kind".into(),
+        });
+    }
+    validate_replay_value(identity, kind)?;
+
+    let linked_audit = activities.values().find(|candidate| {
+        let candidate_kind = match candidate.definition.stable_step_id.as_str() {
+            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID => "canonical",
+            RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID => "recovery",
+            _ => return false,
+        };
+        candidate_kind == kind
+            && candidate.definition.input.get("replay") == Some(identity)
+            && match candidate_kind {
+                "canonical" => candidate.definition.logical_key == "terminal",
+                "recovery" => candidate.definition.logical_key == expected_invocation_id,
+                _ => false,
+            }
+    });
+    if matches!(kind, "canonical" | "recovery") && linked_audit.is_none() {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle replay does not match its linked terminal audit activity"
+                .into(),
+        });
+    }
+    if matches!(kind, "canonical" | "recovery") {
+        let accepted_delivery = if status == Some("audit_closed") {
+            if let Some((candidate, accepted_output)) = linked_audit.and_then(|candidate| {
+                candidate
+                    .completed_output()
+                    .map(|output| (candidate, output))
+            }) {
+                validate_reserved_audit_completion_output(candidate, accepted_output)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let authorized_retry = if status == Some("terminal_replay_authorized") {
+            if let Some(candidate) = linked_audit.filter(|candidate| {
+                candidate.latest_attempt().is_some_and(|attempt| {
+                    attempt.status == ActivityAttemptStatus::Failed
+                        && attempt.retryable
+                        && !attempt.effect_ambiguous
+                })
+            }) {
+                validate_terminal_replay_input(candidate, kind == "recovery", expected_run_id)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !accepted_delivery && !authorized_retry {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "linked terminal audit lifecycle must record either an accepted delivery or an authorized retry"
+                    .into(),
+            });
+        }
+    } else if status != Some("audit_closed") {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "direct invocation lifecycle reconciliation requires an audit_closed outcome"
+                .into(),
+        });
+    }
+    if kind == "direct"
+        && activities.values().any(|candidate| {
+            matches!(
+                candidate.definition.stable_step_id.as_str(),
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+            ) && candidate
+                .definition
+                .input
+                .get("replay")
+                .and_then(|replay| replay.get("invocation_id"))
+                .and_then(Value::as_str)
+                == Some(expected_invocation_id)
+        })
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "invocation lifecycle must use the replay envelope from its linked terminal audit activity"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_replay_value(replay: &Value, expected_kind: &str) -> DurabilityResult<()> {
+    let object = replay
+        .as_object()
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: "terminal audit replay envelope must be an object".into(),
+        })?;
+    let valid = object.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && object.get("kind").and_then(Value::as_str) == Some(expected_kind)
+        && object
+            .get("run_stopped_sequence")
+            .and_then(Value::as_u64)
+            .is_some_and(|sequence| sequence > 0)
+        && object.get("terminal_receipt").is_some_and(Value::is_object)
+        && object
+            .get("audit_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+        && object.get("audit_turns").and_then(Value::as_u64).is_some();
+    if !valid {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay envelope is incomplete or malformed".into(),
+        });
+    }
+    serde_json::from_value::<crate::durable_runtime::DurableRunStoppedAuditReplayEnvelope>(
+        replay.clone(),
+    )
+    .map_err(|_| DurabilityError::InvalidEvent {
+        reason: "terminal audit replay envelope contains unsupported fields or values".into(),
+    })?;
+    validate_audit_replay_binding(replay, false)?;
+    let Some(receipt) = object.get("terminal_receipt").and_then(Value::as_object) else {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay receipt is malformed".into(),
+        });
+    };
+    let valid_receipt = receipt
+        .get("turns")
+        .and_then(Value::as_u64)
+        .is_some_and(|turns| usize::try_from(turns).is_ok())
+        && receipt
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+        && receipt.get("usage").is_some_and(|usage| {
+            usage.as_object().is_some_and(|usage| {
+                usage.len() == 5
+                    && usage.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "input_tokens"
+                                | "output_tokens"
+                                | "cache_creation_input_tokens"
+                                | "cache_read_input_tokens"
+                                | "reasoning_tokens"
+                        )
+                    })
+                    && serde_json::from_value::<crate::types::Usage>(Value::Object(usage.clone()))
+                        .is_ok()
+            })
+        });
+    if !valid_receipt {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay receipt is malformed".into(),
+        });
+    }
+    if expected_kind != "recovery" {
+        let audit_turns = object.get("audit_turns").and_then(Value::as_u64);
+        let audit_reason = object.get("audit_reason").and_then(Value::as_str);
+        if audit_turns != receipt.get("turns").and_then(Value::as_u64)
+            || audit_reason != receipt.get("reason").and_then(Value::as_str)
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "terminal audit replay event does not match its terminal receipt".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_audit_replay_binding(replay: &Value, require_stable: bool) -> DurabilityResult<()> {
+    let binding =
+        replay
+            .get("audit_binding")
+            .cloned()
+            .ok_or_else(|| DurabilityError::InvalidEvent {
+                reason: "terminal audit replay is missing its audit delivery binding".into(),
+            })?;
+    let binding: crate::observability::AuditReplayBinding = serde_json::from_value(binding)
+        .map_err(|_| DurabilityError::InvalidEvent {
+            reason: "terminal audit replay delivery binding is malformed".into(),
+        })?;
+    let valid_delivery_id = binding
+        .delivery_id
+        .as_deref()
+        .is_none_or(|value| !value.is_empty() && !value.chars().any(char::is_control));
+    if binding.schema_version != 1 || binding.max_preview_bytes == 0 || !valid_delivery_id {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit replay delivery binding is malformed".into(),
+        });
+    }
+    if require_stable
+        && (binding.delivery_id.is_none()
+            || binding.sink_count == 0
+            || binding.failure_mode != crate::observability::AuditFailureMode::FailClosed)
+    {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "terminal audit SafeToRetry requires a stable fail-closed delivery binding"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_identifier(field: &'static str, value: &str) -> DurabilityResult<()> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(DurabilityError::InvalidIdentifier { field });
     }
+    Ok(())
+}
+
+fn validate_worker_lease_window(
+    starts_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> DurabilityResult<()> {
+    let duration = expires_at_unix_ms
+        .checked_sub(starts_at_unix_ms)
+        .filter(|duration| *duration > 0 && *duration <= MAX_DURABLE_WORKER_LEASE_MS)
+        .ok_or_else(|| DurabilityError::InvalidEvent {
+            reason: format!(
+                "durable worker lease must expire within {MAX_DURABLE_WORKER_LEASE_MS}ms after its claim or heartbeat"
+            ),
+        })?;
+    debug_assert!(duration > 0);
     Ok(())
 }
 
@@ -2871,6 +4741,308 @@ mod tests {
         }
     }
 
+    fn test_terminal_receipt() -> Value {
+        json!({
+            "turns": 2,
+            "reason": "completed",
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "reasoning_tokens": 0,
+            },
+        })
+    }
+
+    fn test_terminal_replay(kind: &str, invocation_id: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "kind": kind,
+            "terminal_receipt": test_terminal_receipt(),
+            "audit_run_id": "audit-run",
+            "invocation_id": invocation_id,
+            "run_stopped_sequence": 7,
+            "audit_turns": 2,
+            "audit_reason": "completed",
+            "audit_binding": {
+                "schema_version": 1,
+                "delivery_id": "test-audit-destination",
+                "sink_count": 1,
+                "payload_policy": "metadata_only",
+                "failure_mode": "fail_closed",
+                "max_preview_bytes": 4096,
+            },
+        })
+    }
+
+    fn test_terminal_audit_input(replay: &Value, expected_output: &Value) -> Value {
+        json!({
+            "replay": replay,
+            "expected_output_hash": stable_input_hash(expected_output),
+        })
+    }
+
+    fn test_lifecycle_input(invocation_id: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "audit_run_id": "audit-run",
+            "invocation_id": invocation_id,
+        })
+    }
+
+    fn complete_canonical_source(run: &mut RunState, invocation_id: &str) {
+        let canonical_replay = test_terminal_replay("canonical", invocation_id);
+        let (lifecycle_id, lifecycle_attempt) = execute(
+            run.prepare_activity(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        let (canonical_id, canonical_attempt) = execute(
+            run.prepare_activity(
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        run.complete_activity(&canonical_id, canonical_attempt, test_terminal_receipt())
+            .unwrap();
+        run.complete_activity(
+            &lifecycle_id,
+            lifecycle_attempt,
+            json!({"status": "audit_closed", "replay": canonical_replay}),
+        )
+        .unwrap();
+    }
+
+    fn test_reconciliation_run(
+        stable_step_id: &str,
+        logical_key: &str,
+        input: Value,
+    ) -> (RunState, String) {
+        let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        prepare_terminal_audit_prerequisites(&mut run, stable_step_id, &input);
+        let (activity_id, attempt) = execute(
+            run.prepare_activity(
+                stable_step_id,
+                logical_key,
+                input,
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            run.fail_activity(&activity_id, attempt, "unknown sink result", true, true)
+                .unwrap(),
+            ActivityDecision::ReconcileRequired { .. }
+        ));
+        (run, activity_id)
+    }
+
+    fn test_running_reserved_run(
+        stable_step_id: &str,
+        logical_key: &str,
+        input: Value,
+    ) -> (RunState, String, u32) {
+        let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        prepare_terminal_audit_prerequisites(&mut run, stable_step_id, &input);
+        let (activity_id, attempt) = execute(
+            run.prepare_activity(
+                stable_step_id,
+                logical_key,
+                input,
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        (run, activity_id, attempt)
+    }
+
+    fn prepare_terminal_audit_prerequisites(
+        run: &mut RunState,
+        stable_step_id: &str,
+        input: &Value,
+    ) {
+        if !matches!(
+            stable_step_id,
+            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID | RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID
+        ) {
+            return;
+        }
+        let Some(invocation_id) = input
+            .get("replay")
+            .and_then(|replay| replay.get("invocation_id"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        if stable_step_id == RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID {
+            complete_canonical_source(run, "canonical-source-invocation");
+        }
+        execute(
+            run.prepare_activity(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+    }
+
+    fn assert_raw_v2_event_rejected(run: &RunState, event_id: &str, kind: RunEventKind) {
+        let event = RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: run.run_id().to_string(),
+            sequence: run.next_sequence(),
+            event_id: event_id.to_string(),
+            kind,
+        };
+
+        let mut appended = run.clone();
+        assert!(matches!(
+            appended.append_event(event.clone()),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(&appended, run);
+
+        let mut replayed_events = run.events().to_vec();
+        replayed_events.push(event);
+        assert!(matches!(
+            RunState::from_events(replayed_events),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+    }
+
+    fn test_linked_lifecycle_run(kind: &str) -> (RunState, String, String, Value) {
+        let invocation_id = "invocation-1";
+        let replay = test_terminal_replay(kind, invocation_id);
+        let expected_output = if kind == "canonical" {
+            test_terminal_receipt()
+        } else {
+            json!({"accepted": true})
+        };
+        let (audit_step, audit_logical_key) = if kind == "canonical" {
+            (RUNTIME_RUN_STOPPED_AUDIT_STEP_ID, "terminal")
+        } else {
+            (RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID, invocation_id)
+        };
+        let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        if kind == "recovery" {
+            complete_canonical_source(&mut run, "canonical-source-invocation");
+        }
+        let (lifecycle_id, lifecycle_attempt) = execute(
+            run.prepare_activity(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        let (audit_id, audit_attempt) = execute(
+            run.prepare_activity(
+                audit_step,
+                audit_logical_key,
+                test_terminal_audit_input(&replay, &expected_output),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        run.fail_activity(
+            &audit_id,
+            audit_attempt,
+            "unknown terminal audit result",
+            true,
+            true,
+        )
+        .unwrap();
+        run.fail_activity(
+            &lifecycle_id,
+            lifecycle_attempt,
+            "unknown invocation lifecycle result",
+            false,
+            true,
+        )
+        .unwrap();
+        (run, lifecycle_id, audit_id, replay)
+    }
+
+    fn legacy_v1_terminal_fixture(status: DurableRunStatus, reconcile_required: bool) -> Value {
+        let run_id = match (status, reconcile_required) {
+            (DurableRunStatus::Failed, false) => "legacy-v1-failed-running",
+            (DurableRunStatus::Cancelled, false) => "legacy-v1-cancelled-running",
+            (DurableRunStatus::Failed, true) => "legacy-v1-failed-reconcile-required",
+            _ => panic!("unsupported legacy fixture shape"),
+        };
+        let mut run = RunState::new("legacy-session", run_id, DurabilityMode::Sync).unwrap();
+        let (activity_id, attempt) = execute(
+            run.prepare_activity(
+                "legacy-external-write-v1",
+                "write-1",
+                json!({"value": 1}),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        if reconcile_required {
+            run.fail_activity(&activity_id, attempt, "unknown outcome", false, true)
+                .unwrap();
+        }
+
+        let sequence = run.next_sequence();
+        let (kind, serialized_status, pause_reason) = match status {
+            DurableRunStatus::Failed => (
+                RunEventKind::RunFailed {
+                    error: "legacy failure".into(),
+                },
+                "failed",
+                Some("legacy failure"),
+            ),
+            DurableRunStatus::Cancelled => (
+                RunEventKind::RunCancelled {
+                    reason: Some("legacy cancellation".into()),
+                },
+                "cancelled",
+                Some("legacy cancellation"),
+            ),
+            _ => unreachable!(),
+        };
+        let terminal_event = RunEvent {
+            schema_version: 1,
+            run_id: run_id.into(),
+            sequence,
+            event_id: format!("legacy-terminal-{sequence}"),
+            kind,
+        };
+        let mut fixture = serde_json::to_value(run).unwrap();
+        fixture["schema_version"] = json!(1);
+        for event in fixture["events"].as_array_mut().unwrap() {
+            event["schema_version"] = json!(1);
+        }
+        fixture["events"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(terminal_event).unwrap());
+        fixture["projection"]["status"] = json!(serialized_status);
+        fixture["projection"]["pause_reason"] = json!(pause_reason);
+        fixture
+    }
+
     #[test]
     fn canonical_input_hash_is_order_independent_and_sha256_is_correct() {
         assert_eq!(
@@ -3030,6 +5202,848 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(second_attempt, 2);
+    }
+
+    #[test]
+    fn reserved_terminal_audit_activities_reject_cancelled_reconciliation_atomically() {
+        let invocation_id = "invocation-1";
+        let canonical_replay = test_terminal_replay("canonical", invocation_id);
+        let recovery_replay = test_terminal_replay("recovery", invocation_id);
+        let cases = [
+            (
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+            ),
+            (
+                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                invocation_id,
+                test_terminal_audit_input(&recovery_replay, &json!({"accepted": true})),
+            ),
+            (
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            ),
+        ];
+
+        for (index, (stable_step_id, logical_key, input)) in cases.into_iter().enumerate() {
+            let (mut run, activity_id) =
+                test_reconciliation_run(stable_step_id, logical_key, input);
+            let before = run.clone();
+            assert!(matches!(
+                run.reconcile_activity(
+                    &format!("cancel-reserved-{index}"),
+                    &activity_id,
+                    ActivityReconciliation::Cancelled,
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(run, before);
+        }
+    }
+
+    #[test]
+    fn raw_v2_events_cannot_bypass_reserved_reconciliation_validation() {
+        let invocation_id = "invocation-1";
+        let (lifecycle, lifecycle_id) = test_reconciliation_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        let lifecycle_attempt = lifecycle
+            .activity(&lifecycle_id)
+            .unwrap()
+            .latest_attempt()
+            .unwrap()
+            .attempt;
+        assert_raw_v2_event_rejected(
+            &lifecycle,
+            "raw-lifecycle-safe-to-retry",
+            RunEventKind::ActivityReconciled {
+                activity_id: lifecycle_id,
+                attempt: lifecycle_attempt,
+                resolution: ActivityReconciliation::SafeToRetry,
+            },
+        );
+
+        let cancellation_cases = [
+            (
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(
+                    &test_terminal_replay("canonical", invocation_id),
+                    &test_terminal_receipt(),
+                ),
+            ),
+            (
+                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                invocation_id,
+                test_terminal_audit_input(
+                    &test_terminal_replay("recovery", invocation_id),
+                    &json!({"accepted": true}),
+                ),
+            ),
+            (
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            ),
+        ];
+        for (index, (stable_step_id, logical_key, input)) in
+            cancellation_cases.into_iter().enumerate()
+        {
+            let (run, activity_id) = test_reconciliation_run(stable_step_id, logical_key, input);
+            let attempt = run
+                .activity(&activity_id)
+                .unwrap()
+                .latest_attempt()
+                .unwrap()
+                .attempt;
+            assert_raw_v2_event_rejected(
+                &run,
+                &format!("raw-reserved-cancelled-{index}"),
+                RunEventKind::ActivityReconciled {
+                    activity_id,
+                    attempt,
+                    resolution: ActivityReconciliation::Cancelled,
+                },
+            );
+        }
+
+        for kind in ["canonical", "recovery"] {
+            let replay = test_terminal_replay(kind, invocation_id);
+            let (stable_step_id, logical_key, expected_output) = if kind == "canonical" {
+                (
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_receipt(),
+                )
+            } else {
+                (
+                    RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                    invocation_id,
+                    json!({"accepted": true}),
+                )
+            };
+            let (run, activity_id) = test_reconciliation_run(
+                stable_step_id,
+                logical_key,
+                test_terminal_audit_input(&replay, &expected_output),
+            );
+            let attempt = run
+                .activity(&activity_id)
+                .unwrap()
+                .latest_attempt()
+                .unwrap()
+                .attempt;
+            assert_raw_v2_event_rejected(
+                &run,
+                &format!("raw-tampered-completed-{kind}"),
+                RunEventKind::ActivityReconciled {
+                    activity_id,
+                    attempt,
+                    resolution: ActivityReconciliation::Completed {
+                        output: json!({"tampered": true}),
+                    },
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v2_reserved_failures_are_rejected_without_state_changes() {
+        let invocation_id = "invocation-1";
+        let cases = [
+            (
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(
+                    &test_terminal_replay("canonical", invocation_id),
+                    &test_terminal_receipt(),
+                ),
+            ),
+            (
+                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                invocation_id,
+                test_terminal_audit_input(
+                    &test_terminal_replay("recovery", invocation_id),
+                    &json!({"accepted": true}),
+                ),
+            ),
+            (
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            ),
+        ];
+
+        for (index, (stable_step_id, logical_key, input)) in cases.into_iter().enumerate() {
+            let (run, activity_id, attempt) =
+                test_running_reserved_run(stable_step_id, logical_key, input);
+            assert_raw_v2_event_rejected(
+                &run,
+                &format!("raw-reserved-failed-{index}"),
+                RunEventKind::ActivityAttemptFailed {
+                    activity_id,
+                    attempt,
+                    error: "forged reserved failure".into(),
+                    retryable: true,
+                    effect_ambiguous: true,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_fail_activity_transitions_directly_to_reconciliation_required() {
+        let invocation_id = "invocation-1";
+        let cases = [
+            (
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(
+                    &test_terminal_replay("canonical", invocation_id),
+                    &test_terminal_receipt(),
+                ),
+            ),
+            (
+                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                invocation_id,
+                test_terminal_audit_input(
+                    &test_terminal_replay("recovery", invocation_id),
+                    &json!({"accepted": true}),
+                ),
+            ),
+            (
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            ),
+        ];
+
+        for (stable_step_id, logical_key, input) in cases {
+            let (mut run, activity_id, attempt) =
+                test_running_reserved_run(stable_step_id, logical_key, input);
+            let before_event_count = run.events().len();
+
+            assert!(matches!(
+                run.fail_activity(
+                    &activity_id,
+                    attempt,
+                    "unknown reserved audit outcome",
+                    true,
+                    true,
+                )
+                .unwrap(),
+                ActivityDecision::ReconcileRequired { .. }
+            ));
+            assert_eq!(run.events().len(), before_event_count + 1);
+            assert!(matches!(
+                run.events().last().map(|event| &event.kind),
+                Some(RunEventKind::ActivityReconciliationRequired {
+                    activity_id: reconciled_id,
+                    attempt: reconciled_attempt,
+                    ..
+                }) if reconciled_id == &activity_id && *reconciled_attempt == attempt
+            ));
+            assert!(!run.events().iter().any(|event| matches!(
+                &event.kind,
+                RunEventKind::ActivityAttemptFailed {
+                    activity_id: failed_id,
+                    ..
+                } if failed_id == &activity_id
+            )));
+            assert_eq!(
+                run.activity(&activity_id)
+                    .unwrap()
+                    .latest_attempt()
+                    .unwrap()
+                    .status,
+                ActivityAttemptStatus::ReconcileRequired
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v2_reserved_completions_cannot_bypass_delivery_intent() {
+        let invocation_id = "invocation-1";
+        for kind in ["canonical", "recovery"] {
+            let replay = test_terminal_replay(kind, invocation_id);
+            let (stable_step_id, logical_key, expected_output) = if kind == "canonical" {
+                (
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_receipt(),
+                )
+            } else {
+                (
+                    RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                    invocation_id,
+                    json!({"accepted": true}),
+                )
+            };
+            let (run, activity_id, attempt) = test_running_reserved_run(
+                stable_step_id,
+                logical_key,
+                test_terminal_audit_input(&replay, &expected_output),
+            );
+            let forged_output = json!({"accepted": false, "tampered": true});
+            assert_raw_v2_event_rejected(
+                &run,
+                &format!("raw-wrong-terminal-output-{kind}"),
+                RunEventKind::ActivityAttemptCompleted {
+                    activity_id,
+                    attempt,
+                    output: forged_output.clone(),
+                    output_hash: stable_input_hash(&forged_output),
+                },
+            );
+        }
+
+        let lifecycle_cases = [
+            (
+                "raw-lifecycle-replay-authorization",
+                json!({
+                    "status": "terminal_replay_authorized",
+                    "replay": test_terminal_replay("canonical", invocation_id),
+                }),
+            ),
+            ("raw-lifecycle-invalid-direct-close", {
+                let mut replay = test_terminal_replay("direct", invocation_id);
+                replay["audit_reason"] = json!("does-not-match-receipt");
+                json!({"status": "audit_closed", "replay": replay})
+            }),
+            (
+                "raw-lifecycle-unlinked-close",
+                json!({
+                    "status": "audit_closed",
+                    "replay": test_terminal_replay("canonical", invocation_id),
+                }),
+            ),
+        ];
+        for (event_id, output) in lifecycle_cases {
+            let (run, activity_id, attempt) = test_running_reserved_run(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            );
+            assert_raw_v2_event_rejected(
+                &run,
+                event_id,
+                RunEventKind::ActivityAttemptCompleted {
+                    activity_id,
+                    attempt,
+                    output: output.clone(),
+                    output_hash: stable_input_hash(&output),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn raw_v2_terminal_events_reject_unresolved_reserved_audit_marker() {
+        let invocation_id = "invocation-1";
+        let replay = test_terminal_replay("canonical", invocation_id);
+        let (run, _) = test_reconciliation_run(
+            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+            "terminal",
+            test_terminal_audit_input(&replay, &test_terminal_receipt()),
+        );
+
+        let terminal_cases = [
+            ("raw-run-completed", RunEventKind::RunCompleted),
+            (
+                "raw-run-failed",
+                RunEventKind::RunFailed {
+                    error: "forged failure".into(),
+                },
+            ),
+            (
+                "raw-run-cancelled",
+                RunEventKind::RunCancelled {
+                    reason: Some("forged cancellation".into()),
+                },
+            ),
+        ];
+        for (event_id, kind) in terminal_cases {
+            assert_raw_v2_event_rejected(&run, event_id, kind);
+        }
+    }
+
+    #[test]
+    fn invocation_lifecycle_rejects_safe_to_retry_atomically() {
+        let invocation_id = "invocation-1";
+        let (mut run, activity_id) = test_reconciliation_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        let before = run.clone();
+
+        assert!(matches!(
+            run.reconcile_activity(
+                "retry-lifecycle",
+                &activity_id,
+                ActivityReconciliation::SafeToRetry,
+            ),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(run, before);
+    }
+
+    #[test]
+    fn v2_hash_only_terminal_audit_schedule_is_rejected() {
+        let receipt = test_terminal_receipt();
+        let run = RunState::new("session", "hash-only-v2", DurabilityMode::Sync).unwrap();
+        let input = json!({"input_hash": stable_input_hash(&receipt)});
+        let definition = ActivityDefinition {
+            activity_id: stable_id(
+                "activity",
+                &[
+                    run.run_id(),
+                    &run.projection().branch_id,
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                ],
+            ),
+            stable_step_id: RUNTIME_RUN_STOPPED_AUDIT_STEP_ID.into(),
+            logical_key: "terminal".into(),
+            input_hash: stable_input_hash(&input),
+            input,
+            side_effect_class: SideEffectClass::ReconcileRequired,
+            idempotency_key: None,
+        };
+        assert_raw_v2_event_rejected(
+            &run,
+            "v2-hash-only-terminal-schedule",
+            RunEventKind::ActivityScheduled { definition },
+        );
+    }
+
+    #[test]
+    fn typed_terminal_audit_replay_allows_safe_to_retry_for_canonical_and_recovery() {
+        for (index, kind) in ["canonical", "recovery"].into_iter().enumerate() {
+            let invocation_id = "invocation-1";
+            let replay = test_terminal_replay(kind, invocation_id);
+            let (stable_step_id, logical_key, expected_output) = if kind == "canonical" {
+                (
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_receipt(),
+                )
+            } else {
+                (
+                    RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                    invocation_id,
+                    json!({"accepted": true}),
+                )
+            };
+            let (mut run, activity_id) = test_reconciliation_run(
+                stable_step_id,
+                logical_key,
+                test_terminal_audit_input(&replay, &expected_output),
+            );
+
+            run.reconcile_activity(
+                &format!("retry-typed-audit-{index}"),
+                &activity_id,
+                ActivityReconciliation::SafeToRetry,
+            )
+            .unwrap();
+
+            let attempt = run
+                .activity(&activity_id)
+                .unwrap()
+                .latest_attempt()
+                .unwrap();
+            assert_eq!(attempt.status, ActivityAttemptStatus::Failed);
+            assert!(attempt.retryable);
+            assert!(!attempt.effect_ambiguous);
+            assert_eq!(run.status(), DurableRunStatus::Paused);
+        }
+    }
+
+    #[test]
+    fn v2_terminal_audit_schedule_rejects_malformed_but_allows_non_replayable_binding() {
+        let invocation_id = "invocation-1";
+        for invalid_binding in 0..9 {
+            let mut replay = test_terminal_replay("canonical", invocation_id);
+            match invalid_binding {
+                0 => {
+                    replay.as_object_mut().unwrap().remove("audit_binding");
+                }
+                1 => {
+                    replay["audit_binding"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("delivery_id");
+                }
+                2 => replay["audit_binding"]["sink_count"] = json!(0),
+                3 => replay["audit_binding"]["failure_mode"] = json!("best_effort"),
+                4 => replay["terminal_receipt"]["unexpected"] = json!(true),
+                5 => replay["terminal_receipt"]["usage"]["unexpected"] = json!(1),
+                6 => replay["audit_binding"]["unexpected"] = json!(true),
+                7 => replay["unexpected"] = json!(true),
+                8 => replay["terminal_receipt"]["usage"] = json!({}),
+                _ => unreachable!(),
+            }
+            let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+            execute(
+                run.prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                    test_lifecycle_input(invocation_id),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+            );
+            let input = test_terminal_audit_input(&replay, &test_terminal_receipt());
+            let event = RunEventKind::ActivityScheduled {
+                definition: ActivityDefinition {
+                    activity_id: stable_id(
+                        "activity",
+                        &[
+                            run.run_id(),
+                            &run.projection().branch_id,
+                            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                            "terminal",
+                        ],
+                    ),
+                    stable_step_id: RUNTIME_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                    logical_key: "terminal".into(),
+                    input_hash: stable_input_hash(&input),
+                    input,
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+            };
+            if invalid_binding == 0 || invalid_binding >= 4 {
+                assert_raw_v2_event_rejected(
+                    &run,
+                    &format!("malformed-binding-{invalid_binding}"),
+                    event,
+                );
+            } else {
+                run.append_event(RunEvent {
+                    schema_version: DURABILITY_SCHEMA_VERSION,
+                    run_id: run.run_id().into(),
+                    sequence: run.next_sequence(),
+                    event_id: format!("non-replayable-binding-{invalid_binding}"),
+                    kind: event,
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn v1_events_cannot_smuggle_v2_reserved_audit_activities_into_a_mixed_schema_log() {
+        let run_id = "mixed-schema-audit-run";
+        let invocation_id = "invocation-1";
+        let cases = [
+            (
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(
+                    &test_terminal_replay("canonical", invocation_id),
+                    &test_terminal_receipt(),
+                ),
+            ),
+            (
+                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                invocation_id,
+                test_terminal_audit_input(
+                    &test_terminal_replay("recovery", invocation_id),
+                    &json!({"accepted": true}),
+                ),
+            ),
+            (
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            ),
+        ];
+
+        for (index, (stable_step_id, logical_key, input)) in cases.into_iter().enumerate() {
+            let seed = RunState::new("session", run_id, DurabilityMode::Sync).unwrap();
+            let branch_id = seed.projection().branch_id.clone();
+            let activity_id = stable_id(
+                "activity",
+                &[run_id, &branch_id, stable_step_id, logical_key],
+            );
+            let mut start = seed.events()[0].clone();
+            start.schema_version = 1;
+            let schedule = RunEvent {
+                schema_version: 1,
+                run_id: run_id.into(),
+                sequence: 2,
+                event_id: format!("smuggled-v1-schedule-{index}"),
+                kind: RunEventKind::ActivityScheduled {
+                    definition: ActivityDefinition {
+                        activity_id: activity_id.clone(),
+                        stable_step_id: stable_step_id.into(),
+                        logical_key: logical_key.into(),
+                        input_hash: stable_input_hash(&input),
+                        input,
+                        side_effect_class: SideEffectClass::ReconcileRequired,
+                        idempotency_key: None,
+                    },
+                },
+            };
+            let v2_attempt = RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: run_id.into(),
+                sequence: 3,
+                event_id: format!("smuggled-v2-attempt-{index}"),
+                kind: RunEventKind::ActivityAttemptStarted {
+                    activity_id,
+                    attempt: 1,
+                },
+            };
+
+            assert!(matches!(
+                RunState::from_events([start, schedule, v2_attempt]),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn reserved_terminal_audit_completed_reconciliation_rejects_tampered_output() {
+        for kind in ["canonical", "recovery"] {
+            let invocation_id = "invocation-1";
+            let replay = test_terminal_replay(kind, invocation_id);
+            let (stable_step_id, logical_key, expected_output) = if kind == "canonical" {
+                (
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_receipt(),
+                )
+            } else {
+                (
+                    RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                    invocation_id,
+                    json!({"accepted": true}),
+                )
+            };
+            let (mut run, activity_id) = test_reconciliation_run(
+                stable_step_id,
+                logical_key,
+                test_terminal_audit_input(&replay, &expected_output),
+            );
+            let before = run.clone();
+
+            assert!(matches!(
+                run.reconcile_activity(
+                    &format!("complete-tampered-{kind}"),
+                    &activity_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({"tampered": true}),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(run, before);
+        }
+    }
+
+    #[test]
+    fn lifecycle_completed_reconciliation_requires_exact_linked_terminal_replay() {
+        for kind in ["canonical", "recovery"] {
+            let (mut premature, lifecycle_id, _, replay) = test_linked_lifecycle_run(kind);
+            let before = premature.clone();
+            assert!(matches!(
+                premature.reconcile_activity(
+                    &format!("authorize-before-safe-retry-{kind}"),
+                    &lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "terminal_replay_authorized",
+                            "replay": replay,
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(premature, before);
+
+            let (mut exact, exact_lifecycle_id, exact_audit_id, exact_replay) =
+                test_linked_lifecycle_run(kind);
+            exact
+                .reconcile_activity(
+                    &format!("retry-linked-audit-{kind}"),
+                    &exact_audit_id,
+                    ActivityReconciliation::SafeToRetry,
+                )
+                .unwrap();
+            let before_wrong_status = exact.clone();
+            assert!(matches!(
+                exact.reconcile_activity(
+                    &format!("close-linked-audit-{kind}"),
+                    &exact_lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "audit_closed",
+                            "replay": exact_replay,
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(exact, before_wrong_status);
+            exact
+                .reconcile_activity(
+                    &format!("authorize-linked-replay-{kind}"),
+                    &exact_lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "terminal_replay_authorized",
+                            "replay": exact_replay,
+                        }),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                exact
+                    .activity(&exact_lifecycle_id)
+                    .unwrap()
+                    .latest_attempt()
+                    .unwrap()
+                    .status,
+                ActivityAttemptStatus::Completed
+            );
+
+            let (mut wrong_identity, lifecycle_id, audit_id, mut replay) =
+                test_linked_lifecycle_run(kind);
+            wrong_identity
+                .reconcile_activity(
+                    &format!("retry-before-wrong-identity-{kind}"),
+                    &audit_id,
+                    ActivityReconciliation::SafeToRetry,
+                )
+                .unwrap();
+            replay["invocation_id"] = json!("another-invocation");
+            let before = wrong_identity.clone();
+            assert!(matches!(
+                wrong_identity.reconcile_activity(
+                    &format!("wrong-identity-{kind}"),
+                    &lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "terminal_replay_authorized",
+                            "replay": replay,
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(wrong_identity, before);
+
+            let (mut wrong_replay, lifecycle_id, audit_id, mut replay) =
+                test_linked_lifecycle_run(kind);
+            wrong_replay
+                .reconcile_activity(
+                    &format!("retry-before-wrong-replay-{kind}"),
+                    &audit_id,
+                    ActivityReconciliation::SafeToRetry,
+                )
+                .unwrap();
+            replay["run_stopped_sequence"] = json!(8);
+            let before = wrong_replay.clone();
+            assert!(matches!(
+                wrong_replay.reconcile_activity(
+                    &format!("wrong-linked-replay-{kind}"),
+                    &lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "terminal_replay_authorized",
+                            "replay": replay,
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(wrong_replay, before);
+        }
+    }
+
+    #[test]
+    fn direct_lifecycle_completion_is_allowed_only_without_a_linked_terminal_marker() {
+        let invocation_id = "invocation-1";
+        let direct_replay = test_terminal_replay("direct", invocation_id);
+        let (mut unlinked, lifecycle_id) = test_reconciliation_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        unlinked
+            .reconcile_activity(
+                "complete-direct-unlinked",
+                &lifecycle_id,
+                ActivityReconciliation::Completed {
+                    output: json!({
+                        "status": "audit_closed",
+                        "replay": direct_replay,
+                    }),
+                },
+            )
+            .unwrap();
+        assert_eq!(unlinked.status(), DurableRunStatus::Paused);
+
+        for kind in ["canonical", "recovery"] {
+            let (mut linked, lifecycle_id, _, _) = test_linked_lifecycle_run(kind);
+            let before = linked.clone();
+            assert!(matches!(
+                linked.reconcile_activity(
+                    &format!("complete-direct-with-{kind}"),
+                    &lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "audit_closed",
+                            "replay": test_terminal_replay("direct", invocation_id),
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(linked, before);
+        }
+    }
+
+    #[test]
+    fn direct_lifecycle_completion_rejects_receipt_event_mismatch_atomically() {
+        let invocation_id = "invocation-1";
+        for mismatch in ["turns", "reason"] {
+            let mut direct_replay = test_terminal_replay("direct", invocation_id);
+            if mismatch == "turns" {
+                direct_replay["audit_turns"] = json!(3);
+            } else {
+                direct_replay["audit_reason"] = json!("different-reason");
+            }
+            let (mut run, lifecycle_id) = test_reconciliation_run(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+            );
+            let before = run.clone();
+
+            assert!(matches!(
+                run.reconcile_activity(
+                    &format!("direct-{mismatch}-mismatch"),
+                    &lifecycle_id,
+                    ActivityReconciliation::Completed {
+                        output: json!({
+                            "status": "audit_closed",
+                            "replay": direct_replay,
+                        }),
+                    },
+                ),
+                Err(DurabilityError::InvalidEvent { .. })
+            ));
+            assert_eq!(run, before);
+        }
     }
 
     #[test]
@@ -3438,6 +6452,182 @@ mod tests {
     }
 
     #[test]
+    fn terminal_transitions_reject_running_activity_atomically() {
+        let mut run = RunState::new("session", "terminal-guard", DurabilityMode::Sync).unwrap();
+        run.prepare_activity(
+            "external-write-v1",
+            "write-1",
+            json!({"value": 1}),
+            SideEffectClass::ReconcileRequired,
+            None,
+        )
+        .unwrap();
+        let before = run.clone();
+
+        assert!(matches!(
+            run.complete_run("complete"),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(run, before);
+        assert!(matches!(
+            run.fail_run("fail", "failed"),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(run, before);
+        assert!(matches!(
+            run.apply_command(RunCommand::Cancel {
+                command_id: "cancel".into(),
+                reason: Some("cancelled".into()),
+            }),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(run, before);
+    }
+
+    #[test]
+    fn legacy_v1_terminal_snapshots_migrate_without_weakening_v2_writes() {
+        let cases = [
+            (
+                DurableRunStatus::Failed,
+                false,
+                ActivityAttemptStatus::Running,
+            ),
+            (
+                DurableRunStatus::Cancelled,
+                false,
+                ActivityAttemptStatus::Running,
+            ),
+            (
+                DurableRunStatus::Failed,
+                true,
+                ActivityAttemptStatus::ReconcileRequired,
+            ),
+        ];
+
+        for (status, reconcile_required, activity_status) in cases {
+            let fixture = legacy_v1_terminal_fixture(status, reconcile_required);
+            let migrated: RunState = serde_json::from_value(fixture).unwrap();
+            assert_eq!(migrated.schema_version(), DURABILITY_SCHEMA_VERSION);
+            assert_eq!(migrated.status(), status);
+            assert!(migrated
+                .events()
+                .iter()
+                .all(|event| event.schema_version == 1));
+            assert_eq!(
+                migrated
+                    .projection()
+                    .activities
+                    .values()
+                    .next()
+                    .unwrap()
+                    .latest_attempt()
+                    .unwrap()
+                    .status,
+                activity_status
+            );
+
+            let encoded = serde_json::to_value(&migrated).unwrap();
+            assert_eq!(encoded["schema_version"], json!(DURABILITY_SCHEMA_VERSION));
+            assert_eq!(
+                serde_json::from_value::<RunState>(encoded).unwrap(),
+                migrated
+            );
+        }
+
+        let fresh = RunState::new("session", "reject-v1-append", DurabilityMode::Sync).unwrap();
+        let mut legacy_event = fresh.events()[0].clone();
+        legacy_event.schema_version = 1;
+        let mut blank = RunState::new("session", "other-run", DurabilityMode::Sync).unwrap();
+        legacy_event.run_id = blank.run_id().into();
+        legacy_event.sequence = blank.next_sequence();
+        legacy_event.event_id = "legacy-v1-new-write".into();
+        legacy_event.kind = RunEventKind::StateReplaced {
+            state: json!({"legacy": true}),
+        };
+        assert_eq!(
+            blank.append_event(legacy_event).unwrap_err(),
+            DurabilityError::UnsupportedSchema {
+                expected: DURABILITY_SCHEMA_VERSION,
+                actual: 1,
+            }
+        );
+
+        let mut v1_events = fresh.events().to_vec();
+        for event in &mut v1_events {
+            event.schema_version = 1;
+        }
+        let mut migrated_open = RunState::from_events(v1_events).unwrap();
+        migrated_open
+            .replace_state("post-migration", json!({"schema": 2}))
+            .unwrap();
+        assert_eq!(migrated_open.events()[0].schema_version, 1);
+        assert_eq!(
+            migrated_open.events().last().unwrap().schema_version,
+            DURABILITY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_v1_typed_approval_envelopes_survive_schema_migration() {
+        let mut run =
+            RunState::new("legacy-session", "legacy-approval", DurabilityMode::Sync).unwrap();
+        let approval_id = run
+            .request_typed_approval(DurableApprovalRequest {
+                logical_key: "customer-id".into(),
+                activity_id: None,
+                kind: DurableApprovalKind::MissingInput,
+                prompt: "Customer id?".into(),
+                payload: json!({"field": "customer_id"}),
+                policy_snapshot_hash: None,
+                governance_binding: None,
+                requested_at_unix_ms: 100,
+                expires_at_unix_ms: 200,
+            })
+            .unwrap();
+        run.apply_command_at(
+            RunCommand::Resume {
+                command_id: "legacy-resume".into(),
+                approvals: vec![ApprovalResolution {
+                    approval_id: approval_id.clone(),
+                    approved: true,
+                    response: Some(json!("cust-1")),
+                }],
+            },
+            150,
+        )
+        .unwrap();
+
+        let mut fixture = serde_json::to_value(&run).unwrap();
+        fixture["schema_version"] = json!(1);
+        for event in fixture["events"].as_array_mut().unwrap() {
+            event["schema_version"] = json!(1);
+            match event["kind"]["type"].as_str() {
+                Some("approval_requested") => {
+                    event["kind"]["payload"][DURABLE_APPROVAL_ENVELOPE_KEY]["schema_version"] =
+                        json!(1);
+                }
+                Some("approval_resolved") => {
+                    event["kind"]["response"][DURABLE_RESOLUTION_ENVELOPE_KEY]["schema_version"] =
+                        json!(1);
+                }
+                _ => {}
+            }
+        }
+
+        let migrated: RunState = serde_json::from_value(fixture).unwrap();
+        assert_eq!(migrated.schema_version(), DURABILITY_SCHEMA_VERSION);
+        assert_eq!(migrated.status(), DurableRunStatus::Running);
+        assert_eq!(
+            migrated.projection().approvals[&approval_id].status,
+            DurableApprovalStatus::Approved
+        );
+        assert_eq!(
+            migrated.projection().approvals[&approval_id].response,
+            Some(json!("cust-1"))
+        );
+    }
+
+    #[test]
     fn deserialization_rebuilds_projection_and_rejects_tampering() {
         let mut run = RunState::new("session", "serialized", DurabilityMode::Async).unwrap();
         run.replace_state("state-1", json!({"trusted": true}))
@@ -3760,5 +6950,893 @@ mod tests {
         assert_eq!(run.status(), DurableRunStatus::Paused);
         assert!(run.expire_approvals("sweep-1", 110).unwrap().is_empty());
         assert_eq!(RunState::from_events(run.events().to_vec()).unwrap(), run);
+    }
+
+    #[test]
+    fn raw_v2_reserved_schedules_require_the_exact_lifecycle_and_completed_canonical_receipt() {
+        let invocation_id = "invocation-1";
+        let without_lifecycle =
+            RunState::new("session", "raw-schedule", DurabilityMode::Sync).unwrap();
+        let canonical_replay = test_terminal_replay("canonical", invocation_id);
+        let canonical_definition = ActivityDefinition {
+            activity_id: stable_identifier(
+                "activity",
+                &[
+                    without_lifecycle.run_id(),
+                    &without_lifecycle.projection().branch_id,
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                ],
+            ),
+            stable_step_id: RUNTIME_RUN_STOPPED_AUDIT_STEP_ID.into(),
+            logical_key: "terminal".into(),
+            input: test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+            input_hash: stable_input_hash(&test_terminal_audit_input(
+                &canonical_replay,
+                &test_terminal_receipt(),
+            )),
+            side_effect_class: SideEffectClass::ReconcileRequired,
+            idempotency_key: None,
+        };
+        assert_raw_v2_event_rejected(
+            &without_lifecycle,
+            "raw-canonical-without-lifecycle",
+            RunEventKind::ActivityScheduled {
+                definition: canonical_definition.clone(),
+            },
+        );
+
+        let (mut wrong_lifecycle, _, _) = test_running_reserved_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            "another-invocation",
+            test_lifecycle_input("another-invocation"),
+        );
+        let mut wrong_definition = canonical_definition.clone();
+        wrong_definition.activity_id = stable_identifier(
+            "activity",
+            &[
+                wrong_lifecycle.run_id(),
+                &wrong_lifecycle.projection().branch_id,
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+            ],
+        );
+        assert_raw_v2_event_rejected(
+            &wrong_lifecycle,
+            "raw-canonical-wrong-lifecycle",
+            RunEventKind::ActivityScheduled {
+                definition: wrong_definition.clone(),
+            },
+        );
+        execute(
+            wrong_lifecycle
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                    test_lifecycle_input(invocation_id),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        let recovery_replay = test_terminal_replay("recovery", invocation_id);
+        let recovery_input =
+            test_terminal_audit_input(&recovery_replay, &json!({"accepted": true}));
+        assert_raw_v2_event_rejected(
+            &wrong_lifecycle,
+            "raw-recovery-without-completed-canonical",
+            RunEventKind::ActivityScheduled {
+                definition: ActivityDefinition {
+                    activity_id: stable_identifier(
+                        "activity",
+                        &[
+                            wrong_lifecycle.run_id(),
+                            &wrong_lifecycle.projection().branch_id,
+                            RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                            invocation_id,
+                        ],
+                    ),
+                    stable_step_id: RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                    logical_key: invocation_id.into(),
+                    input_hash: stable_input_hash(&recovery_input),
+                    input: recovery_input,
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+            },
+        );
+
+        let mut duplicate = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        let (_, lifecycle_attempt) = execute(
+            duplicate
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                    test_lifecycle_input(invocation_id),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(lifecycle_attempt, 1);
+        let canonical = duplicate
+            .prepare_activity(
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap();
+        let ActivityDecision::Execute {
+            activity_id: canonical_id,
+            ..
+        } = canonical
+        else {
+            panic!("canonical audit must begin its first attempt");
+        };
+        let duplicate_definition = duplicate
+            .activity(&canonical_id)
+            .unwrap()
+            .definition
+            .clone();
+        let before_duplicate = duplicate.clone();
+        assert!(duplicate
+            .append_event(RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: duplicate.run_id().into(),
+                sequence: duplicate.next_sequence(),
+                event_id: "raw-duplicate-canonical".into(),
+                kind: RunEventKind::ActivityScheduled {
+                    definition: duplicate_definition
+                },
+            })
+            .is_err());
+        assert_eq!(duplicate, before_duplicate);
+        let legacy_input = json!({"input_hash": stable_input_hash(&test_terminal_receipt())});
+        assert_raw_v2_event_rejected(
+            &duplicate,
+            "raw-v2-legacy-schedule",
+            RunEventKind::ActivityScheduled {
+                definition: ActivityDefinition {
+                    activity_id: stable_identifier(
+                        "activity",
+                        &[
+                            duplicate.run_id(),
+                            &duplicate.projection().branch_id,
+                            RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID,
+                            "terminal",
+                        ],
+                    ),
+                    stable_step_id: RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                    logical_key: "terminal".into(),
+                    input_hash: stable_input_hash(&legacy_input),
+                    input: legacy_input,
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn raw_lifecycle_audit_run_id_forgery_rejects_direct_and_reconciled_completion_atomically() {
+        let invocation_id = "invocation-1";
+        let (run, activity_id, attempt) = test_running_reserved_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        let mut replay = test_terminal_replay("direct", invocation_id);
+        replay["audit_run_id"] = json!("another-run");
+        let output = json!({"status": "audit_closed", "replay": replay});
+        assert_raw_v2_event_rejected(
+            &run,
+            "raw-forged-lifecycle-audit-run",
+            RunEventKind::ActivityAttemptCompleted {
+                activity_id: activity_id.clone(),
+                attempt,
+                output: output.clone(),
+                output_hash: stable_input_hash(&output),
+            },
+        );
+
+        let (mut reconciled, reconciliation_id) = test_reconciliation_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        let before = reconciled.clone();
+        assert!(matches!(
+            reconciled.reconcile_activity(
+                "forged-lifecycle-audit-run",
+                &reconciliation_id,
+                ActivityReconciliation::Completed { output },
+            ),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(reconciled, before);
+    }
+
+    #[test]
+    fn v1_legacy_run_stopped_marker_must_be_canonical_and_unique_on_replay() {
+        let seed = RunState::new("session", "legacy-marker", DurabilityMode::Sync).unwrap();
+        let run_id = seed.run_id().to_string();
+        let branch_id = seed.projection().branch_id.clone();
+        let mut start = seed.events()[0].clone();
+        start.schema_version = 1;
+        let input = json!({"input_hash": stable_input_hash(&test_terminal_receipt())});
+        let canonical = ActivityDefinition {
+            activity_id: stable_identifier(
+                "activity",
+                &[
+                    &run_id,
+                    &branch_id,
+                    RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                ],
+            ),
+            stable_step_id: RUNTIME_LEGACY_RUN_STOPPED_AUDIT_STEP_ID.into(),
+            logical_key: "terminal".into(),
+            input_hash: stable_input_hash(&input),
+            input,
+            side_effect_class: SideEffectClass::ReconcileRequired,
+            idempotency_key: None,
+        };
+        let scheduled = RunEvent {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            sequence: 2,
+            event_id: "legacy-terminal-scheduled".into(),
+            kind: RunEventKind::ActivityScheduled {
+                definition: canonical.clone(),
+            },
+        };
+        assert!(RunState::from_events([start.clone(), scheduled.clone()]).is_ok());
+
+        let duplicate = RunEvent {
+            schema_version: 1,
+            run_id: run_id.clone(),
+            sequence: 3,
+            event_id: "legacy-terminal-duplicated".into(),
+            kind: RunEventKind::ActivityScheduled {
+                definition: canonical.clone(),
+            },
+        };
+        assert!(matches!(
+            RunState::from_events([start.clone(), scheduled.clone(), duplicate]),
+            Err(DurabilityError::InvalidActivityTransition { .. })
+                | Err(DurabilityError::InvalidEvent { .. })
+        ));
+
+        let mut non_canonical = canonical;
+        non_canonical.activity_id = "legacy-terminal-forged-id".into();
+        let wrong_identity = RunEvent {
+            schema_version: 1,
+            run_id,
+            sequence: 3,
+            event_id: "legacy-terminal-wrong-id".into(),
+            kind: RunEventKind::ActivityScheduled {
+                definition: non_canonical,
+            },
+        };
+        assert!(matches!(
+            RunState::from_events([start, scheduled, wrong_identity]),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_not_started_lifecycle_completion_rejects_post_fence_ordinary_work() {
+        let invocation_id = "invocation-1";
+        let (mut run, lifecycle_id, lifecycle_attempt) = test_running_reserved_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        execute(
+            run.prepare_activity(
+                "ordinary-post-fence",
+                "work-1",
+                json!({"value": 1}),
+                SideEffectClass::Pure,
+                None,
+            )
+            .unwrap(),
+        );
+        let output = json!({
+            "status": "not_started",
+            "audit_run_id": run.run_id(),
+            "invocation_id": invocation_id,
+        });
+        assert_raw_v2_event_rejected(
+            &run,
+            "raw-not-started-after-ordinary-work",
+            RunEventKind::ActivityAttemptCompleted {
+                activity_id: lifecycle_id,
+                attempt: lifecycle_attempt,
+                output: output.clone(),
+                output_hash: stable_input_hash(&output),
+            },
+        );
+    }
+
+    #[test]
+    fn quarantined_unstarted_lifecycle_can_close_as_not_started_then_resume_work() {
+        let invocation_id = "invocation-1";
+        let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        let lifecycle_definition = ActivityDefinition {
+            activity_id: stable_identifier(
+                "activity",
+                &[
+                    run.run_id(),
+                    &run.projection().branch_id,
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                ],
+            ),
+            stable_step_id: RUNTIME_INVOCATION_LIFECYCLE_STEP_ID.into(),
+            logical_key: invocation_id.into(),
+            input: test_lifecycle_input(invocation_id),
+            input_hash: stable_input_hash(&test_lifecycle_input(invocation_id)),
+            side_effect_class: SideEffectClass::ReconcileRequired,
+            idempotency_key: None,
+        };
+        let lifecycle_id = lifecycle_definition.activity_id.clone();
+        run.append_event(RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: run.run_id().into(),
+            sequence: run.next_sequence(),
+            event_id: "raw-unstarted-lifecycle".into(),
+            kind: RunEventKind::ActivityScheduled {
+                definition: lifecycle_definition,
+            },
+        })
+        .unwrap();
+        run.quarantine_unstarted_reserved_activity(&lifecycle_id, "operator review")
+            .unwrap();
+        let output = json!({
+            "status": "not_started",
+            "audit_run_id": run.run_id(),
+            "invocation_id": invocation_id,
+        });
+        run.reconcile_activity(
+            "reconcile-unstarted-lifecycle",
+            &lifecycle_id,
+            ActivityReconciliation::Completed {
+                output: output.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run.activity(&lifecycle_id).unwrap().completed_output(),
+            Some(&output)
+        );
+        assert_eq!(run.status(), DurableRunStatus::Paused);
+        run.apply_command(RunCommand::Resume {
+            command_id: "resume-after-unstarted-lifecycle".into(),
+            approvals: vec![],
+        })
+        .unwrap();
+        assert!(matches!(
+            run.prepare_activity(
+                "ordinary-after-resume",
+                "work-1",
+                json!({"value": 1}),
+                SideEffectClass::Pure,
+                None,
+            )
+            .unwrap(),
+            ActivityDecision::Execute { .. }
+        ));
+        assert_eq!(RunState::from_events(run.events().to_vec()).unwrap(), run);
+    }
+
+    #[test]
+    fn recovery_audit_cannot_reuse_the_completed_canonical_invocation() {
+        let invocation_id = "invocation-1";
+        let canonical_replay = test_terminal_replay("canonical", invocation_id);
+        let mut run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        execute(
+            run.prepare_activity(
+                RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                invocation_id,
+                test_lifecycle_input(invocation_id),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        let (canonical_id, canonical_attempt) = execute(
+            run.prepare_activity(
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+                test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+                SideEffectClass::ReconcileRequired,
+                None,
+            )
+            .unwrap(),
+        );
+        run.complete_activity(&canonical_id, canonical_attempt, test_terminal_receipt())
+            .unwrap();
+
+        let recovery_replay = test_terminal_replay("recovery", invocation_id);
+        let recovery_input =
+            test_terminal_audit_input(&recovery_replay, &json!({"accepted": true}));
+        assert_raw_v2_event_rejected(
+            &run,
+            "recovery-reuses-canonical-invocation",
+            RunEventKind::ActivityScheduled {
+                definition: ActivityDefinition {
+                    activity_id: stable_identifier(
+                        "activity",
+                        &[
+                            run.run_id(),
+                            &run.projection().branch_id,
+                            RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                            invocation_id,
+                        ],
+                    ),
+                    stable_step_id: RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                    logical_key: invocation_id.into(),
+                    input_hash: stable_input_hash(&recovery_input),
+                    input: recovery_input,
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn terminal_markers_block_running_work_and_later_ordinary_schedule_or_start() {
+        let invocation_id = "invocation-1";
+        let canonical_replay = test_terminal_replay("canonical", invocation_id);
+        let canonical_input =
+            test_terminal_audit_input(&canonical_replay, &test_terminal_receipt());
+
+        let (mut canonical_run, _, _) = test_running_reserved_run(
+            RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+            invocation_id,
+            test_lifecycle_input(invocation_id),
+        );
+        execute(
+            canonical_run
+                .prepare_activity(
+                    "ordinary-running-before-canonical",
+                    "work-1",
+                    json!({"value": 1}),
+                    SideEffectClass::Pure,
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_raw_v2_event_rejected(
+            &canonical_run,
+            "canonical-blocked-by-running-ordinary-work",
+            RunEventKind::ActivityScheduled {
+                definition: ActivityDefinition {
+                    activity_id: stable_identifier(
+                        "activity",
+                        &[
+                            canonical_run.run_id(),
+                            &canonical_run.projection().branch_id,
+                            RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                            "terminal",
+                        ],
+                    ),
+                    stable_step_id: RUNTIME_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                    logical_key: "terminal".into(),
+                    input_hash: stable_input_hash(&canonical_input),
+                    input: canonical_input.clone(),
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+            },
+        );
+
+        let mut recovery_run = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        let (canonical_lifecycle_id, canonical_lifecycle_attempt) = execute(
+            recovery_run
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    "canonical-invocation",
+                    test_lifecycle_input("canonical-invocation"),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        let canonical_replay = test_terminal_replay("canonical", "canonical-invocation");
+        let (canonical_id, canonical_attempt) = execute(
+            recovery_run
+                .prepare_activity(
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_audit_input(&canonical_replay, &test_terminal_receipt()),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        recovery_run
+            .complete_activity(&canonical_id, canonical_attempt, test_terminal_receipt())
+            .unwrap();
+        recovery_run
+            .fail_activity(
+                &canonical_lifecycle_id,
+                canonical_lifecycle_attempt,
+                "close canonical lifecycle",
+                true,
+                true,
+            )
+            .unwrap();
+        recovery_run
+            .reconcile_activity(
+                "close-canonical-lifecycle",
+                &canonical_lifecycle_id,
+                ActivityReconciliation::Completed {
+                    output: json!({"status": "audit_closed", "replay": canonical_replay}),
+                },
+            )
+            .unwrap();
+        recovery_run
+            .apply_command(RunCommand::Resume {
+                command_id: "resume-before-recovery".into(),
+                approvals: vec![],
+            })
+            .unwrap();
+        let recovery_invocation = "recovery-invocation";
+        execute(
+            recovery_run
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    recovery_invocation,
+                    test_lifecycle_input(recovery_invocation),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        // A legal canonical marker already forbids scheduling new ordinary work. Model a
+        // recovered legacy projection with an ordinary attempt that was already in flight, so
+        // this assertion reaches the recovery-marker schedule guard itself.
+        let ordinary_id = "recovered-ordinary-running".to_string();
+        recovery_run.projection.activities.insert(
+            ordinary_id.clone(),
+            ActivityRecord {
+                definition: ActivityDefinition {
+                    activity_id: ordinary_id,
+                    stable_step_id: "ordinary-recovered-work".into(),
+                    logical_key: "work-1".into(),
+                    input: json!({"value": 1}),
+                    input_hash: stable_input_hash(&json!({"value": 1})),
+                    side_effect_class: SideEffectClass::Pure,
+                    idempotency_key: None,
+                },
+                attempts: vec![ActivityAttempt {
+                    attempt: 1,
+                    status: ActivityAttemptStatus::Running,
+                    started_sequence: recovery_run.next_sequence(),
+                    finished_sequence: None,
+                    output: None,
+                    output_hash: None,
+                    error: None,
+                    retryable: false,
+                    effect_ambiguous: false,
+                }],
+            },
+        );
+        let recovery_replay = test_terminal_replay("recovery", recovery_invocation);
+        let recovery_input =
+            test_terminal_audit_input(&recovery_replay, &json!({"accepted": true}));
+        let before_recovery_schedule = recovery_run.clone();
+        assert!(matches!(
+            recovery_run.append_event(RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: recovery_run.run_id().into(),
+                sequence: recovery_run.next_sequence(),
+                event_id: "recovery-blocked-by-running-ordinary-work".into(),
+                kind: RunEventKind::ActivityScheduled {
+                    definition: ActivityDefinition {
+                        activity_id: stable_identifier(
+                            "activity",
+                            &[
+                                recovery_run.run_id(),
+                                &recovery_run.projection().branch_id,
+                                RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID,
+                                recovery_invocation,
+                            ],
+                        ),
+                        stable_step_id: RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                        logical_key: recovery_invocation.into(),
+                        input_hash: stable_input_hash(&recovery_input),
+                        input: recovery_input,
+                        side_effect_class: SideEffectClass::ReconcileRequired,
+                        idempotency_key: None,
+                    },
+                },
+            }),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(recovery_run, before_recovery_schedule);
+
+        let mut post_marker = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        let ordinary = ActivityDefinition {
+            activity_id: stable_identifier(
+                "activity",
+                &[
+                    post_marker.run_id(),
+                    &post_marker.projection().branch_id,
+                    "ordinary-before-marker",
+                    "work-1",
+                ],
+            ),
+            stable_step_id: "ordinary-before-marker".into(),
+            logical_key: "work-1".into(),
+            input: json!({"value": 1}),
+            input_hash: stable_input_hash(&json!({"value": 1})),
+            side_effect_class: SideEffectClass::Pure,
+            idempotency_key: None,
+        };
+        post_marker
+            .append_event(RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: post_marker.run_id().into(),
+                sequence: post_marker.next_sequence(),
+                event_id: "ordinary-scheduled-before-marker".into(),
+                kind: RunEventKind::ActivityScheduled {
+                    definition: ordinary.clone(),
+                },
+            })
+            .unwrap();
+        let marker_invocation = "marker-invocation";
+        execute(
+            post_marker
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    marker_invocation,
+                    test_lifecycle_input(marker_invocation),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        let marker_replay = test_terminal_replay("canonical", marker_invocation);
+        post_marker
+            .append_event(RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: post_marker.run_id().into(),
+                sequence: post_marker.next_sequence(),
+                event_id: "canonical-marker-scheduled".into(),
+                kind: RunEventKind::ActivityScheduled {
+                    definition: ActivityDefinition {
+                        activity_id: stable_identifier(
+                            "activity",
+                            &[
+                                post_marker.run_id(),
+                                &post_marker.projection().branch_id,
+                                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                                "terminal",
+                            ],
+                        ),
+                        stable_step_id: RUNTIME_RUN_STOPPED_AUDIT_STEP_ID.into(),
+                        logical_key: "terminal".into(),
+                        input_hash: stable_input_hash(&test_terminal_audit_input(
+                            &marker_replay,
+                            &test_terminal_receipt(),
+                        )),
+                        input: test_terminal_audit_input(&marker_replay, &test_terminal_receipt()),
+                        side_effect_class: SideEffectClass::ReconcileRequired,
+                        idempotency_key: None,
+                    },
+                },
+            })
+            .unwrap();
+        let later_ordinary = ActivityDefinition {
+            activity_id: stable_identifier(
+                "activity",
+                &[
+                    post_marker.run_id(),
+                    &post_marker.projection().branch_id,
+                    "ordinary-after-marker",
+                    "work-2",
+                ],
+            ),
+            stable_step_id: "ordinary-after-marker".into(),
+            logical_key: "work-2".into(),
+            input: json!({"value": 2}),
+            input_hash: stable_input_hash(&json!({"value": 2})),
+            side_effect_class: SideEffectClass::Pure,
+            idempotency_key: None,
+        };
+        assert_raw_v2_event_rejected(
+            &post_marker,
+            "ordinary-scheduled-after-marker",
+            RunEventKind::ActivityScheduled {
+                definition: later_ordinary,
+            },
+        );
+        assert_raw_v2_event_rejected(
+            &post_marker,
+            "ordinary-started-after-marker",
+            RunEventKind::ActivityAttemptStarted {
+                activity_id: ordinary.activity_id,
+                attempt: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn raw_fork_strips_malformed_reserved_identity_before_canonical_marker_begins() {
+        let fork_run_id = "malformed-marker-fork";
+        let new_branch_id = "fork-branch";
+        let squatted_activity_id = stable_identifier(
+            "activity",
+            &[
+                fork_run_id,
+                new_branch_id,
+                RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                "terminal",
+            ],
+        );
+        let malformed_input = json!({});
+        let mut source_projection = RunProjection::root("source-run");
+        source_projection.activities.insert(
+            squatted_activity_id.clone(),
+            ActivityRecord {
+                definition: ActivityDefinition {
+                    activity_id: squatted_activity_id.clone(),
+                    stable_step_id: "ordinary-squatter".into(),
+                    logical_key: "ordinary".into(),
+                    input_hash: stable_input_hash(&malformed_input),
+                    input: malformed_input,
+                    side_effect_class: SideEffectClass::ReconcileRequired,
+                    idempotency_key: None,
+                },
+                attempts: Vec::new(),
+            },
+        );
+        let checkpoint = Checkpoint {
+            checkpoint_id: "malformed-terminal-marker-checkpoint".into(),
+            run_id: "source-run".into(),
+            event_sequence: 1,
+            parent_checkpoint_id: None,
+            label: None,
+            projection: source_projection,
+        };
+        let mut forked = RunState::from_events([RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: fork_run_id.into(),
+            sequence: 1,
+            event_id: "raw-forked-from-malformed-terminal-marker".into(),
+            kind: RunEventKind::ForkedFrom {
+                session_id: "session".into(),
+                source_run_id: "source-run".into(),
+                durability: DurabilityMode::Sync,
+                source_checkpoint: Box::new(checkpoint),
+                new_branch_id: new_branch_id.into(),
+            },
+        }])
+        .unwrap();
+
+        assert!(matches!(
+            forked.activity(&squatted_activity_id),
+            Err(DurabilityError::ActivityNotFound { .. })
+        ));
+
+        let invocation_id = "fork-invocation";
+        execute(
+            forked
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                    json!({
+                        "schema_version": 1,
+                        "audit_run_id": fork_run_id,
+                        "invocation_id": invocation_id,
+                    }),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        let mut replay = test_terminal_replay("canonical", invocation_id);
+        replay["audit_run_id"] = json!(fork_run_id);
+        let (canonical_activity_id, attempt) = execute(
+            forked
+                .prepare_activity(
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_audit_input(&replay, &test_terminal_receipt()),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(canonical_activity_id, squatted_activity_id);
+        assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn fork_and_rewind_strip_reserved_markers_and_completed_terminal_receipts() {
+        let invocation_id = "invocation-1";
+        let mut source = RunState::new("session", "audit-run", DurabilityMode::Sync).unwrap();
+        execute(
+            source
+                .prepare_activity(
+                    RUNTIME_INVOCATION_LIFECYCLE_STEP_ID,
+                    invocation_id,
+                    test_lifecycle_input(invocation_id),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        let replay = test_terminal_replay("canonical", invocation_id);
+        let (terminal_id, terminal_attempt) = execute(
+            source
+                .prepare_activity(
+                    RUNTIME_RUN_STOPPED_AUDIT_STEP_ID,
+                    "terminal",
+                    test_terminal_audit_input(&replay, &test_terminal_receipt()),
+                    SideEffectClass::ReconcileRequired,
+                    None,
+                )
+                .unwrap(),
+        );
+        source
+            .complete_activity(&terminal_id, terminal_attempt, test_terminal_receipt())
+            .unwrap();
+        let checkpoint = source
+            .checkpoint("terminal-marker-checkpoint", None)
+            .unwrap();
+        assert!(source
+            .projection()
+            .activities
+            .values()
+            .any(is_reserved_audit_activity));
+
+        let CommandOutcome::Forked { run: forked, .. } = source
+            .apply_command(RunCommand::Fork {
+                command_id: "fork-with-terminal-marker".into(),
+                new_run_id: "audit-fork".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected a forked run");
+        };
+        assert!(forked
+            .projection()
+            .activities
+            .values()
+            .all(|record| !is_reserved_audit_activity(record)));
+        assert!(matches!(
+            forked.activity(&terminal_id),
+            Err(DurabilityError::ActivityNotFound { .. })
+        ));
+
+        source
+            .apply_command(RunCommand::Rewind {
+                command_id: "rewind-with-terminal-marker".into(),
+                checkpoint_id: checkpoint.checkpoint_id,
+                side_effects_reconciled: false,
+            })
+            .unwrap();
+        assert!(source
+            .projection()
+            .activities
+            .values()
+            .all(|record| !is_reserved_audit_activity(record)));
+        assert!(matches!(
+            source.activity(&terminal_id),
+            Err(DurabilityError::ActivityNotFound { .. })
+        ));
+        assert_eq!(
+            RunState::from_events(source.events().to_vec()).unwrap(),
+            source
+        );
     }
 }
