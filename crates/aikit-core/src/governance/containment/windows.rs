@@ -5,6 +5,14 @@ use super::{
 use crate::error::{AikitError, Result};
 use std::path::Path;
 
+// Windows PowerShell 5.1 performs a cold C# compilation for Add-Type on fresh CI hosts. That
+// control-plane startup gets its own realistic outer budget; once native Run starts, the probe's
+// child remains independently bounded to five seconds and cleanup remains bounded in the launcher.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_JOB_PROBE_CHILD_WAIT_MS: u32 = 5_000;
+
 pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
     #[cfg(not(target_os = "windows"))]
     {
@@ -56,7 +64,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
             ),
             (
                 std::ffi::OsString::from("AIKIT_JOB_WAIT_MS"),
-                std::ffi::OsString::from("5000"),
+                std::ffi::OsString::from(WINDOWS_JOB_PROBE_CHILD_WAIT_MS.to_string()),
             ),
         ]);
         prepared.command.stdin(std::process::Stdio::null());
@@ -70,7 +78,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
             .command
             .envs(prepared.environment_overrides.clone());
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT,
             prepared.command.status(),
         )
         .await;
@@ -541,6 +549,20 @@ mod tests {
     }
 
     #[test]
+    fn probe_separates_cold_compiler_child_and_cleanup_budgets() {
+        assert_eq!(
+            WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(WINDOWS_JOB_PROBE_CHILD_WAIT_MS, 5_000);
+        assert!(
+            WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT
+                > std::time::Duration::from_millis(WINDOWS_JOB_PROBE_CHILD_WAIT_MS.into())
+        );
+        assert!(WINDOWS_JOB_LAUNCHER.contains("TERMINATION_WAIT_MS = 5000u"));
+    }
+
+    #[test]
     fn launcher_scrubs_job_environment_before_exec() {
         for variable in [
             "AIKIT_JOB_COMMAND",
@@ -647,7 +669,7 @@ mod tests {
     async fn native_job_probe_compiles_launcher_in_private_temp_and_completes() {
         let workspace = tempfile::tempdir().unwrap();
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(70),
             capability(Some(workspace.path())),
         )
         .await
