@@ -55,5 +55,6 @@ error to the generic runner, so the correct `ContentTypeNotSupportedError` is re
 failure. Keep the upstream commit and raw reports visible when evaluating future runs.
 
 The dedicated remote workflow passed for this source snapshot: [GitHub Actions run
-30057429879](https://github.com/matakartal/aikit-runtime/actions/runs/30057429879). That result is
-separate from the repository's general CI workflow and does not override failures in other jobs.
+30060414399](https://github.com/matakartal/aikit-runtime/actions/runs/30060414399). The repository's
+[general CI workflow](https://github.com/matakartal/aikit-runtime/actions/runs/30060414507) also
+passed for the same commit.

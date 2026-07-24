@@ -94,16 +94,15 @@ identity, registry ownership, or another operating system.
 
 | Workflow | Result | Evidence |
 |---|---|---|
-| A2A conformance | Passed | [run 30057429879](https://github.com/matakartal/aikit-runtime/actions/runs/30057429879) |
-| Chaos | Passed | [run 30057429881](https://github.com/matakartal/aikit-runtime/actions/runs/30057429881) |
-| Security | Passed | [run 30057429883](https://github.com/matakartal/aikit-runtime/actions/runs/30057429883) |
-| Main push workflow | Passed | [run 30057429687](https://github.com/matakartal/aikit-runtime/actions/runs/30057429687) |
-| General CI | **Failed** | [run 30057429891](https://github.com/matakartal/aikit-runtime/actions/runs/30057429891) |
+| A2A conformance | Passed | [run 30060414399](https://github.com/matakartal/aikit-runtime/actions/runs/30060414399) |
+| Chaos | Passed | [run 30060414351](https://github.com/matakartal/aikit-runtime/actions/runs/30060414351) |
+| Security | Passed | [run 30060414388](https://github.com/matakartal/aikit-runtime/actions/runs/30060414388) |
+| CodeQL main push | Passed | [run 30060414054](https://github.com/matakartal/aikit-runtime/actions/runs/30060414054) |
+| General CI | Passed | [run 30060414507](https://github.com/matakartal/aikit-runtime/actions/runs/30060414507) |
 
-The general CI failure is binding-test drift, not a green result: the Python A2A mapper scenario
-still expects snapshot schema version `2`, while the runtime contract emits version `4`. The Node
-scenario contains the same stale literal, although that job did not become the first reported
-failure. Until those tests are corrected and rerun, `main` must not be described as fully green.
+All required workflows passed for commit `ac023c6837d3f235b98f60b51969aa74ebd4a0a3`. The Python and
+Node A2A mapper scenarios now assert snapshot schema version `4`, and their public type contracts
+cover the current durable outbox and pending-event fields.
 
 ## Not yet v1-complete
 
