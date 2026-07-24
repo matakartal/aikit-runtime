@@ -84,10 +84,13 @@ All notable changes to this project will be documented in this file. The format 
   dedupe, cancellation, typed provider SPIs, and fallback-disabled capability-aware routing.
 - Governed MCP 2025-11-25 JSON-RPC server with real stdio and Streamable HTTP listeners, bounded
   SSE replay, Origin/auth/session/version/Host/Accept enforcement, SQLite CAS persistence,
-  restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 and ACP v1 wire
-  listeners remain separately tracked parity gates.
+  restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 now has a
+  bounded experimental Rust JSON-RPC/SSE listener; ACP v1 remains mapping-only.
 - Canonical A2A `ListTasks` with subject+tenant isolation before filters/counts/cursor pagination,
   bounded pages, stable ordering, snapshot recovery, and shared Rust/Python/Node mapper surfaces.
+- A2A artifact and direct-`Message` projection, durable SSE event replay, isolated protected
+  cancellation ingress, typed delta-journal/checkpoint contracts, and a pinned official TCK
+  workflow that preserves six upstream false negatives while verifying their exact causes.
 - Optional fail-closed Firecracker lifecycle: immutable hash-pinned host inputs, shell-free jailer
   argv, trusted-path/version/KVM/TAP/netns checks, bounded API startup and cleanup. It is not a
   Bash backend until guest command/workspace transport and Linux escape proof exist.
@@ -125,8 +128,9 @@ All notable changes to this project will be documented in this file. The format 
 - Source-first `aikit` CLI with one-shot runs, canonical multi-turn chat, provider/capability
   discovery, containment doctor, text/JSON/JSONL output, stable exit codes, and shell completions.
 - CI security gates: cargo-deny (RustSec advisories, license policy, duplicate/wildcard bans, and
-  registry-source pinning via `deny.toml`), a full-history Gitleaks committed-secret scan, and
-  CodeQL static analysis for Rust, JavaScript/TypeScript, and Python.
+  registry-source pinning via `deny.toml`), an independent cargo-audit run, a full-history Gitleaks
+  committed-secret scan, deterministic SBOM/provenance checks, and repository-level CodeQL default
+  setup rather than a duplicate workflow file.
 - A required deterministic-eval CI job over the keyless `mock-1` datasets, including governed
   tool-trajectory and denied-tool cases.
 - Dependabot, community-health files, Discussions, and repository metadata.
@@ -200,6 +204,9 @@ All notable changes to this project will be documented in this file. The format 
 - Reworked the documentation set for the 0.3 alpha parity candidate: architecture and migration
   guides, current status, SDK/CLI contracts, security boundaries, MCP/evaluation limits, release
   operations, historical labels, and repository navigation now share one consistent vocabulary.
+- Refreshed the complete documentation map for A2A transport/TCK evidence, eight-module parity,
+  durable worker/store boundaries, current remote-workflow status, and the distinction between
+  source proof, live-provider acceptance, signing, registry ownership, and publication.
 
 ## [0.1.0] - Source preview
 

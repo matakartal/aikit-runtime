@@ -6,10 +6,10 @@
 default branch; no public package-registry support line is claimed.
 
 CI security checks include dependency advisory/license/source review (`cargo-deny`), an independent
-RustSec audit (`cargo-audit`), CodeQL static analysis for Rust, JavaScript/TypeScript, and Python,
-complete-history committed-secret scanning (Gitleaks), deterministic CycloneDX SBOM generation,
-and release-provenance contract checks. Source users should review the repository's current
-security state before deploying a commit.
+RustSec audit (`cargo-audit`), repository-level CodeQL default setup, complete-history
+committed-secret scanning (Gitleaks), deterministic CycloneDX SBOM generation, and
+release-provenance contract checks. Source users should review the repository's current security
+state before deploying a commit.
 
 Run the same supply-chain checks locally with:
 
@@ -74,6 +74,8 @@ High-value areas include:
 - structured-output validator decisions that fail open, leak candidate values, or create
   uncontrolled retry loops;
 - expired-session lease replay that can duplicate an external side effect.
+- A2A owner/tenant isolation, idempotency-key confusion, artifact/media validation, SSE replay,
+  protected-cancellation admission, and snapshot/journal corruption;
 
 The documented security boundary matters when assessing a report. Built-in Bash can use Seatbelt,
 Linux namespaces+seccomp, Windows Job Objects, or hardened Docker containment; arbitrary Rust
@@ -81,6 +83,8 @@ executors and Python/Node callbacks run in their host process unless the applica
 Remote MCP servers are untrusted inputs: discovery, cursors, JSON-RPC responses, names, and tool
 results must remain bounded and governed. Semantic validators also execute as host callbacks; they
 must be pure/idempotent and use a caller-owned timeout when their latency is not inherently bounded.
+The protected A2A cancellation listener assumes a private/mTLS or equivalent transport boundary;
+exposing that TCP port directly to untrusted peers requires pre-HTTP transport identity and quotas.
 See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md).
 
 Never send a real provider key as part of a report. Revoke any credential that may have been

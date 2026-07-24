@@ -22,7 +22,7 @@ boundaries remain the embedding application's responsibility. It describes the s
 
 | Path | Owns |
 |---|---|
-| `crates/aikit-core` | Canonical types, providers, runtime loop, governance, tools, routing, state, audit, structured output, MCP, and eval. |
+| `crates/aikit-core` | Canonical types, providers, runtime loop, governance, tools, routing, state, audit, structured output, MCP/A2A/ACP, and eval. |
 | `crates/aikit` | Ergonomic Rust facade and public re-exports. |
 | `crates/aikit-py` | PyO3 conversion, Python async streams/callbacks, and type stubs. |
 | `crates/aikit-node` | napi conversion, JavaScript lifecycle helpers, and TypeScript declarations. |
@@ -134,6 +134,22 @@ cancellation must be confirmed before a task becomes cancelled; timeout or ambig
 moves the task to a fail-closed reconciliation state. After schema drift is approved, arguments
 are validated against the new schema before dispatch.
 
+## A2A boundary
+
+The shared A2A mapper owns the governed, owner-scoped mapping between A2A contexts/tasks and aikit
+sessions/runs. Rust, Python, and Node expose the same mapper behavior, but a mapper snapshot is
+internal persistence state, not an official A2A wire DTO and not a network server.
+
+The experimental Rust listener adds bounded A2A 1.0 JSON-RPC and SSE, artifact and direct-Message
+projection, and a separate protected cancellation ingress. That protected ingress is intended for
+a private or mutually authenticated boundary; exposing it directly to untrusted callers would
+move identity and quota enforcement outside aikit's current pre-header guarantees.
+
+Transport updates currently commit through full-snapshot compare-and-swap. A typed delta-journal
+contract exists and is tested, but it is not yet wired into the production transport hot path.
+This distinction matters: the journal API is implementation evidence, not a distributed durability
+claim.
+
 ## State and crash safety
 
 - Memory is explicit: model output is not remembered unless the host calls `remember`.
@@ -199,8 +215,9 @@ the host.
 ## Cross-language contract
 
 Public behavior is added to the Rust core first, then projected through PyO3/napi with strict
-unknown-field rejection and typed stubs/declarations. `scripts/parity-check.sh` compares seven
-canonical modules and their observable transcripts across Rust, Python, and Node. Language-specific
+unknown-field rejection and typed stubs/declarations. `scripts/parity-check.sh` compares eight
+canonical modules—governance, structured output, run options, state, orchestration, built-ins,
+input, and A2A—and their observable transcripts across Rust, Python, and Node. Language-specific
 conveniences may differ, but enforcement and canonical outcomes must not.
 
 ## Verification layers
@@ -211,6 +228,7 @@ conveniences may differ, but enforcement and canonical outcomes must not.
 | Runtime correctness | Full workspace tests and local real-socket provider fixtures. |
 | Compatibility | Rust 1.88 MSRV check, Python mypy strict, TypeScript strict. |
 | Cross-language behavior | `scripts/parity-check.sh`. |
+| A2A interoperability | Raw pinned official TCK report plus the exact-set verified-waiver gate in `scripts/a2a-conformance.sh`. |
 | Deterministic quality | `aikit eval evals/smoke.json`. |
 | Distribution | `scripts/release-check.sh --candidate` and manual artifact workflow. |
 | External providers | Explicit, billable live-smoke workflow only. |

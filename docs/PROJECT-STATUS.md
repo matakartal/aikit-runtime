@@ -1,6 +1,6 @@
 # Project status
 
-**Snapshot:** 2026-07-23
+**Snapshot:** 2026-07-24
 **Release state:** source-first `v0.3.0-alpha.1` candidate on `main`; not published
 
 The five-phase parity implementation now has a substantially larger local core. This page keeps
@@ -81,6 +81,7 @@ identity, registry ownership, or another operating system.
 | Node binding | `./scripts/build-node.sh` plus the Node scenarios | Native addon linkage, wrapper behavior and strict typing on this host |
 | Strict Rust lint | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | No accepted Rust warnings |
 | Three-language parity | `./scripts/parity-check.sh` after both binding builds above | Registered Rust/Python/Node observable contracts are byte-identical |
+| Official A2A TCK | Start `a2a_tck_sut`, then run `./scripts/a2a-conformance.sh` | Preserves the raw pinned upstream result; CI separately permits only the exact six verified false negatives |
 | Provider cassettes | `cargo test -p aikit-runtime-core --test provider_cassettes --locked` | Sanitized required scenario inventory and envelope validation |
 | Process chaos | `cargo test -p aikit-runtime-core --test process_chaos --locked` | A committed SQLite checkpoint survives forced child termination and resumes append-only |
 | Persistent fuzz | `cargo +nightly-2026-07-15 fuzz run <target>` for the three targets under `fuzz/` | Coverage-guided mutation of stream, durability and cassette parsers |
@@ -88,6 +89,21 @@ identity, registry ownership, or another operating system.
 | Security/SBOM | `./scripts/security-check.sh --all` | Advisory/license/secret/SBOM/provenance policy on this checkout |
 | Source candidate | `./scripts/release-check.sh --candidate` | Version, immutable CI input, history collision and package policy |
 | Live providers | `AIKIT_LIVE_SMOKE=1 AIKIT_LIVE_SMOKE_FULL=1 ./scripts/live-smoke.sh` | Fail-closed billable acceptance; requires all eight credential/model pairs |
+
+## Remote workflow status at this snapshot
+
+| Workflow | Result | Evidence |
+|---|---|---|
+| A2A conformance | Passed | [run 30057429879](https://github.com/matakartal/aikit-runtime/actions/runs/30057429879) |
+| Chaos | Passed | [run 30057429881](https://github.com/matakartal/aikit-runtime/actions/runs/30057429881) |
+| Security | Passed | [run 30057429883](https://github.com/matakartal/aikit-runtime/actions/runs/30057429883) |
+| Main push workflow | Passed | [run 30057429687](https://github.com/matakartal/aikit-runtime/actions/runs/30057429687) |
+| General CI | **Failed** | [run 30057429891](https://github.com/matakartal/aikit-runtime/actions/runs/30057429891) |
+
+The general CI failure is binding-test drift, not a green result: the Python A2A mapper scenario
+still expects snapshot schema version `2`, while the runtime contract emits version `4`. The Node
+scenario contains the same stale literal, although that job did not become the first reported
+failure. Until those tests are corrected and rerun, `main` must not be described as fully green.
 
 ## Not yet v1-complete
 

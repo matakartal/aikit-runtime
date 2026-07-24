@@ -1,5 +1,7 @@
 # A2A conformance
 
+**Evidence snapshot:** 2026-07-24
+
 AIKit includes a credentials-free localhost fixture for the official A2A Technology
 Compatibility Kit (TCK). The fixture advertises only the implemented A2A 1.0 `JSONRPC`
 interface and SSE streaming. It does not advertise REST, gRPC, push notifications, an extended
@@ -51,3 +53,7 @@ session, while AIKit correctly treats that as an idempotency conflict; every cas
 fresh TCK process. `CORE-SEND-003` sends an unsupported media type but does not declare its expected
 error to the generic runner, so the correct `ContentTypeNotSupportedError` is recorded as a
 failure. Keep the upstream commit and raw reports visible when evaluating future runs.
+
+The dedicated remote workflow passed for this source snapshot: [GitHub Actions run
+30057429879](https://github.com/matakartal/aikit-runtime/actions/runs/30057429879). That result is
+separate from the repository's general CI workflow and does not override failures in other jobs.

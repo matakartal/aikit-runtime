@@ -135,7 +135,8 @@ reserve another tenant's idempotency key. Pre-scoping alpha snapshots remain rea
 original owner, but callers must stop treating `A2aMapper::contexts()` or `receipts()` keys as wire
 ids; use `context_session` or `message_receipt` with an authenticated principal.
 
-Mapper snapshots now include `schema_version`. Restore validates task/map keys, generated sequence,
+Mapper snapshots now include `schema_version` (currently `4`). Treat the exported runtime constant
+as authoritative instead of hard-coding an older numeric value. Restore validates task/map keys, generated sequence,
 owner/context relations, globally unique runtime ids, receipt references and revision bounds before
 accepting state. List cursors are bound to one mapper revision and stale cursors are rejected rather
 than producing duplicate/skipped tasks. Node's
@@ -171,6 +172,12 @@ Completed side-effect receipts now have bounded retention. Once replay proof for
 expires, that connection's request-id/dedupe namespace is permanently retired and further calls
 return reconciliation-required. Reconnect with a new session identity after resolving any
 ambiguous external effect; do not reuse old request identifiers.
+
+The Python and Node `A2aMapper` APIs remain transport-neutral mapping/persistence surfaces; they do
+not start an A2A listener. The experimental Rust listener now projects artifacts and direct
+Messages, supports SSE, and separates protected cancellation ingress. Its typed delta-journal API
+is tested but not yet the transport's persistence hot path. See [A2A-CONFORMANCE.md](A2A-CONFORMANCE.md)
+for the pinned official TCK result and exact verified-waiver boundary.
 
 ## Skills and executable hooks
 

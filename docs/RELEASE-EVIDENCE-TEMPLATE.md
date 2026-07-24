@@ -32,9 +32,12 @@ record API keys, access tokens, private prompts, or raw provider responses here.
 | Rust/Python/Node conformance |  |  |
 | Deterministic eval dataset(s) |  |  |
 | Containment capability review |  |  |
-| CodeQL review (`codeql.yml` run URL) |  |  |
+| CodeQL default-setup review (repository security result/run URL) |  |  |
 | Dependency advisory/license review (`security.yml` cargo-deny run URL) |  |  |
 | Committed-secret review (`security.yml` gitleaks run URL) |  |  |
+| Official A2A TCK raw report |  |  |
+| A2A exact-set verified-waiver gate |  |  |
+| Required remote CI/branch checks |  |  |
 
 ## Optional live-provider matrix
 

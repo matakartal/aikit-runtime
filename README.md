@@ -10,6 +10,8 @@ Build provider-aware agents in **Rust**, **Python**, and **TypeScript** without 
 streaming, tools, policy, routing, budgets, audit, memory, or sessions in every language.
 
 [![CI](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml)
+[![A2A conformance](https://github.com/matakartal/aikit-runtime/actions/workflows/a2a-conformance.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/a2a-conformance.yml)
+[![Security](https://github.com/matakartal/aikit-runtime/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/security.yml)
 [![Artifacts](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml/badge.svg)](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml)
 [![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust)](Cargo.toml)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](crates/aikit-py/pyproject.toml)
@@ -202,6 +204,8 @@ main();
 | Orchestration | Scoped subagents, ordered parallel fan-out, council synthesis, quorum, and shared budget accounting. |
 | State | Namespaced memory, revisioned sessions, JSON/transactional SQLite persistence, canonical recording, and resume. |
 | Compaction | Opt-in transcript bounding: keep the task anchor and recent tail within a token budget, preserving tool pairing. |
+| Durable execution | Append-only run history, fenced worker leases, crash recovery, HITL approvals, reconciliation, SQLite/PostgreSQL stores, and a Sync-mode runtime driver. |
+| A2A interoperability | Governed A2A 1.0 mapping in all three SDKs plus an experimental bounded Rust JSON-RPC/SSE listener with artifacts, direct messages, and protected cancellation ingress. |
 | Web and browser | HTTPS allowlisted fetch/search plus an existing-session WebDriver executor; browser registration requires an explicit assertion of caller-owned pre-request egress enforcement. |
 | Observability | Typed audit lifecycle, metadata-only redaction by default, JSONL sinks, and an optional Rust OpenTelemetry bridge. |
 
@@ -353,9 +357,11 @@ keep those details secret-free too because an application may log exceptions.
 | Memory | `remember` / `recall` | `remember` / `recall` | `remember` / `recall` |
 | Parallel agents | `parallel` | `parallel` | `parallel` |
 | Persistent audit | `JsonlAuditSink` | `configure_jsonl_audit` | `configureJsonlAudit` |
+| A2A mapper | `A2aMapper` | `aikit.A2aMapper` | `new A2aMapper()` |
 
 Cross-language conformance runs canonical scenarios through all three SDKs and compares normalized
-results byte for byte.
+results byte for byte. The registry currently contains eight modules: governance, structured
+output, run options, state, orchestration, built-ins, canonical input, and A2A.
 
 ## Multimodal and structured input
 
@@ -434,6 +440,8 @@ cargo test --workspace --all-features --locked --exclude aikit-py
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ./scripts/build-node.sh
 ./scripts/parity-check.sh
+# In another terminal first: cargo run -p aikit-runtime-core --example a2a_tck_sut --locked
+AIKIT_A2A_SUT_URL=http://127.0.0.1:9999 ./scripts/a2a-conformance.sh
 ./scripts/security-check.sh --all
 ./scripts/release-check.sh --candidate
 ```
@@ -442,6 +450,7 @@ Normal GitHub CI verifies:
 
 - Rust 1.97.1 as the pinned primary toolchain, Rust 1.88 MSRV, rustdoc, and doctests
 - Rust / Python / Node canonical parity
+- pinned official A2A JSON-RPC MUST reports plus an exact-set false-negative verification gate
 - Node native packages on five target combinations
 - package dry-runs and native-addon loading
 - keyless provider wire contracts and fail-closed containment behavior
@@ -480,6 +489,8 @@ inheriting the GitHub runner's newer glibc requirement.
 | [Architecture](docs/ARCHITECTURE.md) | Ownership boundaries, run lifecycle, state model, and trust boundaries. |
 | [Feature reference](docs/FEATURES.md) | Runtime capabilities, governance depth, fidelity, routing, state, and limits. |
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
+| [A2A conformance](docs/A2A-CONFORMANCE.md) | Pinned official TCK procedure, raw result, verified false negatives, and proof boundary. |
+| [Project status](docs/PROJECT-STATUS.md) | Current local, remote-CI, live-provider, and publication evidence boundaries. |
 | [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Competitor parity matrix](docs/PARITY-MATRIX.md) | Current upstream pins, implementation evidence, honest gaps, and the v1 gate. |

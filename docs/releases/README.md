@@ -24,5 +24,8 @@ There is currently no `v0.2.0` or `v0.3.0-alpha.1` evidence record. The version 
 manifests and current source documentation must not be interpreted as a tag, registry release, or
 completed artifact review.
 
+A future 0.3 record must retain both the raw pinned official A2A TCK report and the exact-set
+verified-waiver gate result, plus the overall required-workflow state for the recorded source SHA.
+
 No registry publication is claimed for this candidate. See [`RELEASE.md`](../RELEASE.md) for the
 current source-first distribution policy and future release gates.

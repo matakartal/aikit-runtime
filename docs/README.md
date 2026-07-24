@@ -1,5 +1,7 @@
 # Documentation
 
+**Current-contract review:** 2026-07-24
+
 The root [`README`](../README.md) is the public overview and quick start. Everything under `docs/`
 goes deeper: architecture, capabilities, security, migration, verification, release evidence, and
 historical design notes. Current-contract documents are listed before archived material so an old
@@ -16,6 +18,7 @@ milestone cannot be mistaken for present behavior.
 | [Threat model](THREAT-MODEL.md) | Security reviewers | Guarantees and exclusions for built-in tools and Bash containment. |
 | [Regulatory evidence aids](COMPLIANCE.md) | Risk and audit teams | Honest mapping from runtime evidence to assessor questions; explicitly not legal advice. |
 | [Live-provider harness](LIVE-SMOKE.md) | Maintainers | Explicit, billable real-provider acceptance contract. |
+| [A2A conformance](A2A-CONFORMANCE.md) | Integrators and reviewers | Pinned official TCK procedure, raw result, and exact waiver boundary. |
 | [Distribution guide](RELEASE.md) | Maintainers | Source-first policy and manual artifact assembly. |
 | [0.3 migration guide](MIGRATING-0.3.md) | Integrators | Stream, MCP naming, capability and durability migration. |
 | [0.2 migration guide](MIGRATING-0.2.md) | Integrators | Historical changes from the 0.1 source preview. |
@@ -100,11 +103,14 @@ Use this ownership order when behavior changes:
 3. `FEATURES.md` owns the detailed capability contract; `THREAT-MODEL.md` owns security claims.
 4. Binding/CLI README files own language-specific syntax and lifecycle details.
 5. `PROJECT-STATUS.md`, `PARITY-MATRIX.md`, and release docs own proof boundaries; they must
-   never turn a local/keyless check into a live-provider or registry-release claim.
+   never turn a local/keyless check into a live-provider or registry-release claim. They also keep
+   dedicated workflow success separate from the overall CI state.
 6. Phase and evidence files are historical. Add a current banner or new record instead of rewriting
    old facts, hashes, or workflow URLs.
 
 Before merging documentation changes, validate local links, balanced fenced code blocks,
 `git diff --check`, current CLI help/output, package/toolchain version claims, and every example path.
+For A2A, preserve both the raw official TCK report and the exact-set verified-waiver result; neither
+may be rewritten into an unqualified certification claim.
 External provider references should point to primary vendor documentation and be rechecked when the
 corresponding adapter contract changes.

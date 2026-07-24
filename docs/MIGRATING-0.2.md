@@ -1,7 +1,10 @@
 # Migrating from the 0.1 source preview to 0.2
 
+> **Historical guide:** this page describes the 0.2 milestone, not current `main`. Users moving to
+> the 0.3 alpha should continue with [MIGRATING-0.3.md](MIGRATING-0.3.md).
+
 This guide is for source-checkout users moving code written against the `0.1.0` preview to the
-current `0.2.0` tree. No public registry upgrade is implied because npm, PyPI, and crates.io
+`0.2.0` tree at that milestone. No public registry upgrade is implied because npm, PyPI, and crates.io
 packages are not published by this project.
 
 ## Before changing application code

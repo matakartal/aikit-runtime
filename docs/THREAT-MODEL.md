@@ -216,6 +216,22 @@ requests on it as reconciliation-required. A caller must establish a fresh conne
 identity before submitting new work; this bounds retained receipts without turning expiry into an
 unsafe duplicate-execution window.
 
+### A2A peers
+
+A2A JSON-RPC/SSE callers are untrusted protocol peers. The listener bounds request bodies,
+responses, SSE replay, pagination, artifacts, and task state; authenticated subject and tenant
+filtering occurs before totals and cursors. Content-bound idempotency rejects reuse of one message
+id with different content instead of silently executing a second effect.
+
+The protected cancellation ingress assumes a private or mutually authenticated network boundary.
+Direct exposure to arbitrary internet clients would require caller identity and quota enforcement
+before aikit accepts headers/body bytes. Artifact media and base64 remain size/type validated, but
+the host still owns malware scanning, retention, and access policy.
+
+Transport persistence currently uses full-snapshot compare-and-swap. The typed delta journal is a
+tested contract, not yet the production hot path; it must not be described as deployed distributed
+durability or exactly-once execution.
+
 ### Firecracker
 
 The optional Firecracker lifecycle is a Linux deployment boundary, not a guarantee established by

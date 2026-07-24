@@ -2,6 +2,7 @@
 
 The CLI is the source-first terminal interface to the same governed Rust core used by the Rust,
 Python, and TypeScript SDKs. It does not reimplement provider routing or agent behavior.
+It is an outbound operator surface; it does not start the experimental inbound A2A or MCP servers.
 
 ## Run from the repository
 

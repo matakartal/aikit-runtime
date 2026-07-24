@@ -41,7 +41,7 @@ tracks the `v0.2.0` source-preview contract.
 | Evaluation | Strict versioned datasets; current-invocation text/tool/status/usage/model-attempt gates; redacted provenance; bounded live opt-in | `eval.rs`, `evals/smoke.json`, CLI and Rust/Python/Node outcome-evaluation tests | Complete keylessly |
 | Conformance | Eight canonical Rust/Python/Node modules: governance, objects, options/errors, state/audit, orchestration, built-ins, multimodal/routed input, and A2A | `crates/aikit/examples/conformance.rs`, `examples/{python,node}/conformance.*`, `scripts/parity-check.sh` | Complete keylessly |
 | Live proof | Text, structured output, governed denial, and two-request replay against all four configured real providers | Ignored harness and fail-closed wrapper in `crates/aikit/tests/live_smoke.rs` / `scripts/live-smoke.sh` | Not run; requires real keys/models and billable network calls |
-| OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs, `.github`, and the `codeql.yml` / `security.yml` workflows | Repository materials complete; source remote and private security reporting verified |
+| OSS readiness | README, feature reference, status, threat model, security/support policies, contributing/code of conduct, issue/PR templates, Discussions, CODEOWNERS, Dependabot, CodeQL, and CI | Root docs, `.github`, repository-level CodeQL default setup, and `security.yml` | Repository materials complete; source remote and private security reporting verified |
 | Distribution | Source checkout plus locally assembled Cargo, Python ABI3, and Node artifacts | CI/manual assembly workflow plus `stage-node-platform.sh` and packaged-loader tests | Complete; external registry publication is intentionally out of scope |
 
 ## Deliberate boundaries beyond 0.2
@@ -53,7 +53,8 @@ Linux/macOS-only.
 
 ## Optional external validation
 
-The explicit four-provider live matrix still requires real keys, selected model ids, network
+The historical 0.2 gate covered four native providers. The current harness expands this to all
+eight named adapters and still requires real keys, selected model ids, network
 access, and billable calls. It is not required for source distribution and the keyless suite must
 not convert its absence into a synthetic pass. The historical artifact snapshot remains in
 [`releases/v0.1.0.md`](releases/v0.1.0.md).

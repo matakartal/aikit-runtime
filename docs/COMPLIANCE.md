@@ -7,12 +7,16 @@ typed evidence of how an agent actually behaved — the raw material that compli
 risk teams ask application owners for. This page maps aikit's existing artifacts to the kinds of
 questions those teams ask.
 
-## Context: obligations that took effect on 2 August 2026
+## Context: obligations around 2 August 2026
 
-Two EU AI Act milestones landed on 2 August 2026 and were not deferred by the 2026 Digital
-Omnibus amendments: the Article 50 transparency obligations for AI systems that interact with
-people or generate content, and the Commission's enforcement powers over general-purpose AI
-model providers. Application teams deploying agents in scope of these rules need to answer
+As of this page's 24 July 2026 review, the EU AI Act's Article 50 transparency obligations are
+scheduled to apply from 2 August 2026. General-purpose AI model-provider obligations have applied
+since 2 August 2025, while the European Commission says its full enforcement powers for those
+obligations apply from 2 August 2026. See the Commission's [Article 50
+guidelines](https://digital-strategy.ec.europa.eu/en/library/guidelines-transparency-obligations-providers-and-deployers-ai-systems)
+and the official [AI Act text](https://eur-lex.europa.eu/eli/reg/2024/1689/).
+
+Application teams deploying agents in scope of these rules need to answer
 questions like "what did the agent do, who approved it, and what evidence exists?" — with
 records rather than recollection.
 

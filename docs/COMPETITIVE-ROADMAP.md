@@ -2,10 +2,10 @@
 
 *Synthesized 2026-07-16 from a GitHub scan of ~50 competitors across multi-provider SDKs, agent
 frameworks, coding-agent harnesses, and governance/sandbox tooling; reconciled with the source tree
-on 2026-07-20. This is what to **take** from the field, phase by phase — disciplined by what
+on 2026-07-24. This is what to **take** from the field, phase by phase — disciplined by what
 actually defends aikit's moat.*
 
-> **Status note (2026-07-20):** This is a historical strategy document, not the current completion
+> **Status note (2026-07-24):** This is a historical strategy document, not the current completion
 > dashboard. Durable runs, PostgreSQL/Temporal reference layers, eight provider adapters,
 > multimodal contracts, governed protocol mappings, scoped governance, egress brokering, trace
 > evals, and redacted telemetry have landed since the original scan. Use
@@ -17,6 +17,12 @@ actually defends aikit's moat.*
 > All three have Rust, Python, and Node contract tests. Durable checkpoint/fork/rewind now uses an
 > append-only event model and explicit reconciliation for ambiguous external effects; process-level
 > chaos and real distributed-engine acceptance remain open gates.
+
+> **2026-07-24 addendum:** the Sync in-process durable driver, bounded MCP server, and experimental
+> A2A JSON-RPC/SSE listener have landed. A2A now includes artifact/direct-Message projection,
+> protected cancellation ingress, and pinned official TCK evidence. Distributed workers,
+> production A2A journal wiring, complete timestamps/history/artifact updates, and ACP wire
+> integration remain open.
 
 ## What the research changed (read this first)
 
@@ -111,10 +117,10 @@ capability broker as the base.*
 | # | Take | From | Why | Effort |
 |---|------|------|-----|--------|
 | 4.1 | **Agent Client Protocol (ACP) surface** — expose aikit over ACP so editors (Zed, etc.) can drive it. | grok-build (ACP), Zed | Editor embedding = distribution, without us building a UI. | M |
-| 4.2 | **A2A (Agent-to-Agent) protocol** — standard multi-agent interop + agent identity/trust for delegation. | Strands, BeeAI (LF), Google A2A, MS toolkit (identity) | Interop with the broader agent ecosystem; identity underpins safe delegation. | M–L |
+| 4.2 | **A2A (Agent-to-Agent) protocol** — standard multi-agent interop + agent identity/trust for delegation. | Strands, BeeAI (LF), Google A2A, MS toolkit (identity) | **Partial in tree:** governed JSON-RPC/SSE and official TCK evidence exist; production journal/deployment gaps remain. | M–L |
 | 4.3 | **Skills / plugins loader** — load skills/plugins/hooks from a directory (`AGENTS.md`-style), sandboxed + governed. | grok-build, Claude Agent SDK, opencode plugins | Extensibility without a marketplace-as-product; everything still governed. | M |
 | 4.4 | **Cedar/OPA policy import** — let the permission engine ingest standard Cedar/OPA policies. | MS toolkit (Cedar/OPA), Permit.io | Enterprise policy interop; standards credibility. | M |
-| 4.5 | **MCP: resources + prompts + Streamable-HTTP transport** (client already extended with these) → add an **MCP *server*** surface so aikit tools are consumable by other agents. | MCP ecosystem | Two-way MCP = full ecosystem citizenship. | M |
+| 4.5 | **MCP: resources + prompts + Streamable-HTTP transport** (client already extended with these) → add an **MCP *server*** surface so aikit tools are consumable by other agents. | MCP ecosystem | **Landed locally:** external SDK/OAuth conformance remains. | M |
 | 4.6 | **Richer trace/replay + OTel spans everywhere** — session replay of every request/tool/permission decision. We have an OTel bridge + audit; deepen it. | Langfuse, AgentOps, VoltAgent console, OpenLLMetry | Observability is table stakes for production adoption. | M |
 
 ---
@@ -153,8 +159,8 @@ Taking "everything" means every **capability** relevant to a governed, provider-
 ```
 P1  Complete the conjunction     ──►  guardrails + real OS sandbox   [largely landed]
 P2  Governance depth ≥ Claude    ──►  policy, plan mode, SmartApprove, reliability, off-prompt  [landed in core]
-P3  Depth / isolation / scale    ──►  microVM, durable resume, model-compaction, worktrees, generic adapter
-P4  Ecosystem / interop          ──►  ACP, A2A+identity, plugins, Cedar/OPA, MCP-server, observability
+P3  Depth / isolation / scale    ──►  durable core landed; distributed worker, microVM, model summaries remain
+P4  Ecosystem / interop          ──►  MCP server landed; A2A partial; ACP wire and production proof remain
 P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat) — project remaining Rust-only P2 helpers to Py/TS next
 ```
 

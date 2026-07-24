@@ -1,6 +1,6 @@
 # AIKit competitor parity matrix
 
-**Snapshot:** 2026-07-23
+**Snapshot:** 2026-07-24
 **Source candidate:** `v0.3.0-alpha.1` (not published)
 **Rule:** a locally green test is implementation evidence, not live-provider, registry, signing, or
 cross-platform release evidence.
@@ -125,3 +125,8 @@ registry publication, and rollback rehearsal.
 
 The local implementation must not turn missing credentials, registry ownership, signing identity,
 or billable acceptance into a synthetic pass. Those are explicit external gates.
+
+At this snapshot the dedicated A2A conformance, chaos, security, and main push workflows succeeded.
+The general CI workflow is still red because a Python A2A binding test expects obsolete mapper
+schema version `2` while the runtime emits version `4`; therefore the repository is not described
+as fully green even though the dedicated A2A gate passed.

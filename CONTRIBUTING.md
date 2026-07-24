@@ -25,7 +25,7 @@ Security vulnerabilities must **not** be filed as public issues — follow [`SEC
 
 ```bash
 # Pure-Rust default members (fast)
-cargo +1.97.1 test --workspace --all-features --locked
+cargo +1.97.1 test --workspace --all-features --locked --exclude aikit-py
 cargo +1.97.1 clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo +1.97.1 fmt --all --check
 cargo +1.88.0 check --workspace --all-targets --all-features --locked
@@ -47,6 +47,18 @@ Optional end-to-end release-candidate invariants (still keyless):
 ```bash
 ./scripts/release-check.sh --candidate
 ```
+
+Protocol changes should also run the relevant external-shaped gate. For A2A, start the local
+fixture in one terminal and run the pinned official suite from another:
+
+```bash
+cargo +1.97.1 run -p aikit-runtime-core --example a2a_tck_sut --locked
+AIKIT_A2A_SUT_URL=http://127.0.0.1:9999 ./scripts/a2a-conformance.sh
+```
+
+The raw TCK result remains authoritative. CI's verified-waiver mode accepts only the exact pinned
+false-negative set and fails on any additional or missing failure; see
+[`docs/A2A-CONFORMANCE.md`](docs/A2A-CONFORMANCE.md).
 
 Normal tests must remain keyless. The live smoke path is an explicit, billable maintainer action;
 see [`docs/LIVE-SMOKE.md`](docs/LIVE-SMOKE.md).
@@ -111,6 +123,7 @@ Suggested local checklist before request:
 - [ ] strict Clippy (`-D warnings`)
 - [ ] relevant Rust tests
 - [ ] binding/parity checks when a public schema or binding surface changed
+- [ ] pinned protocol conformance when MCP/A2A transport behavior changed
 - [ ] deterministic eval smoke when outcomes, transcripts, usage, or terminal status changed
 - [ ] no credentials, private prompts, or generated native artifacts committed
 - [ ] docs updated when behavior or limits change
@@ -128,7 +141,7 @@ contribution is licensed under MIT OR Apache-2.0, at the recipient's option.
 | Documentation | Docs-only corrections and expansions |
 
 Feature proposals should describe the safety and fidelity boundary, not only the happy path.
-Deferred work beyond the 0.2 source preview is listed in [`docs/FEATURES.md`](docs/FEATURES.md) and the
+Deferred work beyond the 0.3 alpha source preview is listed in [`docs/FEATURES.md`](docs/FEATURES.md) and the
 [competitive roadmap](docs/COMPETITIVE-ROADMAP.md).
 
 ## Code of conduct

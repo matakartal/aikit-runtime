@@ -25,6 +25,11 @@ Run the keyless candidate gates locally:
 Normal CI verifies Rust, Python, Node, parity, local package layouts, and supported native targets.
 These checks do not contact a model provider or upload a package.
 
+A2A evidence is a separate, keyless gate: retain the raw report from the pinned official TCK and
+the exact-set verified-waiver result from `scripts/a2a-conformance.sh`. Before recording a release
+candidate, verify that the general CI and required branch checks are green; a dedicated protocol
+workflow passing does not cancel an unrelated CI failure.
+
 The candidate script also requires complete Git history and fetched tags, rejects reuse of an
 existing tag/evidence version for different source bytes, checks that Cargo/Python/Node versions
 and exact Node platform dependencies agree, requires immutable GitHub Action SHAs and digest-pinned

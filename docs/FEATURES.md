@@ -463,8 +463,9 @@ remains Linux/macOS-only; Windows file operations fail closed even though Bash c
 
 The conformance gate runs canonical modules through Rust, Python, and Node and compares normalized
 JSON byte for byte. It covers governance/hooks, structured streaming and repair, run options and
-typed terminal errors, state/audit/provider metadata, orchestration/session/shared deadlines, and
-the public built-in-tool and multimodal/routed-input contracts. Platform-specific paths,
+typed terminal errors, state/audit/provider metadata, orchestration/session/shared deadlines,
+the public built-in-tool and multimodal/routed-input contracts, and the governed A2A mapper.
+Platform-specific paths,
 timestamps, run ids, and selected containment backend names are removed; their security invariants
 are asserted instead.
 
@@ -473,7 +474,9 @@ are asserted instead.
 - Live PostgreSQL failover proof and a deployed Temporal SDK worker beyond the implemented
   transactional PostgreSQL store and deterministic Temporal mapping.
 - Model-generated/two-pass summaries beyond deterministic extractive compaction.
-- MCP/A2A/ACP network transports and official conformance beyond the governed protocol mappings.
+- A2A timestamps/history/artifact-update completion, production delta-journal wiring, authenticated
+  deployment proof, and removal of the six pinned TCK waivers; ACP wire transport and official MCP
+  external SDK/OAuth conformance also remain open.
 - Stronger Windows filesystem/network isolation beyond Job Objects.
 - Built-in LLM risk judge (the trait + heuristic scorer ship now; hosts can plug their own).
 - Transparent egress enforcement for arbitrary child processes beyond explicit brokered HTTP and

@@ -71,6 +71,15 @@ agent.can_use_tool(approve)
 Permission decisions, hooks, and tool execution policy live in Rust. Python only supplies host
 callbacks and structured configuration.
 
+## Governed A2A mapper
+
+`aikit.A2aMapper` exposes the shared Rust mapper for owner-scoped contexts/tasks, idempotent
+messages, task listing, cancellation decisions, snapshot, and restore. Its snapshots are internal
+persistence state—not official A2A response objects—and callers should follow the exported schema
+version instead of hard-coding an old number. The Python class does not start an A2A HTTP or gRPC
+listener; the bounded experimental wire listener currently lives on the Rust host side. See the
+[A2A conformance guide](../../docs/A2A-CONFORMANCE.md) for the exact tested boundary.
+
 ## MCP tool visibility
 
 Filter each MCP connection before registering it with an agent:

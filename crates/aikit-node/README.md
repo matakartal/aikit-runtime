@@ -113,6 +113,15 @@ Provider-specific options use `compatibilityMode: "strict"` by default. `"warn"`
 `"best_effort"` are explicit opt-ins; both preserve `ProviderWarning` values as normal warning
 deltas and on completed results/outcomes instead of silently dropping parameters.
 
+## Governed A2A mapper
+
+`A2aMapper` exposes the shared Rust mapper for owner-scoped contexts/tasks, idempotent messages,
+task listing, cancellation decisions, snapshot, and restore. `A2aMapperState` is internal
+persistence state—not an official A2A wire DTO—and consumers should not hard-code an older schema
+number. The Node class does not start an A2A HTTP or gRPC listener; the bounded experimental wire
+listener currently lives on the Rust host side. See the [A2A conformance
+guide](../../docs/A2A-CONFORMANCE.md) for the exact tested boundary.
+
 ## MCP tool visibility
 
 MCP connections can expose only exact approved tool names before registration:
