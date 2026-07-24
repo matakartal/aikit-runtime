@@ -5,11 +5,12 @@
 
 use aikit_core::{
     A2aAction, A2aAgentCapabilities, A2aAgentCard, A2aAgentInterface, A2aAgentSkill, A2aArtifact,
-    A2aContentPart, A2aDispatchAck, A2aDispatchContext, A2aDispatchHost, A2aHttpAuthError,
-    A2aHttpAuthenticator, A2aHttpConfig, A2aHttpHeaders, A2aHttpJsonRpcServer, A2aMapper,
-    A2aMessage, A2aPart, A2aRole, A2aRunMapping, A2aTaskRecord, A2aTaskState, CancellationToken,
-    GovernanceEnvelope, InMemoryA2aEventStore, InMemoryA2aMapperSnapshotStore, ProtocolError,
-    ProtocolPrincipal, ProtocolResult,
+    A2aContentPart, A2aDispatchAck, A2aDispatchContext, A2aDispatchHost, A2aDispatchOutboxRecord,
+    A2aDispatchOutboxState, A2aHttpAuthError, A2aHttpAuthenticator, A2aHttpConfig, A2aHttpHeaders,
+    A2aHttpJsonRpcServer, A2aMapper, A2aMessage, A2aPart, A2aRole, A2aRunMapping, A2aTaskRecord,
+    A2aTaskState, A2aUnknownDispatchDecision, CancellationToken, GovernanceEnvelope,
+    InMemoryA2aEventStore, InMemoryA2aMapperSnapshotStore, ProtocolError, ProtocolPrincipal,
+    ProtocolResult,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -69,6 +70,17 @@ struct TckDispatchHost;
 
 #[async_trait]
 impl A2aDispatchHost for TckDispatchHost {
+    async fn reconcile_unknown(
+        &self,
+        _server: Arc<A2aHttpJsonRpcServer>,
+        _record: &A2aDispatchOutboxRecord,
+    ) -> ProtocolResult<A2aUnknownDispatchDecision> {
+        // This fixture performs no external work before its exact mapper transition. A recovery
+        // scan that overlaps a live acceptance may therefore coalesce with, or safely retry, the
+        // same durable dispatch without risking a duplicate side effect.
+        Ok(A2aUnknownDispatchDecision::SafeToRetry)
+    }
+
     async fn handle(
         &self,
         server: Arc<A2aHttpJsonRpcServer>,
@@ -84,11 +96,27 @@ impl A2aDispatchHost for TckDispatchHost {
             A2aAction::DispatchMessage {
                 message, mapping, ..
             } => (&mapping.task_id, &message.message_id, &mapping.context_id),
-            A2aAction::DuplicateMessage { receipt } => (
-                &receipt.mapping.task_id,
-                &receipt.message.message_id,
-                &receipt.mapping.context_id,
-            ),
+            A2aAction::DuplicateMessage { receipt } => {
+                let snapshot = server.mapper_snapshot().await;
+                let task = snapshot
+                    .tasks()
+                    .get(&receipt.mapping.task_id)
+                    .ok_or_else(|| ProtocolError::not_found("A2A TCK task is not registered"))?;
+                let settled = snapshot.dispatch_outbox().values().any(|dispatch| {
+                    dispatch.task_id == receipt.mapping.task_id
+                        && dispatch.message_id == receipt.message.message_id
+                        && dispatch.state == A2aDispatchOutboxState::Settled
+                });
+                if settled && !matches!(task.state, A2aTaskState::Submitted | A2aTaskState::Working)
+                {
+                    // The transport projects the durable Task or direct Message response. The
+                    // fixture must not execute or transition an already-settled idempotent retry.
+                    return Ok(A2aDispatchAck::Settled);
+                }
+                return Err(ProtocolError::conflict(
+                    "A2A TCK duplicate dispatch is not durably settled",
+                ));
+            }
             // This fixture starts no external work, so observing CancelTask is itself the
             // deterministic execution fence required before acknowledging cancellation.
             A2aAction::CancelTask { .. } => return Ok(A2aDispatchAck::Stopped),
@@ -297,6 +325,11 @@ mod tests {
         .expect("official-shaped A2A request timed out")
     }
 
+    fn response_body(response: &str) -> Value {
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1)
+            .expect("A2A fixture returned invalid JSON")
+    }
+
     #[tokio::test]
     async fn official_send_and_stream_shapes_settle_the_exact_dispatch() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -324,8 +357,7 @@ mod tests {
         )
         .await;
         assert!(send.starts_with("HTTP/1.1 200"), "{send}");
-        let send_body: Value = serde_json::from_str(send.split_once("\r\n\r\n").unwrap().1)
-            .expect("SendMessage returned invalid JSON");
+        let send_body = response_body(&send);
         assert_eq!(send_body["jsonrpc"], "2.0");
         assert_eq!(send_body["id"], 1);
         assert!(send_body.get("error").is_none(), "{send_body}");
@@ -371,6 +403,165 @@ mod tests {
             events[1]["result"]["statusUpdate"]["status"]["state"],
             "TASK_STATE_COMPLETED"
         );
+
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn settled_retries_reuse_output_and_open_replacements_keep_their_dispatch_fence() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let handle = cancellation.handle();
+        let server = server(&format!("http://{address}/")).unwrap();
+        let running_server = server.clone();
+        let task = tokio::spawn(server.serve(listener, cancellation));
+
+        let completed_message = json!({
+            "role": "ROLE_USER",
+            "parts": [{"text": "Blocking request"}],
+            "messageId": "tck-complete-task-full-then-isolated-jsonrpc"
+        });
+        let completed = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "SendMessage",
+                    "params": {"message": completed_message.clone()}
+                }),
+            )
+            .await,
+        );
+        let completed_retry = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "SendMessage",
+                    "params": {
+                        "message": completed_message,
+                        "configuration": {"returnImmediately": false}
+                    }
+                }),
+            )
+            .await,
+        );
+        assert!(completed.get("error").is_none(), "{completed}");
+        assert!(completed_retry.get("error").is_none(), "{completed_retry}");
+        assert_eq!(completed["result"], completed_retry["result"]);
+
+        let direct_message = json!({
+            "role": "ROLE_USER",
+            "parts": [{"text": "Direct response"}],
+            "messageId": "tck-message-response-full-then-isolated-jsonrpc"
+        });
+        let direct = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "SendMessage",
+                    "params": {"message": direct_message.clone()}
+                }),
+            )
+            .await,
+        );
+        let direct_retry = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "SendMessage",
+                    "params": {
+                        "message": direct_message,
+                        "configuration": {"returnImmediately": false}
+                    }
+                }),
+            )
+            .await,
+        );
+        assert!(direct.get("error").is_none(), "{direct}");
+        assert!(direct_retry.get("error").is_none(), "{direct_retry}");
+        assert_eq!(direct["result"], direct_retry["result"]);
+        assert_eq!(
+            direct["result"]["message"]["messageId"],
+            "tck-message-response-full-then-isolated-jsonrpc-response"
+        );
+
+        let interrupted = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 14,
+                    "method": "SendMessage",
+                    "params": {"message": {
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "Need input"}],
+                        "messageId": "tck-input-required-open-replacement-jsonrpc"
+                    }}
+                }),
+            )
+            .await,
+        );
+        assert!(interrupted.get("error").is_none(), "{interrupted}");
+        assert_eq!(
+            interrupted["result"]["task"]["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+        let task_id = interrupted["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let context_id = interrupted["result"]["task"]["contextId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let replacement_message_id = "tck-complete-task-open-replacement-jsonrpc";
+        let replacement = response_body(
+            &post_jsonrpc(
+                address,
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 15,
+                    "method": "SendMessage",
+                    "params": {"message": {
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "Replacement input"}],
+                        "messageId": replacement_message_id,
+                        "taskId": task_id,
+                        "contextId": context_id
+                    }}
+                }),
+            )
+            .await,
+        );
+        assert!(replacement.get("error").is_none(), "{replacement}");
+        assert_eq!(
+            replacement["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        assert_eq!(replacement["result"]["task"]["id"], task_id);
+        let snapshot = running_server.mapper_snapshot().await;
+        let replacement_dispatch = snapshot
+            .dispatch_outbox()
+            .values()
+            .find(|dispatch| dispatch.message_id == replacement_message_id)
+            .expect("open replacement retained its durable dispatch");
+        assert_eq!(replacement_dispatch.state, A2aDispatchOutboxState::Settled);
+        assert!(replacement_dispatch.attempts > 0);
 
         handle.cancel();
         task.await.unwrap().unwrap();

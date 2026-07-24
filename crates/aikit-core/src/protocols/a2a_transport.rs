@@ -2845,11 +2845,50 @@ struct DispatchAcceptance {
     newly_reserved: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+struct PreparedLiveDispatch {
+    dispatch_id: String,
+    job: A2aDispatchJob,
+    reservation: DispatchReservation,
+}
+
+#[derive(Debug)]
+struct StagedLiveDispatch {
+    dispatch_id: String,
+    acceptance: Option<DispatchAcceptance>,
+    recovery_claim: RecoveryAttemptClaim,
+}
+
+#[derive(Debug)]
 struct DispatchCommit {
     expected_dispatch_attempt: Option<u32>,
     expected_cancellation_attempt: Option<u32>,
     host_already_fenced: bool,
+    dispatch_recovery_claim: Option<RecoveryAttemptClaim>,
+}
+
+#[derive(Debug)]
+struct RecoveryAttemptClaim {
+    attempted: Arc<StdMutex<BTreeSet<String>>>,
+    durable_id: String,
+    release_on_drop: bool,
+}
+
+impl RecoveryAttemptClaim {
+    fn quarantine(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for RecoveryAttemptClaim {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.attempted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.durable_id);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2864,6 +2903,9 @@ struct ScheduledDispatchCompletion {
 enum ScheduledRecoveryClaim {
     #[default]
     None,
+    Dispatch {
+        claim: RecoveryAttemptClaim,
+    },
     Cancellation {
         cancellation_id: String,
     },
@@ -2998,7 +3040,7 @@ pub struct A2aHttpJsonRpcServer {
     control_sender: mpsc::Sender<ScheduledA2aDispatch>,
     control_receiver: Mutex<Option<mpsc::Receiver<ScheduledA2aDispatch>>>,
     dispatch_state: StdMutex<DispatchSchedulerState>,
-    recovery_attempted: StdMutex<BTreeSet<String>>,
+    recovery_attempted: Arc<StdMutex<BTreeSet<String>>>,
     cancellation_reconciliations: StdMutex<BTreeMap<String, CancellationReconciliationCache>>,
     cancellation_reconciliation_notify: Notify,
     running_dispatch_cancellations: StdMutex<BTreeMap<DispatchRuntimeKey, CancellationToken>>,
@@ -3166,7 +3208,7 @@ impl A2aHttpJsonRpcServer {
             control_sender,
             control_receiver: Mutex::new(Some(control_receiver)),
             dispatch_state: StdMutex::new(DispatchSchedulerState::default()),
-            recovery_attempted: StdMutex::new(BTreeSet::new()),
+            recovery_attempted: Arc::new(StdMutex::new(BTreeSet::new())),
             cancellation_reconciliations: StdMutex::new(BTreeMap::new()),
             cancellation_reconciliation_notify: Notify::new(),
             running_dispatch_cancellations: StdMutex::new(BTreeMap::new()),
@@ -3619,9 +3661,70 @@ impl A2aHttpJsonRpcServer {
         Ok(output)
     }
 
-    async fn mark_dispatch_running(&self, dispatch_id: &str) -> ProtocolResult<()> {
-        self.persist_mapper_mutation(|candidate| candidate.mark_dispatch_running(dispatch_id))
-            .await
+    async fn mark_dispatch_running_with_commit(
+        self: &Arc<Self>,
+        dispatch_id: &str,
+        commit: oneshot::Sender<DispatchCommit>,
+        recovery_claim: RecoveryAttemptClaim,
+    ) -> ProtocolResult<()> {
+        let expected_attempt = Arc::new(StdMutex::new(None));
+        let expected_for_mutation = expected_attempt.clone();
+        let expected_for_commit = expected_attempt;
+        let handoff = Arc::new(StdMutex::new(Some((commit, recovery_claim))));
+        let handoff_for_commit = handoff;
+        let dispatch_id = dispatch_id.to_owned();
+        self.persist_mapper_mutation_with_post_commit(
+            move |candidate| {
+                candidate.mark_dispatch_running(&dispatch_id)?;
+                let attempt = candidate
+                    .dispatch_outbox()
+                    .get(&dispatch_id)
+                    .map(|record| record.attempts)
+                    .ok_or_else(|| {
+                        ProtocolError::conflict(
+                            "A2A running dispatch disappeared before scheduler handoff",
+                        )
+                    })?;
+                *expected_for_mutation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(attempt);
+                Ok(())
+            },
+            Some(Box::new(move || {
+                let expected_dispatch_attempt = expected_for_commit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .ok_or_else(|| {
+                        ProtocolError::conflict(
+                            "A2A running dispatch lost its committed generation",
+                        )
+                    })?;
+                let (commit, recovery_claim) = handoff_for_commit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .ok_or_else(|| {
+                        ProtocolError::conflict(
+                            "A2A running dispatch scheduler handoff was already consumed",
+                        )
+                    })?;
+                commit
+                    .send(DispatchCommit {
+                        expected_dispatch_attempt: Some(expected_dispatch_attempt),
+                        expected_cancellation_attempt: None,
+                        host_already_fenced: false,
+                        dispatch_recovery_claim: Some(recovery_claim),
+                    })
+                    .map_err(|_| {
+                        ProtocolError::conflict(
+                            "A2A running dispatch scheduler commit receiver disappeared",
+                        )
+                    })?;
+                Ok(())
+            })),
+        )
+        .await
     }
 
     async fn mark_dispatch_reconcile_pending(
@@ -4018,6 +4121,21 @@ impl A2aHttpJsonRpcServer {
             .insert(durable_id.to_owned());
     }
 
+    fn claim_recovery_attempt(&self, durable_id: &str) -> Option<RecoveryAttemptClaim> {
+        let mut attempted = self
+            .recovery_attempted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !attempted.insert(durable_id.to_owned()) {
+            return None;
+        }
+        Some(RecoveryAttemptClaim {
+            attempted: self.recovery_attempted.clone(),
+            durable_id: durable_id.to_owned(),
+            release_on_drop: true,
+        })
+    }
+
     fn release_recovery_attempt(&self, durable_id: &str) {
         self.recovery_attempted
             .lock()
@@ -4324,6 +4442,7 @@ impl A2aHttpJsonRpcServer {
                     expected_dispatch_attempt: None,
                     expected_cancellation_attempt: Some(expected_attempt),
                     host_already_fenced: false,
+                    dispatch_recovery_claim: None,
                 })
                 .is_err()
             {
@@ -4393,14 +4512,12 @@ impl A2aHttpJsonRpcServer {
         cancellation: CancellationToken,
         recovery_deadline: Instant,
     ) -> usize {
-        if cancellation.is_cancelled()
-            || Instant::now() >= recovery_deadline
-            || self
-                .recovery_was_attempted(&record.dispatch_id)
-                .unwrap_or(true)
-        {
+        if cancellation.is_cancelled() || Instant::now() >= recovery_deadline {
             return 0;
         }
+        let Some(recovery_claim) = self.claim_recovery_attempt(&record.dispatch_id) else {
+            return 0;
+        };
         if record.attempts >= A2A_MAX_DISPATCH_ATTEMPTS {
             if record.state == A2aDispatchOutboxState::Running {
                 let _ = self
@@ -4410,17 +4527,17 @@ impl A2aHttpJsonRpcServer {
                     )
                     .await;
             }
-            self.quarantine_recovery(&record.dispatch_id);
+            recovery_claim.quarantine();
             return 0;
         }
         let Some(principal) = record.envelope.principal.clone() else {
-            self.quarantine_recovery(&record.dispatch_id);
+            recovery_claim.quarantine();
             return 0;
         };
         if principal.subject != record.owner_subject
             || principal.tenant_id != record.owner_tenant_id
         {
-            self.quarantine_recovery(&record.dispatch_id);
+            recovery_claim.quarantine();
             return 0;
         }
         let unknown = matches!(
@@ -4428,22 +4545,24 @@ impl A2aHttpJsonRpcServer {
             A2aDispatchOutboxState::Running | A2aDispatchOutboxState::ReconcilePending
         );
         if unknown {
-            self.quarantine_recovery(&record.dispatch_id);
             let decision = self
                 .reconcile_unknown_dispatch(&record, &cancellation, recovery_deadline)
                 .await;
             if decision != A2aUnknownDispatchDecision::SafeToRetry {
-                if record.state == A2aDispatchOutboxState::Running {
-                    let _ = self
+                if record.state == A2aDispatchOutboxState::Running
+                    && self
                         .mark_dispatch_reconcile_pending(
                             &record.dispatch_id,
                             "unknown external outcome requires host reconciliation",
                         )
-                        .await;
+                        .await
+                        .is_err()
+                {
+                    return 0;
                 }
+                recovery_claim.quarantine();
                 return 0;
             }
-            self.release_recovery_attempt(&record.dispatch_id);
         }
         let reconstructed = self
             .mapper
@@ -4451,7 +4570,7 @@ impl A2aHttpJsonRpcServer {
             .await
             .reconstruct_dispatch(&record.dispatch_id, &principal);
         let Ok((envelope, action)) = reconstructed else {
-            self.quarantine_recovery(&record.dispatch_id);
+            recovery_claim.quarantine();
             return 0;
         };
         let owner = A2aEventOwner {
@@ -4479,12 +4598,7 @@ impl A2aHttpJsonRpcServer {
             },
         ) {
             Ok(acceptance) => acceptance,
-            Err(_) => {
-                if unknown {
-                    self.release_recovery_attempt(&record.dispatch_id);
-                }
-                return 0;
-            }
+            Err(_) => return 0,
         };
         let Some(acceptance_ref) = acceptance.as_mut() else {
             return 0;
@@ -4501,43 +4615,16 @@ impl A2aHttpJsonRpcServer {
                 .await
                 .is_err()
         {
-            self.release_recovery_attempt(&record.dispatch_id);
             return 0;
         }
+        let Some(commit) = acceptance_ref.commit.take() else {
+            return 0;
+        };
         if self
-            .mark_dispatch_running(&record.dispatch_id)
+            .mark_dispatch_running_with_commit(&record.dispatch_id, commit, recovery_claim)
             .await
             .is_err()
         {
-            self.release_recovery_attempt(&record.dispatch_id);
-            return 0;
-        }
-        let expected_attempt = self
-            .mapper
-            .lock()
-            .await
-            .dispatch_outbox()
-            .get(&record.dispatch_id)
-            .map(|record| record.attempts);
-        let Some(expected_attempt) = expected_attempt else {
-            self.release_recovery_attempt(&record.dispatch_id);
-            return 0;
-        };
-        if let Some(commit) = acceptance_ref.commit.take() {
-            if commit
-                .send(DispatchCommit {
-                    expected_dispatch_attempt: Some(expected_attempt),
-                    expected_cancellation_attempt: None,
-                    host_already_fenced: false,
-                })
-                .is_err()
-            {
-                self.release_recovery_attempt(&record.dispatch_id);
-                return 0;
-            }
-            self.quarantine_recovery(&record.dispatch_id);
-        } else {
-            self.release_recovery_attempt(&record.dispatch_id);
             return 0;
         }
         1
@@ -6100,22 +6187,98 @@ impl A2aHttpJsonRpcServer {
                     )
                 })
         };
+        let mut staged_live_dispatch = None;
         let governed = match duplicate_governed {
             Some(governed) => governed,
             None => {
                 // The commit helper rechecks against its isolated candidate. If another request
                 // accepted the same exact id before this writer entered, it becomes a no-op retry.
-                self.persist_mapper_mutation(|candidate| {
-                    Ok(
-                        candidate.prepare_send_message_candidate_with_response_policy(
-                            message,
-                            correlation,
-                            Some(&principal),
-                            response_policy,
-                        ),
+                let prepared_slot: Arc<StdMutex<Option<PreparedLiveDispatch>>> =
+                    Arc::new(StdMutex::new(None));
+                let staged_slot: Arc<StdMutex<Option<ProtocolResult<StagedLiveDispatch>>>> =
+                    Arc::new(StdMutex::new(None));
+                let prepared_for_mutation = prepared_slot.clone();
+                let prepared_for_commit = prepared_slot;
+                let staged_for_commit = staged_slot.clone();
+                let stage_server = self.clone();
+                let stage_message_id = message.message_id.clone();
+                let stage_principal = principal.clone();
+                let governed = self
+                    .persist_mapper_mutation_with_post_commit(
+                        move |candidate| {
+                            let before_revision = candidate.revision();
+                            let governed = candidate
+                                .prepare_send_message_candidate_with_response_policy(
+                                    message,
+                                    correlation,
+                                    Some(&stage_principal),
+                                    response_policy,
+                                );
+                            if governed.is_authorized() && candidate.revision() != before_revision {
+                                let record = candidate
+                                    .dispatch_for_message(&stage_message_id, &stage_principal)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        ProtocolError::conflict(
+                                            "A2A accepted live message has no durable dispatch",
+                                        )
+                                    })?;
+                                let (envelope, action) = candidate
+                                    .reconstruct_dispatch(&record.dispatch_id, &stage_principal)?;
+                                *prepared_for_mutation
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(PreparedLiveDispatch {
+                                        dispatch_id: record.dispatch_id.clone(),
+                                        job: A2aDispatchJob {
+                                            durable_dispatch_id: Some(record.dispatch_id),
+                                            durable_cancellation_id: None,
+                                            lane: DispatchLane::Message,
+                                            mode,
+                                            envelope,
+                                            action,
+                                        },
+                                        reservation: DispatchReservation {
+                                            owner: A2aEventOwner {
+                                                subject: record.owner_subject,
+                                                tenant_id: record.owner_tenant_id,
+                                            },
+                                            task_id: record.task_id,
+                                            message_id: record.message_id,
+                                            run_id: record.run_id,
+                                            lane: DispatchLane::Message,
+                                            delay_start: streaming,
+                                            allow_new: true,
+                                        },
+                                    });
+                            }
+                            Ok(governed)
+                        },
+                        Some(Box::new(move || {
+                            let prepared = prepared_for_commit
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            if let Some(prepared) = prepared {
+                                let staged = stage_server.stage_live_dispatch(prepared);
+                                *staged_for_commit
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(staged);
+                            }
+                            // The durable mapper is already installed. A staging error is returned
+                            // to the request through the slot so the snapshot commit itself remains
+                            // a successful, recoverable acceptance.
+                            Ok(())
+                        })),
                     )
-                })
-                .await?
+                    .await?;
+                staged_live_dispatch = staged_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .and_then(Result::ok);
+                governed
             }
         };
         let (_, accepted_action) = match governed_action(governed, OperationKind::Send) {
@@ -6217,39 +6380,79 @@ impl A2aHttpJsonRpcServer {
             action,
         };
         let should_schedule = otherwise_schedulable && event_ready;
+        if staged_live_dispatch
+            .as_ref()
+            .is_some_and(|staged| staged.dispatch_id != record.dispatch_id)
+        {
+            return Err(ProtocolError::conflict(
+                "A2A staged live dispatch does not match its durable acceptance",
+            ));
+        }
+        let mut dispatch_recovery_claim = None;
+        let mut staged_reservation_failed = false;
+        let staged_acceptance = if should_schedule {
+            if let Some(staged) = staged_live_dispatch.take() {
+                dispatch_recovery_claim = Some(staged.recovery_claim);
+                staged_reservation_failed = staged.acceptance.is_none();
+                staged.acceptance
+            } else {
+                None
+            }
+        } else {
+            drop(staged_live_dispatch.take());
+            None
+        };
         let mut acceptance = if should_schedule {
-            match self.reserve_dispatch(
-                job,
-                DispatchReservation {
-                    owner: owner.clone(),
-                    task_id: task_id.clone(),
-                    message_id: message_id.clone(),
-                    run_id: run_id.clone(),
-                    lane: DispatchLane::Message,
-                    delay_start: streaming,
-                    allow_new: true,
+            if staged_reservation_failed {
+                return Ok(ConnectionOutcome::Response(HttpResponse::json(
+                    503,
+                    jsonrpc_error(rpc.id, -32603, "Dispatch capacity exhausted", None),
+                )));
+            }
+            match staged_acceptance {
+                Some(acceptance) => Some(acceptance),
+                None => match self.reserve_dispatch(
+                    job,
+                    DispatchReservation {
+                        owner: owner.clone(),
+                        task_id: task_id.clone(),
+                        message_id: message_id.clone(),
+                        run_id: run_id.clone(),
+                        lane: DispatchLane::Message,
+                        delay_start: streaming,
+                        allow_new: true,
+                    },
+                ) {
+                    Ok(acceptance) => acceptance,
+                    Err(_) => {
+                        return Ok(ConnectionOutcome::Response(HttpResponse::json(
+                            503,
+                            jsonrpc_error(rpc.id, -32603, "Dispatch capacity exhausted", None),
+                        )))
+                    }
                 },
-            ) {
-                Ok(acceptance) => acceptance,
-                Err(_) => {
-                    return Ok(ConnectionOutcome::Response(HttpResponse::json(
-                        503,
-                        jsonrpc_error(rpc.id, -32603, "Dispatch capacity exhausted", None),
-                    )))
-                }
             }
         } else {
             None
         };
         let mut reconciliation = Vec::new();
+        let mut retain_recovery_claim = false;
         if acceptance
             .as_ref()
             .is_some_and(|acceptance| acceptance.newly_reserved)
         {
-            if matches!(
-                record.state,
-                A2aDispatchOutboxState::Running | A2aDispatchOutboxState::ReconcilePending
-            ) {
+            if dispatch_recovery_claim.is_none() {
+                dispatch_recovery_claim = self.claim_recovery_attempt(&record.dispatch_id);
+            }
+            if dispatch_recovery_claim.is_none() {
+                reconciliation.push("dispatch recovery ownership is already claimed".to_owned());
+            }
+            if reconciliation.is_empty()
+                && matches!(
+                    record.state,
+                    A2aDispatchOutboxState::Running | A2aDispatchOutboxState::ReconcilePending
+                )
+            {
                 let decision = self
                     .reconcile_unknown_dispatch(
                         &record,
@@ -6258,13 +6461,17 @@ impl A2aHttpJsonRpcServer {
                     )
                     .await;
                 if decision != A2aUnknownDispatchDecision::SafeToRetry {
-                    if record.state == A2aDispatchOutboxState::Running {
-                        let _ = self
+                    retain_recovery_claim = true;
+                    if record.state == A2aDispatchOutboxState::Running
+                        && self
                             .mark_dispatch_reconcile_pending(
                                 &record.dispatch_id,
                                 "unknown external outcome requires host reconciliation",
                             )
-                            .await;
+                            .await
+                            .is_err()
+                    {
+                        retain_recovery_claim = false;
                     }
                     reconciliation.push(
                         "dispatch outcome is unknown and the host did not attest a safe retry"
@@ -6284,42 +6491,37 @@ impl A2aHttpJsonRpcServer {
             {
                 reconciliation.push("persisting dispatch reconciliation failed".to_owned());
             }
-            if reconciliation.is_empty()
-                && self
-                    .mark_dispatch_running(&record.dispatch_id)
-                    .await
-                    .is_err()
-            {
-                reconciliation.push("persisting the running dispatch fence failed".to_owned());
-            }
         }
         if reconciliation.is_empty() {
             if let Some(commit) = acceptance
                 .as_mut()
                 .and_then(|acceptance| acceptance.commit.take())
             {
-                let expected_attempt = self
-                    .mapper
-                    .lock()
+                let Some(recovery_claim) = dispatch_recovery_claim.take() else {
+                    reconciliation.push("dispatch recovery ownership disappeared".to_owned());
+                    return Ok(rpc_reconciliation_error(
+                        rpc.id,
+                        &task,
+                        &reconciliation.join("; "),
+                    ));
+                };
+                if self
+                    .mark_dispatch_running_with_commit(&record.dispatch_id, commit, recovery_claim)
                     .await
-                    .dispatch_outbox()
-                    .get(&record.dispatch_id)
-                    .map(|record| record.attempts);
-                if commit
-                    .send(DispatchCommit {
-                        expected_dispatch_attempt: expected_attempt,
-                        expected_cancellation_attempt: None,
-                        host_already_fenced: false,
-                    })
                     .is_err()
                 {
-                    reconciliation.push("dispatch reservation commit failed".to_owned());
-                } else {
-                    self.quarantine_recovery(&record.dispatch_id);
+                    reconciliation.push(
+                        "persisting or committing the running dispatch fence failed".to_owned(),
+                    );
                 }
             }
         }
         if !reconciliation.is_empty() {
+            if retain_recovery_claim {
+                if let Some(claim) = dispatch_recovery_claim.take() {
+                    claim.quarantine();
+                }
+            }
             return Ok(rpc_reconciliation_error(
                 rpc.id,
                 &task,
@@ -6405,6 +6607,33 @@ impl A2aHttpJsonRpcServer {
             _stream_lease: stream_lease.expect("streaming send acquired a stream lease"),
         };
         Ok(ConnectionOutcome::Stream(Box::new(plan)))
+    }
+
+    fn stage_live_dispatch(
+        self: &Arc<Self>,
+        prepared: PreparedLiveDispatch,
+    ) -> ProtocolResult<StagedLiveDispatch> {
+        let recovery_claim = self
+            .claim_recovery_attempt(&prepared.dispatch_id)
+            .ok_or_else(|| {
+                ProtocolError::conflict(
+                    "A2A live dispatch lost ownership before its post-commit reservation",
+                )
+            })?;
+        // Capacity can be transient between durable acceptance and event settlement. Keep the
+        // exact claim even when staging cannot reserve: the request returns a retryable capacity
+        // response after flushing the immutable acceptance event, and recovery cannot steal the
+        // execution mode while that request still owns the acceptance.
+        let acceptance = self
+            .reserve_dispatch(prepared.job, prepared.reservation)
+            .ok()
+            .flatten()
+            .filter(|acceptance| acceptance.newly_reserved);
+        Ok(StagedLiveDispatch {
+            dispatch_id: prepared.dispatch_id,
+            acceptance,
+            recovery_claim,
+        })
     }
 
     fn reserve_dispatch(
@@ -6687,7 +6916,7 @@ impl A2aHttpJsonRpcServer {
         job: &A2aDispatchJob,
         task_id: &str,
         owner: &A2aEventOwner,
-        commit: DispatchCommit,
+        commit: &DispatchCommit,
         server_cancellation: CancellationToken,
     ) -> ProtocolResult<()> {
         if job.lane == DispatchLane::Message
@@ -6820,7 +7049,7 @@ impl A2aHttpJsonRpcServer {
         // A reservation reaches this queue before its mapper/event persistence. Always observe the
         // commit gate itself: shutdown may race the accepting connection, and treating that race as
         // cancellation could strand a snapshot accepted a few instructions later.
-        let commit = match scheduled.commit.await {
+        let mut commit = match scheduled.commit.await {
             Ok(commit) => commit,
             Err(_) => {
                 let _ = scheduled.completion.send(Err(ProtocolError::new(
@@ -6841,14 +7070,20 @@ impl A2aHttpJsonRpcServer {
         let durable_dispatch_id = scheduled.job.durable_dispatch_id.clone();
         let durable_cancellation_id = scheduled.job.durable_cancellation_id.clone();
         let lane = scheduled.job.lane;
-        let recovery_claim = durable_cancellation_id
-            .as_ref()
-            .filter(|_| lane == DispatchLane::Cancellation)
-            .map_or(ScheduledRecoveryClaim::None, |cancellation_id| {
-                ScheduledRecoveryClaim::Cancellation {
+        let recovery_claim = match lane {
+            DispatchLane::Message => commit
+                .dispatch_recovery_claim
+                .take()
+                .map_or(ScheduledRecoveryClaim::None, |claim| {
+                    ScheduledRecoveryClaim::Dispatch { claim }
+                }),
+            DispatchLane::Cancellation => durable_cancellation_id.as_ref().map_or(
+                ScheduledRecoveryClaim::None,
+                |cancellation_id| ScheduledRecoveryClaim::Cancellation {
                     cancellation_id: cancellation_id.clone(),
-                }
-            });
+                },
+            ),
+        };
         let acquire_gates = async {
             if let Some(start) = scheduled.start {
                 start.await.map_err(|_| {
@@ -6908,7 +7143,7 @@ impl A2aHttpJsonRpcServer {
                         &scheduled.job,
                         &task_id,
                         &owner,
-                        commit,
+                        &commit,
                         server_cancellation,
                     )
                     .await
@@ -7086,7 +7321,7 @@ impl A2aHttpJsonRpcServer {
         job: &A2aDispatchJob,
         task_id: &str,
         owner: &A2aEventOwner,
-        commit: DispatchCommit,
+        commit: &DispatchCommit,
         acknowledgement: A2aDispatchAck,
     ) -> ProtocolResult<()> {
         let current = self
@@ -7225,6 +7460,7 @@ impl A2aHttpJsonRpcServer {
         drop(state);
         match completion.recovery_claim {
             ScheduledRecoveryClaim::None => {}
+            ScheduledRecoveryClaim::Dispatch { claim } => drop(claim),
             ScheduledRecoveryClaim::Cancellation { cancellation_id } => {
                 self.release_recovery_attempt(&cancellation_id);
                 #[cfg(test)]
@@ -7545,6 +7781,7 @@ impl A2aHttpJsonRpcServer {
                                     expected_dispatch_attempt: None,
                                     expected_cancellation_attempt: Some(expected_attempt),
                                     host_already_fenced: true,
+                                    dispatch_recovery_claim: None,
                                 })
                                 .is_err()
                             {
@@ -7651,6 +7888,7 @@ impl A2aHttpJsonRpcServer {
                     expected_dispatch_attempt: None,
                     expected_cancellation_attempt,
                     host_already_fenced: false,
+                    dispatch_recovery_claim: None,
                 })
                 .is_err()
             {
@@ -9665,6 +9903,7 @@ mod tests {
     #[derive(Default)]
     struct CompletingHost {
         calls: AtomicUsize,
+        reconcile_calls: AtomicUsize,
         safe_retry_unknown: bool,
     }
 
@@ -9675,6 +9914,7 @@ mod tests {
             _server: Arc<A2aHttpJsonRpcServer>,
             _record: &A2aDispatchOutboxRecord,
         ) -> ProtocolResult<A2aUnknownDispatchDecision> {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
             Ok(if self.safe_retry_unknown {
                 A2aUnknownDispatchDecision::SafeToRetry
             } else {
@@ -10761,6 +11001,72 @@ mod tests {
         }
     }
 
+    struct FirstAppendBarrierEventStore {
+        inner: InMemoryA2aEventStore,
+        attempts: AtomicUsize,
+        first_entered: Notify,
+        first_released: AtomicBool,
+        release_first: Notify,
+    }
+
+    impl Default for FirstAppendBarrierEventStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemoryA2aEventStore::default(),
+                attempts: AtomicUsize::new(0),
+                first_entered: Notify::new(),
+                first_released: AtomicBool::new(false),
+                release_first: Notify::new(),
+            }
+        }
+    }
+
+    impl FirstAppendBarrierEventStore {
+        fn release_first(&self) {
+            self.first_released.store(true, Ordering::SeqCst);
+            self.release_first.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl A2aEventStore for FirstAppendBarrierEventStore {
+        async fn append(
+            &self,
+            logical_event_id: &str,
+            owner: &A2aEventOwner,
+            task_id: &str,
+            response: &A2aStreamResponse,
+            retention: A2aEventRetention,
+        ) -> Result<A2aEventAppendOutcome, A2aEventAppendError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_entered.notify_one();
+                loop {
+                    let released = self.release_first.notified();
+                    if self.first_released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
+                }
+            }
+            self.inner
+                .append(logical_event_id, owner, task_id, response, retention)
+                .await
+        }
+
+        async fn replay_page(
+            &self,
+            owner: &A2aEventOwner,
+            task_id: &str,
+            after_event_id: Option<u64>,
+            through_high_water: Option<u64>,
+            limits: A2aReplayLimits,
+        ) -> Result<A2aReplayPage, A2aEventStoreError> {
+            self.inner
+                .replay_page(owner, task_id, after_event_id, through_high_water, limits)
+                .await
+        }
+    }
+
     struct AmbiguousTwiceEventSettlementSnapshotStore {
         snapshot: Mutex<Option<A2aSerializedMapperSnapshot>>,
         failures_remaining: AtomicUsize,
@@ -11556,6 +11862,17 @@ mod tests {
 
     fn send_body(message_id: &str, complete: bool, return_immediately: Option<bool>) -> String {
         send_body_for_tenant(message_id, "tenant-a", complete, return_immediately)
+    }
+
+    fn send_rpc_request(message_id: &str) -> JsonRpcRequest {
+        let value: Value = serde_json::from_str(&send_body(message_id, true, None)).unwrap();
+        JsonRpcRequest {
+            id: value["id"].clone(),
+            method: value["method"].as_str().unwrap().to_owned(),
+            params: value["params"].clone(),
+            correlation_id: None,
+            last_event_id: None,
+        }
     }
 
     fn send_body_for_tenant(
@@ -14387,6 +14704,463 @@ mod tests {
 
         handle.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_live_streaming_intent_blocks_immediate_recovery_until_start_gate() {
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        let events = Arc::new(FirstAppendBarrierEventStore::default());
+        let host = Arc::new(DelayedHost::new(Duration::from_millis(20)));
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(A2aMapper::new())),
+                snapshots,
+                events.clone(),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.initialize_snapshot_store().await.unwrap();
+        let mut dispatch_receiver = server.dispatch_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            let scheduled = dispatch_receiver
+                .recv()
+                .await
+                .expect("post-commit live streaming dispatch was not staged");
+            let completion = scheduler_server
+                .clone()
+                .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                .await;
+            scheduler_server
+                .finish_scheduled_dispatch(completion)
+                .unwrap();
+        });
+
+        let request_server = server.clone();
+        let request = tokio::spawn(async move {
+            request_server
+                .handle_send(
+                    send_rpc_request("queued-live-streaming-intent"),
+                    owner_principal(),
+                    true,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), events.first_entered.notified())
+            .await
+            .expect("live streaming send did not block in its acceptance-event append");
+
+        let queued = server.mapper_snapshot().await;
+        let dispatch = queued
+            .dispatch_for_message("queued-live-streaming-intent", &owner_principal())
+            .unwrap()
+            .clone();
+        assert_eq!(dispatch.state, A2aDispatchOutboxState::Queued);
+        assert!(server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+        assert_eq!(server.dispatch_state.lock().unwrap().accepted, 1);
+
+        // A concurrent recovery publisher settles the exact event while the live request remains
+        // paused in its first append. Dispatch recovery now sees a runnable Queued record, but the
+        // post-commit live reservation and claim must prevent an Immediate takeover.
+        let recovery_cancellation = CancellationToken::new();
+        let mut event_cursor = None;
+        assert_eq!(
+            server
+                .recover_pending_events(
+                    &recovery_cancellation,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut event_cursor,
+                )
+                .await,
+            1
+        );
+        assert!(server
+            .mapper_snapshot()
+            .await
+            .dispatch_event_ready(&dispatch));
+        let mut dispatch_cursor = None;
+        assert_eq!(
+            server
+                .recover_pending_dispatches(
+                    &recovery_cancellation,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut dispatch_cursor,
+                )
+                .await,
+            0
+        );
+        assert!(host.modes.lock().unwrap().is_empty());
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&dispatch.dispatch_id].state,
+            A2aDispatchOutboxState::Queued
+        );
+
+        events.release_first();
+        let outcome = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("live streaming send did not resume")
+            .unwrap()
+            .unwrap();
+        let ConnectionOutcome::Stream(mut plan) = outcome else {
+            panic!("live streaming send did not retain its stream response")
+        };
+        assert!(plan.dispatch_start.is_some());
+        assert!(host.modes.lock().unwrap().is_empty());
+        plan.dispatch_start
+            .take()
+            .unwrap()
+            .send(())
+            .expect("streaming start gate receiver disappeared");
+        timeout(Duration::from_secs(1), host.started.notified())
+            .await
+            .expect("streaming host did not start after the explicit gate");
+        wait_for_task_state(&server, &dispatch.task_id, A2aTaskState::Completed).await;
+        scheduler.await.unwrap();
+        assert_eq!(
+            host.modes.lock().unwrap().as_slice(),
+            [A2aExecutionMode::Streaming]
+        );
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&dispatch.dispatch_id].state,
+            A2aDispatchOutboxState::Settled
+        );
+        assert!(!server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+        assert_eq!(server.dispatch_state.lock().unwrap().accepted, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_queued_live_activation_releases_stage_for_later_recovery() {
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        let events = Arc::new(FirstAppendBarrierEventStore::default());
+        let host = Arc::new(CompletingHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(A2aMapper::new())),
+                snapshots,
+                events.clone(),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.initialize_snapshot_store().await.unwrap();
+        let mut dispatch_receiver = server.dispatch_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            for _ in 0..2 {
+                let scheduled = dispatch_receiver
+                    .recv()
+                    .await
+                    .expect("expected staged or recovered dispatch was not scheduled");
+                let completion = scheduler_server
+                    .clone()
+                    .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                    .await;
+                scheduler_server
+                    .finish_scheduled_dispatch(completion)
+                    .unwrap();
+            }
+        });
+
+        let request_server = server.clone();
+        let request = tokio::spawn(async move {
+            request_server
+                .handle_send(
+                    send_rpc_request("aborted-queued-live-activation"),
+                    owner_principal(),
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), events.first_entered.notified())
+            .await
+            .expect("live send did not reach the queued event barrier");
+        let dispatch = server
+            .mapper_snapshot()
+            .await
+            .dispatch_for_message("aborted-queued-live-activation", &owner_principal())
+            .unwrap()
+            .clone();
+        assert_eq!(dispatch.state, A2aDispatchOutboxState::Queued);
+        assert!(server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        wait_for_scheduler_idle(&server).await;
+        assert!(!server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+
+        events.release_first();
+        let recovery_cancellation = CancellationToken::new();
+        let mut event_cursor = None;
+        assert_eq!(
+            server
+                .recover_pending_events(
+                    &recovery_cancellation,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut event_cursor,
+                )
+                .await,
+            1
+        );
+        let mut dispatch_cursor = None;
+        assert_eq!(
+            server
+                .recover_pending_dispatches(
+                    &recovery_cancellation,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut dispatch_cursor,
+                )
+                .await,
+            1
+        );
+        wait_for_task_state(&server, &dispatch.task_id, A2aTaskState::Completed).await;
+        scheduler.await.unwrap();
+        assert_eq!(host.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&dispatch.dispatch_id].state,
+            A2aDispatchOutboxState::Settled
+        );
+        assert!(!server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_dispatch_claim_blocks_recovery_between_running_and_host_callback() {
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        let host = Arc::new(CompletingHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(A2aMapper::new())),
+                snapshots,
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.initialize_snapshot_store().await.unwrap();
+        let saturated_dispatch = server
+            .dispatch_global
+            .clone()
+            .acquire_many_owned(server.config.max_background_dispatches.try_into().unwrap())
+            .await
+            .unwrap();
+        let mut dispatch_receiver = server.dispatch_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            let scheduled = dispatch_receiver
+                .recv()
+                .await
+                .expect("live dispatch was not scheduled");
+            let completion = scheduler_server
+                .clone()
+                .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                .await;
+            scheduler_server
+                .finish_scheduled_dispatch(completion)
+                .unwrap();
+        });
+
+        let request_server = server.clone();
+        let request = tokio::spawn(async move {
+            request_server
+                .handle_send(
+                    send_rpc_request("live-running-recovery-race"),
+                    owner_principal(),
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        let dispatch = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(dispatch) = server
+                    .mapper_snapshot()
+                    .await
+                    .dispatch_for_message("live-running-recovery-race", &owner_principal())
+                    .filter(|dispatch| dispatch.state == A2aDispatchOutboxState::Running)
+                    .cloned()
+                {
+                    break dispatch;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live dispatch did not atomically persist and commit its running fence");
+        assert!(server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+
+        let recovery_cancellation = CancellationToken::new();
+        let mut recovery_cursor = None;
+        let recovered = server
+            .recover_pending_dispatches(
+                &recovery_cancellation,
+                Instant::now() + Duration::from_secs(1),
+                &mut recovery_cursor,
+            )
+            .await;
+        assert_eq!(recovered, 0);
+        assert_eq!(host.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&dispatch.dispatch_id].state,
+            A2aDispatchOutboxState::Running
+        );
+
+        drop(saturated_dispatch);
+        let outcome = timeout(Duration::from_secs(2), request)
+            .await
+            .expect("live send did not finish")
+            .unwrap()
+            .unwrap();
+        let ConnectionOutcome::Response(response) = outcome else {
+            panic!("blocking live send unexpectedly streamed")
+        };
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            payload["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        scheduler.await.unwrap();
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&dispatch.dispatch_id].state,
+            A2aDispatchOutboxState::Settled
+        );
+        assert!(!server
+            .recovery_was_attempted(&dispatch.dispatch_id)
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_abort_after_running_cas_apply_still_commits_host_once() {
+        let principal = owner_principal();
+        let message_id = "running-cas-abort-handoff";
+        let mut seeded = A2aMapper::new();
+        let mapping = prepare_seeded_message_for(&mut seeded, message_id, &principal);
+        let event_id = event_id_for_message(&seeded, message_id, &principal);
+        seeded.mark_event_settled(&event_id).unwrap();
+        let record = seeded
+            .dispatch_for_message(message_id, &principal)
+            .unwrap()
+            .clone();
+        let (envelope, action) = seeded
+            .reconstruct_dispatch(&record.dispatch_id, &principal)
+            .unwrap();
+        let snapshots = Arc::new(AppliedBlockingSnapshotStore::default());
+        snapshots.initialize(&seeded).await.unwrap();
+        let host = Arc::new(CompletingHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new_owned(
+                seeded,
+                snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.initialize_snapshot_store().await.unwrap();
+        let recovery_claim = server
+            .claim_recovery_attempt(&record.dispatch_id)
+            .expect("test dispatch ownership was not available");
+        let mut acceptance = server
+            .reserve_dispatch(
+                A2aDispatchJob {
+                    durable_dispatch_id: Some(record.dispatch_id.clone()),
+                    durable_cancellation_id: None,
+                    lane: DispatchLane::Message,
+                    mode: A2aExecutionMode::Blocking,
+                    envelope,
+                    action,
+                },
+                DispatchReservation {
+                    owner: A2aEventOwner {
+                        subject: record.owner_subject.clone(),
+                        tenant_id: record.owner_tenant_id.clone(),
+                    },
+                    task_id: mapping.task_id.clone(),
+                    message_id: record.message_id.clone(),
+                    run_id: record.run_id.clone(),
+                    lane: DispatchLane::Message,
+                    delay_start: false,
+                    allow_new: true,
+                },
+            )
+            .unwrap()
+            .expect("test dispatch was not reserved");
+        assert!(acceptance.newly_reserved);
+        let commit = acceptance
+            .commit
+            .take()
+            .expect("new test reservation had no commit sender");
+        let mut dispatch_receiver = server.dispatch_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            let scheduled = dispatch_receiver
+                .recv()
+                .await
+                .expect("running handoff dispatch was not scheduled");
+            let completion = scheduler_server
+                .clone()
+                .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                .await;
+            scheduler_server
+                .finish_scheduled_dispatch(completion)
+                .unwrap();
+        });
+
+        snapshots
+            .block_after_next_apply
+            .store(true, Ordering::SeqCst);
+        let marker_server = server.clone();
+        let dispatch_id = record.dispatch_id.clone();
+        let marker = tokio::spawn(async move {
+            marker_server
+                .mark_dispatch_running_with_commit(&dispatch_id, commit, recovery_claim)
+                .await
+        });
+        timeout(Duration::from_secs(1), snapshots.entered.notified())
+            .await
+            .expect("running CAS was not durably applied");
+        marker.abort();
+        assert!(marker.await.unwrap_err().is_cancelled());
+        snapshots.release.notify_one();
+
+        wait_for_task_state(&server, &record.task_id, A2aTaskState::Completed).await;
+        scheduler.await.unwrap();
+        assert_eq!(host.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server.mapper_snapshot().await.dispatch_outbox()[&record.dispatch_id].state,
+            A2aDispatchOutboxState::Settled
+        );
+        assert!(!server.recovery_was_attempted(&record.dispatch_id).unwrap());
     }
 
     #[tokio::test]
