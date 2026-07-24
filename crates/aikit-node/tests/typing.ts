@@ -1,4 +1,5 @@
 import {
+  A2aMapper,
   Agent,
   Client,
   DurableRun,
@@ -17,6 +18,8 @@ import {
   validateMediaInput,
   validateModelProfile,
   type AuditablePolicyDecision,
+  type A2aGovernedAction,
+  type A2aMapperState,
   type CapabilityState,
   type ApprovalResponse,
   type ContainmentCapabilityReport,
@@ -217,6 +220,43 @@ void governedDurable.policySnapshotHash;
 void typedApproval;
 void typedResume;
 void governedDurable.expireApprovals("sweep-typed", 200n);
+
+const a2a = new A2aMapper();
+const a2aPrincipal = {
+  subject: "typed-owner",
+  tenant_id: "typed-tenant",
+  scopes: ["a2a:message:send", "a2a:tasks:read"],
+};
+const a2aCorrelation = { correlation_id: "typed-correlation", request_id: "typed-request" };
+const governedA2a: A2aGovernedAction = a2a.sendMessage(
+  {
+    message_id: "typed-message",
+    role: "ROLE_USER",
+    parts: [{ kind: "text", text: "typed" }],
+  },
+  a2aCorrelation,
+  a2aPrincipal,
+);
+if (governedA2a.action !== undefined) {
+  void governedA2a.action.kind;
+}
+const a2aPage = a2a.listTasks(
+  { tenant: "typed-tenant", pageSize: 10 },
+  a2aCorrelation,
+  a2aPrincipal,
+);
+const a2aState: A2aMapperState = a2a.snapshot();
+const a2aRestored: A2aMapper = A2aMapper.fromState(a2aState);
+const a2aNextSequence: number = a2aRestored.snapshot().next_sequence;
+void a2aPage;
+void a2aState;
+void a2aNextSequence;
+// @ts-expect-error persisted A2A counters are JavaScript numbers, not bigint values
+A2aMapper.fromState({ ...a2aState, next_sequence: 1n });
+// @ts-expect-error A2A list request uses camelCase field names in Node
+a2a.listTasks({ page_size: 10 }, a2aCorrelation, a2aPrincipal);
+// @ts-expect-error A2A roles are a closed wire enum
+a2a.sendMessage({ message_id: "bad-role", role: "user", parts: [] }, a2aCorrelation, a2aPrincipal);
 const evalOutcome: RunOutcome = {
   messages,
   usage: {

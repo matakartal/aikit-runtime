@@ -1,4 +1,4 @@
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Literal, Mapping, NoReturn, Optional, Protocol, Sequence, TypedDict, TypeVar, Union, overload
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Literal, Mapping, NoReturn, Optional, Protocol, Sequence, TypedDict, TypeVar, Union, final, overload
 
 JsonPrimitive = Union[str, int, float, bool, None]
 JsonValue = Union[JsonPrimitive, List["JsonValue"], Dict[str, "JsonValue"]]
@@ -1322,6 +1322,266 @@ class Tool(Protocol):
 
 
 ToolCallback = Callable[[Dict[str, JsonValue]], Awaitable[str]]
+
+
+A2aRole = Literal["ROLE_USER", "ROLE_AGENT"]
+A2aTaskState = Literal[
+    "TASK_STATE_SUBMITTED",
+    "TASK_STATE_WORKING",
+    "TASK_STATE_INPUT_REQUIRED",
+    "TASK_STATE_AUTH_REQUIRED",
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_FAILED",
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_REJECTED",
+]
+A2aGovernanceDenialCode = Literal[
+    "invalid_request",
+    "missing_principal",
+    "missing_scope",
+    "principal_mismatch",
+    "unknown_target",
+    "state_conflict",
+    "invalid_approval",
+    "duplicate_conflict",
+]
+
+
+class A2aTextPart(TypedDict):
+    kind: Literal["text"]
+    text: str
+
+
+class A2aDataPart(TypedDict):
+    kind: Literal["data"]
+    data: JsonValue
+
+
+class A2aFilePart(TypedDict):
+    kind: Literal["file"]
+    uri: str
+    media_type: str
+
+
+A2aPart = Union[A2aTextPart, A2aDataPart, A2aFilePart]
+
+
+class _A2aMessageRequired(TypedDict):
+    message_id: str
+    role: A2aRole
+    parts: List[A2aPart]
+
+
+class A2aMessage(_A2aMessageRequired, total=False):
+    context_id: str
+    task_id: str
+    metadata: Dict[str, JsonValue]
+
+
+class A2aListTasksRequest(TypedDict, total=False):
+    tenant: str
+    contextId: str
+    status: A2aTaskState
+    pageSize: int
+    pageToken: str
+
+
+class _A2aCorrelationIdentityRequired(TypedDict):
+    correlation_id: str
+    request_id: str
+
+
+class A2aCorrelationIdentity(_A2aCorrelationIdentityRequired, total=False):
+    session_id: str
+    run_id: str
+
+
+class _A2aProtocolPrincipalRequired(TypedDict):
+    subject: str
+
+
+class A2aProtocolPrincipal(_A2aProtocolPrincipalRequired, total=False):
+    tenant_id: str
+    scopes: Sequence[str]
+
+
+class A2aGovernanceAllowed(TypedDict):
+    status: Literal["allowed"]
+
+
+class A2aGovernanceDenied(TypedDict):
+    status: Literal["denied"]
+    code: A2aGovernanceDenialCode
+    reason: str
+
+
+A2aGovernanceAuthorization = Union[A2aGovernanceAllowed, A2aGovernanceDenied]
+
+
+class _A2aGovernanceEnvelopeRequired(TypedDict):
+    schema_version: int
+    protocol: Literal["a2a"]
+    correlation: A2aCorrelationIdentity
+    operation: str
+    target: str
+    required_scopes: List[str]
+    authorization: A2aGovernanceAuthorization
+
+
+class A2aGovernanceEnvelope(_A2aGovernanceEnvelopeRequired, total=False):
+    principal: A2aProtocolPrincipal
+
+
+class A2aRunMapping(TypedDict):
+    context_id: str
+    session_id: str
+    task_id: str
+    run_id: str
+    message_id: str
+
+
+class _A2aTaskRecordRequired(TypedDict):
+    """Internal mapper record; never serialize this directly as an A2A wire Task DTO."""
+
+    mapping: A2aRunMapping
+    state: A2aTaskState
+    owner_subject: str
+    created_revision: int
+    updated_revision: int
+
+
+class A2aTaskRecord(_A2aTaskRecordRequired, total=False):
+    owner_tenant_id: str
+    status_message: str
+
+
+class _A2aMessageReceiptRequired(TypedDict):
+    message: A2aMessage
+    mapping: A2aRunMapping
+    owner_subject: str
+    accepted_revision: int
+
+
+class A2aMessageReceipt(_A2aMessageReceiptRequired, total=False):
+    owner_tenant_id: str
+
+
+class A2aTaskPage(TypedDict):
+    tasks: List[A2aTaskRecord]
+    nextPageToken: str
+    pageSize: int
+    totalSize: int
+
+
+class A2aDispatchMessageAction(TypedDict):
+    kind: Literal["dispatch_message"]
+    message: A2aMessage
+    mapping: A2aRunMapping
+    resumed_from: Optional[A2aTaskState]
+
+
+class A2aDuplicateMessageAction(TypedDict):
+    kind: Literal["duplicate_message"]
+    receipt: A2aMessageReceipt
+
+
+class A2aGetTaskAction(TypedDict):
+    kind: Literal["get_task"]
+    task: A2aTaskRecord
+
+
+class A2aListTasksAction(TypedDict):
+    kind: Literal["list_tasks"]
+    page: A2aTaskPage
+
+
+class A2aCancelTaskAction(TypedDict):
+    kind: Literal["cancel_task"]
+    task: A2aTaskRecord
+
+
+A2aAction = Union[
+    A2aDispatchMessageAction,
+    A2aDuplicateMessageAction,
+    A2aGetTaskAction,
+    A2aListTasksAction,
+    A2aCancelTaskAction,
+]
+
+
+class A2aGovernedActionAllowed(TypedDict):
+    envelope: A2aGovernanceEnvelope
+    action: A2aAction
+
+
+class A2aGovernedActionDenied(TypedDict):
+    envelope: A2aGovernanceEnvelope
+
+
+A2aGovernedAction = Union[A2aGovernedActionAllowed, A2aGovernedActionDenied]
+
+
+class _A2aContextOwnerRequired(TypedDict):
+    subject: str
+
+
+class A2aContextOwner(_A2aContextOwnerRequired, total=False):
+    tenant_id: str
+
+
+class A2aMapperState(TypedDict):
+    """Canonical persisted mapping state, not an A2A network payload."""
+
+    schema_version: int
+    contexts: Dict[str, str]
+    context_owners: Dict[str, A2aContextOwner]
+    tasks: Dict[str, A2aTaskRecord]
+    receipts: Dict[str, A2aMessageReceipt]
+    next_sequence: int
+    revision: int
+
+
+@final
+class A2aMapper:
+    """Rust-core A2A mapping state; not a network listener or wire Task serializer."""
+
+    def __init__(self) -> None: ...
+
+    @staticmethod
+    def from_state(state: A2aMapperState) -> "A2aMapper": ...
+
+    def snapshot(self) -> A2aMapperState: ...
+    def send_message(
+        self,
+        message: A2aMessage,
+        correlation: A2aCorrelationIdentity,
+        principal: Optional[A2aProtocolPrincipal] = ...,
+    ) -> A2aGovernedAction: ...
+    def list_tasks(
+        self,
+        request: A2aListTasksRequest,
+        correlation: A2aCorrelationIdentity,
+        principal: Optional[A2aProtocolPrincipal] = ...,
+    ) -> A2aGovernedAction: ...
+    def get_task(
+        self,
+        task_id: str,
+        correlation: A2aCorrelationIdentity,
+        principal: Optional[A2aProtocolPrincipal] = ...,
+    ) -> A2aGovernedAction: ...
+    def cancel_task(
+        self,
+        task_id: str,
+        correlation: A2aCorrelationIdentity,
+        principal: Optional[A2aProtocolPrincipal] = ...,
+    ) -> A2aGovernedAction: ...
+    def transition_task(
+        self,
+        task_id: str,
+        state: A2aTaskState,
+        status_message: Optional[str] = ...,
+    ) -> A2aMapperState: ...
+
 
 class McpToolFilter(TypedDict, total=False):
     """Exact, case-sensitive MCP tool visibility policy; deny always wins."""

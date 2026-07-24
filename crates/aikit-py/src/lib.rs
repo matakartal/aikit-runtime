@@ -20,26 +20,27 @@ use aikit_core::orchestration::{
 };
 use aikit_core::{
     evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
-    request_capability_tool, tools::ToolExecutor, Agent, AgentError,
-    AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
-    AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits,
-    BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker,
-    CapabilityGate, CedarDecisionAdapter, Client as CoreClient, CompactionPolicy,
-    CompatibilityMode, ContainmentPolicy, DockerConfig, DurabilityMode, DurableApprovalRequest,
-    ErrorCode, ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext,
-    FailureHookOutcome, GeneratedText, Governance, GovernanceBinding, GuardedExecutor,
-    GuardrailChain, HookDispatcher, HookMatcher, HookOutcome, InMemorySessionStore,
-    JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient, McpToolExecutor,
-    McpToolFilter, MediaArtifact, MediaInput, Message, ModelCapability, ModelCatalog,
-    ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing, ModelProfile, ObjectOptions,
-    ObjectStream as CoreObjectStream, ObjectStreamEvent, OpaDecisionAdapter, PermissionEngine,
-    PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument, PolicySnapshot, PostToolOutcome,
-    PostToolUseContext, PreToolUseContext, PromptContext, PromptHookOutcome, ProviderOptions,
-    RegexBlocklist, RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome,
-    RunRecorder, RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation,
-    SemanticValidator, Session, SessionStore, SessionStoreError, SqliteMemoryStore,
-    SqliteSessionStore, StdioTransport, StopContext, StreamDelta, StreamEvent, StreamEventEncoder,
-    StreamableHttpTransport, ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
+    request_capability_tool, tools::ToolExecutor, A2aListTasksRequest, A2aMapper as CoreA2aMapper,
+    A2aMessage, A2aTaskState, Agent, AgentError, AgentOptions as CoreAgentOptions,
+    ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail,
+    BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
+    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, CedarDecisionAdapter,
+    Client as CoreClient, CompactionPolicy, CompatibilityMode, ContainmentPolicy,
+    CorrelationIdentity, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode,
+    ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
+    GeneratedText, Governance, GovernanceBinding, GuardedExecutor, GuardrailChain, HookDispatcher,
+    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
+    JsonlAuditSink, McpClient, McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message,
+    ModelCapability, ModelCatalog, ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing,
+    ModelProfile, ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent,
+    OpaDecisionAdapter, PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor,
+    PolicyDocument, PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext,
+    PromptContext, PromptHookOutcome, ProtocolPrincipal, ProviderOptions, RegexBlocklist,
+    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome, RunRecorder, RunState,
+    RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
+    SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
+    StopContext, StreamDelta, StreamEvent, StreamEventEncoder, StreamableHttpTransport,
+    ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -270,6 +271,150 @@ fn python_json<'py>(py: Python<'py>, value: &impl serde::Serialize) -> PyResult<
     pythonize::pythonize(py, value)
         .map(Bound::unbind)
         .map_err(|_| PyRuntimeError::new_err("failed to encode canonical JSON value"))
+}
+
+fn python_protocol_value<T>(value: &Bound<'_, PyAny>, label: &str) -> PyResult<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value: Value = pythonize::depythonize(value)
+        .map_err(|error| PyValueError::new_err(format!("invalid {label}: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| PyValueError::new_err(format!("invalid {label}: {error}")))
+}
+
+fn python_protocol_principal(
+    principal: Option<Bound<'_, PyAny>>,
+) -> PyResult<Option<ProtocolPrincipal>> {
+    principal
+        .as_ref()
+        .map(|value| python_protocol_value(value, "A2A principal"))
+        .transpose()
+}
+
+fn py_protocol_error(error: aikit_core::ProtocolError) -> PyErr {
+    let code = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "protocol_error".into());
+    PyValueError::new_err(format!("{code}: {}", error.message))
+}
+
+/// Thin stateful Python handle over the canonical Rust A2A mapper.
+///
+/// This object maps authenticated A2A operations into governed runtime intents. It is not an A2A
+/// network listener, and its persisted task records are internal mapping state rather than wire
+/// `Task` DTOs.
+#[pyclass(name = "A2aMapper", module = "aikit")]
+struct PyA2aMapper {
+    inner: CoreA2aMapper,
+}
+
+#[pymethods]
+impl PyA2aMapper {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: CoreA2aMapper::new(),
+        }
+    }
+
+    #[staticmethod]
+    fn from_state(state: Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            inner: python_protocol_value(&state, "canonical A2A mapper state")?,
+        })
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        python_json(py, &self.inner)
+    }
+
+    #[pyo3(signature = (message, correlation, principal=None))]
+    fn send_message<'py>(
+        &mut self,
+        py: Python<'py>,
+        message: Bound<'_, PyAny>,
+        correlation: Bound<'_, PyAny>,
+        principal: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let message: A2aMessage = python_protocol_value(&message, "canonical A2A message")?;
+        let correlation: CorrelationIdentity =
+            python_protocol_value(&correlation, "A2A correlation identity")?;
+        let principal = python_protocol_principal(principal)?;
+        let action = self
+            .inner
+            .prepare_send_message(message, correlation, principal.as_ref());
+        python_json(py, &action)
+    }
+
+    #[pyo3(signature = (request, correlation, principal=None))]
+    fn list_tasks<'py>(
+        &self,
+        py: Python<'py>,
+        request: Bound<'_, PyAny>,
+        correlation: Bound<'_, PyAny>,
+        principal: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let request: A2aListTasksRequest =
+            python_protocol_value(&request, "canonical A2A list-tasks request")?;
+        let correlation: CorrelationIdentity =
+            python_protocol_value(&correlation, "A2A correlation identity")?;
+        let principal = python_protocol_principal(principal)?;
+        let action = self
+            .inner
+            .prepare_list_tasks(request, correlation, principal.as_ref());
+        python_json(py, &action)
+    }
+
+    #[pyo3(signature = (task_id, correlation, principal=None))]
+    fn get_task<'py>(
+        &self,
+        py: Python<'py>,
+        task_id: &str,
+        correlation: Bound<'_, PyAny>,
+        principal: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let correlation: CorrelationIdentity =
+            python_protocol_value(&correlation, "A2A correlation identity")?;
+        let principal = python_protocol_principal(principal)?;
+        let action = self
+            .inner
+            .prepare_get_task(task_id, correlation, principal.as_ref());
+        python_json(py, &action)
+    }
+
+    #[pyo3(signature = (task_id, correlation, principal=None))]
+    fn cancel_task<'py>(
+        &mut self,
+        py: Python<'py>,
+        task_id: &str,
+        correlation: Bound<'_, PyAny>,
+        principal: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let correlation: CorrelationIdentity =
+            python_protocol_value(&correlation, "A2A correlation identity")?;
+        let principal = python_protocol_principal(principal)?;
+        let action = self
+            .inner
+            .prepare_cancel_task(task_id, correlation, principal.as_ref());
+        python_json(py, &action)
+    }
+
+    #[pyo3(signature = (task_id, state, status_message=None))]
+    fn transition_task<'py>(
+        &mut self,
+        py: Python<'py>,
+        task_id: &str,
+        state: Bound<'_, PyAny>,
+        status_message: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let state: A2aTaskState = python_protocol_value(&state, "canonical A2A task state")?;
+        self.inner
+            .transition_task(task_id, state, status_message)
+            .map_err(py_protocol_error)?;
+        python_json(py, &self.inner)
+    }
 }
 
 /// Thin stateful binding over the canonical append-only Rust durability engine.
@@ -3569,6 +3714,7 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QueryStream>()?;
     m.add_class::<QueryEventStream>()?;
     m.add_class::<ObjectStream>()?;
+    m.add_class::<PyA2aMapper>()?;
     m.add_class::<PyDurableRun>()?;
     m.add_class::<PyAgent>()?;
     m.add_class::<PyMcpConnection>()?;

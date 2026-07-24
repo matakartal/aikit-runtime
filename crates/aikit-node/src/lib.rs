@@ -25,13 +25,14 @@ use std::sync::{Arc, RwLock};
 use aikit_core::orchestration::{ExecutionContext, Orchestrator, SubagentSpec};
 use aikit_core::{
     evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
-    request_capability_tool, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions,
-    AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
-    AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
-    BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
-    CedarDecisionAdapter, Client as CoreClient, CompactionPolicy, CompatibilityMode,
-    ContainmentPolicy, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode, ErrorInfo,
-    EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
+    request_capability_tool, A2aListTasksRequest, A2aMapper as CoreA2aMapper, A2aMessage,
+    A2aTaskState, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions, AikitError,
+    ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail,
+    BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
+    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, CedarDecisionAdapter,
+    Client as CoreClient, CompactionPolicy, CompatibilityMode, ContainmentPolicy,
+    CorrelationIdentity, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode,
+    ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
     GeneratedText, Governance, GovernanceBinding, GuardedExecutor, GuardrailChain, HookDispatcher,
     HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
     JsonlAuditSink, McpClient, McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message,
@@ -39,13 +40,13 @@ use aikit_core::{
     ModelProfile, NoTools, ObjectOptions, ObjectStream as CoreObjectStream, OpaDecisionAdapter,
     PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument,
     PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext,
-    PromptHookOutcome, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
-    RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig, RunOutcome, RunRecorder,
-    RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator,
-    Session, SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore,
-    StdioTransport, StopContext, StreamDelta, StreamEvent, StreamEventEncoder,
-    StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter, ToolSpec, TraceInput,
-    WebTools,
+    PromptHookOutcome, ProtocolError, ProtocolPrincipal, ProviderOptions, RegexBlocklist,
+    RetryPolicy, RouteRequest, RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig,
+    RunOutcome, RunRecorder, RunState, RunTerminalStatus, Sandbox, SecretRedactor,
+    SemanticValidation, SemanticValidator, Session, SessionStore, SessionStoreError,
+    SqliteMemoryStore, SqliteSessionStore, StdioTransport, StopContext, StreamDelta, StreamEvent,
+    StreamEventEncoder, StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter, ToolSpec,
+    TraceInput, WebTools,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -793,6 +794,238 @@ fn node_command_outcome_value(outcome: aikit_core::CommandOutcome) -> Result<Val
         aikit_core::CommandOutcome::Cancelled { sequence } => {
             Ok(serde_json::json!({"type": "cancelled", "sequence": sequence}))
         }
+    }
+}
+
+fn invalid_a2a_input(label: &str, error: impl std::fmt::Display) -> Error {
+    Error::new(Status::InvalidArg, format!("invalid {label}: {error}"))
+}
+
+const A2A_NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+fn normalize_a2a_safe_u64(value: &mut Value, path: &str) -> Result<()> {
+    let Some(number) = value.as_number() else {
+        return Err(invalid_a2a_input(
+            "A2A mapper state",
+            format!("{path} must be a non-negative safe integer number"),
+        ));
+    };
+
+    let normalized = if let Some(value) = number.as_u64() {
+        value
+    } else if let Some(value) = number.as_i64() {
+        u64::try_from(value).map_err(|_| {
+            invalid_a2a_input(
+                "A2A mapper state",
+                format!("{path} must be a non-negative safe integer number"),
+            )
+        })?
+    } else {
+        let value = number.as_f64().ok_or_else(|| {
+            invalid_a2a_input(
+                "A2A mapper state",
+                format!("{path} must be a non-negative safe integer number"),
+            )
+        })?;
+        if value < 0.0 || value.fract() != 0.0 || value > A2A_NODE_MAX_SAFE_INTEGER as f64 {
+            return Err(invalid_a2a_input(
+                "A2A mapper state",
+                format!("{path} must be a non-negative safe integer number"),
+            ));
+        }
+        value as u64
+    };
+
+    if normalized > A2A_NODE_MAX_SAFE_INTEGER {
+        return Err(invalid_a2a_input(
+            "A2A mapper state",
+            format!("{path} must be a non-negative safe integer number"),
+        ));
+    }
+    *value = Value::Number(normalized.into());
+    Ok(())
+}
+
+fn normalize_a2a_mapper_state_numbers(mut state: Value) -> Result<Value> {
+    let Some(root) = state.as_object_mut() else {
+        return Ok(state);
+    };
+
+    for field in ["next_sequence", "revision"] {
+        if let Some(value) = root.get_mut(field) {
+            normalize_a2a_safe_u64(value, field)?;
+        }
+    }
+    if let Some(tasks) = root.get_mut("tasks").and_then(Value::as_object_mut) {
+        for (task_id, task) in tasks {
+            let Some(task) = task.as_object_mut() else {
+                continue;
+            };
+            for field in ["created_revision", "updated_revision"] {
+                if let Some(value) = task.get_mut(field) {
+                    normalize_a2a_safe_u64(value, &format!("tasks.{task_id}.{field}"))?;
+                }
+            }
+        }
+    }
+    if let Some(receipts) = root.get_mut("receipts").and_then(Value::as_object_mut) {
+        for (receipt_id, receipt) in receipts {
+            let Some(receipt) = receipt.as_object_mut() else {
+                continue;
+            };
+            if let Some(value) = receipt.get_mut("accepted_revision") {
+                normalize_a2a_safe_u64(value, &format!("receipts.{receipt_id}.accepted_revision"))?;
+            }
+        }
+    }
+
+    Ok(state)
+}
+
+fn decode_a2a_correlation(value: Value) -> Result<CorrelationIdentity> {
+    serde_json::from_value(value).map_err(|error| invalid_a2a_input("A2A correlation", error))
+}
+
+fn decode_a2a_principal(value: Option<Value>) -> Result<Option<ProtocolPrincipal>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| invalid_a2a_input("A2A principal", error))
+}
+
+fn a2a_protocol_error(error: ProtocolError) -> Error {
+    let code = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    Error::new(
+        Status::InvalidArg,
+        format!("A2A protocol error ({code}): {}", error.message),
+    )
+}
+
+/// Thin Node projection of the canonical, transport-neutral Rust A2A mapper.
+#[napi(js_name = "A2aMapper")]
+pub struct A2aMapper {
+    inner: CoreA2aMapper,
+}
+
+impl Default for A2aMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[napi]
+impl A2aMapper {
+    #[napi(constructor)]
+    pub fn new() -> Self {
+        Self {
+            inner: CoreA2aMapper::new(),
+        }
+    }
+
+    #[napi(factory)]
+    pub fn from_state(state: Value) -> Result<Self> {
+        let state = normalize_a2a_mapper_state_numbers(state)?;
+        let inner = serde_json::from_value(state)
+            .map_err(|error| invalid_a2a_input("A2A mapper state", error))?;
+        Ok(Self { inner })
+    }
+
+    #[napi]
+    pub fn snapshot(&self) -> Result<Value> {
+        serde_json::to_value(&self.inner)
+            .map_err(|_| Error::from_reason("failed to encode A2A mapper state"))
+    }
+
+    #[napi]
+    pub fn send_message(
+        &mut self,
+        message: Value,
+        correlation: Value,
+        principal: Option<Value>,
+    ) -> Result<Value> {
+        let message: A2aMessage = serde_json::from_value(message)
+            .map_err(|error| invalid_a2a_input("A2A message", error))?;
+        let correlation = decode_a2a_correlation(correlation)?;
+        let principal = decode_a2a_principal(principal)?;
+        serde_json::to_value(self.inner.prepare_send_message(
+            message,
+            correlation,
+            principal.as_ref(),
+        ))
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+    }
+
+    #[napi]
+    pub fn list_tasks(
+        &self,
+        request: Value,
+        correlation: Value,
+        principal: Option<Value>,
+    ) -> Result<Value> {
+        let request: A2aListTasksRequest = serde_json::from_value(request)
+            .map_err(|error| invalid_a2a_input("A2A list-tasks request", error))?;
+        let correlation = decode_a2a_correlation(correlation)?;
+        let principal = decode_a2a_principal(principal)?;
+        serde_json::to_value(self.inner.prepare_list_tasks(
+            request,
+            correlation,
+            principal.as_ref(),
+        ))
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+    }
+
+    #[napi]
+    pub fn get_task(
+        &self,
+        task_id: String,
+        correlation: Value,
+        principal: Option<Value>,
+    ) -> Result<Value> {
+        let correlation = decode_a2a_correlation(correlation)?;
+        let principal = decode_a2a_principal(principal)?;
+        serde_json::to_value(
+            self.inner
+                .prepare_get_task(&task_id, correlation, principal.as_ref()),
+        )
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+    }
+
+    #[napi]
+    pub fn cancel_task(
+        &mut self,
+        task_id: String,
+        correlation: Value,
+        principal: Option<Value>,
+    ) -> Result<Value> {
+        let correlation = decode_a2a_correlation(correlation)?;
+        let principal = decode_a2a_principal(principal)?;
+        serde_json::to_value(self.inner.prepare_cancel_task(
+            &task_id,
+            correlation,
+            principal.as_ref(),
+        ))
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+    }
+
+    #[napi]
+    pub fn transition_task(
+        &mut self,
+        task_id: String,
+        state: String,
+        status_message: Option<String>,
+    ) -> Result<Value> {
+        let state: A2aTaskState = serde_json::from_value(Value::String(state))
+            .map_err(|error| invalid_a2a_input("A2A task state", error))?;
+        self.inner
+            .transition_task(&task_id, state, status_message)
+            .map_err(a2a_protocol_error)?;
+        serde_json::to_value(&self.inner)
+            .map_err(|_| Error::from_reason("failed to encode A2A mapper state"))
     }
 }
 

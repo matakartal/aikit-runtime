@@ -1,15 +1,16 @@
 use aikit::{
-    run_agent, ActiveContainmentBackend, Agent, AgentOptions, ApprovalDecision, ApprovalRequest,
-    AuditEvent, AuditTrail, BackendSelector, BudgetLedger, BudgetLimits, BudgetPolicy,
-    BuiltinTools, CancellationToken, Client, CompatibilityMode, ContainmentPolicy,
-    ContainmentRequirement, ContentBlock, DockerConfig, ExecutionContext, FailureHookOutcome,
-    Governance, HookDispatcher, HookMatcher, HookOutcome, InMemoryAuditSink, InMemorySessionStore,
-    MediaSource, Message, MockProvider, ModelCatalog, ModelPricing, ModelProfile,
-    ModelRouteRequirements, NoTools, ObjectOptions, ObjectStreamEvent, Orchestrator,
-    PermissionEngine, PermissionMode, PermissionUpdate, PostToolOutcome, PromptHookOutcome,
-    ProviderOptions, RetryPolicy, RouteObjective, RouteRequest, RoutingOptions, Rule, RunConfig,
-    RunOutcome, RunRecorder, Sandbox, StreamDelta, SubagentSpec, ToolApprover, ToolExecutor,
-    ToolSpec,
+    run_agent, A2aAction, A2aListTasksRequest, A2aMapper, A2aMessage, A2aPart, A2aRole,
+    ActiveContainmentBackend, Agent, AgentOptions, ApprovalDecision, ApprovalRequest, AuditEvent,
+    AuditTrail, BackendSelector, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
+    CancellationToken, Client, CompatibilityMode, ContainmentPolicy, ContainmentRequirement,
+    ContentBlock, CorrelationIdentity, DockerConfig, ExecutionContext, FailureHookOutcome,
+    Governance, GovernanceAuthorization, HookDispatcher, HookMatcher, HookOutcome,
+    InMemoryAuditSink, InMemorySessionStore, MediaSource, Message, MockProvider, ModelCatalog,
+    ModelPricing, ModelProfile, ModelRouteRequirements, NoTools, ObjectOptions, ObjectStreamEvent,
+    Orchestrator, PermissionEngine, PermissionMode, PermissionUpdate, PostToolOutcome,
+    PromptHookOutcome, ProtocolPrincipal, ProviderOptions, RetryPolicy, RouteObjective,
+    RouteRequest, RoutingOptions, Rule, RunConfig, RunOutcome, RunRecorder, Sandbox, StreamDelta,
+    SubagentSpec, ToolApprover, ToolExecutor, ToolSpec,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -1087,6 +1088,153 @@ async fn input_facts() -> Value {
     })
 }
 
+fn a2a_correlation(sequence: u8) -> CorrelationIdentity {
+    CorrelationIdentity::new(
+        format!("a2a-correlation-{sequence}"),
+        format!("a2a-request-{sequence}"),
+    )
+    .expect("valid deterministic A2A correlation")
+}
+
+fn a2a_principal(tenant: &str) -> ProtocolPrincipal {
+    ProtocolPrincipal::new("shared-agent", ["a2a:message:send", "a2a:tasks:read"])
+        .and_then(|principal| principal.with_tenant(tenant))
+        .expect("valid deterministic A2A principal")
+}
+
+fn a2a_send(
+    mapper: &mut A2aMapper,
+    message_id: &str,
+    sequence: u8,
+    principal: &ProtocolPrincipal,
+) -> aikit::A2aRunMapping {
+    let action = mapper.prepare_send_message(
+        A2aMessage {
+            message_id: message_id.into(),
+            context_id: Some("shared-context".into()),
+            task_id: None,
+            role: A2aRole::User,
+            parts: vec![A2aPart::Text {
+                text: message_id.into(),
+            }],
+            metadata: BTreeMap::new(),
+        },
+        a2a_correlation(sequence),
+        Some(principal),
+    );
+    match action.action().expect("authorized deterministic A2A send") {
+        A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
+        other => panic!("expected A2A dispatch action, got {other:?}"),
+    }
+}
+
+fn a2a_facts() -> Value {
+    let tenant_a = a2a_principal("tenant-a");
+    let tenant_b = a2a_principal("tenant-b");
+    let mut mapper = A2aMapper::new();
+
+    let tenant_a_first = a2a_send(&mut mapper, "tenant-a-message-1", 1, &tenant_a);
+    let tenant_b_only = a2a_send(&mut mapper, "tenant-b-message-1", 2, &tenant_b);
+    let tenant_a_second = a2a_send(&mut mapper, "tenant-a-message-2", 3, &tenant_a);
+
+    let first = mapper.prepare_list_tasks(
+        A2aListTasksRequest {
+            tenant: Some("tenant-a".into()),
+            page_size: Some(1),
+            ..A2aListTasksRequest::default()
+        },
+        a2a_correlation(4),
+        Some(&tenant_a),
+    );
+    let first_page = match first.action().expect("authorized first A2A page") {
+        A2aAction::ListTasks { page } => page.clone(),
+        other => panic!("expected first A2A list action, got {other:?}"),
+    };
+
+    let snapshot = serde_json::to_value(&mapper).expect("serializable A2A mapper state");
+    let restored: A2aMapper =
+        serde_json::from_value(snapshot.clone()).expect("restorable A2A mapper state");
+    let snapshot_equal = serde_json::to_value(&restored).expect("restored A2A state") == snapshot;
+
+    let second = restored.prepare_list_tasks(
+        A2aListTasksRequest {
+            tenant: Some("tenant-a".into()),
+            page_size: Some(1),
+            page_token: Some(first_page.next_page_token.clone()),
+            ..A2aListTasksRequest::default()
+        },
+        a2a_correlation(5),
+        Some(&tenant_a),
+    );
+    let second_page = match second.action().expect("authorized second A2A page") {
+        A2aAction::ListTasks { page } => page,
+        other => panic!("expected second A2A list action, got {other:?}"),
+    };
+
+    let tenant_b_page = mapper.prepare_list_tasks(
+        A2aListTasksRequest {
+            tenant: Some("tenant-b".into()),
+            ..A2aListTasksRequest::default()
+        },
+        a2a_correlation(6),
+        Some(&tenant_b),
+    );
+    let tenant_b_total = match tenant_b_page
+        .action()
+        .expect("authorized tenant B A2A page")
+    {
+        A2aAction::ListTasks { page } => page.total_size,
+        other => panic!("expected tenant B A2A list action, got {other:?}"),
+    };
+
+    let denied = restored.prepare_list_tasks(
+        A2aListTasksRequest {
+            tenant: Some("tenant-b".into()),
+            ..A2aListTasksRequest::default()
+        },
+        a2a_correlation(7),
+        Some(&tenant_a),
+    );
+    let (denied_status, denied_code) = match &denied.envelope.authorization {
+        GovernanceAuthorization::Denied { code, .. } => ("denied", enum_name(code)),
+        GovernanceAuthorization::Allowed => panic!("cross-tenant A2A list was authorized"),
+    };
+
+    let first_ids = first_page
+        .tasks
+        .iter()
+        .map(|task| task.mapping.task_id.clone())
+        .collect::<Vec<_>>();
+    let second_ids = second_page
+        .tasks
+        .iter()
+        .map(|task| task.mapping.task_id.clone())
+        .collect::<Vec<_>>();
+
+    json!({
+        "context_isolation": {
+            "same_context_id": tenant_a_first.context_id == tenant_b_only.context_id,
+            "sessions_distinct": tenant_a_first.session_id != tenant_b_only.session_id,
+            "tenant_a_session_reused": tenant_a_first.session_id == tenant_a_second.session_id,
+            "tenant_a_tasks": first_page.total_size,
+            "tenant_b_tasks": tenant_b_total,
+        },
+        "pagination": {
+            "cursor_present": !first_page.next_page_token.is_empty(),
+            "final_cursor_empty": second_page.next_page_token.is_empty(),
+            "first_page_ids": first_ids,
+            "page_size": first_page.page_size,
+            "second_page_ids": second_ids,
+            "total_size": first_page.total_size,
+        },
+        "restore": { "snapshot_equal": snapshot_equal },
+        "security": {
+            "cross_tenant_code": denied_code,
+            "cross_tenant_status": denied_status,
+        },
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit("governance", governance_facts().await)?;
@@ -1096,5 +1244,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit("orchestration", orchestration_facts().await)?;
     emit("builtins", builtins_facts().await?)?;
     emit("input", input_facts().await)?;
+    emit("a2a", a2a_facts())?;
     Ok(())
 }

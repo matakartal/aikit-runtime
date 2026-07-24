@@ -823,6 +823,194 @@ export type DurableCommandResult =
   | { type: "rewound"; checkpoint_id: string; sequence: number }
   | { type: "cancelled"; sequence: number };
 
+export type A2aTaskState =
+  | "TASK_STATE_SUBMITTED"
+  | "TASK_STATE_WORKING"
+  | "TASK_STATE_INPUT_REQUIRED"
+  | "TASK_STATE_AUTH_REQUIRED"
+  | "TASK_STATE_COMPLETED"
+  | "TASK_STATE_FAILED"
+  | "TASK_STATE_CANCELED"
+  | "TASK_STATE_REJECTED";
+
+export type A2aRole = "ROLE_USER" | "ROLE_AGENT";
+
+export type A2aPart =
+  | { kind: "text"; text: string }
+  | { kind: "data"; data: JsonValue }
+  | { kind: "file"; uri: string; media_type: string };
+
+export interface A2aMessage {
+  message_id: string;
+  context_id?: string;
+  task_id?: string;
+  role: A2aRole;
+  parts: A2aPart[];
+  metadata?: Record<string, JsonValue>;
+}
+
+export interface A2aCorrelationIdentity {
+  correlation_id: string;
+  request_id: string;
+  session_id?: string;
+  run_id?: string;
+}
+
+export interface A2aProtocolPrincipal {
+  subject: string;
+  tenant_id?: string;
+  scopes?: string[];
+}
+
+export interface A2aListTasksRequest {
+  tenant?: string;
+  contextId?: string;
+  status?: A2aTaskState;
+  pageSize?: number;
+  pageToken?: string;
+}
+
+export interface A2aRunMapping {
+  context_id: string;
+  session_id: string;
+  task_id: string;
+  run_id: string;
+  message_id: string;
+}
+
+/** Internal canonical mapper record. This is not an official A2A wire Task DTO. */
+export interface A2aTaskRecord {
+  mapping: A2aRunMapping;
+  state: A2aTaskState;
+  owner_subject: string;
+  owner_tenant_id?: string;
+  /** Positive JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
+  created_revision: number;
+  /** Positive JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
+  updated_revision: number;
+  status_message?: string;
+}
+
+/** Internal canonical mapper receipt. This is not an official A2A wire DTO. */
+export interface A2aMessageReceipt {
+  message: A2aMessage;
+  mapping: A2aRunMapping;
+  owner_subject: string;
+  owner_tenant_id?: string;
+  /** Positive JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
+  accepted_revision: number;
+}
+
+export interface A2aTaskPage {
+  tasks: A2aTaskRecord[];
+  nextPageToken: string;
+  pageSize: number;
+  totalSize: number;
+}
+
+export type A2aAction =
+  | {
+      kind: "dispatch_message";
+      message: A2aMessage;
+      mapping: A2aRunMapping;
+      resumed_from: A2aTaskState | null;
+    }
+  | { kind: "duplicate_message"; receipt: A2aMessageReceipt }
+  | { kind: "get_task"; task: A2aTaskRecord }
+  | { kind: "list_tasks"; page: A2aTaskPage }
+  | { kind: "cancel_task"; task: A2aTaskRecord };
+
+export type A2aGovernanceAuthorization =
+  | { status: "allowed" }
+  | {
+      status: "denied";
+      code:
+        | "invalid_request"
+        | "missing_principal"
+        | "missing_scope"
+        | "principal_mismatch"
+        | "unknown_target"
+        | "state_conflict"
+        | "invalid_approval"
+        | "duplicate_conflict";
+      reason: string;
+    };
+
+export interface A2aGovernanceEnvelope {
+  schema_version: number;
+  protocol: "a2a";
+  correlation: A2aCorrelationIdentity;
+  principal?: A2aProtocolPrincipal;
+  operation: string;
+  target: string;
+  required_scopes: string[];
+  authorization: A2aGovernanceAuthorization;
+}
+
+export type A2aGovernedAction =
+  | {
+      envelope: A2aGovernanceEnvelope & { authorization: { status: "allowed" } };
+      action: A2aAction;
+    }
+  | {
+      envelope: A2aGovernanceEnvelope & {
+        authorization: Extract<A2aGovernanceAuthorization, { status: "denied" }>;
+      };
+      /** Omitted when authorization or mapper validation denies the request. */
+      action?: never;
+    };
+
+/**
+ * Serializable internal mapper state for local persistence and restore only.
+ * Its owner indexes, task records, and receipts must never be used as A2A wire DTOs.
+ */
+export interface A2aMapperState {
+  schema_version: number;
+  contexts: Record<string, string>;
+  context_owners: Record<string, { subject: string; tenant_id?: string }>;
+  tasks: Record<string, A2aTaskRecord>;
+  receipts: Record<string, A2aMessageReceipt>;
+  /** Positive JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
+  next_sequence: number;
+  /** Non-negative JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
+  revision: number;
+}
+
+/**
+ * Canonical, transport-neutral mapping backed by the shared Rust core.
+ * This class does not start an A2A HTTP/gRPC listener or project official wire responses.
+ */
+export class A2aMapper {
+  constructor();
+  static fromState(state: A2aMapperState): A2aMapper;
+  snapshot(): A2aMapperState;
+  sendMessage(
+    message: A2aMessage,
+    correlation: A2aCorrelationIdentity,
+    principal?: A2aProtocolPrincipal,
+  ): A2aGovernedAction;
+  listTasks(
+    request: A2aListTasksRequest,
+    correlation: A2aCorrelationIdentity,
+    principal?: A2aProtocolPrincipal,
+  ): A2aGovernedAction;
+  getTask(
+    taskId: string,
+    correlation: A2aCorrelationIdentity,
+    principal?: A2aProtocolPrincipal,
+  ): A2aGovernedAction;
+  cancelTask(
+    taskId: string,
+    correlation: A2aCorrelationIdentity,
+    principal?: A2aProtocolPrincipal,
+  ): A2aGovernedAction;
+  transitionTask(
+    taskId: string,
+    state: A2aTaskState,
+    statusMessage?: string,
+  ): A2aMapperState;
+}
+
 /** Stateful wrapper over the canonical append-only Rust durability engine. */
 export class DurableRun {
   constructor(sessionId: string, runId: string, durability?: DurabilityMode);

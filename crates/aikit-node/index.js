@@ -665,6 +665,7 @@ class DurableRun {
 }
 
 module.exports = {
+  A2aMapper: native.A2aMapper,
   Agent: native.Agent,
   Client: native.Client,
   DurableRun,

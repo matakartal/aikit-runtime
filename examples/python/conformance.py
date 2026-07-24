@@ -739,6 +739,100 @@ async def builtins_facts():
                 "status": child["status"],
             },
         }
+
+
+def a2a_facts():
+    def correlation(sequence):
+        return {
+            "correlation_id": f"a2a-correlation-{sequence}",
+            "request_id": f"a2a-request-{sequence}",
+        }
+
+    def principal(tenant):
+        return {
+            "subject": "shared-agent",
+            "tenant_id": tenant,
+            "scopes": ["a2a:message:send", "a2a:tasks:read"],
+        }
+
+    mapper = aikit.A2aMapper()
+    tenant_a = principal("tenant-a")
+    tenant_b = principal("tenant-b")
+
+    def send(message_id, sequence, actor):
+        result = mapper.send_message(
+            {
+                "message_id": message_id,
+                "context_id": "shared-context",
+                "role": "ROLE_USER",
+                "parts": [{"kind": "text", "text": message_id}],
+            },
+            correlation(sequence),
+            actor,
+        )
+        assert result["envelope"]["authorization"]["status"] == "allowed"
+        assert result["action"]["kind"] == "dispatch_message"
+        return result["action"]["mapping"]
+
+    tenant_a_first = send("tenant-a-message-1", 1, tenant_a)
+    tenant_b_only = send("tenant-b-message-1", 2, tenant_b)
+    tenant_a_second = send("tenant-a-message-2", 3, tenant_a)
+
+    first = mapper.list_tasks(
+        {"tenant": "tenant-a", "pageSize": 1}, correlation(4), tenant_a
+    )
+    first_page = first["action"]["page"]
+    snapshot = mapper.snapshot()
+    restored = aikit.A2aMapper.from_state(snapshot)
+    snapshot_equal = restored.snapshot() == snapshot
+    second = restored.list_tasks(
+        {
+            "tenant": "tenant-a",
+            "pageSize": 1,
+            "pageToken": first_page["nextPageToken"],
+        },
+        correlation(5),
+        tenant_a,
+    )
+    second_page = second["action"]["page"]
+    tenant_b_page = mapper.list_tasks(
+        {"tenant": "tenant-b"}, correlation(6), tenant_b
+    )["action"]["page"]
+    denied = restored.list_tasks(
+        {"tenant": "tenant-b"}, correlation(7), tenant_a
+    )
+
+    return {
+        "context_isolation": {
+            "same_context_id": tenant_a_first["context_id"]
+            == tenant_b_only["context_id"],
+            "sessions_distinct": tenant_a_first["session_id"]
+            != tenant_b_only["session_id"],
+            "tenant_a_session_reused": tenant_a_first["session_id"]
+            == tenant_a_second["session_id"],
+            "tenant_a_tasks": first_page["totalSize"],
+            "tenant_b_tasks": tenant_b_page["totalSize"],
+        },
+        "pagination": {
+            "cursor_present": bool(first_page["nextPageToken"]),
+            "final_cursor_empty": second_page["nextPageToken"] == "",
+            "first_page_ids": [
+                task["mapping"]["task_id"] for task in first_page["tasks"]
+            ],
+            "page_size": first_page["pageSize"],
+            "second_page_ids": [
+                task["mapping"]["task_id"] for task in second_page["tasks"]
+            ],
+            "total_size": first_page["totalSize"],
+        },
+        "restore": {"snapshot_equal": snapshot_equal},
+        "security": {
+            "cross_tenant_code": denied["envelope"]["authorization"]["code"],
+            "cross_tenant_status": denied["envelope"]["authorization"]["status"],
+        },
+    }
+
+
 async def main():
     emit("governance", await governance_facts())
     emit("structured", await structured_facts())
@@ -747,6 +841,7 @@ async def main():
     emit("orchestration", await orchestration_facts())
     emit("builtins", await builtins_facts())
     emit("input", await input_facts())
+    emit("a2a", a2a_facts())
 
 
 if __name__ == "__main__":

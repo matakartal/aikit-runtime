@@ -6,6 +6,8 @@
 //! no protocol adapter executes a provider or tool directly.
 
 pub mod a2a;
+pub mod a2a_journal;
+pub mod a2a_transport;
 pub mod acp;
 pub mod common;
 pub mod mcp;
@@ -14,6 +16,8 @@ pub mod mcp_sqlite;
 pub mod mcp_transport;
 
 pub use a2a::*;
+pub use a2a_journal::*;
+pub use a2a_transport::*;
 pub use acp::*;
 pub use common::*;
 pub use mcp::*;

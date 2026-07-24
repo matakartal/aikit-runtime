@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-pub const PROTOCOL_CONTRACT_VERSION: u32 = 1;
+pub const PROTOCOL_CONTRACT_VERSION: u32 = 2;
 
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
@@ -173,6 +173,7 @@ impl ProtocolPrincipal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernanceDenialCode {
+    InvalidRequest,
     MissingPrincipal,
     MissingScope,
     PrincipalMismatch,
@@ -223,18 +224,26 @@ impl GovernanceEnvelope {
         target: impl Into<String>,
         required_scopes: BTreeSet<String>,
     ) -> Self {
-        let authorization = match principal {
-            None => GovernanceAuthorization::Denied {
+        let invalid_identity = correlation
+            .validate()
+            .err()
+            .or_else(|| principal.and_then(|value| value.validate().err()));
+        let authorization = match (invalid_identity, principal) {
+            (Some(error), _) => GovernanceAuthorization::Denied {
+                code: GovernanceDenialCode::InvalidRequest,
+                reason: error.message,
+            },
+            (None, None) => GovernanceAuthorization::Denied {
                 code: GovernanceDenialCode::MissingPrincipal,
                 reason: "authenticated principal is required".into(),
             },
-            Some(principal) if !principal.allows(&required_scopes) => {
+            (None, Some(principal)) if !principal.allows(&required_scopes) => {
                 GovernanceAuthorization::Denied {
                     code: GovernanceDenialCode::MissingScope,
                     reason: "principal lacks a required protocol scope".into(),
                 }
             }
-            Some(_) => GovernanceAuthorization::Allowed,
+            (None, Some(_)) => GovernanceAuthorization::Allowed,
         };
         Self {
             schema_version: PROTOCOL_CONTRACT_VERSION,
@@ -294,8 +303,14 @@ impl<T> GovernedAction<T> {
             (GovernanceAuthorization::Allowed, Some(action)) => Ok((self.envelope, action)),
             (GovernanceAuthorization::Denied { code, reason }, _) => Err(ProtocolError::new(
                 match code {
+                    GovernanceDenialCode::InvalidRequest => ProtocolErrorCode::InvalidRequest,
                     GovernanceDenialCode::MissingPrincipal => ProtocolErrorCode::Unauthorized,
-                    _ => ProtocolErrorCode::Forbidden,
+                    GovernanceDenialCode::MissingScope
+                    | GovernanceDenialCode::PrincipalMismatch => ProtocolErrorCode::Forbidden,
+                    GovernanceDenialCode::UnknownTarget => ProtocolErrorCode::NotFound,
+                    GovernanceDenialCode::StateConflict
+                    | GovernanceDenialCode::InvalidApproval
+                    | GovernanceDenialCode::DuplicateConflict => ProtocolErrorCode::Conflict,
                 },
                 reason,
             )),

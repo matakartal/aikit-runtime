@@ -5,7 +5,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { Agent, Client } = require("../../crates/aikit-node");
+const { A2aMapper, Agent, Client } = require("../../crates/aikit-node");
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -666,6 +666,96 @@ async function builtinsFacts() {
   }
 }
 
+function a2aFacts() {
+  const correlation = (sequence) => ({
+    correlation_id: `a2a-correlation-${sequence}`,
+    request_id: `a2a-request-${sequence}`,
+  });
+  const principal = (tenant) => ({
+    subject: "shared-agent",
+    tenant_id: tenant,
+    scopes: ["a2a:message:send", "a2a:tasks:read"],
+  });
+
+  const mapper = new A2aMapper();
+  const tenantA = principal("tenant-a");
+  const tenantB = principal("tenant-b");
+  const send = (messageId, sequence, actor) => {
+    const result = mapper.sendMessage(
+      {
+        message_id: messageId,
+        context_id: "shared-context",
+        role: "ROLE_USER",
+        parts: [{ kind: "text", text: messageId }],
+      },
+      correlation(sequence),
+      actor,
+    );
+    if (result.envelope.authorization.status !== "allowed") {
+      throw new Error("deterministic A2A send was denied");
+    }
+    if (result.action.kind !== "dispatch_message") {
+      throw new Error(`expected A2A dispatch, got ${result.action.kind}`);
+    }
+    return result.action.mapping;
+  };
+
+  const tenantAFirst = send("tenant-a-message-1", 1, tenantA);
+  const tenantBOnly = send("tenant-b-message-1", 2, tenantB);
+  const tenantASecond = send("tenant-a-message-2", 3, tenantA);
+  const firstPage = mapper.listTasks(
+    { tenant: "tenant-a", pageSize: 1 },
+    correlation(4),
+    tenantA,
+  ).action.page;
+  const snapshot = mapper.snapshot();
+  const restored = A2aMapper.fromState(snapshot);
+  const snapshotEqual =
+    JSON.stringify(canonical(restored.snapshot())) === JSON.stringify(canonical(snapshot));
+  const secondPage = restored.listTasks(
+    {
+      tenant: "tenant-a",
+      pageSize: 1,
+      pageToken: firstPage.nextPageToken,
+    },
+    correlation(5),
+    tenantA,
+  ).action.page;
+  const tenantBPage = mapper.listTasks(
+    { tenant: "tenant-b" },
+    correlation(6),
+    tenantB,
+  ).action.page;
+  const denied = restored.listTasks(
+    { tenant: "tenant-b" },
+    correlation(7),
+    tenantA,
+  );
+
+  return {
+    context_isolation: {
+      same_context_id: tenantAFirst.context_id === tenantBOnly.context_id,
+      sessions_distinct: tenantAFirst.session_id !== tenantBOnly.session_id,
+      tenant_a_session_reused: tenantAFirst.session_id === tenantASecond.session_id,
+      tenant_a_tasks: firstPage.totalSize,
+      tenant_b_tasks: tenantBPage.totalSize,
+    },
+    pagination: {
+      cursor_present: firstPage.nextPageToken !== "",
+      final_cursor_empty: secondPage.nextPageToken === "",
+      first_page_ids: firstPage.tasks.map((task) => task.mapping.task_id),
+      page_size: firstPage.pageSize,
+      second_page_ids: secondPage.tasks.map((task) => task.mapping.task_id),
+      total_size: firstPage.totalSize,
+    },
+    restore: { snapshot_equal: snapshotEqual },
+    security: {
+      cross_tenant_code: denied.envelope.authorization.code,
+      cross_tenant_status: denied.envelope.authorization.status,
+    },
+  };
+}
+
 async function main() {
   emit("governance", await governanceFacts());
   emit("structured", await structuredFacts());
@@ -674,6 +764,7 @@ async function main() {
   emit("state", await stateFacts());
   emit("orchestration", await orchestrationFacts());
   emit("builtins", await builtinsFacts());
+  emit("a2a", a2aFacts());
 }
 
 main().catch((error) => {
