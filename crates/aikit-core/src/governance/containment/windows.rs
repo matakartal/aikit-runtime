@@ -92,6 +92,12 @@ pub(super) fn prepare(
             .prefix("aikit-windows-job-")
             .tempdir()
             .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+        let control_temp = artifacts.path().join("control-temp");
+        std::fs::create_dir(&control_temp).map_err(|error| {
+            AikitError::Sandbox(format!(
+                "cannot create private Windows launcher temp directory: {error}"
+            ))
+        })?;
         let environment_file = artifacts.path().join("workload.env");
         write_workload_environment(&environment_file, environment)?;
         let script = encode_powershell(WINDOWS_JOB_LAUNCHER);
@@ -113,6 +119,7 @@ pub(super) fn prepare(
                 workspace,
                 &system,
                 environment_file,
+                control_temp,
                 limits,
             ),
             cleanup: None,
@@ -215,6 +222,7 @@ fn job_environment(
     workspace: std::path::PathBuf,
     system: &WindowsSystemPaths,
     environment_file: std::path::PathBuf,
+    control_temp: std::path::PathBuf,
     limits: ContainmentLimits,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     use std::ffi::OsString;
@@ -231,6 +239,11 @@ fn job_environment(
             system.root.clone().into_os_string(),
         ),
         (OsString::from("PATH"), system.path.clone()),
+        (
+            OsString::from("TEMP"),
+            control_temp.clone().into_os_string(),
+        ),
+        (OsString::from("TMP"), control_temp.into_os_string()),
         (OsString::from("AIKIT_JOB_COMMAND"), OsString::from(command)),
         (
             OsString::from("AIKIT_JOB_WORKDIR"),
@@ -347,6 +360,7 @@ $processes = [uint32]$env:AIKIT_JOB_PROCESS_LIMIT; $memory = [uint64]$env:AIKIT_
 $environmentFile = $env:AIKIT_JOB_ENV_FILE
 $env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null; $env:AIKIT_JOB_SHELL = $null
 $env:AIKIT_JOB_PROCESS_LIMIT = $null; $env:AIKIT_JOB_MEMORY_LIMIT = $null; $env:AIKIT_JOB_ENV_FILE = $null
+$env:TEMP = $null; $env:TMP = $null
 if (![String]::IsNullOrWhiteSpace($environmentFile)) {
   Get-Content -LiteralPath $environmentFile -Encoding ASCII | ForEach-Object {
     $parts = $_ -split "`t", 2
@@ -413,6 +427,8 @@ mod tests {
             "AIKIT_JOB_PROCESS_LIMIT",
             "AIKIT_JOB_MEMORY_LIMIT",
             "AIKIT_JOB_ENV_FILE",
+            "TEMP",
+            "TMP",
         ] {
             assert!(
                 WINDOWS_JOB_LAUNCHER.contains(&format!("$env:{variable} = $null")),
@@ -421,6 +437,13 @@ mod tests {
         }
         assert!(WINDOWS_JOB_LAUNCHER.contains("Get-Content -LiteralPath $environmentFile"));
         assert!(WINDOWS_JOB_LAUNCHER.contains("SetEnvironmentVariable($key, $value, 'Process')"));
+        let add_type = WINDOWS_JOB_LAUNCHER.find("Add-Type").unwrap();
+        let temp_scrub = WINDOWS_JOB_LAUNCHER.find("$env:TEMP = $null").unwrap();
+        let workload_environment = WINDOWS_JOB_LAUNCHER
+            .find("Get-Content -LiteralPath")
+            .unwrap();
+        assert!(add_type < temp_scrub);
+        assert!(temp_scrub < workload_environment);
     }
 
     #[test]
@@ -448,11 +471,14 @@ mod tests {
             std::path::PathBuf::from("/w"),
             &system,
             std::path::PathBuf::from(r"C:\private\workload.env"),
+            std::path::PathBuf::from(r"C:\private\control-temp"),
             ContainmentLimits::default(),
         );
         assert_eq!(lookup(&environment, "SystemRoot"), r"C:\Windows");
         assert_eq!(lookup(&environment, "WINDIR"), r"C:\Windows");
         assert!(lookup(&environment, "PATH").contains("WindowsPowerShell"));
+        assert_eq!(lookup(&environment, "TEMP"), r"C:\private\control-temp");
+        assert_eq!(lookup(&environment, "TMP"), r"C:\private\control-temp");
         assert!(system
             .powershell
             .to_string_lossy()
@@ -471,6 +497,7 @@ mod tests {
                 std::path::PathBuf::from("/w"),
                 &system,
                 std::path::PathBuf::from(r"C:\private\workload.env"),
+                std::path::PathBuf::from(r"C:\private\control-temp"),
                 ContainmentLimits {
                     max_processes: Some(max),
                     ..Default::default()
@@ -479,5 +506,19 @@ mod tests {
         };
         assert_eq!(lookup(&custom(16), "AIKIT_JOB_PROCESS_LIMIT"), "16");
         assert_eq!(lookup(&custom(0), "AIKIT_JOB_PROCESS_LIMIT"), "1");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn native_job_probe_compiles_launcher_in_private_temp_and_completes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            capability(Some(workspace.path())),
+        )
+        .await
+        .expect("native Windows Job probe exceeded its bounded deadline");
+
+        assert!(result.available, "{}", result.detail);
     }
 }
