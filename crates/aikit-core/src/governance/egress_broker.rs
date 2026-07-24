@@ -836,7 +836,7 @@ pub(crate) fn ipv6_destination_is_public(address: Ipv6Addr) -> bool {
         // 2001::/23 is non-global unless a more-specific IANA allocation says otherwise.
         let protocol_anycast = segments[1] == 0x0001
             && segments[2..7].iter().all(|segment| *segment == 0)
-            && matches!(segments[7], 0x0001 | 0x0002 | 0x0003);
+            && matches!(segments[7], 0x0001..=0x0003);
         let amt = segments[1] == 0x0003;
         let as112 = segments[1] == 0x0004 && segments[2] == 0x0112;
         let orchid_v2 = segments[1] & 0xfff0 == 0x0020;

@@ -3326,9 +3326,8 @@ impl A2aHttpJsonRpcServer {
         let version = match self.snapshots.load_serialized_snapshot().await {
             Ok(Some(stored_snapshot)) => {
                 let stored_version = stored_snapshot.version();
-                let stored_mapper = stored_snapshot.decode().map_err(|error| {
+                let stored_mapper = stored_snapshot.decode().inspect_err(|error| {
                     self.fail_stop_snapshot(error.clone());
-                    error
                 })?;
                 if stored_version.revision != live.revision() || stored_mapper != live {
                     let error = ProtocolError::conflict(
@@ -17982,8 +17981,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .err()
-            .expect("exact SendMessage retry served a stale fast-path result");
+            .expect_err("exact SendMessage retry served a stale fast-path result");
         assert!(send_error
             .message
             .contains("durable snapshot head diverged"));
@@ -18038,8 +18036,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .err()
-            .expect("exact CancelTask retry served a stale fast-path result");
+            .expect_err("exact CancelTask retry served a stale fast-path result");
         assert!(cancel_error
             .message
             .contains("durable snapshot head diverged"));
