@@ -41,10 +41,12 @@ identity, registry ownership, or another operating system.
   hooks, provider or tool work. Activity inputs persist as hashes, replay outputs are size-bounded
   verbatim data, and each normal resume has a distinct audit invocation identity. Async/Exit and a
   real distributed worker remain open.
-- Durability schema v2 prevents newly written failed or cancelled runs from retaining a running
-  activity. Version 1 snapshots and database rows remain readable and are upgraded on their next
-  write. Cooperative cancellation is persisted as `Cancelled` only when it is unambiguous and no
-  activity remains running; otherwise the run remains available for reconciliation.
+- Durability schema v3 adds `ActivityAttemptCancelled` while retaining v2's rule that a newly
+  written terminal run cannot keep a running activity. v1/v2 snapshots and database rows remain
+  readable and migrate to v3 on their next write. v2 and older readers cannot safely consume v3,
+  so rolling upgrades require new readers before v3 writers and cannot safely downgrade after a
+  v3 write. Cooperative cancellation is persisted as `Cancelled` only when it is unambiguous and
+  no activity remains running; otherwise the run remains available for reconciliation.
 - A feature-gated PostgreSQL store adds transactional row-lock/revision CAS, and the Temporal
   reference adapter deterministically maps activity, retry, idempotency and reconciliation state.
 - Working, episodic, and semantic memory planes preserve provenance and use CAS rather than
@@ -119,7 +121,8 @@ cover the current durable outbox and pending-event fields.
   delta journal into production persistence, plus ACP editor/CLI integration; remove the pinned
   TCK waivers only when upstream fixes land, and add MCP SDK/OAuth conformance.
 - Longer fuzz/chaos campaigns and multi-platform signing proof.
-- crates.io/PyPI/npm ownership, publication authority, published packages and rollback rehearsal.
+- crates.io and npm first-release ownership bootstraps, trusted-publisher authority, PyPI
+  ownership, published packages and rollback rehearsal.
 
 No missing external gate is converted into a synthetic pass. See
 [`PARITY-MATRIX.md`](PARITY-MATRIX.md) for row-level status and exact upstream pins.

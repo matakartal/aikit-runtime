@@ -56,9 +56,12 @@ All notable changes to this project will be documented in this file. The format 
   provider/tool/audit effects stop for reconciliation under the durable run/audit identity. It is
   CAS-backed in-process coordination with one executor invocation per validated in-process
   attempt, not an exactly-once or distributed-execution guarantee.
-- Durability schema v2 prevents newly written failed or cancelled runs from retaining a running
-  activity; v1 snapshots and database rows remain readable until their next write. Cooperative
-  cancellation is persisted as `Cancelled` only for an unambiguous stop with no running activity.
+- Durability schema v3 adds the unambiguous `ActivityAttemptCancelled` event while retaining v2's
+  terminal-activity invariants. v1/v2 snapshots and database rows remain readable, replay under
+  their historical rules, and migrate to v3 on the next write. v2 and older readers cannot safely
+  consume v3 events, so rolling upgrades must update readers before enabling v3 writes and must not
+  downgrade after a v3 write. Cooperative cancellation is persisted as `Cancelled` only for an
+  unambiguous stop with no running activity.
 - Persisted two-phase `RunStopped` delivery: an intent is saved before fail-closed audit delivery
   and acceptance after every sink accepts. If the terminal CAS later fails, restart reuses that
   acceptance and retries only terminal persistence; ambiguous audit effects require reconciliation.
@@ -169,6 +172,24 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- A2A host dispatches use exact dispatch/attempt fences, restart and read paths verify the
+  linearizable durable head before serving, and cancellation/single-flight cleanup remains
+  restart-safe across aborted owners and competing processes.
+- Durable fork/rewind localizes inherited checkpoint boundaries, reconciles inherited non-pure
+  activities, records explicit cancellation in schema v3, and keeps memory/SQLite revisions,
+  validation, and concurrent writes fail-closed and equivalent.
+- Provider streams preserve nonzero billed usage before every terminal error, enforce bounded
+  retained/repair state, reject malformed media/tool/structured-output sequences, and atomically
+  own provider-native schema fields without caller-option leakage.
+- Containment separates trusted host-wrapper and untrusted workload environments, verifies Docker
+  cleanup ownership, validates Linux seccomp ABIs, preserves IPv6 authority/DNS pinning, and uses
+  inode-revalidated atomic replacement for jailed file writes instead of raceable truncation.
+- Python and Node A2A mutations are snapshot-size transactional, expose reconcile-pending
+  recovery, validate exact attempts consistently, and preserve safe durable `u64` values without
+  coercing arbitrary JSON payload numbers.
+- Release helpers reject dirty candidate sources, distinguish missing/transient/conflicting
+  registry state, verify exact artifacts and tags, and fail closed until the one-time crates.io/npm
+  ownership bootstraps are completed.
 - Python and Node A2A mapper tests now track snapshot schema version 4 and exercise exact-message
   idempotency without bypassing unsettled event delivery. Their public snapshot types include the
   durable dispatch, cancellation, and event maps actually returned by the runtime.

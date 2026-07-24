@@ -67,13 +67,15 @@ Python and Node expose `DurableRun`; Rust uses `RunState`. Importing a snapshot 
 its event log, so a caller-modified projection is rejected. Every external activity must declare a
 side-effect class and idempotency key where required. AIKit does not promise exactly-once delivery.
 
-Durability schema version 2 prevents newly written failed or cancelled runs from retaining a
-running activity attempt. Version 1 snapshots and SQLite/PostgreSQL rows remain readable: their
-historical events replay with version 1 semantics, then the in-memory state and the next persisted
-write use version 2. Do not rewrite old event versions in place; they identify the validation rules
-under which those append-only events were originally accepted. Cooperative cancellation now writes
-`Cancelled` only when no activity is running and the stop is unambiguous; an ambiguous stop stays
-available for reconciliation instead.
+Durability schema version 3 adds the unambiguous `ActivityAttemptCancelled` event and retains
+version 2's terminal-activity invariant. Version 1 and 2 snapshots and SQLite/PostgreSQL rows remain
+readable: historical events replay under their original rules, then the in-memory state and next
+persisted write use version 3. Do not rewrite old event versions in place; they identify the
+validation rules under which those append-only events were originally accepted. Version 2 and
+older readers cannot safely consume version 3 events: deploy new readers before enabling version 3
+writes, and do not roll back to an older reader after any version 3 write. Cooperative cancellation
+now writes `ActivityAttemptCancelled` only when no activity is running and the stop is unambiguous;
+an ambiguous stop stays available for reconciliation instead.
 
 If an external request may have completed before its checkpoint committed, reconcile it explicitly;
 do not retry it blindly. Rewind does not reverse external systems, and fork creates a separate run
@@ -124,7 +126,8 @@ Rust, Python and Node now expose the same canonical `A2aMapper`, including subje
 task listing and bounded cursor pagination. Direct Rust callers must pass an `A2aListTasksRequest`;
 Python uses `list_tasks`, and Node uses `listTasks`.
 
-Governance envelopes now use protocol contract version `2`. The new version preserves
+Separately from durability schema v3, governance envelopes use protocol contract version `2`. This
+protocol version preserves
 `invalid_request` as a first-class denial code instead of folding malformed identity/message input
 into a generic conflict/forbidden result. Consumers that deserialize the denial enum exhaustively
 must add this value before accepting version 2 envelopes.
