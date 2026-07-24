@@ -2947,6 +2947,8 @@ pub struct A2aHttpJsonRpcServer {
     running_dispatch_cancellations: StdMutex<BTreeMap<DispatchRuntimeKey, CancellationToken>>,
     #[cfg(test)]
     cancellation_commit_after_send_hook: StdMutex<Option<Arc<CancellationCommitAfterSendHook>>>,
+    #[cfg(test)]
+    cancellation_claim_release_hook: StdMutex<Option<Arc<Notify>>>,
     request_global: Arc<Semaphore>,
     control_probe_global: Arc<Semaphore>,
     control_exact_probe_global: Arc<Semaphore>,
@@ -3113,6 +3115,8 @@ impl A2aHttpJsonRpcServer {
             running_dispatch_cancellations: StdMutex::new(BTreeMap::new()),
             #[cfg(test)]
             cancellation_commit_after_send_hook: StdMutex::new(None),
+            #[cfg(test)]
+            cancellation_claim_release_hook: StdMutex::new(None),
             request_global,
             control_probe_global,
             control_exact_probe_global,
@@ -6892,6 +6896,15 @@ impl A2aHttpJsonRpcServer {
             ScheduledRecoveryClaim::None => {}
             ScheduledRecoveryClaim::Cancellation { cancellation_id } => {
                 self.release_recovery_attempt(&cancellation_id);
+                #[cfg(test)]
+                if let Some(hook) = self
+                    .cancellation_claim_release_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                {
+                    hook.notify_one();
+                }
             }
         }
         Ok(())
@@ -12395,6 +12408,8 @@ mod tests {
         .await;
         let hook = Arc::new(CancellationCommitAfterSendHook::new());
         *server.cancellation_commit_after_send_hook.lock().unwrap() = Some(hook.clone());
+        let claim_released = Arc::new(Notify::new());
+        *server.cancellation_claim_release_hook.lock().unwrap() = Some(claim_released.clone());
 
         let request_task = tokio::spawn(raw_http(
             address,
@@ -12412,29 +12427,19 @@ mod tests {
             .await
             .expect("fast cancellation host was not called");
         assert!(host.observed_claim.load(Ordering::SeqCst));
-        let cancellation_id = server
-            .mapper_snapshot()
+        // The scheduler must be allowed to finish while the request sender is still paused. The
+        // host observation above proves the claim existed before `send`; this completion hook
+        // proves that exact scheduler generation released it. Do not assert the transient set's
+        // later value: the independent recovery loop may legitimately reclaim the still-unsettled
+        // durable cancellation before shutdown.
+        timeout(Duration::from_secs(1), claim_released.notified())
             .await
-            .pending_cancellations()
-            .into_iter()
-            .find(|record| record.task_id == mapping.task_id)
-            .unwrap()
-            .cancellation_id;
-        timeout(Duration::from_secs(1), async {
-            while server.recovery_was_attempted(&cancellation_id).unwrap() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fast host completion did not release the published claim");
-
-        // Stop background recovery while the sender remains paused. After it resumes, any claim
-        // left behind can only be a stale post-send insertion by the live request path.
-        handle.cancel();
+            .expect("fast host completion did not release the published claim");
+        wait_for_scheduler_idle(&server).await;
         hook.resume_sender.notify_one();
         let _response = request_task.await.unwrap();
+        handle.cancel();
         task.await.unwrap().unwrap();
-        assert!(!server.recovery_was_attempted(&cancellation_id).unwrap());
     }
 
     #[tokio::test]

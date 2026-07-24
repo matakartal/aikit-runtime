@@ -6,6 +6,7 @@ from typing_extensions import assert_type
 from pydantic import BaseModel
 
 from aikit import (
+    A2aMapper,
     AikitError,
     Agent,
     ApprovalRequest,
@@ -71,6 +72,11 @@ from aikit import (
     validate_media_input,
     validate_model_profile,
 )
+
+a2a_state = A2aMapper().snapshot()
+assert_type(a2a_state["dispatch_outbox"], dict[str, JsonValue])
+assert_type(a2a_state["cancellation_outbox"], dict[str, JsonValue])
+assert_type(a2a_state["pending_events"], dict[str, JsonValue])
 
 if TYPE_CHECKING:
     McpConnection()  # type: ignore[call-arg]  # factory-only native handle

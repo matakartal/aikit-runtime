@@ -169,6 +169,11 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Python and Node A2A mapper tests now track snapshot schema version 4 and exercise exact-message
+  idempotency without bypassing unsettled event delivery. Their public snapshot types include the
+  durable dispatch, cancellation, and event maps actually returned by the runtime.
+- The cancellation claim publish-order race test now observes the exact scheduler-generation
+  release instead of racing the independent background recovery loop under full-suite load.
 - A2A contexts are owner-scoped, so the same wire `context_id` can map to independent sessions in
   different tenants; message receipts are scoped by subject and tenant as well. Versioned restore
   migrates pre-scoping alpha keys and rejects inconsistent task, owner, receipt, revision, or

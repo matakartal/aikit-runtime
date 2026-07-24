@@ -35,6 +35,7 @@ import {
   type DurableApproval,
   type DurableApprovalRequest,
   type GovernanceBinding,
+  type JsonValue,
   type McpToolFilter,
   type ObjectStream,
   type OutputPart,
@@ -248,9 +249,15 @@ const a2aPage = a2a.listTasks(
 const a2aState: A2aMapperState = a2a.snapshot();
 const a2aRestored: A2aMapper = A2aMapper.fromState(a2aState);
 const a2aNextSequence: number = a2aRestored.snapshot().next_sequence;
+const a2aDispatchOutbox: Record<string, JsonValue> = a2aState.dispatch_outbox;
+const a2aCancellationOutbox: Record<string, JsonValue> = a2aState.cancellation_outbox;
+const a2aPendingEvents: Record<string, JsonValue> = a2aState.pending_events;
 void a2aPage;
 void a2aState;
 void a2aNextSequence;
+void a2aDispatchOutbox;
+void a2aCancellationOutbox;
+void a2aPendingEvents;
 // @ts-expect-error persisted A2A counters are JavaScript numbers, not bigint values
 A2aMapper.fromState({ ...a2aState, next_sequence: 1n });
 // @ts-expect-error A2A list request uses camelCase field names in Node

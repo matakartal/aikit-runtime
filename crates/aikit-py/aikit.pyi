@@ -1537,6 +1537,9 @@ class A2aMapperState(TypedDict):
     context_owners: Dict[str, A2aContextOwner]
     tasks: Dict[str, A2aTaskRecord]
     receipts: Dict[str, A2aMessageReceipt]
+    dispatch_outbox: Dict[str, JsonValue]
+    cancellation_outbox: Dict[str, JsonValue]
+    pending_events: Dict[str, JsonValue]
     next_sequence: int
     revision: int
 

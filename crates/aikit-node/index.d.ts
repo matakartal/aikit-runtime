@@ -970,6 +970,12 @@ export interface A2aMapperState {
   context_owners: Record<string, { subject: string; tenant_id?: string }>;
   tasks: Record<string, A2aTaskRecord>;
   receipts: Record<string, A2aMessageReceipt>;
+  /** Opaque durable host-dispatch records; persist but do not project as A2A wire DTOs. */
+  dispatch_outbox: Record<string, JsonValue>;
+  /** Opaque durable cancellation controls; persist but do not expose as protocol responses. */
+  cancellation_outbox: Record<string, JsonValue>;
+  /** Opaque durable event-delivery intents retained for snapshot/restore. */
+  pending_events: Record<string, JsonValue>;
   /** Positive JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */
   next_sequence: number;
   /** Non-negative JavaScript safe integer, at most Number.MAX_SAFE_INTEGER. */

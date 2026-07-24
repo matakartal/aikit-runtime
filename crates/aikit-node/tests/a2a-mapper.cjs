@@ -3,6 +3,8 @@
 const assert = require("node:assert/strict");
 const { A2aMapper } = require("..");
 
+const EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 4;
+
 const mapper = new A2aMapper();
 const tenantA = {
   subject: "agent-1",
@@ -76,12 +78,12 @@ assert.equal(tenantBPage.action.page.totalSize, 1);
 assert.equal(tenantBPage.action.page.tasks[0].mapping.task_id, tenantBOnly);
 
 const snapshot = mapper.snapshot();
-assert.equal(snapshot.schema_version, 2);
+assert.equal(snapshot.schema_version, EXPECTED_A2A_MAPPER_SCHEMA_VERSION);
 const restored = A2aMapper.fromState(snapshot);
 assert.deepEqual(restored.snapshot(), snapshot);
 
 for (const safeInteger of [2 ** 32, Number.MAX_SAFE_INTEGER]) {
-  // Use an empty schema-v2 snapshot so the numeric boundary check does not invalidate the
+  // Use an empty current-schema snapshot so the numeric boundary check does not invalidate the
   // immutable hashes and revision bindings of durable dispatch/event records.
   const highRevisionState = {
     ...new A2aMapper().snapshot(),
@@ -134,7 +136,7 @@ const transitionedState = restored.transitionTask(
   "TASK_STATE_COMPLETED",
   "done",
 );
-assert.equal(transitionedState.schema_version, 2);
+assert.equal(transitionedState.schema_version, EXPECTED_A2A_MAPPER_SCHEMA_VERSION);
 assert.deepEqual(transitionedState, restored.snapshot());
 const completed = restored.getTask(
   tenantAFirst,
@@ -244,27 +246,18 @@ for (const [index, waitingState] of [
   "TASK_STATE_AUTH_REQUIRED",
 ].entries()) {
   const fenceMapper = new A2aMapper();
+  const initialMessage = {
+    message_id: `cancel-fence-initial-${index}`,
+    context_id: `cancel-fence-context-${index}`,
+    role: "ROLE_USER",
+    parts: [{ kind: "text", text: `initial-${index}` }],
+  };
   const initial = fenceMapper.sendMessage(
-    {
-      message_id: `cancel-fence-initial-${index}`,
-      context_id: `cancel-fence-context-${index}`,
-      role: "ROLE_USER",
-      parts: [{ kind: "text", text: `initial-${index}` }],
-    },
+    initialMessage,
     correlation(`cancel-fence-initial-${index}`),
     tenantA,
   );
   assert.equal(initial.action.kind, "dispatch_message");
-  const acceptedRetry = targetedMessage(
-    `cancel-fence-accepted-${index}`,
-    initial.action.mapping,
-  );
-  const accepted = fenceMapper.sendMessage(
-    acceptedRetry,
-    correlation(`cancel-fence-accepted-${index}`),
-    tenantA,
-  );
-  assert.equal(accepted.action.kind, "dispatch_message");
 
   if (waitingState !== "TASK_STATE_WORKING") {
     fenceMapper.transitionTask(
@@ -286,7 +279,7 @@ for (const [index, waitingState] of [
   const beforeSnapshot = fenceMapper.snapshot();
   const beforeBytes = serializedState(fenceMapper);
   const exactRetry = fenceMapper.sendMessage(
-    acceptedRetry,
+    initialMessage,
     correlation(`cancel-fence-exact-retry-${index}`),
     tenantA,
   );

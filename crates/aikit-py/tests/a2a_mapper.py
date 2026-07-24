@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from aikit import A2aMapper
 
+EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 4
+
 if TYPE_CHECKING:
     from aikit import (
         A2aAction,
@@ -101,7 +103,7 @@ def main() -> None:
     assert page["nextPageToken"]
 
     snapshot = mapper.snapshot()
-    assert snapshot["schema_version"] == 2
+    assert snapshot["schema_version"] == EXPECTED_A2A_MAPPER_SCHEMA_VERSION
     restored = A2aMapper.from_state(snapshot)
     assert restored.snapshot() == snapshot
 
@@ -131,7 +133,7 @@ def main() -> None:
     transitioned = restored.transition_task(
         first_task, "TASK_STATE_COMPLETED", "finished"
     )
-    assert transitioned["schema_version"] == 2
+    assert transitioned["schema_version"] == EXPECTED_A2A_MAPPER_SCHEMA_VERSION
     assert transitioned["tasks"][first_task]["state"] == "TASK_STATE_COMPLETED"
     assert transitioned == restored.snapshot()
     try:
@@ -299,17 +301,6 @@ def main() -> None:
             fence_message, correlation(20 + index * 10), tenant_a
         )
         initial_action = cast("A2aDispatchMessageAction", allowed_action(initial))
-        accepted_retry = targeted_message(
-            f"cancel-fence-accepted-{index}", initial_action["mapping"]
-        )
-        assert (
-            allowed_action(
-                fence_mapper.send_message(
-                    accepted_retry, correlation(21 + index * 10), tenant_a
-                )
-            )["kind"]
-            == "dispatch_message"
-        )
         if waiting_state != "TASK_STATE_WORKING":
             fence_mapper.transition_task(
                 initial_action["mapping"]["task_id"],
@@ -330,7 +321,7 @@ def main() -> None:
         before_snapshot = cast(Any, fence_mapper.snapshot())
         before_bytes = serialized_state(fence_mapper)
         exact_retry = fence_mapper.send_message(
-            accepted_retry, correlation(23 + index * 10), tenant_a
+            fence_message, correlation(23 + index * 10), tenant_a
         )
         assert allowed_action(exact_retry)["kind"] == "duplicate_message"
         assert fence_mapper.snapshot() == before_snapshot
