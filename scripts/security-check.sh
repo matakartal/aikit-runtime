@@ -168,17 +168,7 @@ PY
 }
 
 check_provenance() {
-  local unpinned_actions
-
-  unpinned_actions="$(
-    grep -RhE '^[[:space:]]*-[[:space:]]*uses:' .github/workflows \
-      | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' \
-      || true
-  )"
-  if [ -n "$unpinned_actions" ]; then
-    printf 'ERROR workflow actions must use immutable commit SHAs:\n%s\n' "$unpinned_actions" >&2
-    exit 1
-  fi
+  ./scripts/check-workflow-pins.sh
   if grep -RqsE '^[[:space:]]*pull_request_target:' .github/workflows; then
     printf 'ERROR pull_request_target is forbidden for this repository security model\n' >&2
     exit 1
@@ -193,7 +183,9 @@ check_provenance() {
   grep -Fq 'attestations: write' .github/workflows/release.yml
   grep -Fq 'subject-path:' .github/workflows/release.yml
   grep -Fq 'dist/release/SHA256SUMS' .github/workflows/release.yml
-  grep -Fq 'sha256sum -c SHA256SUMS' .github/workflows/release.yml
+  grep -Fq './scripts/verify-checksum-manifest.py dist/release' .github/workflows/release.yml
+  grep -Fq -- '--source-ref "$GITHUB_REF"' .github/workflows/publish.yml
+  grep -Fq 'SOURCE_REF_PROTECTED' .github/workflows/publish.yml
   pass "release provenance, checksum, least-privilege, and immutable-action contracts"
 }
 

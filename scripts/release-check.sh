@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 usage() {
   printf '%s\n' \
     "usage: $0 [--candidate]" \
+    "       $0 --assert-clean-source <checkout-directory>" \
     "       $0 --assert-native <target> <native-addon>" \
     "       $0 --assert-wheel <target> <wheel-directory>" \
     "       $0 --assert-bundle <bundle-directory>" >&2
@@ -15,6 +16,28 @@ usage() {
 
 workspace_version() {
   awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml
+}
+
+release_source_is_clean() {
+  local checkout="$1"
+  local status_output
+
+  git -C "$checkout" rev-parse --verify HEAD >/dev/null 2>&1 || return 1
+  status_output="$(
+    git -C "$checkout" status \
+      --porcelain=v1 --untracked-files=all --ignore-submodules=none 2>/dev/null
+  )" || return 1
+  [ -z "$status_output" ]
+}
+
+assert_clean_source() {
+  local checkout="$1"
+  if release_source_is_clean "$checkout"; then
+    printf 'PASS  release candidate source is a clean Git checkout: %s\n' "$checkout"
+    return 0
+  fi
+  printf 'FAIL  release candidate source must be a clean Git checkout: %s\n' "$checkout" >&2
+  return 1
 }
 
 assert_native() {
@@ -148,6 +171,7 @@ files = {
     for path in root.rglob("*")
     if path.is_file()
 }
+files_without_checksum = files - {"SHA256SUMS"}
 fixed = {
     f"source-packages/aikit-runtime-core-{version}.crate",
     "source-packages/aikit-runtime-files.txt",
@@ -158,8 +182,8 @@ fixed = {
     f"node-linux-x64-gnu/aikit-runtime-linux-x64-gnu-{version}.tgz",
     f"node-win32-x64-msvc/aikit-runtime-win32-x64-msvc-{version}.tgz",
 }
-missing = sorted(fixed - files)
-remaining = set(files - fixed)
+missing = sorted(fixed - files_without_checksum)
+remaining = set(files_without_checksum - fixed)
 
 wheel_prefix = rf"aikit_runtime-{re.escape(wheel_version)}-cp39-abi3-"
 wheel_patterns = {
@@ -195,6 +219,11 @@ MODE="${1:---candidate}"
 case "$MODE" in
   --candidate)
     [ "$#" -le 1 ] || usage
+    ;;
+  --assert-clean-source)
+    [ "$#" -eq 2 ] || usage
+    assert_clean_source "$2"
+    exit 0
     ;;
   --assert-native)
     [ "$#" -eq 3 ] || usage
@@ -280,8 +309,11 @@ release_tag="v${cargo_version}"
 head_commit="$(git rev-parse HEAD 2>/dev/null || true)"
 repository_is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || true)"
 source_is_clean=false
-if [ -n "$head_commit" ] && [ -z "$(git status --porcelain --untracked-files=normal)" ]; then
+if [ -n "$head_commit" ] && release_source_is_clean "."; then
   source_is_clean=true
+  pass "release candidate source is a clean Git checkout"
+else
+  fail "release candidate source must be a clean Git checkout"
 fi
 
 if [ "$repository_is_shallow" = false ]; then
@@ -331,15 +363,10 @@ else
   fail "source-first distribution path is not documented"
 fi
 
-unpinned_actions="$(
-  grep -RhE '^[[:space:]]*-[[:space:]]*uses:' .github/workflows \
-    | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' \
-    || true
-)"
-if [ -z "$unpinned_actions" ]; then
+if workflow_pin_output="$(./scripts/check-workflow-pins.sh 2>&1)"; then
   pass "GitHub Actions dependencies are pinned to immutable commits"
 else
-  fail "workflow actions must use full commit SHAs: $unpinned_actions"
+  fail "$workflow_pin_output"
 fi
 
 for architecture in x86_64 aarch64; do
@@ -351,10 +378,81 @@ for architecture in x86_64 aarch64; do
 done
 
 if grep -Fq 'cd dist/release' .github/workflows/release.yml \
-  && grep -Fq 'sha256sum -c SHA256SUMS' .github/workflows/release.yml; then
-  pass "artifact checksums are relative to and verifiable from the bundle root"
+  && grep -Fq './scripts/verify-checksum-manifest.py dist/release' .github/workflows/release.yml; then
+  pass "artifact checksums are path-safe and exactly cover the release bundle"
 else
-  fail "artifact checksum manifest is not self-verifying from the bundle root"
+  fail "artifact checksum manifest lacks strict path and exact-coverage verification"
+fi
+
+if grep -Fq 'SOURCE_REF_PROTECTED' .github/workflows/publish.yml \
+  && grep -Fq 'refs/heads/$DEFAULT_BRANCH' .github/workflows/publish.yml \
+  && grep -Fq -- '--source-ref "$GITHUB_REF"' .github/workflows/publish.yml; then
+  pass "registry publishing is bound to the protected default branch and attested source ref"
+else
+  fail "registry publishing lacks protected-source or attestation source-ref binding"
+fi
+
+if grep -Fq 'publish-crate-idempotent.sh' .github/workflows/publish.yml \
+  && grep -Fq 'wait-crate-version.sh' .github/workflows/publish.yml \
+  && grep -Fq 'publish-npm-idempotent.sh' .github/workflows/publish.yml \
+  && grep -Fq 'prepare-pypi-publish.py' .github/workflows/publish.yml; then
+  pass "prepared registry publishers are checksum-aware and resumable"
+else
+  fail "prepared registry publishers lack resumable exact-integrity helpers"
+fi
+
+if python3 - <<'PY'
+import pathlib
+
+workflow = pathlib.Path(".github/workflows/publish.yml").read_text(encoding="utf-8")
+bootstrap = workflow.find("./scripts/require-crates-oidc-bootstrap.sh")
+oidc = workflow.find("rust-lang/crates-io-auth-action@")
+if bootstrap < 0 or oidc < 0 or bootstrap > oidc:
+    raise SystemExit(1)
+PY
+then
+  pass "crates.io owner bootstrap is checked before requesting an OIDC token"
+else
+  fail "crates.io OIDC publishing lacks a pre-auth first-release bootstrap gate"
+fi
+
+if grep -Fq 'One-time crates.io ownership bootstrap' docs/RELEASE.md \
+  && grep -Fq 'OIDC trusted publishing cannot create their first release' docs/RELEASE.md; then
+  pass "manual crates.io first-release ownership bootstrap is documented"
+else
+  fail "crates.io first-release ownership bootstrap runbook is missing"
+fi
+
+if python3 - <<'PY'
+import pathlib
+
+workflow = pathlib.Path(".github/workflows/publish.yml").read_text(encoding="utf-8")
+npm_job = workflow.find("\n  npm:")
+bootstrap = workflow.find("./scripts/require-npm-oidc-bootstrap.sh", npm_job)
+download = workflow.find("Download and verify the exact assembled release bundle", npm_job)
+if npm_job < 0 or bootstrap < npm_job or download < 0 or bootstrap > download:
+    raise SystemExit(1)
+PY
+then
+  pass "npm owner bootstrap is checked before artifact download or trusted publishing"
+else
+  fail "npm trusted publishing lacks a fail-fast first-release bootstrap gate"
+fi
+
+if grep -Fq 'One-time npm ownership bootstrap' docs/RELEASE.md \
+  && grep -Fq 'trusted publishers are configured from an existing package' docs/RELEASE.md \
+  && grep -Fq 'npm publish "$PLATFORM_TARBALL" --tag "$TAG"' docs/RELEASE.md \
+  && grep -Fq 'npm dist-tag add <package>@<version> <derived-tag>' docs/RELEASE.md; then
+  pass "manual npm first-release ownership bootstrap is documented"
+else
+  fail "npm first-release ownership bootstrap runbook is missing"
+fi
+
+if grep -Fq 'group: registry-publish' .github/workflows/publish.yml \
+  && grep -Fq 'cancel-in-progress: false' .github/workflows/publish.yml; then
+  pass "registry publication dispatches are serialized without cancelling an active publish"
+else
+  fail "registry publication workflow lacks non-cancelling serialization"
 fi
 
 if [ "$cargo_version" = "0.0.0" ]; then

@@ -27,6 +27,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: registry-publish
+  cancel-in-progress: false
+
 jobs:
   guard:
     name: Publishing is prepared but disabled
@@ -36,11 +40,27 @@ jobs:
         env:
           PUBLISH_ENABLED: ${{ vars.REGISTRY_PUBLISH_ENABLED }}
           ACKNOWLEDGE: ${{ inputs.acknowledge }}
+          SOURCE_EVENT: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REF_PROTECTED: ${{ github.ref_protected }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ "$PUBLISH_ENABLED" != "true" ] || [ "$ACKNOWLEDGE" != "PUBLISH" ]; then
             echo "Registry publishing is intentionally disabled; see docs/RELEASE.md." >&2
             exit 1
           fi
+          test "$SOURCE_EVENT" = workflow_dispatch || {
+            echo "registry publishing requires an explicit workflow_dispatch event" >&2
+            exit 1
+          }
+          test "$SOURCE_REF_PROTECTED" = true || {
+            echo "registry publishing requires a protected source ref" >&2
+            exit 1
+          }
+          test "$SOURCE_REF" = "refs/heads/$DEFAULT_BRANCH" || {
+            echo "registry publishing is restricted to the protected default branch" >&2
+            exit 1
+          }
 
   crates:
     name: Publish Rust crates (crates.io trusted publishing)
@@ -61,14 +81,24 @@ jobs:
           toolchain: "1.97.1"
       - name: Candidate gates must pass on the exact publish source
         run: ./scripts/release-check.sh --candidate
+      - name: Refuse OIDC until both crate names have an owner bootstrap
+        run: ./scripts/require-crates-oidc-bootstrap.sh aikit-runtime-core aikit-runtime
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
-      - name: Publish the core, then the facade once the index can resolve it
+      - name: Publish the core, then the facade once Cargo resolves the exact registry artifact
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          cargo publish -p aikit-runtime-core --locked
-          cargo publish -p aikit-runtime --locked
+          version="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          cargo package -p aikit-runtime-core --locked
+          core_artifact="target/package/aikit-runtime-core-$version.crate"
+          ./scripts/publish-crate-idempotent.sh \
+            aikit-runtime-core "$version" "$core_artifact" -- -p aikit-runtime-core --locked
+          ./scripts/wait-crate-version.sh aikit-runtime-core "$version" "$core_artifact"
+          cargo package -p aikit-runtime --locked
+          facade_artifact="target/package/aikit-runtime-$version.crate"
+          ./scripts/publish-crate-idempotent.sh \
+            aikit-runtime "$version" "$facade_artifact" -- -p aikit-runtime --locked
 
   pypi:
     name: Publish Python wheels (PyPI trusted publisher)
@@ -77,23 +107,44 @@ jobs:
     runs-on: ubuntu-latest
     environment: registry-publish
     permissions:
+      actions: read
+      attestations: read
       contents: read
       id-token: write # PyPI trusted-publisher OIDC
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - name: Download the assembled wheels from the acknowledged release.yml run
+      - name: Download and verify the exact assembled release bundle
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.artifacts_run_id }}
         run: |
           test -n "$RUN_ID" || { echo "artifacts_run_id is required for pypi" >&2; exit 1; }
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist/publish
-          mkdir -p dist/wheels
-          find dist/publish -name '*.whl' -exec mv {} dist/wheels/ \;
+          ./scripts/validate-release-run.sh \
+            "$RUN_ID" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_REPOSITORY"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name source-distribution-bundle --dir dist/release
+          ./scripts/prepare-publish-bundle.sh pypi dist/release dist/wheels
+          signer_workflow="${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          find dist/wheels -type f -name '*.whl' -print0 \
+            | xargs -0 -n 1 gh attestation verify \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
           ls -l dist/wheels
+      - name: Skip exact PyPI files and reject filename checksum conflicts
+        id: pypi_plan
+        run: |
+          ./scripts/prepare-pypi-publish.py dist/wheels dist/wheels-to-publish
+          if find dist/wheels-to-publish -type f -name '*.whl' -print -quit | grep -q .; then
+            echo "has_packages=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_packages=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        if: steps.pypi_plan.outputs.has_packages == 'true'
         with:
-          packages-dir: dist/wheels
+          packages-dir: dist/wheels-to-publish
 
   npm:
     name: Publish npm packages (npm trusted publishing)
@@ -102,6 +153,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: registry-publish
     permissions:
+      actions: read
+      attestations: read
       contents: read
       id-token: write # npm trusted publishing (provenance is automatic with npm >= 11.5.1)
     steps:
@@ -110,22 +163,44 @@ jobs:
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
-      - name: Download the assembled npm tarballs from the acknowledged release.yml run
+      - name: Refuse trusted publishing until all npm packages have an owner bootstrap
+        run: |
+          ./scripts/require-npm-oidc-bootstrap.sh \
+            aikit-runtime \
+            aikit-runtime-darwin-arm64 \
+            aikit-runtime-darwin-x64 \
+            aikit-runtime-linux-arm64-gnu \
+            aikit-runtime-linux-x64-gnu \
+            aikit-runtime-win32-x64-msvc
+      - name: Download and verify the exact assembled release bundle
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.artifacts_run_id }}
         run: |
           test -n "$RUN_ID" || { echo "artifacts_run_id is required for npm" >&2; exit 1; }
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist/publish
-          find dist/publish -name '*.tgz' | sort
+          ./scripts/validate-release-run.sh \
+            "$RUN_ID" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_REPOSITORY"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name source-distribution-bundle --dir dist/release
+          ./scripts/prepare-publish-bundle.sh npm dist/release dist/npm
+          signer_workflow="${GITHUB_SERVER_URL#https://}/$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          find dist/npm -type f -name '*.tgz' -print0 \
+            | xargs -0 -n 1 gh attestation verify \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$signer_workflow" \
+              --source-digest "$GITHUB_SHA" \
+              --source-ref "$GITHUB_REF"
+          find dist/npm -name '*.tgz' | sort
       - name: Publish platform packages first, then the wrapper
         run: |
           wrapper=""
+          version="$(node -p "require('./crates/aikit-node/package.json').version")"
+          tag="$(./scripts/npm-release-tag.sh "$version")"
           while IFS= read -r tarball; do
             case "$tarball" in
               *aikit-runtime-[0-9]*.tgz) wrapper="$tarball" ;;
-              *) npm publish "$tarball" ;;
+              *) ./scripts/publish-npm-idempotent.sh "$tarball" "$tag" ;;
             esac
-          done < <(find dist/publish -name '*.tgz' | sort)
+          done < <(find dist/npm -name '*.tgz' | sort)
           test -n "$wrapper" || { echo "wrapper tarball not found" >&2; exit 1; }
-          npm publish "$wrapper"
+          ./scripts/publish-npm-idempotent.sh "$wrapper" "$tag"
