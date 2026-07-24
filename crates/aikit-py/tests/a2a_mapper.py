@@ -13,6 +13,7 @@ if TYPE_CHECKING:
         A2aAction,
         A2aCorrelationIdentity,
         A2aDispatchMessageAction,
+        A2aDispatchOutboxRecord,
         A2aGovernedAction,
         A2aGovernedActionAllowed,
         A2aListTasksAction,
@@ -58,6 +59,18 @@ def serialized_state(mapper: A2aMapper) -> bytes:
     return json.dumps(
         mapper.snapshot(), sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+
+
+def dispatch_for_task(
+    mapper: A2aMapper, task_id: str
+) -> tuple[str, "A2aDispatchOutboxRecord"]:
+    matches = [
+        (dispatch_id, record)
+        for dispatch_id, record in mapper.snapshot()["dispatch_outbox"].items()
+        if record["task_id"] == task_id and record["state"] != "settled"
+    ]
+    assert len(matches) == 1, matches
+    return matches[0]
 
 
 def allowed_action(result: "A2aGovernedAction") -> "A2aAction":
@@ -130,12 +143,76 @@ def main() -> None:
     assert denied["envelope"]["authorization"]["code"] == "principal_mismatch"
     assert "action" not in denied
 
-    transitioned = restored.transition_task(
-        first_task, "TASK_STATE_COMPLETED", "finished"
+    dispatch_id, queued_dispatch = dispatch_for_task(restored, first_task)
+    assert queued_dispatch["attempts"] == 0
+    claimed = restored.mark_dispatch_running(dispatch_id)
+    first_attempt = claimed["dispatch_outbox"][dispatch_id]["attempts"]
+    assert first_attempt == 1
+    for invalid_attempt in [True, False, 0, -1, 1.5, "1", 9, 2**32 + 1]:
+        before_invalid_attempt = restored.snapshot()
+        try:
+            restored.transition_dispatch_task(
+                dispatch_id,
+                cast(Any, invalid_attempt),
+                "TASK_STATE_WORKING",
+                "must not apply",
+            )
+        except ValueError as error:
+            assert "expected_attempt must be an integer between 1 and 8" in str(error)
+        else:
+            raise AssertionError(
+                f"invalid A2A dispatch attempt {invalid_attempt!r} was accepted"
+            )
+        assert restored.snapshot() == before_invalid_attempt
+    first_progress = restored.transition_dispatch_task(
+        dispatch_id, first_attempt, "TASK_STATE_WORKING", "half complete"
+    )
+    assert first_progress["tasks"][first_task]["status_message"] == "half complete"
+    assert first_progress["dispatch_outbox"][dispatch_id]["state"] == "running"
+    second_progress = restored.transition_dispatch_task(
+        dispatch_id, first_attempt, "TASK_STATE_WORKING", "three quarters complete"
+    )
+    assert (
+        second_progress["tasks"][first_task]["status_message"]
+        == "three quarters complete"
+    )
+    assert second_progress["revision"] > first_progress["revision"]
+    reconcile = restored.mark_dispatch_reconcile_pending(
+        dispatch_id, "Bearer must-never-be-persisted"
+    )
+    assert reconcile["dispatch_outbox"][dispatch_id]["state"] == "reconcile_pending"
+    assert (
+        reconcile["dispatch_outbox"][dispatch_id]["last_error"]
+        == "dispatch requires reconciliation"
+    )
+    assert b"must-never-be-persisted" not in serialized_state(restored)
+    reclaimed = restored.mark_dispatch_running(dispatch_id)
+    current_attempt = reclaimed["dispatch_outbox"][dispatch_id]["attempts"]
+    assert current_attempt == 2
+    before_stale = restored.snapshot()
+    try:
+        restored.transition_dispatch_task(
+            dispatch_id, first_attempt, "TASK_STATE_COMPLETED", "finished"
+        )
+    except ValueError as error:
+        assert "generation is stale" in str(error), error
+    else:
+        raise AssertionError("stale A2A dispatch attempt changed task state")
+    assert restored.snapshot() == before_stale
+
+    transitioned = restored.transition_dispatch_task(
+        dispatch_id, current_attempt, "TASK_STATE_COMPLETED", "finished"
     )
     assert transitioned["schema_version"] == EXPECTED_A2A_MAPPER_SCHEMA_VERSION
     assert transitioned["tasks"][first_task]["state"] == "TASK_STATE_COMPLETED"
+    assert transitioned["dispatch_outbox"][dispatch_id]["state"] == "settled"
     assert transitioned == restored.snapshot()
+    assert (
+        restored.transition_dispatch_task(
+            dispatch_id, current_attempt, "TASK_STATE_COMPLETED", "finished"
+        )
+        == transitioned
+    )
     try:
         restored.transition_task(first_task, "TASK_STATE_WORKING")
     except ValueError as error:
@@ -302,8 +379,16 @@ def main() -> None:
         )
         initial_action = cast("A2aDispatchMessageAction", allowed_action(initial))
         if waiting_state != "TASK_STATE_WORKING":
-            fence_mapper.transition_task(
-                initial_action["mapping"]["task_id"],
+            waiting_dispatch_id, _ = dispatch_for_task(
+                fence_mapper, initial_action["mapping"]["task_id"]
+            )
+            claimed = fence_mapper.mark_dispatch_running(waiting_dispatch_id)
+            waiting_attempt = claimed["dispatch_outbox"][waiting_dispatch_id][
+                "attempts"
+            ]
+            fence_mapper.transition_dispatch_task(
+                waiting_dispatch_id,
+                waiting_attempt,
                 waiting_state,
                 f"waiting-{index}",
             )

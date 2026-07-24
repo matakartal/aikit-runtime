@@ -36,6 +36,14 @@ function serializedState(targetMapper) {
   return Buffer.from(JSON.stringify(targetMapper.snapshot()), "utf8");
 }
 
+function dispatchForTask(targetMapper, taskId) {
+  const matches = Object.entries(targetMapper.snapshot().dispatch_outbox).filter(
+    ([, record]) => record.task_id === taskId && record.state !== "settled",
+  );
+  assert.equal(matches.length, 1, `expected one open dispatch for ${taskId}`);
+  return matches[0];
+}
+
 function send(messageId, principal) {
   const result = mapper.sendMessage(
     {
@@ -131,13 +139,97 @@ assert.equal(secondPage.action.page.tasks.length, 1);
 assert.equal(secondPage.action.page.tasks[0].mapping.task_id, tenantAFirst);
 assert.equal(secondPage.action.page.nextPageToken, "");
 
-const transitionedState = restored.transitionTask(
-  tenantAFirst,
+const [dispatchId, queuedDispatch] = dispatchForTask(restored, tenantAFirst);
+assert.equal(queuedDispatch.attempts, 0);
+const claimedState = restored.markDispatchRunning(dispatchId);
+const firstAttempt = claimedState.dispatch_outbox[dispatchId].attempts;
+assert.equal(firstAttempt, 1);
+for (const invalidAttempt of [
+  Number.NaN,
+  Number.POSITIVE_INFINITY,
+  Number.NEGATIVE_INFINITY,
+  -1,
+  0,
+  1.5,
+  9,
+  2 ** 32 + 1,
+]) {
+  const beforeInvalidAttempt = restored.snapshot();
+  assert.throws(
+    () => restored.transitionDispatchTask(
+      dispatchId,
+      invalidAttempt,
+      "TASK_STATE_WORKING",
+      "must not apply",
+    ),
+    /expectedAttempt.*integer between 1 and 8/,
+  );
+  assert.deepEqual(restored.snapshot(), beforeInvalidAttempt);
+}
+
+const firstProgress = restored.transitionDispatchTask(
+  dispatchId,
+  firstAttempt,
+  "TASK_STATE_WORKING",
+  "half complete",
+);
+assert.equal(firstProgress.tasks[tenantAFirst].state, "TASK_STATE_WORKING");
+assert.equal(firstProgress.tasks[tenantAFirst].status_message, "half complete");
+assert.equal(firstProgress.dispatch_outbox[dispatchId].state, "running");
+const secondProgress = restored.transitionDispatchTask(
+  dispatchId,
+  firstAttempt,
+  "TASK_STATE_WORKING",
+  "three quarters complete",
+);
+assert.equal(secondProgress.tasks[tenantAFirst].state, "TASK_STATE_WORKING");
+assert.equal(secondProgress.tasks[tenantAFirst].status_message, "three quarters complete");
+assert.equal(secondProgress.dispatch_outbox[dispatchId].state, "running");
+assert(secondProgress.revision > firstProgress.revision);
+
+const reconcileState = restored.markDispatchReconcilePending(
+  dispatchId,
+  "Bearer must-never-be-persisted",
+);
+assert.equal(reconcileState.dispatch_outbox[dispatchId].state, "reconcile_pending");
+assert.equal(
+  reconcileState.dispatch_outbox[dispatchId].last_error,
+  "dispatch requires reconciliation",
+);
+assert(!JSON.stringify(reconcileState).includes("must-never-be-persisted"));
+const reclaimedState = restored.markDispatchRunning(dispatchId);
+const currentAttempt = reclaimedState.dispatch_outbox[dispatchId].attempts;
+assert.equal(currentAttempt, 2);
+const beforeStaleAttempt = restored.snapshot();
+assert.throws(
+  () => restored.transitionDispatchTask(
+    dispatchId,
+    firstAttempt,
+    "TASK_STATE_COMPLETED",
+    "done",
+  ),
+  /generation is stale/,
+);
+assert.deepEqual(restored.snapshot(), beforeStaleAttempt);
+
+const transitionedState = restored.transitionDispatchTask(
+  dispatchId,
+  currentAttempt,
   "TASK_STATE_COMPLETED",
   "done",
 );
 assert.equal(transitionedState.schema_version, EXPECTED_A2A_MAPPER_SCHEMA_VERSION);
+assert.equal(transitionedState.dispatch_outbox[dispatchId].state, "settled");
 assert.deepEqual(transitionedState, restored.snapshot());
+assert.deepEqual(
+  restored.transitionDispatchTask(
+    dispatchId,
+    currentAttempt,
+    "TASK_STATE_COMPLETED",
+    "done",
+  ),
+  transitionedState,
+);
 const completed = restored.getTask(
   tenantAFirst,
   correlation("completed-task"),
@@ -260,8 +352,15 @@ for (const [index, waitingState] of [
   assert.equal(initial.action.kind, "dispatch_message");
 
   if (waitingState !== "TASK_STATE_WORKING") {
-    fenceMapper.transitionTask(
+    const [waitingDispatchId] = dispatchForTask(
+      fenceMapper,
       initial.action.mapping.task_id,
+    );
+    const claimed = fenceMapper.markDispatchRunning(waitingDispatchId);
+    const waitingAttempt = claimed.dispatch_outbox[waitingDispatchId].attempts;
+    fenceMapper.transitionDispatchTask(
+      waitingDispatchId,
+      waitingAttempt,
       waitingState,
       `waiting-${index}`,
     );
@@ -316,5 +415,37 @@ for (const [index, waitingState] of [
   );
   assert.equal(afterSnapshot.revision, beforeSnapshot.revision);
 }
+
+// The binding's 32 MiB persistence boundary is transactional: the candidate that crosses the
+// limit must not remain installed after the thrown error.
+const oversizedMapper = new A2aMapper();
+const largeText = "x".repeat(240 * 1024);
+let oversizedRejected = false;
+for (let index = 0; index < 100; index += 1) {
+  const before = JSON.stringify(oversizedMapper.snapshot());
+  const owner = {
+    subject: `large-owner-${index}`,
+    tenant_id: `large-tenant-${index}`,
+    scopes: ["a2a:message:send"],
+  };
+  try {
+    oversizedMapper.sendMessage(
+      {
+        message_id: `large-message-${index}`,
+        context_id: `large-context-${index}`,
+        role: "ROLE_USER",
+        parts: [{ kind: "text", text: largeText }],
+      },
+      correlation(`large-message-${index}`),
+      owner,
+    );
+  } catch (error) {
+    assert.match(String(error), /exceeds the 33554432 byte limit/);
+    assert.equal(JSON.stringify(oversizedMapper.snapshot()), before);
+    oversizedRejected = true;
+    break;
+  }
+}
+assert(oversizedRejected, "test data did not reach the A2A snapshot byte limit");
 
 console.log("a2a mapper Node contract: ok");

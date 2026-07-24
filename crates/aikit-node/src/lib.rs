@@ -19,34 +19,37 @@
 //! main thread stays in its event loop while Rust awaits the oneshot the promise resolves.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use aikit_core::orchestration::{ExecutionContext, Orchestrator, SubagentSpec};
 use aikit_core::{
-    evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
-    request_capability_tool, A2aListTasksRequest, A2aMapper as CoreA2aMapper, A2aMessage,
-    A2aTaskState, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions, AikitError,
-    ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail,
-    BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
-    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, CedarDecisionAdapter,
-    Client as CoreClient, CompactionPolicy, CompatibilityMode, ContainmentPolicy,
-    CorrelationIdentity, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode,
-    ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
-    GeneratedText, Governance, GovernanceBinding, GuardedExecutor, GuardrailChain, HookDispatcher,
-    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
-    JsonlAuditSink, McpClient, McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message,
-    ModelCapability, ModelCatalog, ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing,
-    ModelProfile, NoTools, ObjectOptions, ObjectStream as CoreObjectStream, OpaDecisionAdapter,
-    PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument,
-    PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext,
-    PromptHookOutcome, ProtocolError, ProtocolPrincipal, ProviderOptions, RegexBlocklist,
-    RetryPolicy, RouteRequest, RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig,
-    RunOutcome, RunRecorder, RunState, RunTerminalStatus, Sandbox, SecretRedactor,
-    SemanticValidation, SemanticValidator, Session, SessionStore, SessionStoreError,
-    SqliteMemoryStore, SqliteSessionStore, StdioTransport, StopContext, StreamDelta, StreamEvent,
-    StreamEventEncoder, StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter, ToolSpec,
-    TraceInput, WebTools,
+    deserialize_a2a_mapper_snapshot_bounded, evaluate_outcome as core_evaluate_outcome,
+    evaluate_trace as core_evaluate_trace, request_capability_tool,
+    serialize_a2a_mapper_snapshot_bounded, A2aListTasksRequest, A2aMapper as CoreA2aMapper,
+    A2aMessage, A2aTaskState, Agent as CoreAgent, AgentError, AgentOptions as CoreAgentOptions,
+    AikitError, ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy,
+    AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy,
+    BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate,
+    CedarDecisionAdapter, Client as CoreClient, CompactionPolicy, CompatibilityMode,
+    ContainmentPolicy, CorrelationIdentity, DockerConfig, DurabilityMode, DurableApprovalRequest,
+    ErrorCode, ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext,
+    FailureHookOutcome, GeneratedText, Governance, GovernanceBinding, GuardedExecutor,
+    GuardrailChain, HookDispatcher, HookMatcher, HookOutcome, InMemorySessionStore,
+    JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient, McpToolExecutor,
+    McpToolFilter, MediaArtifact, MediaInput, Message, ModelCapability, ModelCatalog,
+    ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing, ModelProfile, NoTools,
+    ObjectOptions, ObjectStream as CoreObjectStream, OpaDecisionAdapter, PermissionEngine,
+    PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument, PolicySnapshot, PostToolOutcome,
+    PostToolUseContext, PreToolUseContext, PromptContext, PromptHookOutcome, ProtocolError,
+    ProtocolPrincipal, ProviderOptions, RegexBlocklist, RetryPolicy, RouteRequest,
+    RoutingOptions as CoreRoutingOptions, Rule, RunCommand, RunConfig, RunOutcome, RunRecorder,
+    RunState, RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator,
+    Session, SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore,
+    StdioTransport, StopContext, StreamDelta, StreamEvent, StreamEventEncoder,
+    StreamableHttpTransport, ToolApprover, ToolExecutor, ToolRouter, ToolSpec, TraceInput,
+    WebTools, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES, A2A_MAX_DISPATCH_ATTEMPTS,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -197,13 +200,6 @@ impl ToolApprover for NodeToolApprover {
     }
 }
 
-fn action(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("action").and_then(Value::as_str))
-        .or_else(|| value.get("decision").and_then(Value::as_str))
-}
-
 fn parse_semantic_validation(value: Value) -> std::result::Result<SemanticValidation, String> {
     match value {
         Value::String(action) if action == "accept" => Ok(SemanticValidation::Accept),
@@ -249,26 +245,78 @@ impl SemanticValidator for NodeSemanticValidator {
 }
 
 fn parse_approval(value: Value) -> std::result::Result<ApprovalDecision, String> {
-    match action(&value) {
-        Some("allow") => Ok(ApprovalDecision::Allow {
-            updated_input: value
+    if let Some(decision) = value.as_str() {
+        return match decision {
+            "allow" => Ok(ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: Vec::new(),
+            }),
+            "deny" => Ok(ApprovalDecision::Deny {
+                message: "tool use denied by Node approver".into(),
+                interrupt: false,
+            }),
+            _ => Err(
+                "Node approver returned an invalid decision; expected bool or allow|deny".into(),
+            ),
+        };
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        "Node approver returned an invalid decision; expected bool or {decision: allow|deny}"
+            .to_string()
+    })?;
+    let action = object.get("action");
+    let decision = object.get("decision");
+    if action.is_some() && decision.is_some() {
+        return Err("Node approver decision must use exactly one of action or decision".into());
+    }
+    let (discriminator, selected) = action
+        .map(|value| ("action", value))
+        .or_else(|| decision.map(|value| ("decision", value)))
+        .ok_or_else(|| {
+            "Node approver decision requires exactly one action or decision field".to_string()
+        })?;
+    let selected = selected
+        .as_str()
+        .ok_or_else(|| format!("Node approver {discriminator} must be allow or deny"))?;
+    let allowed_fields: &[&str] = match selected {
+        "allow" => &[discriminator, "updated_input", "updated_permissions"],
+        "deny" => &[discriminator, "message", "interrupt"],
+        _ => {
+            return Err(format!(
+                "Node approver {discriminator} must be allow or deny"
+            ))
+        }
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "Node approver {selected} decision contains unknown field '{field}'"
+        ));
+    }
+
+    match selected {
+        "allow" => Ok(ApprovalDecision::Allow {
+            updated_input: object
                 .get("updated_input")
                 .filter(|input| !input.is_null())
                 .cloned(),
             updated_permissions: parse_permission_updates(&value)?,
         }),
-        Some("deny") => Ok(ApprovalDecision::Deny {
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("tool use denied by Node approver")
-                .to_string(),
-            interrupt: optional_bool(&value, "interrupt")?.unwrap_or(false),
-        }),
-        _ => Err(
-            "Node approver returned an invalid decision; expected bool or {decision: allow|deny}"
-                .into(),
-        ),
+        "deny" => {
+            let message = match object.get("message") {
+                None | Some(Value::Null) => "tool use denied by Node approver".to_string(),
+                Some(Value::String(message)) => message.clone(),
+                Some(_) => return Err("Node approver message must be a string".into()),
+            };
+            Ok(ApprovalDecision::Deny {
+                message,
+                interrupt: optional_bool(&value, "interrupt")?.unwrap_or(false),
+            })
+        }
+        _ => unreachable!("approval discriminator was validated above"),
     }
 }
 
@@ -304,87 +352,144 @@ fn optional_bool(value: &Value, field: &str) -> std::result::Result<Option<bool>
     }
 }
 
+type ParsedHookResponse<'a> = Option<(&'a str, &'a serde_json::Map<String, Value>)>;
+
+fn strict_hook_response<'a>(
+    value: &'a Value,
+    shapes: &[(&str, &[&str])],
+) -> std::result::Result<ParsedHookResponse<'a>, String> {
+    if value.is_null() || value.as_str() == Some("continue") {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "hook response must be null, 'continue', or an action object".to_string())?;
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hook response object requires a string action".to_string())?;
+    let allowed = shapes
+        .iter()
+        .find_map(|(candidate, fields)| (*candidate == action).then_some(*fields))
+        .ok_or_else(|| format!("hook response action '{action}' is not valid here"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| field.as_str() != "action" && !allowed.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "hook response action '{action}' contains unknown field '{field}'"
+        ));
+    }
+    Ok(Some((action, object)))
+}
+
 fn parse_prompt_hook(value: Value) -> PromptHookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        PromptHookOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("prompt")
-                .and_then(Value::as_str)
-                .map(|prompt| PromptHookOutcome::Rewrite(prompt.to_string()))
-                .unwrap_or_else(|| {
-                    PromptHookOutcome::Block("UserPrompt hook rewrite omitted prompt".into())
-                }),
-            Some("block") => PromptHookOutcome::Block(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("blocked by UserPrompt hook")
-                    .to_string(),
-            ),
-            _ => PromptHookOutcome::Block("UserPrompt hook returned an invalid action".into()),
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["prompt"]),
+            ("block", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => PromptHookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(|prompt| PromptHookOutcome::Rewrite(prompt.to_string()))
+            .unwrap_or_else(|| {
+                PromptHookOutcome::Block("UserPrompt hook rewrite omitted prompt".into())
+            }),
+        Ok(Some(("block", object))) => match object.get("message") {
+            None | Some(Value::Null) => {
+                PromptHookOutcome::Block("blocked by UserPrompt hook".into())
+            }
+            Some(Value::String(message)) => PromptHookOutcome::Block(message.clone()),
+            Some(_) => {
+                PromptHookOutcome::Block("UserPrompt hook block message must be a string".into())
+            }
+        },
+        Ok(Some((_, _))) => {
+            PromptHookOutcome::Block("UserPrompt hook returned an invalid action".into())
         }
+        Err(error) => PromptHookOutcome::Block(format!(
+            "UserPrompt hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_pre_hook(value: Value) -> HookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        HookOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("input")
-                .cloned()
-                .map(HookOutcome::Rewrite)
-                .unwrap_or_else(|| HookOutcome::Block("PreToolUse rewrite omitted input".into())),
-            Some("block") => HookOutcome::Block(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("blocked by PreToolUse hook")
-                    .to_string(),
-            ),
-            _ => HookOutcome::Block("PreToolUse hook returned an invalid action".into()),
-        }
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["input"]),
+            ("block", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => HookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("input")
+            .cloned()
+            .map(HookOutcome::Rewrite)
+            .unwrap_or_else(|| HookOutcome::Block("PreToolUse rewrite omitted input".into())),
+        Ok(Some(("block", object))) => match object.get("message") {
+            None | Some(Value::Null) => HookOutcome::Block("blocked by PreToolUse hook".into()),
+            Some(Value::String(message)) => HookOutcome::Block(message.clone()),
+            Some(_) => HookOutcome::Block("PreToolUse block message must be a string".into()),
+        },
+        Ok(Some((_, _))) => HookOutcome::Block("PreToolUse hook returned an invalid action".into()),
+        Err(error) => HookOutcome::Block(format!(
+            "PreToolUse hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_post_hook(value: Value) -> PostToolOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        PostToolOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("output")
-                .and_then(Value::as_str)
-                .map(|output| PostToolOutcome::RewriteOutput(output.to_string()))
-                .unwrap_or_else(|| {
-                    PostToolOutcome::MarkError("PostToolUse rewrite omitted output".into())
-                }),
-            Some("error") | Some("mark_error") => PostToolOutcome::MarkError(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("marked as error by PostToolUse hook")
-                    .to_string(),
-            ),
-            _ => PostToolOutcome::MarkError("PostToolUse hook returned an invalid action".into()),
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["output"]),
+            ("error", &["message"]),
+            ("mark_error", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => PostToolOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("output")
+            .and_then(Value::as_str)
+            .map(|output| PostToolOutcome::RewriteOutput(output.to_string()))
+            .unwrap_or_else(|| {
+                PostToolOutcome::MarkError("PostToolUse rewrite omitted output".into())
+            }),
+        Ok(Some(("error" | "mark_error", object))) => match object.get("message") {
+            None | Some(Value::Null) => {
+                PostToolOutcome::MarkError("marked as error by PostToolUse hook".into())
+            }
+            Some(Value::String(message)) => PostToolOutcome::MarkError(message.clone()),
+            Some(_) => {
+                PostToolOutcome::MarkError("PostToolUse error message must be a string".into())
+            }
+        },
+        Ok(Some((_, _))) => {
+            PostToolOutcome::MarkError("PostToolUse hook returned an invalid action".into())
         }
+        Err(error) => PostToolOutcome::MarkError(format!(
+            "PostToolUse hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_failure_hook(value: Value) -> FailureHookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        FailureHookOutcome::Continue
-    } else if matches!(action(&value), Some("rewrite")) {
-        value
+    match strict_hook_response(&value, &[("continue", &[]), ("rewrite", &["error"])]) {
+        Ok(None | Some(("continue", _))) => FailureHookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
             .get("error")
             .and_then(Value::as_str)
             .map(|error| FailureHookOutcome::RewriteError(error.to_string()))
-            .unwrap_or(FailureHookOutcome::Continue)
-    } else {
-        FailureHookOutcome::Continue
+            .unwrap_or(FailureHookOutcome::Continue),
+        Ok(Some((_, _))) | Err(_) => FailureHookOutcome::Continue,
     }
 }
 
@@ -756,10 +861,12 @@ fn node_compatibility_mode(value: Option<String>, field: &str) -> Result<Compati
 
 fn node_u64(value: BigInt, field: &str) -> Result<u64> {
     let (signed, value, lossless) = value.get_u64();
-    if signed || !lossless {
+    if signed || !lossless || value > NODE_MAX_SAFE_INTEGER {
         return Err(Error::new(
             Status::InvalidArg,
-            format!("{field} must be a non-negative u64 bigint"),
+            format!(
+                "{field} must be a non-negative safe-integer bigint at most Number.MAX_SAFE_INTEGER"
+            ),
         ));
     }
     Ok(value)
@@ -801,7 +908,7 @@ fn invalid_a2a_input(label: &str, error: impl std::fmt::Display) -> Error {
     Error::new(Status::InvalidArg, format!("invalid {label}: {error}"))
 }
 
-const A2A_NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn normalize_a2a_safe_u64(value: &mut Value, path: &str) -> Result<()> {
     let Some(number) = value.as_number() else {
@@ -827,7 +934,7 @@ fn normalize_a2a_safe_u64(value: &mut Value, path: &str) -> Result<()> {
                 format!("{path} must be a non-negative safe integer number"),
             )
         })?;
-        if value < 0.0 || value.fract() != 0.0 || value > A2A_NODE_MAX_SAFE_INTEGER as f64 {
+        if value < 0.0 || value.fract() != 0.0 || value > NODE_MAX_SAFE_INTEGER as f64 {
             return Err(invalid_a2a_input(
                 "A2A mapper state",
                 format!("{path} must be a non-negative safe integer number"),
@@ -836,13 +943,25 @@ fn normalize_a2a_safe_u64(value: &mut Value, path: &str) -> Result<()> {
         value as u64
     };
 
-    if normalized > A2A_NODE_MAX_SAFE_INTEGER {
+    if normalized > NODE_MAX_SAFE_INTEGER {
         return Err(invalid_a2a_input(
             "A2A mapper state",
             format!("{path} must be a non-negative safe integer number"),
         ));
     }
     *value = Value::Number(normalized.into());
+    Ok(())
+}
+
+fn normalize_a2a_task_numbers(task: &mut Value, path: &str) -> Result<()> {
+    let Some(task) = task.as_object_mut() else {
+        return Ok(());
+    };
+    for field in ["created_revision", "updated_revision"] {
+        if let Some(value) = task.get_mut(field) {
+            normalize_a2a_safe_u64(value, &format!("{path}.{field}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -858,14 +977,7 @@ fn normalize_a2a_mapper_state_numbers(mut state: Value) -> Result<Value> {
     }
     if let Some(tasks) = root.get_mut("tasks").and_then(Value::as_object_mut) {
         for (task_id, task) in tasks {
-            let Some(task) = task.as_object_mut() else {
-                continue;
-            };
-            for field in ["created_revision", "updated_revision"] {
-                if let Some(value) = task.get_mut(field) {
-                    normalize_a2a_safe_u64(value, &format!("tasks.{task_id}.{field}"))?;
-                }
-            }
+            normalize_a2a_task_numbers(task, &format!("tasks.{task_id}"))?;
         }
     }
     if let Some(receipts) = root.get_mut("receipts").and_then(Value::as_object_mut) {
@@ -878,8 +990,340 @@ fn normalize_a2a_mapper_state_numbers(mut state: Value) -> Result<Value> {
             }
         }
     }
+    if let Some(dispatches) = root
+        .get_mut("dispatch_outbox")
+        .and_then(Value::as_object_mut)
+    {
+        for (dispatch_id, dispatch) in dispatches {
+            let Some(dispatch) = dispatch.as_object_mut() else {
+                continue;
+            };
+            for field in ["created_revision", "updated_revision"] {
+                if let Some(value) = dispatch.get_mut(field) {
+                    normalize_a2a_safe_u64(
+                        value,
+                        &format!("dispatch_outbox.{dispatch_id}.{field}"),
+                    )?;
+                }
+            }
+            if let Some(task) = dispatch.get_mut("immediate_response") {
+                normalize_a2a_task_numbers(
+                    task,
+                    &format!("dispatch_outbox.{dispatch_id}.immediate_response"),
+                )?;
+            }
+        }
+    }
+    if let Some(cancellations) = root
+        .get_mut("cancellation_outbox")
+        .and_then(Value::as_object_mut)
+    {
+        for (cancellation_id, cancellation) in cancellations {
+            let Some(cancellation) = cancellation.as_object_mut() else {
+                continue;
+            };
+            for field in ["created_revision", "updated_revision"] {
+                if let Some(value) = cancellation.get_mut(field) {
+                    normalize_a2a_safe_u64(
+                        value,
+                        &format!("cancellation_outbox.{cancellation_id}.{field}"),
+                    )?;
+                }
+            }
+            if let Some(task) = cancellation.get_mut("task") {
+                normalize_a2a_task_numbers(
+                    task,
+                    &format!("cancellation_outbox.{cancellation_id}.task"),
+                )?;
+            }
+        }
+    }
+    if let Some(events) = root
+        .get_mut("pending_events")
+        .and_then(Value::as_object_mut)
+    {
+        for (event_id, event) in events {
+            let Some(event) = event.as_object_mut() else {
+                continue;
+            };
+            for field in [
+                "source_revision",
+                "next_attempt_at_unix_ms",
+                "created_revision",
+                "updated_revision",
+            ] {
+                if let Some(value) = event.get_mut(field) {
+                    if !value.is_null() {
+                        normalize_a2a_safe_u64(
+                            value,
+                            &format!("pending_events.{event_id}.{field}"),
+                        )?;
+                    }
+                }
+            }
+            if let Some(task) = event.get_mut("task") {
+                normalize_a2a_task_numbers(task, &format!("pending_events.{event_id}.task"))?;
+            }
+        }
+    }
 
     Ok(state)
+}
+
+fn normalize_durable_safe_u64(value: &mut Value, path: &str) -> Result<()> {
+    let Some(number) = value.as_number() else {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("invalid durable state: {path} must be a non-negative safe integer number"),
+        ));
+    };
+    let normalized = if let Some(value) = number.as_u64() {
+        value
+    } else if let Some(value) = number.as_i64() {
+        u64::try_from(value).map_err(|_| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid durable state: {path} must be a non-negative safe integer number"),
+            )
+        })?
+    } else {
+        let value = number.as_f64().ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid durable state: {path} must be a non-negative safe integer number"),
+            )
+        })?;
+        if !value.is_finite()
+            || value < 0.0
+            || value.fract() != 0.0
+            || value > NODE_MAX_SAFE_INTEGER as f64
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("invalid durable state: {path} must be a non-negative safe integer number"),
+            ));
+        }
+        value as u64
+    };
+    if normalized > NODE_MAX_SAFE_INTEGER {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("invalid durable state: {path} must be a non-negative safe integer number"),
+        ));
+    }
+    *value = Value::Number(normalized.into());
+    Ok(())
+}
+
+fn normalize_durable_object_u64_fields(
+    value: &mut Value,
+    path: &str,
+    fields: &[&str],
+) -> Result<()> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    for field in fields {
+        if let Some(value) = object.get_mut(*field) {
+            if !value.is_null() {
+                normalize_durable_safe_u64(value, &format!("{path}.{field}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_durable_approval_payload(value: &mut Value, path: &str) -> Result<()> {
+    let Some(envelope) = value
+        .as_object_mut()
+        .and_then(|payload| payload.get_mut("$aikit_durable_approval"))
+    else {
+        return Ok(());
+    };
+    normalize_durable_object_u64_fields(
+        envelope,
+        &format!("{path}.$aikit_durable_approval"),
+        &["requested_at_unix_ms", "expires_at_unix_ms"],
+    )
+}
+
+fn normalize_durable_resolution_response(value: &mut Value, path: &str) -> Result<()> {
+    let Some(envelope) = value
+        .as_object_mut()
+        .and_then(|response| response.get_mut("$aikit_durable_resolution"))
+    else {
+        return Ok(());
+    };
+    normalize_durable_object_u64_fields(
+        envelope,
+        &format!("{path}.$aikit_durable_resolution"),
+        &["resolved_at_unix_ms"],
+    )
+}
+
+fn normalize_durable_projection(value: &mut Value, path: &str) -> Result<()> {
+    let Some(projection) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(activities) = projection
+        .get_mut("activities")
+        .and_then(Value::as_object_mut)
+    {
+        for (activity_id, activity) in activities {
+            let Some(attempts) = activity.get_mut("attempts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for (index, attempt) in attempts.iter_mut().enumerate() {
+                normalize_durable_object_u64_fields(
+                    attempt,
+                    &format!("{path}.activities.{activity_id}.attempts[{index}]"),
+                    &["started_sequence", "finished_sequence"],
+                )?;
+            }
+        }
+    }
+    if let Some(approvals) = projection
+        .get_mut("approvals")
+        .and_then(Value::as_object_mut)
+    {
+        for (approval_id, approval) in approvals {
+            normalize_durable_object_u64_fields(
+                approval,
+                &format!("{path}.approvals.{approval_id}"),
+                &[
+                    "requested_at_unix_ms",
+                    "expires_at_unix_ms",
+                    "resolved_at_unix_ms",
+                    "requested_sequence",
+                    "resolved_sequence",
+                ],
+            )?;
+        }
+    }
+    if let Some(artifacts) = projection
+        .get_mut("artifacts")
+        .and_then(Value::as_object_mut)
+    {
+        for (artifact_id, versions) in artifacts {
+            let Some(versions) = versions.as_array_mut() else {
+                continue;
+            };
+            for (index, metadata) in versions.iter_mut().enumerate() {
+                normalize_durable_object_u64_fields(
+                    metadata,
+                    &format!("{path}.artifacts.{artifact_id}[{index}]"),
+                    &["version", "size_bytes"],
+                )?;
+            }
+        }
+    }
+    if let Some(worker_lease) = projection.get_mut("worker_lease") {
+        if !worker_lease.is_null() {
+            normalize_durable_object_u64_fields(
+                worker_lease,
+                &format!("{path}.worker_lease"),
+                &[
+                    "acquired_at_unix_ms",
+                    "heartbeat_at_unix_ms",
+                    "expires_at_unix_ms",
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_durable_checkpoint(value: &mut Value, path: &str) -> Result<()> {
+    normalize_durable_object_u64_fields(value, path, &["event_sequence"])?;
+    if let Some(projection) = value
+        .as_object_mut()
+        .and_then(|checkpoint| checkpoint.get_mut("projection"))
+    {
+        normalize_durable_projection(projection, &format!("{path}.projection"))?;
+    }
+    Ok(())
+}
+
+fn normalize_durable_event_kind(value: &mut Value, path: &str) -> Result<()> {
+    let Some(kind) = value.as_object_mut() else {
+        return Ok(());
+    };
+    match kind.get("type").and_then(Value::as_str) {
+        Some("forked_from") => {
+            if let Some(checkpoint) = kind.get_mut("source_checkpoint") {
+                normalize_durable_checkpoint(checkpoint, &format!("{path}.source_checkpoint"))?;
+            }
+        }
+        Some("worker_lease_claimed") => normalize_durable_object_u64_fields(
+            value,
+            path,
+            &["claimed_at_unix_ms", "expires_at_unix_ms"],
+        )?,
+        Some("worker_lease_renewed") => normalize_durable_object_u64_fields(
+            value,
+            path,
+            &["renewed_at_unix_ms", "expires_at_unix_ms"],
+        )?,
+        Some("worker_lease_released") => {
+            normalize_durable_object_u64_fields(value, path, &["released_at_unix_ms"])?
+        }
+        Some("approval_requested") => {
+            if let Some(payload) = kind.get_mut("payload") {
+                normalize_durable_approval_payload(payload, &format!("{path}.payload"))?;
+            }
+        }
+        Some("approval_resolved") => {
+            if let Some(response) = kind.get_mut("response") {
+                normalize_durable_resolution_response(response, &format!("{path}.response"))?;
+            }
+        }
+        Some("artifact_published") => {
+            if let Some(metadata) = kind.get_mut("metadata") {
+                normalize_durable_object_u64_fields(
+                    metadata,
+                    &format!("{path}.metadata"),
+                    &["version", "size_bytes"],
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn normalize_durable_run_state_numbers(mut state: Value) -> Result<Value> {
+    let Some(root) = state.as_object_mut() else {
+        return Ok(state);
+    };
+    if let Some(events) = root.get_mut("events").and_then(Value::as_array_mut) {
+        for (index, event) in events.iter_mut().enumerate() {
+            normalize_durable_object_u64_fields(event, &format!("events[{index}]"), &["sequence"])?;
+            if let Some(kind) = event
+                .as_object_mut()
+                .and_then(|event| event.get_mut("kind"))
+            {
+                normalize_durable_event_kind(kind, &format!("events[{index}].kind"))?;
+            }
+        }
+    }
+    if let Some(checkpoints) = root.get_mut("checkpoints").and_then(Value::as_object_mut) {
+        for (checkpoint_id, checkpoint) in checkpoints {
+            normalize_durable_checkpoint(checkpoint, &format!("checkpoints.{checkpoint_id}"))?;
+        }
+    }
+    if let Some(projection) = root.get_mut("projection") {
+        normalize_durable_projection(projection, "projection")?;
+    }
+    Ok(state)
+}
+
+fn normalize_durable_approval_request_numbers(mut request: Value) -> Result<Value> {
+    normalize_durable_object_u64_fields(
+        &mut request,
+        "approval request",
+        &["requested_at_unix_ms", "expires_at_unix_ms"],
+    )?;
+    Ok(request)
 }
 
 fn decode_a2a_correlation(value: Value) -> Result<CorrelationIdentity> {
@@ -906,6 +1350,85 @@ fn a2a_protocol_error(error: ProtocolError) -> Error {
     )
 }
 
+struct BoundedA2aStateWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedA2aStateWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedA2aStateWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(input.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("A2A mapper state size overflowed"));
+        };
+        if next_len > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("A2A mapper state exceeded byte limit"));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_a2a_state_bytes(
+    state: &Value,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut writer = BoundedA2aStateWriter::new(max_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, state) {
+        if writer.exceeded {
+            return Err(format!(
+                "A2A mapper state exceeds the {max_bytes} byte limit"
+            ));
+        }
+        return Err(format!("encode A2A mapper state: {error}"));
+    }
+    Ok(writer.bytes)
+}
+
+fn decode_a2a_mapper_state(state: Value) -> Result<CoreA2aMapper> {
+    let bytes = bounded_a2a_state_bytes(&state, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+        .map_err(|error| invalid_a2a_input("A2A mapper state", error))?;
+    deserialize_a2a_mapper_snapshot_bounded(&bytes, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+        .map_err(a2a_protocol_error)
+}
+
+fn encode_a2a_mapper_state(mapper: &CoreA2aMapper) -> Result<Value> {
+    let bytes = serialize_a2a_mapper_snapshot_bounded(mapper, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+        .map_err(a2a_protocol_error)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Error::from_reason(format!("failed to decode A2A snapshot: {error}")))
+}
+
+fn node_dispatch_attempt(value: f64) -> Result<u32> {
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value < 1.0
+        || value > f64::from(A2A_MAX_DISPATCH_ATTEMPTS)
+    {
+        return Err(invalid_a2a_input(
+            "A2A dispatch expectedAttempt",
+            format!("must be an integer between 1 and {A2A_MAX_DISPATCH_ATTEMPTS}"),
+        ));
+    }
+    Ok(value as u32)
+}
+
 /// Thin Node projection of the canonical, transport-neutral Rust A2A mapper.
 #[napi(js_name = "A2aMapper")]
 pub struct A2aMapper {
@@ -930,15 +1453,13 @@ impl A2aMapper {
     #[napi(factory)]
     pub fn from_state(state: Value) -> Result<Self> {
         let state = normalize_a2a_mapper_state_numbers(state)?;
-        let inner = serde_json::from_value(state)
-            .map_err(|error| invalid_a2a_input("A2A mapper state", error))?;
+        let inner = decode_a2a_mapper_state(state)?;
         Ok(Self { inner })
     }
 
     #[napi]
     pub fn snapshot(&self) -> Result<Value> {
-        serde_json::to_value(&self.inner)
-            .map_err(|_| Error::from_reason("failed to encode A2A mapper state"))
+        encode_a2a_mapper_state(&self.inner)
     }
 
     #[napi]
@@ -952,12 +1473,16 @@ impl A2aMapper {
             .map_err(|error| invalid_a2a_input("A2A message", error))?;
         let correlation = decode_a2a_correlation(correlation)?;
         let principal = decode_a2a_principal(principal)?;
-        serde_json::to_value(self.inner.prepare_send_message(
+        let mut candidate = self.inner.clone();
+        let action = serde_json::to_value(candidate.prepare_send_message(
             message,
             correlation,
             principal.as_ref(),
         ))
-        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))?;
+        encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(action)
     }
 
     #[napi]
@@ -1004,14 +1529,69 @@ impl A2aMapper {
     ) -> Result<Value> {
         let correlation = decode_a2a_correlation(correlation)?;
         let principal = decode_a2a_principal(principal)?;
-        serde_json::to_value(self.inner.prepare_cancel_task(
+        let mut candidate = self.inner.clone();
+        let action = serde_json::to_value(candidate.prepare_cancel_task(
             &task_id,
             correlation,
             principal.as_ref(),
         ))
-        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))
+        .map_err(|_| Error::from_reason("failed to encode governed A2A action"))?;
+        encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(action)
     }
 
+    /// Claim one queued/reconcile-pending dispatch. The returned snapshot contains the exact
+    /// incremented attempt fence required by `transitionDispatchTask`.
+    #[napi]
+    pub fn mark_dispatch_running(&mut self, dispatch_id: String) -> Result<Value> {
+        let mut candidate = self.inner.clone();
+        candidate
+            .mark_dispatch_running(&dispatch_id)
+            .map_err(a2a_protocol_error)?;
+        let snapshot = encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    /// Move a queued/running dispatch into startup-safe reconciliation without persisting the raw
+    /// host error, then return the committed canonical snapshot.
+    #[napi]
+    pub fn mark_dispatch_reconcile_pending(
+        &mut self,
+        dispatch_id: String,
+        error: String,
+    ) -> Result<Value> {
+        let mut candidate = self.inner.clone();
+        candidate
+            .mark_dispatch_reconcile_pending(&dispatch_id, error)
+            .map_err(a2a_protocol_error)?;
+        let snapshot = encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    #[napi]
+    pub fn transition_dispatch_task(
+        &mut self,
+        dispatch_id: String,
+        expected_attempt: f64,
+        state: String,
+        status_message: Option<String>,
+    ) -> Result<Value> {
+        let state: A2aTaskState = serde_json::from_value(Value::String(state))
+            .map_err(|error| invalid_a2a_input("A2A task state", error))?;
+        let expected_attempt = node_dispatch_attempt(expected_attempt)?;
+        let mut candidate = self.inner.clone();
+        candidate
+            .transition_dispatch_task(&dispatch_id, expected_attempt, state, status_message)
+            .map_err(a2a_protocol_error)?;
+        let snapshot = encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    /// Admin-only state change. Open host dispatches require the exact attempt-fenced method.
     #[napi]
     pub fn transition_task(
         &mut self,
@@ -1021,11 +1601,13 @@ impl A2aMapper {
     ) -> Result<Value> {
         let state: A2aTaskState = serde_json::from_value(Value::String(state))
             .map_err(|error| invalid_a2a_input("A2A task state", error))?;
-        self.inner
+        let mut candidate = self.inner.clone();
+        candidate
             .transition_task(&task_id, state, status_message)
             .map_err(a2a_protocol_error)?;
-        serde_json::to_value(&self.inner)
-            .map_err(|_| Error::from_reason("failed to encode A2A mapper state"))
+        let snapshot = encode_a2a_mapper_state(&candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
     }
 }
 
@@ -1046,6 +1628,7 @@ impl DurableRun {
 
     #[napi(factory)]
     pub fn from_state(state: Value) -> Result<Self> {
+        let state = normalize_durable_run_state_numbers(state)?;
         let inner = serde_json::from_value(state).map_err(|error| {
             Error::new(
                 Status::InvalidArg,
@@ -1198,6 +1781,7 @@ impl DurableRun {
 
     #[napi]
     pub fn request_typed_approval(&mut self, request: Value) -> Result<String> {
+        let request = normalize_durable_approval_request_numbers(request)?;
         let request: DurableApprovalRequest = serde_json::from_value(request).map_err(|error| {
             Error::new(
                 Status::InvalidArg,
@@ -3446,6 +4030,78 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn a2a_state_encoding_stops_at_the_byte_limit() {
+        let state = serde_json::json!({"padding": "1234567890"});
+        let encoded = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            bounded_a2a_state_bytes(&state, encoded.len()).unwrap(),
+            encoded
+        );
+        let error = bounded_a2a_state_bytes(&state, encoded.len() - 1).unwrap_err();
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn durable_number_normalization_is_schema_scoped_and_null_safe() {
+        let high_number = || Value::Number(serde_json::Number::from_f64(5_368_709_120.0).unwrap());
+        let mut state = serde_json::json!({
+            "events": [{
+                "sequence": 1,
+                "kind": {
+                    "type": "artifact_published",
+                    "metadata": {"version": 1, "size_bytes": 0}
+                }
+            }],
+            "checkpoints": {},
+            "projection": {
+                "state": {"sequence": 1.5, "size_bytes": 2.5},
+                "activities": {
+                    "active": {"attempts": [{
+                        "started_sequence": 1,
+                        "finished_sequence": null,
+                        "output": {"sequence": 3.5}
+                    }]}
+                },
+                "approvals": {
+                    "pending": {
+                        "requested_at_unix_ms": 1,
+                        "expires_at_unix_ms": 2,
+                        "resolved_at_unix_ms": null,
+                        "requested_sequence": 1,
+                        "resolved_sequence": null,
+                        "payload": {"sequence": 4.5}
+                    }
+                },
+                "artifacts": {
+                    "large": [{"version": 1, "size_bytes": 0}]
+                }
+            }
+        });
+        state["events"][0]["kind"]["metadata"]["size_bytes"] = high_number();
+        state["projection"]["artifacts"]["large"][0]["size_bytes"] = high_number();
+
+        let normalized = normalize_durable_run_state_numbers(state).unwrap();
+        assert_eq!(
+            normalized["events"][0]["kind"]["metadata"]["size_bytes"].as_u64(),
+            Some(5_368_709_120)
+        );
+        assert_eq!(
+            normalized["projection"]["artifacts"]["large"][0]["size_bytes"].as_u64(),
+            Some(5_368_709_120)
+        );
+        assert!(
+            normalized["projection"]["activities"]["active"]["attempts"][0]["finished_sequence"]
+                .is_null()
+        );
+        assert!(normalized["projection"]["approvals"]["pending"]["resolved_sequence"].is_null());
+        assert_eq!(normalized["projection"]["state"]["sequence"], 1.5);
+        assert_eq!(
+            normalized["projection"]["approvals"]["pending"]["payload"]["sequence"],
+            4.5
+        );
+    }
+
+    #[test]
     fn durable_binding_round_trips_replay_validated_state_and_evaluates_trace() {
         let mut run = DurableRun::new("session-sdk".into(), "run-sdk".into(), None).unwrap();
         run.replace_state("turn-1".into(), serde_json::json!({"answer": 42}))
@@ -3602,6 +4258,41 @@ mod tests {
                 interrupt: true,
                 ..
             })
+        ));
+        for invalid in [
+            serde_json::json!({"action": "allow", "decision": "deny"}),
+            serde_json::json!({"action": "allow", "decision": "allow"}),
+            serde_json::json!({"decision": "allow", "interrupt": true}),
+            serde_json::json!({"decision": "deny", "updated_permissions": ["allow_tool"]}),
+            serde_json::json!({"decision": "allow", "unexpected": true}),
+            serde_json::json!({"decision": "deny", "message": 7}),
+        ] {
+            assert!(
+                parse_approval(invalid).is_err(),
+                "ambiguous or branch-invalid approval must fail closed"
+            );
+        }
+        assert!(matches!(
+            parse_pre_hook(serde_json::json!({
+                "action": "continue",
+                "decision": "block"
+            })),
+            HookOutcome::Block(message) if message.contains("unknown field")
+        ));
+        assert!(matches!(
+            parse_prompt_hook(serde_json::json!({
+                "action": "rewrite",
+                "prompt": "safe",
+                "unexpected": true
+            })),
+            PromptHookOutcome::Block(message) if message.contains("unknown field")
+        ));
+        assert!(matches!(
+            parse_post_hook(serde_json::json!({
+                "action": "continue",
+                "output": "must not be accepted"
+            })),
+            PostToolOutcome::MarkError(message) if message.contains("unknown field")
         ));
     }
 

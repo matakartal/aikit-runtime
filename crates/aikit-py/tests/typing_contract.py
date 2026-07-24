@@ -6,7 +6,9 @@ from typing_extensions import assert_type
 from pydantic import BaseModel
 
 from aikit import (
+    A2aDispatchOutboxRecord,
     A2aMapper,
+    A2aMapperState,
     AikitError,
     Agent,
     ApprovalRequest,
@@ -16,6 +18,7 @@ from aikit import (
     DurableCommandResult,
     DurableApproval,
     DurableApprovalRequest,
+    DurableWorkerLease,
     GovernanceBinding,
     ContainmentCapabilityReport,
     ContentPart,
@@ -24,8 +27,8 @@ from aikit import (
     EvalGate,
     EvalVerdict,
     FailureContext,
+    FailureHookResponse,
     GeneratedText,
-    HookResponse,
     JsonValue,
     legacy,
     Message,
@@ -74,11 +77,33 @@ from aikit import (
 )
 
 a2a_state = A2aMapper().snapshot()
-assert_type(a2a_state["dispatch_outbox"], dict[str, JsonValue])
+assert_type(a2a_state["dispatch_outbox"], dict[str, A2aDispatchOutboxRecord])
 assert_type(a2a_state["cancellation_outbox"], dict[str, JsonValue])
 assert_type(a2a_state["pending_events"], dict[str, JsonValue])
 
 if TYPE_CHECKING:
+    typed_dispatch = next(iter(a2a_state["dispatch_outbox"].values()))
+    assert_type(typed_dispatch["dispatch_id"], str)
+    assert_type(typed_dispatch["attempts"], int)
+    typed_mapper = A2aMapper.from_state(a2a_state)
+    claimed_a2a_state = typed_mapper.mark_dispatch_running(typed_dispatch["dispatch_id"])
+    assert_type(claimed_a2a_state, A2aMapperState)
+    assert_type(
+        typed_mapper.mark_dispatch_reconcile_pending(
+            typed_dispatch["dispatch_id"], "host outcome unknown"
+        ),
+        A2aMapperState,
+    )
+    assert_type(
+        typed_mapper.transition_dispatch_task(
+            typed_dispatch["dispatch_id"],
+            claimed_a2a_state["dispatch_outbox"][typed_dispatch["dispatch_id"]][
+                "attempts"
+            ],
+            "TASK_STATE_INPUT_REQUIRED",
+        ),
+        A2aMapperState,
+    )
     McpConnection()  # type: ignore[call-arg]  # factory-only native handle
 
 
@@ -230,6 +255,10 @@ typed_approval = governed_durable.snapshot()["projection"]["approvals"][
 ]
 assert_type(typed_approval, DurableApproval)
 assert_type(
+    governed_durable.snapshot()["projection"].get("worker_lease"),
+    Optional[DurableWorkerLease],
+)
+assert_type(
     governed_durable.resolve_approval_at(
         "resume-typed", typed_approval_id, True, 150, "cust-1"
     ),
@@ -352,9 +381,13 @@ async def approve(_request: ApprovalRequest) -> ApprovalResponse:
 
 
 agent.can_use_tool(approve)
+conflicting_approval: ApprovalResponse = {  # type: ignore[assignment]
+    "action": "allow",
+    "decision": "deny",
+}
 
 
-async def post_tool_failure(_context: FailureContext) -> HookResponse:
+async def post_tool_failure(_context: FailureContext) -> FailureHookResponse:
     return None
 
 

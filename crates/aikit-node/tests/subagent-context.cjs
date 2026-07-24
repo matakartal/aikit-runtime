@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { Agent, tool } = require("..");
+const { Agent, DurableRun, tool } = require("..");
 
 const profiles = [
   {
@@ -35,6 +35,138 @@ function spec(id) {
 }
 
 async function main() {
+  const nowUnixMs = Date.now();
+  const durable = new DurableRun("safe-number-session", "safe-number-run");
+  const approvalId = durable.requestTypedApproval({
+    logical_key: "safe-number-approval",
+    kind: "confirmation",
+    prompt: "Proceed?",
+    payload: { ratio: 1.5, nested: { sequence: 1.5 } },
+    requested_at_unix_ms: nowUnixMs,
+    expires_at_unix_ms: nowUnixMs + 10_000,
+  });
+  const pendingJson = JSON.stringify(durable.snapshot());
+  const pendingRestored = DurableRun.fromState(JSON.parse(pendingJson));
+  assert.equal(
+    pendingRestored.snapshot().projection.approvals[approvalId].resolved_sequence,
+    null,
+  );
+  assert.deepEqual(
+    pendingRestored.snapshot().projection.approvals[approvalId].payload,
+    { ratio: 1.5, nested: { sequence: 1.5 } },
+  );
+  pendingRestored.resolveApprovalAt(
+    "safe-number-resume",
+    approvalId,
+    true,
+    BigInt(nowUnixMs + 1),
+    { ratio: 2.5, nested: { sequence: 2.5 } },
+  );
+  const resolvedJson = JSON.stringify(pendingRestored.snapshot());
+  const resolvedRestored = DurableRun.fromState(JSON.parse(resolvedJson));
+  assert.deepEqual(
+    resolvedRestored.snapshot().projection.approvals[approvalId].response,
+    { ratio: 2.5, nested: { sequence: 2.5 } },
+  );
+
+  const highSafe = new DurableRun("high-safe-session", "high-safe-run");
+  highSafe.requestTypedApproval({
+    logical_key: "high-safe-approval",
+    kind: "confirmation",
+    prompt: "Proceed?",
+    payload: null,
+    requested_at_unix_ms: 2 ** 32,
+    expires_at_unix_ms: 2 ** 32 + 1,
+  });
+  DurableRun.fromState(JSON.parse(JSON.stringify(highSafe.snapshot())));
+  for (const invalidTimestamp of [1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const invalid = new DurableRun(
+      `invalid-time-session-${invalidTimestamp}`,
+      `invalid-time-run-${invalidTimestamp}`,
+    );
+    assert.throws(
+      () => invalid.requestTypedApproval({
+        logical_key: "invalid-time-approval",
+        kind: "confirmation",
+        prompt: "Proceed?",
+        payload: null,
+        requested_at_unix_ms: invalidTimestamp,
+        expires_at_unix_ms: invalidTimestamp,
+      }),
+      /safe integer number/,
+    );
+  }
+  const unsafeClock = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+  const beforeUnsafeClocks = JSON.stringify(highSafe.snapshot());
+  assert.throws(
+    () => highSafe.expireApprovals("unsafe-expire", unsafeClock),
+    /Number\.MAX_SAFE_INTEGER/,
+  );
+  assert.throws(
+    () => highSafe.resolveApprovalAt(
+      "unsafe-resolve",
+      "missing-approval",
+      true,
+      unsafeClock,
+    ),
+    /Number\.MAX_SAFE_INTEGER/,
+  );
+  assert.throws(
+    () => highSafe.applyCommandAt(
+      { command: "cancel", command_id: "unsafe-cancel" },
+      unsafeClock,
+    ),
+    /Number\.MAX_SAFE_INTEGER/,
+  );
+  assert.equal(JSON.stringify(highSafe.snapshot()), beforeUnsafeClocks);
+
+  function trackedAbortSignal() {
+    const listeners = new Set();
+    return {
+      listeners,
+      signal: {
+        aborted: false,
+        addEventListener(type, listener) {
+          assert.equal(type, "abort");
+          listeners.add(listener);
+        },
+        removeEventListener(type, listener) {
+          assert.equal(type, "abort");
+          listeners.delete(listener);
+        },
+      },
+    };
+  }
+
+  const exhausted = trackedAbortSignal();
+  const eventParent = Agent.fromEnv({}).run("event listener cleanup", {
+    signal: exhausted.signal,
+  });
+  assert.equal(exhausted.listeners.size, 1);
+  for await (const _event of eventParent.events("event-listener-cleanup")) {
+    // Early return from the event view must also remove the dormant parent listener.
+    break;
+  }
+  assert.equal(exhausted.listeners.size, 0, "event view leaked its parent listener");
+
+  const parentClosed = trackedAbortSignal();
+  const parentStream = Agent.fromEnv({}).run("parent closes first", {
+    signal: parentClosed.signal,
+  });
+  parentStream.events("parent-close-child");
+  assert.equal(parentClosed.listeners.size, 2);
+  await parentStream.close();
+  assert.equal(parentClosed.listeners.size, 0, "parent close leaked child listener");
+
+  const childClosed = trackedAbortSignal();
+  const childParent = Agent.fromEnv({}).run("child closes first", {
+    signal: childClosed.signal,
+  });
+  const childStream = childParent.events("child-close");
+  assert.equal(childClosed.listeners.size, 2);
+  await childStream.close();
+  assert.equal(childClosed.listeners.size, 0, "child close leaked parent listener");
+
   const agent = Agent.fromEnv({});
   let calls = 0;
   agent.addToolDefinition(
@@ -108,6 +240,56 @@ async function main() {
   assert.equal(denied.status, "succeeded");
   assert.equal(calls, 7, "denied subagent reached the host callback");
   assert.equal(approvals, 1, "static deny unexpectedly reached the approver");
+
+  // Conflicting aliases must fail closed. Previously `action` silently won over `decision`, so
+  // this malformed host response authorized the tool despite carrying an explicit denial.
+  const malformed = Agent.fromEnv({});
+  let malformedCalls = 0;
+  malformed.addTool(
+    "search",
+    "must remain denied",
+    { type: "object" },
+    async () => {
+      malformedCalls += 1;
+      return "must not run";
+    },
+  );
+  malformed.canUseTool(async () => ({ action: "allow", decision: "deny" }));
+  malformed.setPermissions([{ effect: "ask", tool: "search" }]);
+  const malformedResult = await malformed.runSubagent(
+    spec("malformed-approval"),
+    profiles,
+  );
+  assert.equal(malformedResult.status, "succeeded");
+  assert.equal(malformedCalls, 0, "ambiguous approval reached the host callback");
+
+  // Hook objects use only the documented `action` discriminator. A contradictory alias must
+  // fail closed instead of letting `continue` silently override `block`.
+  const malformedHook = Agent.fromEnv({});
+  let malformedHookCalls = 0;
+  malformedHook.addTool(
+    "search",
+    "must remain blocked",
+    { type: "object" },
+    async () => {
+      malformedHookCalls += 1;
+      return "must not run";
+    },
+  );
+  malformedHook.onPreToolUse(
+    async () => ({ action: "continue", decision: "block" }),
+    "search",
+  );
+  const malformedHookResult = await malformedHook.runSubagent(
+    spec("malformed-hook"),
+    profiles,
+  );
+  assert.equal(malformedHookResult.status, "succeeded");
+  assert.equal(
+    malformedHookCalls,
+    0,
+    "ambiguous hook reached the host callback",
+  );
 
   const failing = Agent.fromEnv({});
   const failureOrder = [];

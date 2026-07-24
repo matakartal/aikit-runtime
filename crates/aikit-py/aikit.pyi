@@ -401,18 +401,52 @@ class ApprovalRequest(TypedDict):
 PermissionUpdate = Literal["allow_exact_input", "allow_tool"]
 
 
-class ApprovalAllowResponse(TypedDict, total=False):
+class _ApprovalAllowActionRequired(TypedDict):
     action: Literal["allow"]
-    decision: Literal["allow"]
+
+
+class ApprovalAllowActionResponse(_ApprovalAllowActionRequired, total=False):
     updated_input: JsonValue
     updated_permissions: List[PermissionUpdate]
 
 
-class ApprovalDenyResponse(TypedDict, total=False):
+class _ApprovalAllowDecisionRequired(TypedDict):
+    decision: Literal["allow"]
+
+
+class ApprovalAllowDecisionResponse(_ApprovalAllowDecisionRequired, total=False):
+    updated_input: JsonValue
+    updated_permissions: List[PermissionUpdate]
+
+
+ApprovalAllowResponse = Union[
+    ApprovalAllowActionResponse,
+    ApprovalAllowDecisionResponse,
+]
+
+
+class _ApprovalDenyActionRequired(TypedDict):
     action: Literal["deny"]
-    decision: Literal["deny"]
+
+
+class ApprovalDenyActionResponse(_ApprovalDenyActionRequired, total=False):
     message: str
     interrupt: bool
+
+
+class _ApprovalDenyDecisionRequired(TypedDict):
+    decision: Literal["deny"]
+
+
+class ApprovalDenyDecisionResponse(_ApprovalDenyDecisionRequired, total=False):
+    message: str
+    interrupt: bool
+
+
+ApprovalDenyResponse = Union[
+    ApprovalDenyActionResponse,
+    ApprovalDenyDecisionResponse,
+]
 
 
 ApprovalResponse = Union[
@@ -471,7 +505,75 @@ class StopContext(TypedDict):
     usage: Usage
 
 
-HookResponse = Optional[Union[Literal["continue"], Mapping[str, JsonValue]]]
+class HookContinueResponse(TypedDict):
+    action: Literal["continue"]
+
+
+class PromptHookRewriteResponse(TypedDict):
+    action: Literal["rewrite"]
+    prompt: str
+
+
+class _HookBlockRequired(TypedDict):
+    action: Literal["block"]
+
+
+class HookBlockResponse(_HookBlockRequired, total=False):
+    message: str
+
+
+class PreToolHookRewriteResponse(TypedDict):
+    action: Literal["rewrite"]
+    input: JsonValue
+
+
+class PostToolHookRewriteResponse(TypedDict):
+    action: Literal["rewrite"]
+    output: str
+
+
+class _PostToolHookErrorRequired(TypedDict):
+    action: Literal["error", "mark_error"]
+
+
+class PostToolHookErrorResponse(_PostToolHookErrorRequired, total=False):
+    message: str
+
+
+class FailureHookRewriteResponse(TypedDict):
+    action: Literal["rewrite"]
+    error: str
+
+
+PromptHookResponse = Optional[Union[
+    Literal["continue"],
+    HookContinueResponse,
+    PromptHookRewriteResponse,
+    HookBlockResponse,
+]]
+PreToolHookResponse = Optional[Union[
+    Literal["continue"],
+    HookContinueResponse,
+    PreToolHookRewriteResponse,
+    HookBlockResponse,
+]]
+PostToolHookResponse = Optional[Union[
+    Literal["continue"],
+    HookContinueResponse,
+    PostToolHookRewriteResponse,
+    PostToolHookErrorResponse,
+]]
+FailureHookResponse = Optional[Union[
+    Literal["continue"],
+    HookContinueResponse,
+    FailureHookRewriteResponse,
+]]
+HookResponse = Union[
+    PromptHookResponse,
+    PreToolHookResponse,
+    PostToolHookResponse,
+    FailureHookResponse,
+]
 
 
 class ModelPricing(TypedDict):
@@ -1290,6 +1392,8 @@ StreamEvent = Union[
 class QueryEventStream(AsyncIterator[StreamEvent]):
     def __aiter__(self) -> "QueryEventStream": ...
     async def __anext__(self) -> StreamEvent: ...
+    async def __aenter__(self) -> "QueryEventStream": ...
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
     def cancel(self) -> None: ...
     def is_cancelled(self) -> bool: ...
     async def aclose(self) -> RunOutcome: ...
@@ -1466,6 +1570,35 @@ class A2aMessageReceipt(_A2aMessageReceiptRequired, total=False):
     owner_tenant_id: str
 
 
+A2aDispatchOutboxState = Literal["queued", "running", "reconcile_pending", "settled"]
+A2aSendResponsePolicy = Literal["blocking", "immediate", "streaming"]
+
+
+class _A2aDispatchOutboxRecordRequired(TypedDict):
+    dispatch_id: str
+    owner_subject: str
+    message_id: str
+    task_id: str
+    context_id: str
+    session_id: str
+    run_id: str
+    message: A2aMessage
+    envelope: A2aGovernanceEnvelope
+    state: A2aDispatchOutboxState
+    response: JsonValue
+    response_policy: A2aSendResponsePolicy
+    attempts: int
+    created_revision: int
+    updated_revision: int
+
+
+class A2aDispatchOutboxRecord(_A2aDispatchOutboxRecordRequired, total=False):
+    owner_tenant_id: str
+    resumed_from: A2aTaskState
+    immediate_response: A2aTaskRecord
+    last_error: str
+
+
 class A2aTaskPage(TypedDict):
     tasks: List[A2aTaskRecord]
     nextPageToken: str
@@ -1537,7 +1670,7 @@ class A2aMapperState(TypedDict):
     context_owners: Dict[str, A2aContextOwner]
     tasks: Dict[str, A2aTaskRecord]
     receipts: Dict[str, A2aMessageReceipt]
-    dispatch_outbox: Dict[str, JsonValue]
+    dispatch_outbox: Dict[str, A2aDispatchOutboxRecord]
     cancellation_outbox: Dict[str, JsonValue]
     pending_events: Dict[str, JsonValue]
     next_sequence: int
@@ -1578,6 +1711,17 @@ class A2aMapper:
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
     ) -> A2aGovernedAction: ...
+    def mark_dispatch_running(self, dispatch_id: str) -> A2aMapperState: ...
+    def mark_dispatch_reconcile_pending(
+        self, dispatch_id: str, error: str
+    ) -> A2aMapperState: ...
+    def transition_dispatch_task(
+        self,
+        dispatch_id: str,
+        expected_attempt: int,
+        state: A2aTaskState,
+        status_message: Optional[str] = ...,
+    ) -> A2aMapperState: ...
     def transition_task(
         self,
         task_id: str,
@@ -1698,26 +1842,26 @@ class Agent:
     ) -> None: ...
     def on_user_prompt(
         self,
-        callback: Callable[[PromptContext], Awaitable[HookResponse]],
+        callback: Callable[[PromptContext], Awaitable[PromptHookResponse]],
     ) -> None: ...
     def on_pre_tool_use(
         self,
-        callback: Callable[[PreToolUseContext], Awaitable[HookResponse]],
+        callback: Callable[[PreToolUseContext], Awaitable[PreToolHookResponse]],
         tool: Optional[str] = ...,
     ) -> None: ...
     def on_post_tool_use(
         self,
-        callback: Callable[[PostToolUseContext], Awaitable[HookResponse]],
+        callback: Callable[[PostToolUseContext], Awaitable[PostToolHookResponse]],
         tool: Optional[str] = ...,
     ) -> None: ...
     def on_post_tool_failure(
         self,
-        callback: Callable[[FailureContext], Awaitable[HookResponse]],
+        callback: Callable[[FailureContext], Awaitable[FailureHookResponse]],
         tool: Optional[str] = ...,
     ) -> None: ...
     def on_failure(
         self,
-        callback: Callable[[FailureContext], Awaitable[HookResponse]],
+        callback: Callable[[FailureContext], Awaitable[FailureHookResponse]],
     ) -> None: ...
     def on_stop(
         self,
@@ -1952,7 +2096,15 @@ class DurableApproval(_DurableApprovalRequired, total=False):
     resolved_at_unix_ms: int
 
 
-class DurableRunProjection(TypedDict):
+class DurableWorkerLease(TypedDict):
+    owner_id: str
+    lease_id: str
+    acquired_at_unix_ms: int
+    heartbeat_at_unix_ms: int
+    expires_at_unix_ms: int
+
+
+class _DurableRunProjectionRequired(TypedDict):
     branch_id: str
     status: DurableRunStatus
     state: JsonValue
@@ -1961,6 +2113,10 @@ class DurableRunProjection(TypedDict):
     artifacts: Dict[str, List[JsonValue]]
     current_checkpoint_id: Optional[str]
     pause_reason: Optional[str]
+
+
+class DurableRunProjection(_DurableRunProjectionRequired, total=False):
+    worker_lease: DurableWorkerLease
 
 
 class _ResumeCommandRequired(TypedDict):

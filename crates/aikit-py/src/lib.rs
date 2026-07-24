@@ -12,6 +12,7 @@
 //! No Python GIL is held while Rust awaits a provider or a Python coroutine.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -19,41 +20,44 @@ use aikit_core::orchestration::{
     ExecutionContext, ModelRouteRequirements, Orchestrator, SubagentSpec,
 };
 use aikit_core::{
-    evaluate_outcome as core_evaluate_outcome, evaluate_trace as core_evaluate_trace,
-    request_capability_tool, tools::ToolExecutor, A2aListTasksRequest, A2aMapper as CoreA2aMapper,
-    A2aMessage, A2aTaskState, Agent, AgentError, AgentOptions as CoreAgentOptions,
-    ApprovalDecision, ApprovalRequest, AuditFailureMode, AuditPayloadPolicy, AuditTrail,
-    BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits, BudgetPolicy, BuiltinTools,
-    CancellableRun, CancellationHandle, CapabilityBroker, CapabilityGate, CedarDecisionAdapter,
-    Client as CoreClient, CompactionPolicy, CompatibilityMode, ContainmentPolicy,
-    CorrelationIdentity, DockerConfig, DurabilityMode, DurableApprovalRequest, ErrorCode,
-    ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata, FailureContext, FailureHookOutcome,
-    GeneratedText, Governance, GovernanceBinding, GuardedExecutor, GuardrailChain, HookDispatcher,
-    HookMatcher, HookOutcome, InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore,
-    JsonlAuditSink, McpClient, McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message,
-    ModelCapability, ModelCatalog, ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing,
-    ModelProfile, ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent,
-    OpaDecisionAdapter, PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor,
-    PolicyDocument, PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext,
-    PromptContext, PromptHookOutcome, ProtocolPrincipal, ProviderOptions, RegexBlocklist,
-    RetryPolicy, RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome, RunRecorder, RunState,
+    deserialize_a2a_mapper_snapshot_bounded, evaluate_outcome as core_evaluate_outcome,
+    evaluate_trace as core_evaluate_trace, request_capability_tool,
+    serialize_a2a_mapper_snapshot_bounded, tools::ToolExecutor, A2aListTasksRequest,
+    A2aMapper as CoreA2aMapper, A2aMessage, A2aTaskState, Agent, AgentError,
+    AgentOptions as CoreAgentOptions, ApprovalDecision, ApprovalRequest, AuditFailureMode,
+    AuditPayloadPolicy, AuditTrail, BrowserEgressPolicy, BrowserTools, BudgetLedger, BudgetLimits,
+    BudgetPolicy, BuiltinTools, CancellableRun, CancellationHandle, CapabilityBroker,
+    CapabilityGate, CedarDecisionAdapter, Client as CoreClient, CompactionPolicy,
+    CompatibilityMode, ContainmentPolicy, CorrelationIdentity, DockerConfig, DurabilityMode,
+    DurableApprovalRequest, ErrorCode, ErrorInfo, EvalGate, EvalSuite, ExternalDecisionMetadata,
+    FailureContext, FailureHookOutcome, GeneratedText, Governance, GovernanceBinding,
+    GuardedExecutor, GuardrailChain, HookDispatcher, HookMatcher, HookOutcome,
+    InMemorySessionStore, JsonFileMemoryStore, JsonFileSessionStore, JsonlAuditSink, McpClient,
+    McpToolExecutor, McpToolFilter, MediaArtifact, MediaInput, Message, ModelCapability,
+    ModelCatalog, ModelCatalogOverrides, ModelCatalogSnapshot, ModelPricing, ModelProfile,
+    ObjectOptions, ObjectStream as CoreObjectStream, ObjectStreamEvent, OpaDecisionAdapter,
+    PermissionEngine, PermissionMode, PermissionUpdate, PiiRedactor, PolicyDocument,
+    PolicySnapshot, PostToolOutcome, PostToolUseContext, PreToolUseContext, PromptContext,
+    PromptHookOutcome, ProtocolPrincipal, ProviderOptions, RegexBlocklist, RetryPolicy,
+    RouteRequest, RoutingOptions, Rule, RunCommand, RunOutcome, RunRecorder, RunState,
     RunTerminalStatus, Sandbox, SecretRedactor, SemanticValidation, SemanticValidator, Session,
     SessionStore, SessionStoreError, SqliteMemoryStore, SqliteSessionStore, StdioTransport,
     StopContext, StreamDelta, StreamEvent, StreamEventEncoder, StreamableHttpTransport,
-    ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools,
+    ToolApprover, ToolRouter, ToolSpec, TraceInput, WebTools, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES,
+    A2A_MAX_DISPATCH_ATTEMPTS,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBool, PyDict};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 
 pyo3::create_exception!(aikit, AikitError, PyRuntimeError);
 
-type CallbackLocals = Arc<RwLock<Option<Arc<pyo3_async_runtimes::TaskLocals>>>>;
+type CallbackLocals = Arc<pyo3_async_runtimes::TaskLocals>;
 
 fn python_mcp_tool_filter(value: Option<Bound<'_, PyAny>>) -> PyResult<McpToolFilter> {
     let Some(value) = value else {
@@ -300,6 +304,91 @@ fn py_protocol_error(error: aikit_core::ProtocolError) -> PyErr {
     PyValueError::new_err(format!("{code}: {}", error.message))
 }
 
+fn python_a2a_dispatch_attempt(value: &Bound<'_, PyAny>) -> PyResult<u32> {
+    let invalid = || {
+        PyValueError::new_err(format!(
+            "A2A dispatch expected_attempt must be an integer between 1 and {A2A_MAX_DISPATCH_ATTEMPTS}"
+        ))
+    };
+    if value.is_instance_of::<PyBool>() {
+        return Err(invalid());
+    }
+    let value = value.extract::<u32>().map_err(|_| invalid())?;
+    if !(1..=A2A_MAX_DISPATCH_ATTEMPTS).contains(&value) {
+        return Err(invalid());
+    }
+    Ok(value)
+}
+
+struct BoundedA2aStateWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedA2aStateWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedA2aStateWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(input.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("A2A mapper state size overflowed"));
+        };
+        if next_len > self.max_bytes {
+            self.exceeded = true;
+            return Err(io::Error::other("A2A mapper state exceeded byte limit"));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_a2a_state_bytes(state: &Value, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut writer = BoundedA2aStateWriter::new(max_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, state) {
+        if writer.exceeded {
+            return Err(format!(
+                "A2A mapper state exceeds the {max_bytes} byte limit"
+            ));
+        }
+        return Err(format!("encode A2A mapper state: {error}"));
+    }
+    Ok(writer.bytes)
+}
+
+fn python_a2a_mapper_state(state: &Bound<'_, PyAny>) -> PyResult<CoreA2aMapper> {
+    let state: Value = pythonize::depythonize(state).map_err(|error| {
+        PyValueError::new_err(format!("invalid canonical A2A mapper state: {error}"))
+    })?;
+    let bytes =
+        bounded_a2a_state_bytes(&state, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES).map_err(|error| {
+            PyValueError::new_err(format!("invalid canonical A2A mapper state: {error}"))
+        })?;
+    deserialize_a2a_mapper_snapshot_bounded(&bytes, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+        .map_err(py_protocol_error)
+}
+
+fn python_a2a_mapper_snapshot<'py>(py: Python<'py>, mapper: &CoreA2aMapper) -> PyResult<Py<PyAny>> {
+    let bytes = serialize_a2a_mapper_snapshot_bounded(mapper, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+        .map_err(py_protocol_error)?;
+    let state: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        PyRuntimeError::new_err(format!("failed to decode A2A snapshot: {error}"))
+    })?;
+    python_json(py, &state)
+}
+
 /// Thin stateful Python handle over the canonical Rust A2A mapper.
 ///
 /// This object maps authenticated A2A operations into governed runtime intents. It is not an A2A
@@ -322,12 +411,12 @@ impl PyA2aMapper {
     #[staticmethod]
     fn from_state(state: Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            inner: python_protocol_value(&state, "canonical A2A mapper state")?,
+            inner: python_a2a_mapper_state(&state)?,
         })
     }
 
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        python_json(py, &self.inner)
+        python_a2a_mapper_snapshot(py, &self.inner)
     }
 
     #[pyo3(signature = (message, correlation, principal=None))]
@@ -342,10 +431,12 @@ impl PyA2aMapper {
         let correlation: CorrelationIdentity =
             python_protocol_value(&correlation, "A2A correlation identity")?;
         let principal = python_protocol_principal(principal)?;
-        let action = self
-            .inner
-            .prepare_send_message(message, correlation, principal.as_ref());
-        python_json(py, &action)
+        let mut candidate = self.inner.clone();
+        let action = candidate.prepare_send_message(message, correlation, principal.as_ref());
+        let action = python_json(py, &action)?;
+        python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(action)
     }
 
     #[pyo3(signature = (request, correlation, principal=None))]
@@ -395,12 +486,69 @@ impl PyA2aMapper {
         let correlation: CorrelationIdentity =
             python_protocol_value(&correlation, "A2A correlation identity")?;
         let principal = python_protocol_principal(principal)?;
-        let action = self
-            .inner
-            .prepare_cancel_task(task_id, correlation, principal.as_ref());
-        python_json(py, &action)
+        let mut candidate = self.inner.clone();
+        let action = candidate.prepare_cancel_task(task_id, correlation, principal.as_ref());
+        let action = python_json(py, &action)?;
+        python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(action)
     }
 
+    /// Claim one queued/reconcile-pending dispatch and return the snapshot carrying its exact
+    /// incremented attempt fence. Hosts must pass that attempt to `transition_dispatch_task`.
+    fn mark_dispatch_running<'py>(
+        &mut self,
+        py: Python<'py>,
+        dispatch_id: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let mut candidate = self.inner.clone();
+        candidate
+            .mark_dispatch_running(dispatch_id)
+            .map_err(py_protocol_error)?;
+        let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    /// Move a queued/running dispatch into startup-safe reconciliation. The raw host error is
+    /// accepted for API parity but the canonical core persists only a sanitized reason.
+    fn mark_dispatch_reconcile_pending<'py>(
+        &mut self,
+        py: Python<'py>,
+        dispatch_id: &str,
+        error: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let mut candidate = self.inner.clone();
+        candidate
+            .mark_dispatch_reconcile_pending(dispatch_id, error)
+            .map_err(py_protocol_error)?;
+        let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    #[pyo3(signature = (dispatch_id, expected_attempt, state, status_message=None))]
+    fn transition_dispatch_task<'py>(
+        &mut self,
+        py: Python<'py>,
+        dispatch_id: &str,
+        expected_attempt: Bound<'_, PyAny>,
+        state: Bound<'_, PyAny>,
+        status_message: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let expected_attempt = python_a2a_dispatch_attempt(&expected_attempt)?;
+        let state: A2aTaskState = python_protocol_value(&state, "canonical A2A task state")?;
+        let mut candidate = self.inner.clone();
+        candidate
+            .transition_dispatch_task(dispatch_id, expected_attempt, state, status_message)
+            .map_err(py_protocol_error)?;
+        let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
+    }
+
+    /// Admin-only state change. An open host dispatch must use `transition_dispatch_task` so a
+    /// stale callback cannot settle a newer attempt.
     #[pyo3(signature = (task_id, state, status_message=None))]
     fn transition_task<'py>(
         &mut self,
@@ -410,10 +558,13 @@ impl PyA2aMapper {
         status_message: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         let state: A2aTaskState = python_protocol_value(&state, "canonical A2A task state")?;
-        self.inner
+        let mut candidate = self.inner.clone();
+        candidate
             .transition_task(task_id, state, status_message)
             .map_err(py_protocol_error)?;
-        python_json(py, &self.inner)
+        let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
+        self.inner = candidate;
+        Ok(snapshot)
     }
 }
 
@@ -1211,9 +1362,23 @@ fn required_auto_containment(docker: Option<PyDockerContainmentOptions>) -> Cont
     policy.with_docker_fallback(config)
 }
 
+#[derive(Clone)]
+struct PyCallbackTemplate {
+    callable: Arc<Py<PyAny>>,
+}
+
 struct PyHostCallback {
     callable: Arc<Py<PyAny>>,
     locals: CallbackLocals,
+}
+
+impl PyCallbackTemplate {
+    fn bind(&self, locals: CallbackLocals) -> Arc<PyHostCallback> {
+        Arc::new(PyHostCallback {
+            callable: self.callable.clone(),
+            locals,
+        })
+    }
 }
 
 /// Private callable returned by `tool(...)` when used as a decorator factory. The decorated
@@ -1263,9 +1428,38 @@ impl PyToolDecorator {
 
 /// A [`ToolExecutor`] that runs Python `async def` tools. This is the "tool callback in" seam.
 #[derive(Default)]
-struct PyToolExecutor {
+struct PyToolTemplateRegistry {
     /// tool name -> Python async callable taking a dict and returning a str.
-    tools: RwLock<HashMap<String, Arc<PyHostCallback>>>,
+    tools: RwLock<HashMap<String, Arc<PyCallbackTemplate>>>,
+}
+
+struct PyToolExecutor {
+    tools: HashMap<String, Arc<PyHostCallback>>,
+}
+
+impl PyToolTemplateRegistry {
+    fn snapshot(&self) -> PyResult<Self> {
+        let tools = self
+            .tools
+            .read()
+            .map_err(|_| PyRuntimeError::new_err("tool registry poisoned"))?
+            .clone();
+        Ok(Self {
+            tools: RwLock::new(tools),
+        })
+    }
+
+    fn bind(&self, locals: Option<&CallbackLocals>) -> PyResult<Arc<PyToolExecutor>> {
+        let templates = self
+            .tools
+            .read()
+            .map_err(|_| PyRuntimeError::new_err("tool registry poisoned"))?;
+        let mut tools = HashMap::with_capacity(templates.len());
+        for (name, template) in templates.iter() {
+            tools.insert(name.clone(), bind_callback(template, locals)?);
+        }
+        Ok(Arc::new(PyToolExecutor { tools }))
+    }
 }
 
 /// Binding-local composite: canonical built-ins dispatch to the exact registered core suite;
@@ -1295,20 +1489,11 @@ impl ToolExecutor for PyAgentToolExecutor {
 /// Call one Python async callback without holding the GIL across its await and convert the result
 /// through JSON-compatible values. This single seam drives tools, approvals, and all hooks.
 async fn call_python(callback: Arc<PyHostCallback>, payload: Value) -> Result<Value, String> {
-    let locals = callback
-        .locals
-        .read()
-        .map_err(|_| "Python callback context lock poisoned".to_string())?
-        .clone()
-        .ok_or_else(|| {
-            "Python callback requires Agent.run/query to start inside an active asyncio loop"
-                .to_string()
-        })?;
     let future = Python::attach(|py| -> PyResult<_> {
         let input = pythonize::pythonize(py, &payload)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let coroutine = callback.callable.bind(py).call1((input,))?;
-        pyo3_async_runtimes::into_future_with_locals(locals.as_ref(), coroutine)
+        pyo3_async_runtimes::into_future_with_locals(callback.locals.as_ref(), coroutine)
     })
     .map_err(|error| error.to_string())?;
 
@@ -1319,15 +1504,9 @@ async fn call_python(callback: Arc<PyHostCallback>, payload: Value) -> Result<Va
 #[async_trait]
 impl ToolExecutor for PyToolExecutor {
     async fn execute(&self, name: &str, input: Value) -> aikit_core::Result<String> {
-        let callback = self
-            .tools
-            .read()
-            .map_err(|_| aikit_core::AikitError::ToolExecution("tool registry poisoned".into()))?
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                aikit_core::AikitError::ToolExecution(format!("unknown tool '{name}'"))
-            })?;
+        let callback = self.tools.get(name).cloned().ok_or_else(|| {
+            aikit_core::AikitError::ToolExecution(format!("unknown tool '{name}'"))
+        })?;
         match call_python(callback, input).await {
             Ok(Value::String(output)) => Ok(output),
             Ok(_) => Err(aikit_core::AikitError::ToolExecution(format!(
@@ -1371,13 +1550,6 @@ impl ToolApprover for PyToolApprover {
             },
         }
     }
-}
-
-fn action(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("action").and_then(Value::as_str))
-        .or_else(|| value.get("decision").and_then(Value::as_str))
 }
 
 fn parse_semantic_validation(value: Value) -> Result<SemanticValidation, String> {
@@ -1425,26 +1597,78 @@ impl SemanticValidator for PySemanticValidator {
 }
 
 fn parse_approval(value: Value) -> Result<ApprovalDecision, String> {
-    match action(&value) {
-        Some("allow") => Ok(ApprovalDecision::Allow {
-            updated_input: value
+    if let Some(decision) = value.as_str() {
+        return match decision {
+            "allow" => Ok(ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: Vec::new(),
+            }),
+            "deny" => Ok(ApprovalDecision::Deny {
+                message: "tool use denied by Python approver".into(),
+                interrupt: false,
+            }),
+            _ => Err(
+                "Python approver returned an invalid decision; expected bool or allow|deny".into(),
+            ),
+        };
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        "Python approver returned an invalid decision; expected bool or {decision: allow|deny}"
+            .to_string()
+    })?;
+    let action = object.get("action");
+    let decision = object.get("decision");
+    if action.is_some() && decision.is_some() {
+        return Err("Python approver decision must use exactly one of action or decision".into());
+    }
+    let (discriminator, selected) = action
+        .map(|value| ("action", value))
+        .or_else(|| decision.map(|value| ("decision", value)))
+        .ok_or_else(|| {
+            "Python approver decision requires exactly one action or decision field".to_string()
+        })?;
+    let selected = selected
+        .as_str()
+        .ok_or_else(|| format!("Python approver {discriminator} must be allow or deny"))?;
+    let allowed_fields: &[&str] = match selected {
+        "allow" => &[discriminator, "updated_input", "updated_permissions"],
+        "deny" => &[discriminator, "message", "interrupt"],
+        _ => {
+            return Err(format!(
+                "Python approver {discriminator} must be allow or deny"
+            ))
+        }
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed_fields.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "Python approver {selected} decision contains unknown field '{field}'"
+        ));
+    }
+
+    match selected {
+        "allow" => Ok(ApprovalDecision::Allow {
+            updated_input: object
                 .get("updated_input")
                 .filter(|input| !input.is_null())
                 .cloned(),
             updated_permissions: parse_permission_updates(&value)?,
         }),
-        Some("deny") => Ok(ApprovalDecision::Deny {
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("tool use denied by Python approver")
-                .to_string(),
-            interrupt: optional_bool(&value, "interrupt")?.unwrap_or(false),
-        }),
-        _ => Err(
-            "Python approver returned an invalid decision; expected bool or {decision: allow|deny}"
-                .into(),
-        ),
+        "deny" => {
+            let message = match object.get("message") {
+                None | Some(Value::Null) => "tool use denied by Python approver".to_string(),
+                Some(Value::String(message)) => message.clone(),
+                Some(_) => return Err("Python approver message must be a string".into()),
+            };
+            Ok(ApprovalDecision::Deny {
+                message,
+                interrupt: optional_bool(&value, "interrupt")?.unwrap_or(false),
+            })
+        }
+        _ => unreachable!("approval discriminator was validated above"),
     }
 }
 
@@ -1480,114 +1704,315 @@ fn optional_bool(value: &Value, field: &str) -> Result<Option<bool>, String> {
     }
 }
 
+type ParsedHookResponse<'a> = Option<(&'a str, &'a serde_json::Map<String, Value>)>;
+
+fn strict_hook_response<'a>(
+    value: &'a Value,
+    shapes: &[(&str, &[&str])],
+) -> Result<ParsedHookResponse<'a>, String> {
+    if value.is_null() || value.as_str() == Some("continue") {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "hook response must be null, 'continue', or an action object".to_string())?;
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "hook response object requires a string action".to_string())?;
+    let allowed = shapes
+        .iter()
+        .find_map(|(candidate, fields)| (*candidate == action).then_some(*fields))
+        .ok_or_else(|| format!("hook response action '{action}' is not valid here"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| field.as_str() != "action" && !allowed.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "hook response action '{action}' contains unknown field '{field}'"
+        ));
+    }
+    Ok(Some((action, object)))
+}
+
 fn parse_prompt_hook(value: Value) -> PromptHookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        PromptHookOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("prompt")
-                .and_then(Value::as_str)
-                .map(|prompt| PromptHookOutcome::Rewrite(prompt.to_string()))
-                .unwrap_or_else(|| {
-                    PromptHookOutcome::Block("UserPrompt hook rewrite omitted prompt".into())
-                }),
-            Some("block") => PromptHookOutcome::Block(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("blocked by UserPrompt hook")
-                    .to_string(),
-            ),
-            _ => PromptHookOutcome::Block("UserPrompt hook returned an invalid action".into()),
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["prompt"]),
+            ("block", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => PromptHookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(|prompt| PromptHookOutcome::Rewrite(prompt.to_string()))
+            .unwrap_or_else(|| {
+                PromptHookOutcome::Block("UserPrompt hook rewrite omitted prompt".into())
+            }),
+        Ok(Some(("block", object))) => match object.get("message") {
+            None | Some(Value::Null) => {
+                PromptHookOutcome::Block("blocked by UserPrompt hook".into())
+            }
+            Some(Value::String(message)) => PromptHookOutcome::Block(message.clone()),
+            Some(_) => {
+                PromptHookOutcome::Block("UserPrompt hook block message must be a string".into())
+            }
+        },
+        Ok(Some((_, _))) => {
+            PromptHookOutcome::Block("UserPrompt hook returned an invalid action".into())
         }
+        Err(error) => PromptHookOutcome::Block(format!(
+            "UserPrompt hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_pre_hook(value: Value) -> HookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        HookOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("input")
-                .cloned()
-                .map(HookOutcome::Rewrite)
-                .unwrap_or_else(|| HookOutcome::Block("PreToolUse rewrite omitted input".into())),
-            Some("block") => HookOutcome::Block(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("blocked by PreToolUse hook")
-                    .to_string(),
-            ),
-            _ => HookOutcome::Block("PreToolUse hook returned an invalid action".into()),
-        }
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["input"]),
+            ("block", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => HookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("input")
+            .cloned()
+            .map(HookOutcome::Rewrite)
+            .unwrap_or_else(|| HookOutcome::Block("PreToolUse rewrite omitted input".into())),
+        Ok(Some(("block", object))) => match object.get("message") {
+            None | Some(Value::Null) => HookOutcome::Block("blocked by PreToolUse hook".into()),
+            Some(Value::String(message)) => HookOutcome::Block(message.clone()),
+            Some(_) => HookOutcome::Block("PreToolUse block message must be a string".into()),
+        },
+        Ok(Some((_, _))) => HookOutcome::Block("PreToolUse hook returned an invalid action".into()),
+        Err(error) => HookOutcome::Block(format!(
+            "PreToolUse hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_post_hook(value: Value) -> PostToolOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        PostToolOutcome::Continue
-    } else {
-        match action(&value) {
-            Some("rewrite") => value
-                .get("output")
-                .and_then(Value::as_str)
-                .map(|output| PostToolOutcome::RewriteOutput(output.to_string()))
-                .unwrap_or_else(|| {
-                    PostToolOutcome::MarkError("PostToolUse rewrite omitted output".into())
-                }),
-            Some("error") | Some("mark_error") => PostToolOutcome::MarkError(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("marked as error by PostToolUse hook")
-                    .to_string(),
-            ),
-            _ => PostToolOutcome::MarkError("PostToolUse hook returned an invalid action".into()),
+    match strict_hook_response(
+        &value,
+        &[
+            ("continue", &[]),
+            ("rewrite", &["output"]),
+            ("error", &["message"]),
+            ("mark_error", &["message"]),
+        ],
+    ) {
+        Ok(None | Some(("continue", _))) => PostToolOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
+            .get("output")
+            .and_then(Value::as_str)
+            .map(|output| PostToolOutcome::RewriteOutput(output.to_string()))
+            .unwrap_or_else(|| {
+                PostToolOutcome::MarkError("PostToolUse rewrite omitted output".into())
+            }),
+        Ok(Some(("error" | "mark_error", object))) => match object.get("message") {
+            None | Some(Value::Null) => {
+                PostToolOutcome::MarkError("marked as error by PostToolUse hook".into())
+            }
+            Some(Value::String(message)) => PostToolOutcome::MarkError(message.clone()),
+            Some(_) => {
+                PostToolOutcome::MarkError("PostToolUse error message must be a string".into())
+            }
+        },
+        Ok(Some((_, _))) => {
+            PostToolOutcome::MarkError("PostToolUse hook returned an invalid action".into())
         }
+        Err(error) => PostToolOutcome::MarkError(format!(
+            "PostToolUse hook returned an invalid response: {error}"
+        )),
     }
 }
 
 fn parse_failure_hook(value: Value) -> FailureHookOutcome {
-    if value.is_null() || matches!(action(&value), Some("continue")) {
-        FailureHookOutcome::Continue
-    } else if matches!(action(&value), Some("rewrite")) {
-        value
+    match strict_hook_response(&value, &[("continue", &[]), ("rewrite", &["error"])]) {
+        Ok(None | Some(("continue", _))) => FailureHookOutcome::Continue,
+        Ok(Some(("rewrite", object))) => object
             .get("error")
             .and_then(Value::as_str)
             .map(|error| FailureHookOutcome::RewriteError(error.to_string()))
-            .unwrap_or(FailureHookOutcome::Continue)
-    } else {
-        FailureHookOutcome::Continue
+            .unwrap_or(FailureHookOutcome::Continue),
+        Ok(Some((_, _))) | Err(_) => FailureHookOutcome::Continue,
     }
 }
 
-fn host_callback(
-    callback: Bound<'_, PyAny>,
-    locals: CallbackLocals,
-) -> PyResult<Arc<PyHostCallback>> {
+#[derive(Clone, Default)]
+struct PyHookTemplateRegistry {
+    user_prompt: Vec<Arc<PyCallbackTemplate>>,
+    pre_tool: Vec<(HookMatcher, Arc<PyCallbackTemplate>)>,
+    post_tool: Vec<(HookMatcher, Arc<PyCallbackTemplate>)>,
+    post_tool_failure: Vec<(HookMatcher, Arc<PyCallbackTemplate>)>,
+    failure: Vec<Arc<PyCallbackTemplate>>,
+    stop: Vec<Arc<PyCallbackTemplate>>,
+}
+
+impl PyHookTemplateRegistry {
+    fn bind(&self, locals: Option<&CallbackLocals>) -> PyResult<HookDispatcher> {
+        let mut hooks = HookDispatcher::new();
+        for template in &self.user_prompt {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_user_prompt_submit_async(move |ctx: PromptContext| {
+                let callback = callback.clone();
+                async move {
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "prompt": ctx.prompt,
+                    });
+                    match call_python(callback, payload).await {
+                        Ok(value) => parse_prompt_hook(value),
+                        Err(error) => PromptHookOutcome::Block(callback_error("UserPrompt", error)),
+                    }
+                }
+            });
+        }
+        for (matcher, template) in &self.pre_tool {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_pre_tool_use_async(matcher.clone(), move |ctx: PreToolUseContext| {
+                let callback = callback.clone();
+                async move {
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "turn": ctx.turn,
+                        "tool_use_id": ctx.tool_use_id,
+                        "tool": ctx.tool,
+                        "input": ctx.input,
+                    });
+                    match call_python(callback, payload).await {
+                        Ok(value) => parse_pre_hook(value),
+                        Err(error) => HookOutcome::Block(callback_error("PreToolUse", error)),
+                    }
+                }
+            });
+        }
+        for (matcher, template) in &self.post_tool {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_post_tool_use_async(matcher.clone(), move |ctx: PostToolUseContext| {
+                let callback = callback.clone();
+                async move {
+                    let duration_ms = u64::try_from(ctx.duration_ms).unwrap_or(u64::MAX);
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "turn": ctx.turn,
+                        "tool_use_id": ctx.tool_use_id,
+                        "tool": ctx.tool,
+                        "input": ctx.input,
+                        "output": ctx.output,
+                        "duration_ms": duration_ms,
+                    });
+                    match call_python(callback, payload).await {
+                        Ok(value) => parse_post_hook(value),
+                        Err(error) => {
+                            PostToolOutcome::MarkError(callback_error("PostToolUse", error))
+                        }
+                    }
+                }
+            });
+        }
+        for (matcher, template) in &self.post_tool_failure {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_post_tool_failure_async(matcher.clone(), move |ctx: FailureContext| {
+                let callback = callback.clone();
+                async move {
+                    let stage = serde_json::to_value(ctx.stage).unwrap_or(Value::Null);
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "turn": ctx.turn,
+                        "stage": stage,
+                        "tool_use_id": ctx.tool_use_id,
+                        "tool": ctx.tool,
+                        "error": ctx.error,
+                    });
+                    match call_python(callback, payload).await {
+                        Ok(value) => parse_failure_hook(value),
+                        Err(_) => FailureHookOutcome::Continue,
+                    }
+                }
+            });
+        }
+        for template in &self.failure {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_failure_async(move |ctx: FailureContext| {
+                let callback = callback.clone();
+                async move {
+                    let stage = serde_json::to_value(ctx.stage).unwrap_or(Value::Null);
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "turn": ctx.turn,
+                        "stage": stage,
+                        "tool_use_id": ctx.tool_use_id,
+                        "tool": ctx.tool,
+                        "error": ctx.error,
+                    });
+                    match call_python(callback, payload).await {
+                        Ok(value) => parse_failure_hook(value),
+                        Err(_) => FailureHookOutcome::Continue,
+                    }
+                }
+            });
+        }
+        for template in &self.stop {
+            let callback = bind_callback(template, locals)?;
+            hooks.on_stop_async(move |ctx: StopContext| {
+                let callback = callback.clone();
+                async move {
+                    let payload = serde_json::json!({
+                        "run_id": ctx.run_id,
+                        "turns": ctx.turns,
+                        "reason": ctx.reason,
+                        "usage": ctx.usage,
+                    });
+                    let _ = call_python(callback, payload).await;
+                }
+            });
+        }
+        Ok(hooks)
+    }
+}
+
+fn callback_template(callback: Bound<'_, PyAny>) -> PyResult<Arc<PyCallbackTemplate>> {
     if !callback.is_callable() {
         return Err(PyValueError::new_err("callback must be callable"));
     }
-    Ok(Arc::new(PyHostCallback {
+    Ok(Arc::new(PyCallbackTemplate {
         callable: Arc::new(callback.unbind()),
-        locals,
     }))
 }
 
-fn capture_callback_locals(py: Python<'_>, locals: &CallbackLocals) -> PyResult<()> {
+fn capture_callback_locals(py: Python<'_>) -> PyResult<CallbackLocals> {
     let task_locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|error| {
         PyRuntimeError::new_err(format!(
             "cancellable runs must start inside an active asyncio loop: {error}"
         ))
     })?;
-    *locals
-        .write()
-        .map_err(|_| PyRuntimeError::new_err("Python callback context lock poisoned"))? =
-        Some(Arc::new(task_locals));
-    Ok(())
+    Ok(Arc::new(task_locals))
+}
+
+fn capture_callback_locals_if_needed(
+    py: Python<'_>,
+    required: bool,
+) -> PyResult<Option<CallbackLocals>> {
+    if required {
+        return capture_callback_locals(py).map(Some);
+    }
+    Ok(None)
+}
+
+fn bind_callback(
+    template: &Arc<PyCallbackTemplate>,
+    locals: Option<&CallbackLocals>,
+) -> PyResult<Arc<PyHostCallback>> {
+    locals
+        .map(|locals| template.bind(locals.clone()))
+        .ok_or_else(|| PyRuntimeError::new_err("Python callback context is unavailable"))
 }
 
 fn callback_error(stage: &str, error: String) -> String {
@@ -2204,6 +2629,29 @@ impl QueryEventStream {
         })
     }
 
+    /// Event views share the underlying run, so early loop exit needs the same deterministic
+    /// cleanup contract as `QueryStream`.
+    fn __aenter__<'py>(slf: PyRef<'_, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream: Py<QueryEventStream> = slf.into();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(stream) })
+    }
+
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Bound<'_, PyAny>,
+        _exc_value: Bound<'_, PyAny>,
+        _traceback: Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.cancellation.cancel();
+        let inner = self.inner.clone();
+        let recorder = self.recorder.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            close_query_stream(inner, recorder).await;
+            Ok(false)
+        })
+    }
+
     fn cancel(&self) {
         self.cancellation.cancel();
     }
@@ -2323,6 +2771,7 @@ fn jsonl_audit_trail(path: &str, payload_policy: &str, failure_mode: &str) -> Py
 
 fn build_orchestrator(
     binding: &PyAgent,
+    callback_locals: Option<CallbackLocals>,
     profiles: Vec<ModelProfile>,
     budget: BudgetLimits,
     max_parallelism: usize,
@@ -2335,13 +2784,9 @@ fn build_orchestrator(
         .iter()
         .map(|tool| tool.name.clone())
         .collect();
-    let context = ExecutionContext::new(
-        binding.governance(),
-        binding.audit.fresh_run(),
-        budget,
-        allowed_tools,
-    );
-    let executor = binding.tool_executor();
+    let (executor, governance) = binding.bind_run(callback_locals)?;
+    let context =
+        ExecutionContext::new(governance, binding.audit.fresh_run(), budget, allowed_tools);
     let orchestrator = Orchestrator::new(
         Arc::new(binding.inner.clone()),
         catalog,
@@ -2399,9 +2844,7 @@ fn query(
 ) -> PyResult<QueryStream> {
     let messages = python_messages(&prompt)?;
     let mut tool_specs: Vec<ToolSpec> = Vec::new();
-    let mut tool_map: HashMap<String, Arc<PyHostCallback>> = HashMap::new();
-    let callback_locals = Arc::new(RwLock::new(None));
-    capture_callback_locals(py, &callback_locals)?;
+    let mut tool_templates: HashMap<String, Arc<PyCallbackTemplate>> = HashMap::new();
 
     if let Some(tools) = tools {
         for t in tools {
@@ -2415,14 +2858,13 @@ fn query(
                 description,
                 input_schema,
             });
-            tool_map.insert(
-                name,
-                Arc::new(PyHostCallback {
-                    callable: Arc::new(t.unbind()),
-                    locals: callback_locals.clone(),
-                }),
-            );
+            tool_templates.insert(name, callback_template(t)?);
         }
+    }
+    let callback_locals = capture_callback_locals_if_needed(py, !tool_templates.is_empty())?;
+    let mut tool_map = HashMap::with_capacity(tool_templates.len());
+    for (name, template) in tool_templates {
+        tool_map.insert(name, bind_callback(&template, callback_locals.as_ref())?);
     }
 
     let governance = Governance::new(
@@ -2430,9 +2872,7 @@ fn query(
         HookDispatcher::new(),
     );
     let agent = Agent::from_process_env();
-    let executor: Arc<dyn ToolExecutor> = Arc::new(PyToolExecutor {
-        tools: RwLock::new(tool_map),
-    });
+    let executor: Arc<dyn ToolExecutor> = Arc::new(PyToolExecutor { tools: tool_map });
     let mut run_options = python_agent_options(options, governance)?;
     if let Some(model) = model {
         run_options.model = model;
@@ -2449,56 +2889,65 @@ fn query(
 #[pyclass(name = "Agent")]
 struct PyAgent {
     inner: Agent,
-    executor: Arc<PyToolExecutor>,
+    executor: Arc<PyToolTemplateRegistry>,
     builtin_sandbox: Option<Sandbox>,
     builtin_tools: Option<Arc<BuiltinTools>>,
     external_tools: Arc<ToolRouter>,
     session_store: Arc<dyn SessionStore>,
     audit: AuditTrail,
     permissions: PermissionEngine,
-    hooks: HookDispatcher,
-    approver: Option<Arc<dyn ToolApprover>>,
+    hooks: PyHookTemplateRegistry,
+    approver: Option<Arc<PyCallbackTemplate>>,
     gated_tools: Vec<String>,
     input_guardrails: Arc<GuardrailChain>,
     output_guardrails: Arc<GuardrailChain>,
-    callback_locals: CallbackLocals,
+    requires_callback_locals: bool,
 }
 
 impl PyAgent {
     fn from_core(inner: Agent) -> Self {
         Self {
             inner,
-            executor: Arc::new(PyToolExecutor::default()),
+            executor: Arc::new(PyToolTemplateRegistry::default()),
             builtin_sandbox: None,
             builtin_tools: None,
             external_tools: Arc::new(ToolRouter::default()),
             session_store: Arc::new(InMemorySessionStore::default()),
             audit: AuditTrail::new(),
             permissions: PermissionEngine::default(),
-            hooks: HookDispatcher::new(),
+            hooks: PyHookTemplateRegistry::default(),
             approver: None,
             gated_tools: Vec::new(),
             input_guardrails: Arc::new(GuardrailChain::default()),
             output_guardrails: Arc::new(GuardrailChain::default()),
-            callback_locals: Arc::new(RwLock::new(None)),
+            requires_callback_locals: false,
         }
     }
 
-    fn governance(&self) -> Governance {
-        let governance = Governance::new(self.permissions.clone(), self.hooks.clone());
-        match &self.approver {
+    fn bind_run(
+        &self,
+        locals: Option<CallbackLocals>,
+    ) -> PyResult<(Arc<dyn ToolExecutor>, Governance)> {
+        let approver: Option<Arc<dyn ToolApprover>> = self
+            .approver
+            .as_ref()
+            .map(|template| {
+                bind_callback(template, locals.as_ref())
+                    .map(|callback| Arc::new(PyToolApprover { callback }) as Arc<dyn ToolApprover>)
+            })
+            .transpose()?;
+        let governance =
+            Governance::new(self.permissions.clone(), self.hooks.bind(locals.as_ref())?);
+        let governance = match &approver {
             Some(approver) => governance.with_approver(approver.clone()),
             None => governance,
-        }
-    }
-
-    fn tool_executor(&self) -> Arc<dyn ToolExecutor> {
+        };
         let executor: Arc<dyn ToolExecutor> = Arc::new(PyAgentToolExecutor {
-            host: self.executor.clone(),
+            host: self.executor.bind(locals.as_ref())?,
             builtins: self.builtin_tools.clone(),
             external: self.external_tools.clone(),
         });
-        let executor = match (&self.approver, self.gated_tools.is_empty()) {
+        let executor = match (&approver, self.gated_tools.is_empty()) {
             (Some(approver), false) => Arc::new(CapabilityGate::new(
                 Arc::new(CapabilityBroker::new(
                     approver.clone(),
@@ -2509,11 +2958,12 @@ impl PyAgent {
             )),
             _ => executor,
         };
-        Arc::new(GuardedExecutor::new(
+        let executor = Arc::new(GuardedExecutor::new(
             executor,
             self.input_guardrails.clone(),
             self.output_guardrails.clone(),
-        ))
+        ));
+        Ok((executor, governance))
     }
 
     fn install_external_tools(
@@ -2581,7 +3031,7 @@ impl PyAgent {
                 "tool '{name}' is already registered"
             )));
         }
-        let callback = host_callback(callback, self.callback_locals.clone())?;
+        let callback = callback_template(callback)?;
         self.executor
             .tools
             .write()
@@ -2592,6 +3042,7 @@ impl PyAgent {
             description,
             input_schema,
         });
+        self.requires_callback_locals = true;
         Ok(())
     }
 
@@ -2599,10 +3050,10 @@ impl PyAgent {
         &self,
         messages: Vec<Message>,
         mut options: CoreAgentOptions,
+        executor: Arc<dyn ToolExecutor>,
     ) -> PyResult<QueryStream> {
         options.tools = self.inner.tool_specs().to_vec();
         options.audit = self.audit.clone();
-        let executor = self.tool_executor();
         let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
         let run = CoreClient::new(self.inner.clone())
             .query_cancellable_messages_with_executor(messages, options, executor)
@@ -2969,28 +3420,16 @@ impl PyAgent {
 
     /// Register an async human/host approval callback for `ask` permission decisions.
     fn can_use_tool(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
-        self.approver = Some(Arc::new(PyToolApprover {
-            callback: host_callback(callback_value, self.callback_locals.clone())?,
-        }));
+        self.approver = Some(callback_template(callback_value)?);
+        self.requires_callback_locals = true;
         Ok(())
     }
 
     fn on_user_prompt(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
         self.hooks
-            .on_user_prompt_submit_async(move |ctx: PromptContext| {
-                let callback = callback.clone();
-                async move {
-                    let payload = serde_json::json!({
-                        "run_id": ctx.run_id,
-                        "prompt": ctx.prompt,
-                    });
-                    match call_python(callback, payload).await {
-                        Ok(value) => parse_prompt_hook(value),
-                        Err(error) => PromptHookOutcome::Block(callback_error("UserPrompt", error)),
-                    }
-                }
-            });
+            .user_prompt
+            .push(callback_template(callback_value)?);
+        self.requires_callback_locals = true;
         Ok(())
     }
 
@@ -3000,25 +3439,11 @@ impl PyAgent {
         callback_value: Bound<'_, PyAny>,
         tool: Option<String>,
     ) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
-            .on_pre_tool_use_async(matcher, move |ctx: PreToolUseContext| {
-                let callback = callback.clone();
-                async move {
-                    let payload = serde_json::json!({
-                        "run_id": ctx.run_id,
-                        "turn": ctx.turn,
-                        "tool_use_id": ctx.tool_use_id,
-                        "tool": ctx.tool,
-                        "input": ctx.input,
-                    });
-                    match call_python(callback, payload).await {
-                        Ok(value) => parse_pre_hook(value),
-                        Err(error) => HookOutcome::Block(callback_error("PreToolUse", error)),
-                    }
-                }
-            });
+            .pre_tool
+            .push((matcher, callback_template(callback_value)?));
+        self.requires_callback_locals = true;
         Ok(())
     }
 
@@ -3028,30 +3453,11 @@ impl PyAgent {
         callback_value: Bound<'_, PyAny>,
         tool: Option<String>,
     ) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
-            .on_post_tool_use_async(matcher, move |ctx: PostToolUseContext| {
-                let callback = callback.clone();
-                async move {
-                    let duration_ms = u64::try_from(ctx.duration_ms).unwrap_or(u64::MAX);
-                    let payload = serde_json::json!({
-                        "run_id": ctx.run_id,
-                        "turn": ctx.turn,
-                        "tool_use_id": ctx.tool_use_id,
-                        "tool": ctx.tool,
-                        "input": ctx.input,
-                        "output": ctx.output,
-                        "duration_ms": duration_ms,
-                    });
-                    match call_python(callback, payload).await {
-                        Ok(value) => parse_post_hook(value),
-                        Err(error) => {
-                            PostToolOutcome::MarkError(callback_error("PostToolUse", error))
-                        }
-                    }
-                }
-            });
+            .post_tool
+            .push((matcher, callback_template(callback_value)?));
+        self.requires_callback_locals = true;
         Ok(())
     }
 
@@ -3063,67 +3469,23 @@ impl PyAgent {
         callback_value: Bound<'_, PyAny>,
         tool: Option<String>,
     ) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
         let matcher = tool.map(HookMatcher::tool).unwrap_or_else(HookMatcher::any);
         self.hooks
-            .on_post_tool_failure_async(matcher, move |ctx: FailureContext| {
-                let callback = callback.clone();
-                async move {
-                    let stage = serde_json::to_value(ctx.stage).unwrap_or(Value::Null);
-                    let payload = serde_json::json!({
-                        "run_id": ctx.run_id,
-                        "turn": ctx.turn,
-                        "stage": stage,
-                        "tool_use_id": ctx.tool_use_id,
-                        "tool": ctx.tool,
-                        "error": ctx.error,
-                    });
-                    match call_python(callback, payload).await {
-                        Ok(value) => parse_failure_hook(value),
-                        Err(_) => FailureHookOutcome::Continue,
-                    }
-                }
-            });
+            .post_tool_failure
+            .push((matcher, callback_template(callback_value)?));
+        self.requires_callback_locals = true;
         Ok(())
     }
 
     fn on_failure(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
-        self.hooks.on_failure_async(move |ctx: FailureContext| {
-            let callback = callback.clone();
-            async move {
-                let stage = serde_json::to_value(ctx.stage).unwrap_or(Value::Null);
-                let payload = serde_json::json!({
-                    "run_id": ctx.run_id,
-                    "turn": ctx.turn,
-                    "stage": stage,
-                    "tool_use_id": ctx.tool_use_id,
-                    "tool": ctx.tool,
-                    "error": ctx.error,
-                });
-                match call_python(callback, payload).await {
-                    Ok(value) => parse_failure_hook(value),
-                    Err(_) => FailureHookOutcome::Continue,
-                }
-            }
-        });
+        self.hooks.failure.push(callback_template(callback_value)?);
+        self.requires_callback_locals = true;
         Ok(())
     }
 
     fn on_stop(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
-        let callback = host_callback(callback_value, self.callback_locals.clone())?;
-        self.hooks.on_stop_async(move |ctx: StopContext| {
-            let callback = callback.clone();
-            async move {
-                let payload = serde_json::json!({
-                    "run_id": ctx.run_id,
-                    "turns": ctx.turns,
-                    "reason": ctx.reason,
-                    "usage": ctx.usage,
-                });
-                let _ = call_python(callback, payload).await;
-            }
-        });
+        self.hooks.stop.push(callback_template(callback_value)?);
+        self.requires_callback_locals = true;
         Ok(())
     }
 
@@ -3157,10 +3519,9 @@ impl PyAgent {
         max_tokens: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let messages = python_messages(&prompt)?;
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
+        let (executor, governance) = self.bind_run(callback_locals)?;
         let agent = self.inner.clone();
-        let executor = self.tool_executor();
-        let governance = self.governance();
         let audit = self.audit.clone();
         let model = model.unwrap_or_else(|| "mock-1".into());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -3187,14 +3548,15 @@ impl PyAgent {
         max_tokens: u64,
     ) -> PyResult<QueryStream> {
         let messages = python_messages(&prompt)?;
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
+        let (executor, governance) = self.bind_run(callback_locals)?;
         let mut options = CoreAgentOptions {
-            governance: self.governance(),
+            governance,
             ..CoreAgentOptions::default()
         };
         options.model = model.unwrap_or_else(|| "mock-1".into());
         options.max_tokens = max_tokens;
-        self.start_run(messages, options)
+        self.start_run(messages, options, executor)
     }
 
     /// Start a cancellable governed run using the full shared core RunOptions surface.
@@ -3206,13 +3568,14 @@ impl PyAgent {
         options: Option<Bound<'_, PyAny>>,
     ) -> PyResult<QueryStream> {
         let messages = python_messages(&prompt)?;
-        capture_callback_locals(py, &self.callback_locals)?;
-        let options = python_agent_options(options, self.governance())?;
-        self.start_run(messages, options)
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
+        let (executor, governance) = self.bind_run(callback_locals)?;
+        let options = python_agent_options(options, governance)?;
+        self.start_run(messages, options, executor)
     }
 
     /// Snapshot this configured Agent into a reusable high-level Client.
-    fn client(&self) -> PyClient {
+    fn client(&self) -> PyResult<PyClient> {
         PyClient::from_agent(self)
     }
 
@@ -3335,7 +3698,7 @@ impl PyAgent {
         budget: Option<Bound<'py, PyAny>>,
         max_parallelism: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
         let spec: SubagentSpec = pythonize::depythonize(&spec)
             .map_err(|e| PyValueError::new_err(format!("invalid subagent spec: {e}")))?;
         let profiles: Vec<ModelProfile> = pythonize::depythonize(&profiles)
@@ -3345,7 +3708,8 @@ impl PyAgent {
                 .map_err(|e| PyValueError::new_err(format!("invalid budget limits: {e}")))?,
             None => BudgetLimits::default(),
         };
-        let (orchestrator, context) = build_orchestrator(self, profiles, budget, max_parallelism)?;
+        let (orchestrator, context) =
+            build_orchestrator(self, callback_locals, profiles, budget, max_parallelism)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = orchestrator.execute(spec, &context).await;
             let value =
@@ -3368,7 +3732,7 @@ impl PyAgent {
         budget: Option<Bound<'py, PyAny>>,
         max_parallelism: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
         let specs: Vec<SubagentSpec> = pythonize::depythonize(&specs)
             .map_err(|e| PyValueError::new_err(format!("invalid subagent specs: {e}")))?;
         let profiles: Vec<ModelProfile> = pythonize::depythonize(&profiles)
@@ -3378,7 +3742,8 @@ impl PyAgent {
                 .map_err(|e| PyValueError::new_err(format!("invalid budget limits: {e}")))?,
             None => BudgetLimits::default(),
         };
-        let (orchestrator, context) = build_orchestrator(self, profiles, budget, max_parallelism)?;
+        let (orchestrator, context) =
+            build_orchestrator(self, callback_locals, profiles, budget, max_parallelism)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let results = orchestrator.fan_out(specs, &context).await;
             let value = serde_json::to_value(results)
@@ -3417,7 +3782,7 @@ impl PyAgent {
         budget: Option<Bound<'py, PyAny>>,
         max_parallelism: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
         let members: Vec<SubagentSpec> = pythonize::depythonize(&members)
             .map_err(|e| PyValueError::new_err(format!("invalid council members: {e}")))?;
         let synthesizer: SubagentSpec = pythonize::depythonize(&synthesizer)
@@ -3429,7 +3794,8 @@ impl PyAgent {
                 .map_err(|e| PyValueError::new_err(format!("invalid budget limits: {e}")))?,
             None => BudgetLimits::default(),
         };
-        let (orchestrator, context) = build_orchestrator(self, profiles, budget, max_parallelism)?;
+        let (orchestrator, context) =
+            build_orchestrator(self, callback_locals, profiles, budget, max_parallelism)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = orchestrator
                 .council(members, synthesizer, min_successes, &context)
@@ -3456,7 +3822,7 @@ impl PyAgent {
         budget: Option<Bound<'py, PyAny>>,
         max_parallelism: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        capture_callback_locals(py, &self.callback_locals)?;
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
         let spec: SubagentSpec = pythonize::depythonize(&spec)
             .map_err(|e| PyValueError::new_err(format!("invalid subagent spec: {e}")))?;
         let profiles: Vec<ModelProfile> = pythonize::depythonize(&profiles)
@@ -3466,7 +3832,8 @@ impl PyAgent {
                 .map_err(|e| PyValueError::new_err(format!("invalid budget limits: {e}")))?,
             None => BudgetLimits::default(),
         };
-        let (orchestrator, context) = build_orchestrator(self, profiles, budget, max_parallelism)?;
+        let (orchestrator, context) =
+            build_orchestrator(self, callback_locals, profiles, budget, max_parallelism)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = orchestrator.resume(&session_id, spec, &context).await;
             let value =
@@ -3501,9 +3868,9 @@ impl PyAgent {
         let provider_options = structured_provider_options(provider_options)?;
         let semantic_validator = validator
             .map(|callback| {
-                capture_callback_locals(py, &self.callback_locals)?;
+                let callback_locals = capture_callback_locals(py)?;
                 Ok::<Arc<dyn SemanticValidator>, PyErr>(Arc::new(PySemanticValidator {
-                    callback: host_callback(callback, self.callback_locals.clone())?,
+                    callback: callback_template(callback)?.bind(callback_locals),
                 })
                     as Arc<dyn SemanticValidator>)
             })
@@ -3591,9 +3958,9 @@ impl PyAgent {
         let provider_options = structured_provider_options(provider_options)?;
         let semantic_validator = validator
             .map(|callback| {
-                capture_callback_locals(py, &self.callback_locals)?;
+                let callback_locals = capture_callback_locals(py)?;
                 Ok::<Arc<dyn SemanticValidator>, PyErr>(Arc::new(PySemanticValidator {
-                    callback: host_callback(callback, self.callback_locals.clone())?,
+                    callback: callback_template(callback)?.bind(callback_locals),
                 })
                     as Arc<dyn SemanticValidator>)
             })
@@ -3636,31 +4003,87 @@ impl PyAgent {
 #[pyclass(name = "Client")]
 struct PyClient {
     inner: CoreClient,
-    executor: Arc<dyn ToolExecutor>,
-    governance: Governance,
+    executor: Arc<PyToolTemplateRegistry>,
+    builtin_tools: Option<Arc<BuiltinTools>>,
+    external_tools: Arc<ToolRouter>,
+    permissions: PermissionEngine,
+    hooks: PyHookTemplateRegistry,
+    approver: Option<Arc<PyCallbackTemplate>>,
+    gated_tools: Vec<String>,
+    input_guardrails: Arc<GuardrailChain>,
+    output_guardrails: Arc<GuardrailChain>,
     audit: AuditTrail,
-    callback_locals: CallbackLocals,
+    requires_callback_locals: bool,
 }
 
 impl PyClient {
-    fn from_agent(agent: &PyAgent) -> Self {
-        Self {
+    fn from_agent(agent: &PyAgent) -> PyResult<Self> {
+        Ok(Self {
             inner: CoreClient::new(agent.inner.clone()),
-            executor: agent.tool_executor(),
-            governance: agent.governance(),
+            executor: Arc::new(agent.executor.snapshot()?),
+            builtin_tools: agent.builtin_tools.clone(),
+            external_tools: agent.external_tools.clone(),
+            permissions: agent.permissions.clone(),
+            hooks: agent.hooks.clone(),
+            approver: agent.approver.clone(),
+            gated_tools: agent.gated_tools.clone(),
+            input_guardrails: agent.input_guardrails.clone(),
+            output_guardrails: agent.output_guardrails.clone(),
             audit: agent.audit.clone(),
-            callback_locals: agent.callback_locals.clone(),
-        }
+            requires_callback_locals: agent.requires_callback_locals,
+        })
+    }
+
+    fn bind_run(
+        &self,
+        locals: Option<CallbackLocals>,
+    ) -> PyResult<(Arc<dyn ToolExecutor>, Governance)> {
+        let approver: Option<Arc<dyn ToolApprover>> = self
+            .approver
+            .as_ref()
+            .map(|template| {
+                bind_callback(template, locals.as_ref())
+                    .map(|callback| Arc::new(PyToolApprover { callback }) as Arc<dyn ToolApprover>)
+            })
+            .transpose()?;
+        let governance =
+            Governance::new(self.permissions.clone(), self.hooks.bind(locals.as_ref())?);
+        let governance = match &approver {
+            Some(approver) => governance.with_approver(approver.clone()),
+            None => governance,
+        };
+        let executor: Arc<dyn ToolExecutor> = Arc::new(PyAgentToolExecutor {
+            host: self.executor.bind(locals.as_ref())?,
+            builtins: self.builtin_tools.clone(),
+            external: self.external_tools.clone(),
+        });
+        let executor = match (&approver, self.gated_tools.is_empty()) {
+            (Some(approver), false) => Arc::new(CapabilityGate::new(
+                Arc::new(CapabilityBroker::new(
+                    approver.clone(),
+                    self.audit.run_id().to_string(),
+                )),
+                executor,
+                self.gated_tools.clone(),
+            )),
+            _ => executor,
+        };
+        let executor = Arc::new(GuardedExecutor::new(
+            executor,
+            self.input_guardrails.clone(),
+            self.output_guardrails.clone(),
+        ));
+        Ok((executor, governance))
     }
 
     fn start_run(
         &self,
         messages: Vec<Message>,
         mut options: CoreAgentOptions,
+        executor: Arc<dyn ToolExecutor>,
     ) -> PyResult<QueryStream> {
         options.tools = self.inner.agent().tool_specs().to_vec();
         options.audit = self.audit.clone();
-        let executor = self.executor.clone();
         let _runtime = pyo3_async_runtimes::tokio::get_runtime().enter();
         let run = self
             .inner
@@ -3673,7 +4096,7 @@ impl PyClient {
 #[pymethods]
 impl PyClient {
     #[new]
-    fn new(agent: PyRef<'_, PyAgent>) -> Self {
+    fn new(agent: PyRef<'_, PyAgent>) -> PyResult<Self> {
         Self::from_agent(&agent)
     }
 
@@ -3685,9 +4108,10 @@ impl PyClient {
         options: Option<Bound<'_, PyAny>>,
     ) -> PyResult<QueryStream> {
         let messages = python_messages(&prompt)?;
-        capture_callback_locals(py, &self.callback_locals)?;
-        let options = python_agent_options(options, self.governance.clone())?;
-        self.start_run(messages, options)
+        let callback_locals = capture_callback_locals_if_needed(py, self.requires_callback_locals)?;
+        let (executor, governance) = self.bind_run(callback_locals)?;
+        let options = python_agent_options(options, governance)?;
+        self.start_run(messages, options, executor)
     }
 }
 
@@ -3733,6 +4157,18 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a2a_state_encoding_stops_at_the_byte_limit() {
+        let state = serde_json::json!({"padding": "1234567890"});
+        let encoded = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            bounded_a2a_state_bytes(&state, encoded.len()).unwrap(),
+            encoded
+        );
+        let error = bounded_a2a_state_bytes(&state, encoded.len() - 1).unwrap_err();
+        assert!(error.contains("exceeds"));
+    }
 
     #[test]
     fn durable_binding_uses_replay_validated_state_and_canonical_trace_eval() {
@@ -3896,6 +4332,41 @@ mod tests {
                 interrupt: true,
                 ..
             })
+        ));
+        for invalid in [
+            serde_json::json!({"action": "allow", "decision": "deny"}),
+            serde_json::json!({"action": "allow", "decision": "allow"}),
+            serde_json::json!({"decision": "allow", "interrupt": true}),
+            serde_json::json!({"decision": "deny", "updated_permissions": ["allow_tool"]}),
+            serde_json::json!({"decision": "allow", "unexpected": true}),
+            serde_json::json!({"decision": "deny", "message": 7}),
+        ] {
+            assert!(
+                parse_approval(invalid).is_err(),
+                "ambiguous or branch-invalid approval must fail closed"
+            );
+        }
+        assert!(matches!(
+            parse_pre_hook(serde_json::json!({
+                "action": "continue",
+                "decision": "block"
+            })),
+            HookOutcome::Block(message) if message.contains("unknown field")
+        ));
+        assert!(matches!(
+            parse_prompt_hook(serde_json::json!({
+                "action": "rewrite",
+                "prompt": "safe",
+                "unexpected": true
+            })),
+            PromptHookOutcome::Block(message) if message.contains("unknown field")
+        ));
+        assert!(matches!(
+            parse_post_hook(serde_json::json!({
+                "action": "continue",
+                "output": "must not be accepted"
+            })),
+            PostToolOutcome::MarkError(message) if message.contains("unknown field")
         ));
     }
 

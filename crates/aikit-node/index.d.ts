@@ -789,6 +789,14 @@ export interface DurableApproval {
   resolved_sequence: number | null;
 }
 
+export interface DurableWorkerLease {
+  owner_id: string;
+  lease_id: string;
+  acquired_at_unix_ms: number;
+  heartbeat_at_unix_ms: number;
+  expires_at_unix_ms: number;
+}
+
 export interface DurableRunProjection {
   branch_id: string;
   status: DurableRunStatus;
@@ -798,6 +806,8 @@ export interface DurableRunProjection {
   artifacts: Record<string, JsonValue[]>;
   current_checkpoint_id: string | null;
   pause_reason: string | null;
+  /** Present only while a durable worker owns the active execution fence. */
+  worker_lease?: DurableWorkerLease;
 }
 
 export type DurableCommand =
@@ -901,6 +911,37 @@ export interface A2aMessageReceipt {
   accepted_revision: number;
 }
 
+export type A2aDispatchOutboxState =
+  | "queued"
+  | "running"
+  | "reconcile_pending"
+  | "settled";
+
+export type A2aSendResponsePolicy = "blocking" | "immediate" | "streaming";
+
+/** Durable host-dispatch record. `attempts` is the exact stale-callback fence. */
+export interface A2aDispatchOutboxRecord {
+  dispatch_id: string;
+  owner_subject: string;
+  owner_tenant_id?: string;
+  message_id: string;
+  task_id: string;
+  context_id: string;
+  session_id: string;
+  run_id: string;
+  message: A2aMessage;
+  resumed_from?: A2aTaskState;
+  envelope: A2aGovernanceEnvelope;
+  state: A2aDispatchOutboxState;
+  response: JsonValue;
+  response_policy: A2aSendResponsePolicy;
+  immediate_response?: A2aTaskRecord;
+  attempts: number;
+  last_error?: string;
+  created_revision: number;
+  updated_revision: number;
+}
+
 export interface A2aTaskPage {
   tasks: A2aTaskRecord[];
   nextPageToken: string;
@@ -970,8 +1011,8 @@ export interface A2aMapperState {
   context_owners: Record<string, { subject: string; tenant_id?: string }>;
   tasks: Record<string, A2aTaskRecord>;
   receipts: Record<string, A2aMessageReceipt>;
-  /** Opaque durable host-dispatch records; persist but do not project as A2A wire DTOs. */
-  dispatch_outbox: Record<string, JsonValue>;
+  /** Durable host-dispatch records; persist but do not project as A2A wire DTOs. */
+  dispatch_outbox: Record<string, A2aDispatchOutboxRecord>;
   /** Opaque durable cancellation controls; persist but do not expose as protocol responses. */
   cancellation_outbox: Record<string, JsonValue>;
   /** Opaque durable event-delivery intents retained for snapshot/restore. */
@@ -1010,6 +1051,18 @@ export class A2aMapper {
     correlation: A2aCorrelationIdentity,
     principal?: A2aProtocolPrincipal,
   ): A2aGovernedAction;
+  /** Claim a queued/reconcile-pending dispatch and read its incremented attempt fence. */
+  markDispatchRunning(dispatchId: string): A2aMapperState;
+  /** Mark an uncertain queued/running host dispatch for reconciliation; raw errors are sanitized. */
+  markDispatchReconcilePending(dispatchId: string, error: string): A2aMapperState;
+  /** Settle only the exact current dispatch attempt; stale attempts are rejected. */
+  transitionDispatchTask(
+    dispatchId: string,
+    expectedAttempt: number,
+    state: A2aTaskState,
+    statusMessage?: string,
+  ): A2aMapperState;
+  /** Admin-only transition for tasks without an open dispatch. */
   transitionTask(
     taskId: string,
     state: A2aTaskState,
@@ -1211,18 +1264,48 @@ export interface ApprovalRequest {
   input: JsonValue;
 }
 
+export type ApprovalAllowResponse =
+  | {
+      action: "allow";
+      decision?: never;
+      updated_input?: JsonValue;
+      updated_permissions?: ("allow_exact_input" | "allow_tool")[];
+      message?: never;
+      interrupt?: never;
+    }
+  | {
+      decision: "allow";
+      action?: never;
+      updated_input?: JsonValue;
+      updated_permissions?: ("allow_exact_input" | "allow_tool")[];
+      message?: never;
+      interrupt?: never;
+    };
+
+export type ApprovalDenyResponse =
+  | {
+      action: "deny";
+      decision?: never;
+      message?: string;
+      interrupt?: boolean;
+      updated_input?: never;
+      updated_permissions?: never;
+    }
+  | {
+      decision: "deny";
+      action?: never;
+      message?: string;
+      interrupt?: boolean;
+      updated_input?: never;
+      updated_permissions?: never;
+    };
+
 export type ApprovalResponse =
   | boolean
   | "allow"
   | "deny"
-  | {
-      action?: "allow" | "deny";
-      decision?: "allow" | "deny";
-      updated_input?: JsonValue;
-      updated_permissions?: ("allow_exact_input" | "allow_tool")[];
-      message?: string;
-      interrupt?: boolean;
-    };
+  | ApprovalAllowResponse
+  | ApprovalDenyResponse;
 
 export interface PromptContext {
   run_id: string;

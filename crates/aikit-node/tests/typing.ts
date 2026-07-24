@@ -18,6 +18,7 @@ import {
   validateMediaInput,
   validateModelProfile,
   type AuditablePolicyDecision,
+  type A2aDispatchOutboxRecord,
   type A2aGovernedAction,
   type A2aMapperState,
   type CapabilityState,
@@ -34,6 +35,7 @@ import {
   type PolicySnapshot,
   type DurableApproval,
   type DurableApprovalRequest,
+  type DurableWorkerLease,
   type GovernanceBinding,
   type JsonValue,
   type McpToolFilter,
@@ -210,6 +212,8 @@ const typedApprovalRequest: DurableApprovalRequest = {
 const typedApprovalId = governedDurable.requestTypedApproval(typedApprovalRequest);
 const typedApproval: DurableApproval =
   governedDurable.snapshot().projection.approvals[typedApprovalId];
+const typedWorkerLease: DurableWorkerLease | undefined =
+  governedDurable.snapshot().projection.worker_lease;
 const typedResume = governedDurable.resolveApprovalAt(
   "resume-typed",
   typedApprovalId,
@@ -219,6 +223,7 @@ const typedResume = governedDurable.resolveApprovalAt(
 );
 void governedDurable.policySnapshotHash;
 void typedApproval;
+void typedWorkerLease;
 void typedResume;
 void governedDurable.expireApprovals("sweep-typed", 200n);
 
@@ -249,9 +254,29 @@ const a2aPage = a2a.listTasks(
 const a2aState: A2aMapperState = a2a.snapshot();
 const a2aRestored: A2aMapper = A2aMapper.fromState(a2aState);
 const a2aNextSequence: number = a2aRestored.snapshot().next_sequence;
-const a2aDispatchOutbox: Record<string, JsonValue> = a2aState.dispatch_outbox;
+const a2aDispatchOutbox: Record<string, A2aDispatchOutboxRecord> =
+  a2aState.dispatch_outbox;
 const a2aCancellationOutbox: Record<string, JsonValue> = a2aState.cancellation_outbox;
 const a2aPendingEvents: Record<string, JsonValue> = a2aState.pending_events;
+const typedDispatch = Object.values(a2aDispatchOutbox)[0];
+if (typedDispatch != null) {
+  const dispatchId: string = typedDispatch.dispatch_id;
+  const claimedState: A2aMapperState = a2a.markDispatchRunning(dispatchId);
+  const reconcileState: A2aMapperState = a2a.markDispatchReconcilePending(
+    dispatchId,
+    "host outcome unknown",
+  );
+  const reclaimedState: A2aMapperState = a2a.markDispatchRunning(dispatchId);
+  const expectedAttempt: number = reclaimedState.dispatch_outbox[dispatchId].attempts;
+  const transitionedState: A2aMapperState = a2a.transitionDispatchTask(
+    dispatchId,
+    expectedAttempt,
+    "TASK_STATE_INPUT_REQUIRED",
+  );
+  void claimedState;
+  void reconcileState;
+  void transitionedState;
+}
 void a2aPage;
 void a2aState;
 void a2aNextSequence;
@@ -330,6 +355,9 @@ agent.canUseTool(async (): Promise<ApprovalResponse> => ({
   decision: "allow",
   updated_permissions: ["allow_exact_input", "allow_tool"],
 }));
+// @ts-expect-error approval aliases are mutually exclusive and cannot disagree
+const conflictingApproval: ApprovalResponse = { action: "allow", decision: "deny" };
+void conflictingApproval;
 agent.onPostToolFailure(async (context: FailureContext) => {
   if (context.stage === "tool_input_validation") {
     return { action: "rewrite", error: "safe validation failure" };

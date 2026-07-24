@@ -87,8 +87,25 @@ function normalizeNativeError(error) {
   }
 }
 
+function streamLifecycle() {
+  const cleanups = new Set();
+  let finished = false;
+  return {
+    register(cleanup) {
+      if (finished) cleanup();
+      else cleanups.add(cleanup);
+    },
+    finish() {
+      if (finished) return;
+      finished = true;
+      for (const cleanup of cleanups) cleanup();
+      cleanups.clear();
+    },
+  };
+}
+
 /** Make a native pull stream (`next()` → value | null) consumable via `for await`. */
-function asyncIterable(stream, transform, signal) {
+function asyncIterable(stream, transform, signal, lifecycle = streamLifecycle()) {
   const nativeNext = stream.next.bind(stream);
   const nativeEvents =
     typeof stream.events === "function" ? stream.events.bind(stream) : null;
@@ -102,6 +119,9 @@ function asyncIterable(stream, transform, signal) {
   const removeAbortListener = () => {
     if (abortListener != null) signal?.removeEventListener("abort", abortListener);
     abortListener = undefined;
+  };
+  const finishCleanup = () => {
+    lifecycle.finish();
   };
   const close = () => {
     if (closePromise == null) {
@@ -118,7 +138,7 @@ function asyncIterable(stream, transform, signal) {
         .catch((error) => {
           throw normalizeNativeError(error);
         })
-        .finally(removeAbortListener);
+        .finally(finishCleanup);
     }
     return closePromise;
   };
@@ -144,7 +164,8 @@ function asyncIterable(stream, transform, signal) {
   };
   if (nativeClose != null) stream.close = close;
   if (nativeEvents != null) {
-    stream.events = (responseId) => asyncIterable(nativeEvents(responseId), undefined, signal);
+    stream.events = (responseId) =>
+      asyncIterable(nativeEvents(responseId), undefined, signal, lifecycle);
   }
   if (signal != null) {
     if (typeof signal.addEventListener !== "function") {
@@ -156,25 +177,26 @@ function asyncIterable(stream, transform, signal) {
     if (signal.aborted) abortListener();
     else signal.addEventListener("abort", abortListener, { once: true });
   }
+  lifecycle.register(removeAbortListener);
   stream[Symbol.asyncIterator] = function () {
     return {
       next: async () => {
         const value = await stream.next();
         if (value != null) return { done: false, value };
         if (nativeClose != null) await close();
-        else removeAbortListener();
+        else finishCleanup();
         return { done: true, value: undefined };
       },
       // JavaScript calls `return()` on an async iterator when `for await` exits via `break`.
       // Waiting here makes early loop exit deterministically run Stop/audit/session finalizers.
       return: async () => {
         if (nativeClose != null) await close();
-        else removeAbortListener();
+        else finishCleanup();
         return { done: true, value: undefined };
       },
       throw: async (error) => {
         if (nativeClose != null) await close();
-        else removeAbortListener();
+        else finishCleanup();
         throw error;
       },
     };
