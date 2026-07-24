@@ -36,22 +36,26 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
         };
         prepared.command.stdin(std::process::Stdio::null());
         prepared.command.stdout(std::process::Stdio::null());
-        prepared.command.stderr(std::process::Stdio::piped());
+        // The launcher deliberately passes its standard handles to the suspended child. Waiting
+        // for `output()` would therefore couple capability detection to pipe EOF from every
+        // inherited writer, even after the launcher itself has exited. The probe has no output
+        // contract, so wait only for its process status and keep all three streams non-piped.
+        prepared.command.stderr(std::process::Stdio::null());
         prepared.command.kill_on_drop(true);
         prepared.command.env_clear();
         prepared
             .command
             .envs(prepared.environment_overrides.clone());
-        match tokio::time::timeout(std::time::Duration::from_secs(15), prepared.command.output()).await {
-            Ok(Ok(output)) if output.status.success() => BackendCapability::available(
+        match tokio::time::timeout(std::time::Duration::from_secs(15), prepared.command.status()).await {
+            Ok(Ok(status)) if status.success() => BackendCapability::available(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
                 "suspended child assignment to kill-on-close Windows Job succeeded; process limit enforced, job-memory limit is host-dependent, filesystem/network are not isolated",
             ),
-            Ok(Ok(output)) => BackendCapability::unavailable(
+            Ok(Ok(status)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
                 ContainmentGuarantees::windows_job(),
-                format!("Windows Job probe failed: {}", String::from_utf8_lossy(&output.stderr).trim()),
+                format!("Windows Job probe failed with status {status}"),
             ),
             Ok(Err(error)) => BackendCapability::unavailable(
                 ActiveContainmentBackend::WindowsJob,
