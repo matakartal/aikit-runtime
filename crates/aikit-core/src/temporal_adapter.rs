@@ -243,11 +243,10 @@ impl TemporalAdapter {
                 self.plan_from_decision(state, decision)
             }
             TemporalActivityOutcome::Cancelled { effect_ambiguous } => {
-                let decision = state.fail_activity(
+                let decision = state.cancel_activity(
                     &invocation.activity_id,
                     invocation.attempt,
                     "Temporal activity was cancelled",
-                    false,
                     effect_ambiguous,
                 )?;
                 self.plan_from_decision(state, decision)
@@ -623,6 +622,50 @@ mod tests {
         assert_eq!(second.attempt, 2);
         assert_ne!(first.temporal_activity_id, second.temporal_activity_id);
         assert_eq!(first.idempotency_key, second.idempotency_key);
+    }
+
+    #[test]
+    fn unambiguous_cancellation_is_durable_and_replays_as_cancelled() {
+        let adapter = adapter();
+        let mut run = RunState::new("session", "cancelled", crate::DurabilityMode::Sync).unwrap();
+        let spec = TemporalActivitySpec {
+            stable_step_id: "cancelled-read-v1".into(),
+            logical_key: "read-1".into(),
+            input: json!({"id": 1}),
+            side_effect_class: SideEffectClass::Pure,
+            idempotency_key: None,
+        };
+        let invocation = execute(adapter.prepare_activity(&mut run, spec.clone()).unwrap());
+        let cancelled = adapter
+            .record_outcome(
+                &mut run,
+                &invocation,
+                TemporalActivityOutcome::Cancelled {
+                    effect_ambiguous: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cancelled,
+            TemporalActivityPlan::Cancelled {
+                activity_id: invocation.activity_id.clone(),
+            }
+        );
+        assert_eq!(
+            run.activity(&invocation.activity_id)
+                .unwrap()
+                .latest_attempt()
+                .unwrap()
+                .status,
+            crate::durability::ActivityAttemptStatus::Cancelled
+        );
+
+        let mut replayed = RunState::from_events(run.events().to_vec()).unwrap();
+        assert_eq!(replayed, run);
+        assert_eq!(
+            adapter.prepare_activity(&mut replayed, spec).unwrap(),
+            cancelled
+        );
     }
 
     #[test]

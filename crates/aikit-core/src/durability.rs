@@ -13,10 +13,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Schema version for serialized durable run state and newly emitted events.
 ///
-/// Version 2 makes terminal failure and cancellation events fail closed while an activity attempt
-/// is still running. Version 1 logs remain readable with their original replay semantics and are
-/// migrated to a version 2 [`RunState`] when loaded.
-pub const DURABILITY_SCHEMA_VERSION: u32 = 2;
+/// Version 2 makes terminal failure and run-cancellation events fail closed while an activity
+/// attempt is still running. Version 3 adds the explicit `ActivityAttemptCancelled` event without
+/// changing historical v1/v2 event bytes. Older logs retain their original replay semantics and
+/// are migrated to a version 3 [`RunState`] when loaded.
+pub const DURABILITY_SCHEMA_VERSION: u32 = 3;
 pub(crate) const MIN_SUPPORTED_DURABILITY_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) const RUNTIME_RUN_STOPPED_AUDIT_STEP_ID: &str = "runtime-run-stopped-audit-v2";
@@ -26,6 +27,7 @@ pub(crate) const RUNTIME_RECOVERY_RUN_STOPPED_AUDIT_STEP_ID: &str =
 pub(crate) const RUNTIME_INVOCATION_LIFECYCLE_STEP_ID: &str = "runtime-invocation-lifecycle-v1";
 
 const TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION: u32 = 2;
+const ACTIVITY_ATTEMPT_CANCELLED_SCHEMA_VERSION: u32 = 3;
 
 /// Upper bound for one distributed worker lease. Long-running work stays owned through bounded
 /// heartbeat renewals instead of creating an effectively permanent claim.
@@ -402,6 +404,11 @@ pub enum RunEventKind {
         retryable: bool,
         effect_ambiguous: bool,
     },
+    ActivityAttemptCancelled {
+        activity_id: String,
+        attempt: u32,
+        reason: String,
+    },
     ActivityReconciliationRequired {
         activity_id: String,
         attempt: u32,
@@ -777,8 +784,8 @@ impl RunState {
 
     /// Rebuild and validate a run exclusively from its append-only event log.
     ///
-    /// Version 1 events are replayed with version 1 transition semantics and migrated in memory;
-    /// any event subsequently emitted by the returned state uses the current schema version.
+    /// Version 1 and 2 events are replayed with their historical transition semantics and migrated
+    /// in memory; any event subsequently emitted by the returned state uses the current schema.
     pub fn from_events(events: impl IntoIterator<Item = RunEvent>) -> DurabilityResult<Self> {
         let events: Vec<RunEvent> = events.into_iter().collect();
         let first = events.first().ok_or(DurabilityError::MissingRunStart)?;
@@ -1472,6 +1479,35 @@ impl RunState {
         }
     }
 
+    /// Commit an unambiguous activity cancellation without misclassifying it as a failure.
+    ///
+    /// A cancellation reported as effect-ambiguous keeps the existing fail-closed retry and
+    /// reconciliation rules. Reserved audit activities also remain reconciliation-only.
+    pub fn cancel_activity(
+        &mut self,
+        activity_id: &str,
+        attempt: u32,
+        reason: impl Into<String>,
+        effect_ambiguous: bool,
+    ) -> DurabilityResult<ActivityDecision> {
+        self.ensure_active()?;
+        let reason = reason.into();
+        if effect_ambiguous || is_reserved_audit_activity(self.activity(activity_id)?) {
+            return self.fail_activity(activity_id, attempt, reason, false, effect_ambiguous);
+        }
+        self.emit(
+            stable_identifier("event", &[activity_id, &attempt.to_string(), "cancelled"]),
+            RunEventKind::ActivityAttemptCancelled {
+                activity_id: activity_id.to_string(),
+                attempt,
+                reason,
+            },
+        )?;
+        Ok(ActivityDecision::Cancelled {
+            activity_id: activity_id.to_string(),
+        })
+    }
+
     /// Quarantine a reserved schedule that was persisted without its first attempt.
     ///
     /// This transition remains valid while paused or already reconciling, so an incomplete raw
@@ -2073,7 +2109,13 @@ impl RunState {
     ) -> DurabilityResult<CommandOutcome> {
         validate_identifier("command_id", command_id)?;
         validate_identifier("new_run_id", new_run_id)?;
+        if new_run_id == self.run_id {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork destination must differ from its source run".into(),
+            });
+        }
         let checkpoint = self.checkpoint_by_id(checkpoint_id)?.clone();
+        let checkpoint = self.checkpoint_for_current_run(checkpoint)?;
         let new_branch_id = stable_identifier("branch", &[new_run_id, "fork", command_id]);
         let event_id = stable_identifier("event", &[&self.run_id, "fork", command_id]);
         if let Some(event) = self.event_by_id(&event_id) {
@@ -2081,10 +2123,13 @@ impl RunState {
                 new_run_id: existing_run_id,
                 checkpoint_id: existing_checkpoint_id,
                 new_branch_id: existing_branch_id,
-                ..
+                side_effects_reconciled: existing_side_effects_reconciled,
             } = &event.kind
             {
-                if existing_run_id == new_run_id && existing_checkpoint_id == checkpoint_id {
+                if existing_run_id == new_run_id
+                    && existing_checkpoint_id == checkpoint_id
+                    && *existing_side_effects_reconciled == side_effects_reconciled
+                {
                     return Ok(CommandOutcome::Forked {
                         run: Box::new(self.build_fork(
                             new_run_id,
@@ -2162,6 +2207,42 @@ impl RunState {
         Ok(forked)
     }
 
+    fn checkpoint_for_current_run(
+        &self,
+        mut checkpoint: Checkpoint,
+    ) -> DurabilityResult<Checkpoint> {
+        if checkpoint.run_id == self.run_id {
+            return Ok(checkpoint);
+        }
+        let Some(RunEvent {
+            sequence,
+            kind:
+                RunEventKind::ForkedFrom {
+                    source_checkpoint,
+                    new_branch_id,
+                    ..
+                },
+            ..
+        }) = self.events.first()
+        else {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "inherited checkpoint has no fork lineage in the current run".into(),
+            });
+        };
+        if source_checkpoint.checkpoint_id != checkpoint.checkpoint_id
+            || source_checkpoint.run_id != checkpoint.run_id
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "inherited checkpoint does not match the current run's fork lineage".into(),
+            });
+        }
+        checkpoint.projection = fork_projection(&checkpoint, &self.run_id, new_branch_id);
+        checkpoint.run_id = self.run_id.clone();
+        checkpoint.event_sequence = *sequence;
+        checkpoint.parent_checkpoint_id = None;
+        Ok(checkpoint)
+    }
+
     fn rewind(
         &mut self,
         command_id: &str,
@@ -2170,6 +2251,7 @@ impl RunState {
     ) -> DurabilityResult<CommandOutcome> {
         validate_identifier("command_id", command_id)?;
         let checkpoint = self.checkpoint_by_id(checkpoint_id)?.clone();
+        let checkpoint = self.checkpoint_for_current_run(checkpoint)?;
         let new_branch_id = stable_identifier(
             "branch",
             &[&self.run_id, "rewind", command_id, checkpoint_id],
@@ -2178,10 +2260,13 @@ impl RunState {
         if let Some(event) = self.event_by_id(&event_id) {
             if let RunEventKind::RunRewound {
                 checkpoint_id: existing_checkpoint_id,
+                side_effects_reconciled: existing_side_effects_reconciled,
                 ..
             } = &event.kind
             {
-                if existing_checkpoint_id == checkpoint_id {
+                if existing_checkpoint_id == checkpoint_id
+                    && *existing_side_effects_reconciled == side_effects_reconciled
+                {
                     return Ok(CommandOutcome::Rewound {
                         checkpoint_id: checkpoint_id.to_string(),
                         sequence: event.sequence,
@@ -2257,18 +2342,7 @@ impl RunState {
             .filter(|event| event.sequence > event_sequence)
         {
             if let RunEventKind::ActivityAttemptStarted { activity_id, .. } = &event.kind {
-                let class = self
-                    .events
-                    .iter()
-                    .find_map(|candidate| match &candidate.kind {
-                        RunEventKind::ActivityScheduled { definition }
-                            if definition.activity_id == *activity_id =>
-                        {
-                            Some(definition.side_effect_class)
-                        }
-                        _ => None,
-                    });
-                if class.is_some_and(|class| class != SideEffectClass::Pure) {
+                if self.activity_side_effect_class(activity_id)? != SideEffectClass::Pure {
                     unsafe_activities.insert(activity_id.clone());
                 }
             }
@@ -2279,6 +2353,46 @@ impl RunState {
             });
         }
         Ok(())
+    }
+
+    fn activity_side_effect_class(&self, activity_id: &str) -> DurabilityResult<SideEffectClass> {
+        let projected = self
+            .projection
+            .activities
+            .get(activity_id)
+            .map(|record| &record.definition);
+        let mut scheduled = None;
+        for event in &self.events {
+            let RunEventKind::ActivityScheduled { definition } = &event.kind else {
+                continue;
+            };
+            if definition.activity_id != activity_id {
+                continue;
+            }
+            if scheduled.is_some_and(|existing| existing != definition) {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: format!(
+                        "activity `{activity_id}` has conflicting scheduled definitions"
+                    ),
+                });
+            }
+            scheduled = Some(definition);
+        }
+        if matches!((projected, scheduled), (Some(left), Some(right)) if left != right) {
+            return Err(DurabilityError::InvalidEvent {
+                reason: format!(
+                    "activity `{activity_id}` projection conflicts with its scheduled definition"
+                ),
+            });
+        }
+        projected
+            .or(scheduled)
+            .map(|definition| definition.side_effect_class)
+            .ok_or_else(|| DurabilityError::InvalidEvent {
+                reason: format!(
+                    "activity attempt `{activity_id}` has no durable activity definition"
+                ),
+            })
     }
 
     fn apply_event_in_place(&mut self, event: &RunEvent) -> DurabilityResult<()> {
@@ -2311,6 +2425,9 @@ impl RunState {
                             reason: "fork session does not match state".into(),
                         });
                     }
+                    validate_identifier("source_run_id", source_run_id)?;
+                    validate_identifier("new_branch_id", new_branch_id)?;
+                    validate_source_checkpoint(&self.run_id, source_run_id, source_checkpoint)?;
                     self.parent_run_id = Some(source_run_id.clone());
                     self.durability = *durability;
                     self.projection =
@@ -2687,6 +2804,31 @@ impl RunState {
                 attempt_state.retryable = *retryable;
                 attempt_state.effect_ambiguous = *effect_ambiguous;
             }
+            RunEventKind::ActivityAttemptCancelled {
+                activity_id,
+                attempt,
+                reason,
+            } => {
+                self.ensure_active()?;
+                if event.schema_version < ACTIVITY_ATTEMPT_CANCELLED_SCHEMA_VERSION {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "activity attempt cancellation events require durability schema v3"
+                            .into(),
+                    });
+                }
+                if is_reserved_audit_activity(self.activity(activity_id)?) {
+                    return Err(DurabilityError::InvalidEvent {
+                        reason: "reserved audit cancellations require reconciliation".into(),
+                    });
+                }
+                let sequence = event.sequence;
+                let attempt_state = self.running_attempt_mut(activity_id, *attempt)?;
+                attempt_state.status = ActivityAttemptStatus::Cancelled;
+                attempt_state.finished_sequence = Some(sequence);
+                attempt_state.error = Some(reason.clone());
+                attempt_state.retryable = false;
+                attempt_state.effect_ambiguous = false;
+            }
             RunEventKind::ActivityReconciliationRequired {
                 activity_id,
                 attempt,
@@ -3048,6 +3190,7 @@ impl RunState {
                 self.ensure_active()?;
                 validate_identifier("new_run_id", new_run_id)?;
                 let checkpoint = self.checkpoint_by_id(checkpoint_id)?.clone();
+                let checkpoint = self.checkpoint_for_current_run(checkpoint)?;
                 self.require_reconciled_after(checkpoint.event_sequence, *side_effects_reconciled)?;
             }
             RunEventKind::RunRewound {
@@ -3057,6 +3200,7 @@ impl RunState {
             } => {
                 self.ensure_active()?;
                 let checkpoint = self.checkpoint_by_id(checkpoint_id)?.clone();
+                let checkpoint = self.checkpoint_for_current_run(checkpoint)?;
                 self.require_reconciled_after(checkpoint.event_sequence, *side_effects_reconciled)?;
                 self.projection = fork_projection(&checkpoint, &self.run_id, new_branch_id);
                 self.projection.status = DurableRunStatus::Paused;
@@ -4548,6 +4692,194 @@ fn validate_identifier(field: &'static str, value: &str) -> DurabilityResult<()>
     Ok(())
 }
 
+fn validate_source_checkpoint(
+    destination_run_id: &str,
+    source_run_id: &str,
+    checkpoint: &Checkpoint,
+) -> DurabilityResult<()> {
+    validate_identifier("checkpoint_id", &checkpoint.checkpoint_id)?;
+    validate_identifier("checkpoint_run_id", &checkpoint.run_id)?;
+    validate_identifier("checkpoint_branch_id", &checkpoint.projection.branch_id)?;
+    validate_projection_keyed_identities(&checkpoint.projection)?;
+    if source_run_id == destination_run_id {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "fork source and destination run IDs must differ".into(),
+        });
+    }
+    if checkpoint.run_id != source_run_id {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "fork checkpoint does not belong to its declared source run".into(),
+        });
+    }
+    if checkpoint.event_sequence == 0 {
+        return Err(DurabilityError::InvalidEvent {
+            reason: "fork checkpoint must reference a persisted source event".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_projection_keyed_identities(projection: &RunProjection) -> DurabilityResult<()> {
+    for (activity_id, record) in &projection.activities {
+        if activity_id != &record.definition.activity_id {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint activity map key does not match its definition identity"
+                    .into(),
+            });
+        }
+        validate_identifier("activity_id", activity_id)?;
+        validate_identifier("stable_step_id", &record.definition.stable_step_id)?;
+        validate_identifier("logical_key", &record.definition.logical_key)?;
+        if stable_input_hash(&record.definition.input) != record.definition.input_hash {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint activity input hash does not match its input".into(),
+            });
+        }
+        if record.definition.side_effect_class == SideEffectClass::Idempotent
+            && record
+                .definition
+                .idempotency_key
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint idempotent activity has no idempotency key".into(),
+            });
+        }
+        for (index, attempt) in record.attempts.iter().enumerate() {
+            let expected_attempt = u32::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint activity attempt counter overflowed".into(),
+                })?;
+            if attempt.attempt != expected_attempt || attempt.started_sequence == 0 {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint activity attempts are not sequential".into(),
+                });
+            }
+            if attempt
+                .finished_sequence
+                .is_some_and(|finished| finished < attempt.started_sequence)
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint activity attempt finishes before it starts".into(),
+                });
+            }
+            let terminal_shape = attempt.finished_sequence.is_some();
+            let payload_matches_status = match attempt.status {
+                ActivityAttemptStatus::Running => {
+                    !terminal_shape
+                        && attempt.output.is_none()
+                        && attempt.output_hash.is_none()
+                        && attempt.error.is_none()
+                        && !attempt.retryable
+                        && !attempt.effect_ambiguous
+                }
+                ActivityAttemptStatus::Completed => {
+                    terminal_shape
+                        && attempt.output.as_ref().is_some_and(|output| {
+                            attempt.output_hash.as_deref()
+                                == Some(stable_input_hash(output).as_str())
+                        })
+                        && !attempt.retryable
+                        && !attempt.effect_ambiguous
+                }
+                ActivityAttemptStatus::Failed => {
+                    terminal_shape && attempt.output.is_none() && attempt.output_hash.is_none()
+                }
+                ActivityAttemptStatus::ReconcileRequired => {
+                    terminal_shape
+                        && attempt.output.is_none()
+                        && attempt.output_hash.is_none()
+                        && attempt.effect_ambiguous
+                }
+                ActivityAttemptStatus::Cancelled => {
+                    terminal_shape
+                        && attempt.output.is_none()
+                        && attempt.output_hash.is_none()
+                        && !attempt.retryable
+                        && !attempt.effect_ambiguous
+                }
+            };
+            if !payload_matches_status {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint activity attempt payload contradicts its status"
+                        .into(),
+                });
+            }
+            if index + 1 < record.attempts.len()
+                && (attempt.status != ActivityAttemptStatus::Failed
+                    || !attempt.retryable
+                    || !retry_is_safe(&record.definition, attempt.effect_ambiguous))
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint activity has an attempt after a terminal outcome"
+                        .into(),
+                });
+            }
+        }
+    }
+    for (approval_id, approval) in &projection.approvals {
+        if approval_id != &approval.approval_id {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint approval map key does not match its record identity"
+                    .into(),
+            });
+        }
+        validate_identifier("approval_id", approval_id)?;
+        if approval.requested_sequence == 0
+            || (approval.status == DurableApprovalStatus::Pending
+                && (approval.resolved_sequence.is_some()
+                    || approval.resolved_at_unix_ms.is_some()
+                    || approval.timed_out))
+            || (approval.status != DurableApprovalStatus::Pending
+                && approval.resolved_sequence.is_none())
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint approval lifecycle is inconsistent".into(),
+            });
+        }
+    }
+    for (artifact_id, versions) in &projection.artifacts {
+        if versions
+            .iter()
+            .any(|metadata| artifact_id != &metadata.artifact_id)
+        {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint artifact map key does not match its metadata identity"
+                    .into(),
+            });
+        }
+        validate_identifier("artifact_id", artifact_id)?;
+        if versions.is_empty() {
+            return Err(DurabilityError::InvalidEvent {
+                reason: "fork checkpoint artifact has an empty version history".into(),
+            });
+        }
+        for (index, metadata) in versions.iter().enumerate() {
+            let expected_version = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint artifact version counter overflowed".into(),
+                })?;
+            let expected_previous = index
+                .checked_sub(1)
+                .map(|previous| versions[previous].version_id.as_str());
+            if metadata.version != expected_version
+                || metadata.previous_version_id.as_deref() != expected_previous
+            {
+                return Err(DurabilityError::InvalidEvent {
+                    reason: "fork checkpoint artifact version history is inconsistent".into(),
+                });
+            }
+            validate_identifier("artifact_version_id", &metadata.version_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_worker_lease_window(
     starts_at_unix_ms: u64,
     expires_at_unix_ms: u64,
@@ -4918,9 +5250,39 @@ mod tests {
         assert_eq!(&appended, run);
 
         let mut replayed_events = run.events().to_vec();
-        replayed_events.push(event);
+        replayed_events.push(event.clone());
         assert!(matches!(
             RunState::from_events(replayed_events),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+
+        // Preserve the historical v2 contract independently of the current writer schema. The
+        // recursive rewrite also migrates typed envelope versions embedded in event payloads.
+        fn rewrite_v3_to_v2(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    for (key, value) in object {
+                        if key == "schema_version"
+                            && value.as_u64() == Some(u64::from(DURABILITY_SCHEMA_VERSION))
+                        {
+                            *value = json!(TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION);
+                        } else {
+                            rewrite_v3_to_v2(value);
+                        }
+                    }
+                }
+                Value::Array(values) => values.iter_mut().for_each(rewrite_v3_to_v2),
+                _ => {}
+            }
+        }
+        let mut historical = serde_json::to_value(run.events()).unwrap();
+        rewrite_v3_to_v2(&mut historical);
+        let mut historical: Vec<RunEvent> = serde_json::from_value(historical).unwrap();
+        let mut historical_event = serde_json::to_value(&event).unwrap();
+        rewrite_v3_to_v2(&mut historical_event);
+        historical.push(serde_json::from_value(historical_event).unwrap());
+        assert!(matches!(
+            RunState::from_events(historical),
             Err(DurabilityError::InvalidEvent { .. })
         ));
     }
@@ -6155,6 +6517,366 @@ mod tests {
     }
 
     #[test]
+    fn fork_and_rewind_command_ids_bind_the_full_command_payload() {
+        let mut source = RunState::new("session", "source", DurabilityMode::Sync).unwrap();
+        let checkpoint = source.checkpoint("base", None).unwrap();
+
+        source
+            .apply_command(RunCommand::Fork {
+                command_id: "fork-command".into(),
+                new_run_id: "destination".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            source.apply_command(RunCommand::Fork {
+                command_id: "fork-command".into(),
+                new_run_id: "destination".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: true,
+            }),
+            Err(DurabilityError::DuplicateEventConflict { .. })
+        ));
+
+        let mut rewind = RunState::new("session", "rewind-command", DurabilityMode::Sync).unwrap();
+        let checkpoint = rewind.checkpoint("base", None).unwrap();
+        rewind
+            .apply_command(RunCommand::Rewind {
+                command_id: "rewind-command".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            rewind.apply_command(RunCommand::Rewind {
+                command_id: "rewind-command".into(),
+                checkpoint_id: checkpoint.checkpoint_id,
+                side_effects_reconciled: true,
+            }),
+            Err(DurabilityError::DuplicateEventConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn fork_rejects_self_parenting_and_false_checkpoint_lineage() {
+        let mut source = RunState::new("session", "source", DurabilityMode::Sync).unwrap();
+        let checkpoint = source.checkpoint("base", None).unwrap();
+        let before = source.clone();
+        assert!(matches!(
+            source.apply_command(RunCommand::Fork {
+                command_id: "self-fork".into(),
+                new_run_id: "source".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            }),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+        assert_eq!(source, before);
+
+        let mut false_checkpoint = checkpoint;
+        false_checkpoint.run_id = "another-source".into();
+        let replay = RunState::from_events([RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: "destination".into(),
+            sequence: 1,
+            event_id: "false-lineage".into(),
+            kind: RunEventKind::ForkedFrom {
+                session_id: "session".into(),
+                source_run_id: "source".into(),
+                durability: DurabilityMode::Sync,
+                source_checkpoint: Box::new(false_checkpoint),
+                new_branch_id: "destination-branch".into(),
+            },
+        }]);
+        assert!(matches!(replay, Err(DurabilityError::InvalidEvent { .. })));
+    }
+
+    #[test]
+    fn fork_rejects_snapshot_map_keys_that_lie_about_record_identities() {
+        let mut source = RunState::new("session", "source", DurabilityMode::Sync).unwrap();
+        let ActivityDecision::Execute { activity_id, .. } = source
+            .prepare_activity(
+                "stable-step",
+                "work-1",
+                json!({"value": 1}),
+                SideEffectClass::Pure,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("expected activity execution");
+        };
+        let mut checkpoint = source.checkpoint("malicious-map-key", None).unwrap();
+        let record = checkpoint
+            .projection
+            .activities
+            .remove(&activity_id)
+            .unwrap();
+        checkpoint
+            .projection
+            .activities
+            .insert("forged-map-key".into(), record);
+
+        let replay = RunState::from_events([RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: "destination".into(),
+            sequence: 1,
+            event_id: "malicious-snapshot-fork".into(),
+            kind: RunEventKind::ForkedFrom {
+                session_id: "session".into(),
+                source_run_id: "source".into(),
+                durability: DurabilityMode::Sync,
+                source_checkpoint: Box::new(checkpoint),
+                new_branch_id: "destination-branch".into(),
+            },
+        }]);
+        assert!(matches!(replay, Err(DurabilityError::InvalidEvent { .. })));
+    }
+
+    #[test]
+    fn fork_rejects_completed_attempt_without_output_instead_of_panicking() {
+        let mut source = RunState::new("session", "source", DurabilityMode::Sync).unwrap();
+        let (activity_id, attempt) = execute(
+            source
+                .prepare_activity(
+                    "stable-step",
+                    "work-1",
+                    json!({"value": 1}),
+                    SideEffectClass::Pure,
+                    None,
+                )
+                .unwrap(),
+        );
+        source
+            .complete_activity(&activity_id, attempt, json!({"done": true}))
+            .unwrap();
+        let mut checkpoint = source.checkpoint("malicious-completion", None).unwrap();
+        checkpoint
+            .projection
+            .activities
+            .get_mut(&activity_id)
+            .unwrap()
+            .attempts[0]
+            .output = None;
+
+        let replay = RunState::from_events([RunEvent {
+            schema_version: DURABILITY_SCHEMA_VERSION,
+            run_id: "destination".into(),
+            sequence: 1,
+            event_id: "malicious-completion-fork".into(),
+            kind: RunEventKind::ForkedFrom {
+                session_id: "session".into(),
+                source_run_id: "source".into(),
+                durability: DurabilityMode::Sync,
+                source_checkpoint: Box::new(checkpoint),
+                new_branch_id: "destination-branch".into(),
+            },
+        }]);
+        assert!(matches!(replay, Err(DurabilityError::InvalidEvent { .. })));
+    }
+
+    #[test]
+    fn fork_of_fork_rebinds_the_inherited_checkpoint_to_its_immediate_parent() {
+        let mut source = RunState::new("session", "source", DurabilityMode::Sync).unwrap();
+        let checkpoint = source.checkpoint("base", None).unwrap();
+        let CommandOutcome::Forked { run: child, .. } = source
+            .apply_command(RunCommand::Fork {
+                command_id: "source-to-child".into(),
+                new_run_id: "child".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected child fork");
+        };
+        let mut child = *child;
+        let CommandOutcome::Forked {
+            run: grandchild, ..
+        } = child
+            .apply_command(RunCommand::Fork {
+                command_id: "child-to-grandchild".into(),
+                new_run_id: "grandchild".into(),
+                checkpoint_id: checkpoint.checkpoint_id,
+                side_effects_reconciled: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected grandchild fork");
+        };
+        assert_eq!(grandchild.parent_run_id(), Some("child"));
+        let RunEventKind::ForkedFrom {
+            source_run_id,
+            source_checkpoint,
+            ..
+        } = &grandchild.events()[0].kind
+        else {
+            panic!("expected fork lineage event");
+        };
+        assert_eq!(source_run_id, "child");
+        assert_eq!(source_checkpoint.run_id, "child");
+        assert_eq!(source_checkpoint.event_sequence, 1);
+        assert_eq!(
+            RunState::from_events(grandchild.events().to_vec()).unwrap(),
+            *grandchild
+        );
+    }
+
+    #[test]
+    fn inherited_checkpoint_uses_the_child_event_boundary_for_commands_and_replay() {
+        let mut source =
+            RunState::new("session", "high-sequence-source", DurabilityMode::Sync).unwrap();
+        for index in 0..8 {
+            source
+                .replace_state(&format!("padding-{index}"), json!({"index": index}))
+                .unwrap();
+        }
+        let checkpoint = source.checkpoint("high-boundary", None).unwrap();
+        assert!(checkpoint.event_sequence > 4);
+        let CommandOutcome::Forked { run: child } = source
+            .apply_command(RunCommand::Fork {
+                command_id: "high-sequence-fork".into(),
+                new_run_id: "high-sequence-child".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected child fork");
+        };
+        let mut child = *child;
+        let (activity_id, attempt) = execute(
+            child
+                .prepare_activity(
+                    "send-v1",
+                    "message",
+                    json!({"to": "a@example.com"}),
+                    SideEffectClass::Idempotent,
+                    Some("message:a@example.com".into()),
+                )
+                .unwrap(),
+        );
+        child
+            .complete_activity(&activity_id, attempt, json!({"sent": true}))
+            .unwrap();
+        let expected = DurabilityError::ReconcileRequired {
+            activity_ids: vec![activity_id],
+        };
+
+        assert_eq!(
+            child
+                .apply_command(RunCommand::Rewind {
+                    command_id: "child-rewind".into(),
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    side_effects_reconciled: false,
+                })
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            child
+                .apply_command(RunCommand::Fork {
+                    command_id: "child-fork".into(),
+                    new_run_id: "grandchild".into(),
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    side_effects_reconciled: false,
+                })
+                .unwrap_err(),
+            expected
+        );
+
+        let forged_kinds = [
+            RunEventKind::RunRewound {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                new_branch_id: "forged-rewind-branch".into(),
+                side_effects_reconciled: false,
+            },
+            RunEventKind::ForkCreated {
+                new_run_id: "forged-grandchild".into(),
+                checkpoint_id: checkpoint.checkpoint_id,
+                new_branch_id: "forged-fork-branch".into(),
+                side_effects_reconciled: false,
+            },
+        ];
+        for (index, kind) in forged_kinds.into_iter().enumerate() {
+            let before = child.clone();
+            let event = RunEvent {
+                schema_version: DURABILITY_SCHEMA_VERSION,
+                run_id: child.run_id().to_string(),
+                sequence: child.next_sequence(),
+                event_id: format!("forged-local-boundary-{index}"),
+                kind,
+            };
+            assert_eq!(child.append_event(event).unwrap_err(), expected);
+            assert_eq!(child, before);
+        }
+    }
+
+    #[test]
+    fn child_retry_of_inherited_non_pure_activity_requires_reconciliation() {
+        let mut source = RunState::new("session", "retry-source", DurabilityMode::Sync).unwrap();
+        let (activity_id, attempt) = execute(
+            source
+                .prepare_activity(
+                    "send-v1",
+                    "message",
+                    json!({"to": "a@example.com"}),
+                    SideEffectClass::Idempotent,
+                    Some("message:a@example.com".into()),
+                )
+                .unwrap(),
+        );
+        let (_, source_retry_attempt) = execute(
+            source
+                .fail_activity(&activity_id, attempt, "retry", true, false)
+                .unwrap(),
+        );
+        let checkpoint = source.checkpoint("retryable", None).unwrap();
+        let CommandOutcome::Forked { run: child } = source
+            .apply_command(RunCommand::Fork {
+                command_id: "retry-fork".into(),
+                new_run_id: "retry-child".into(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                side_effects_reconciled: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected child fork");
+        };
+        let mut child = *child;
+        let (retried_activity_id, retry_attempt) = execute(
+            child
+                .prepare_activity(
+                    "send-v1",
+                    "message",
+                    json!({"to": "a@example.com"}),
+                    SideEffectClass::Idempotent,
+                    Some("message:a@example.com".into()),
+                )
+                .unwrap(),
+        );
+        assert_eq!(retried_activity_id, activity_id);
+        assert_eq!(retry_attempt, source_retry_attempt + 1);
+        child
+            .complete_activity(&activity_id, retry_attempt, json!({"sent": true}))
+            .unwrap();
+
+        assert_eq!(
+            child
+                .apply_command(RunCommand::Rewind {
+                    command_id: "discard-inherited-retry".into(),
+                    checkpoint_id: checkpoint.checkpoint_id,
+                    side_effects_reconciled: false,
+                })
+                .unwrap_err(),
+            DurabilityError::ReconcileRequired {
+                activity_ids: vec![activity_id],
+            }
+        );
+    }
+
+    #[test]
     fn rewind_is_append_only_restores_projection_and_creates_new_branch() {
         let mut run = RunState::new("session", "rewind", DurabilityMode::Sync).unwrap();
         run.replace_state("v1", json!({"value": 1})).unwrap();
@@ -6485,7 +7207,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_terminal_snapshots_migrate_without_weakening_v2_writes() {
+    fn legacy_v1_terminal_snapshots_migrate_without_weakening_current_writes() {
         let cases = [
             (
                 DurableRunStatus::Failed,
@@ -6558,12 +7280,74 @@ mod tests {
         }
         let mut migrated_open = RunState::from_events(v1_events).unwrap();
         migrated_open
-            .replace_state("post-migration", json!({"schema": 2}))
+            .replace_state(
+                "post-migration",
+                json!({"schema": DURABILITY_SCHEMA_VERSION}),
+            )
             .unwrap();
         assert_eq!(migrated_open.events()[0].schema_version, 1);
         assert_eq!(
             migrated_open.events().last().unwrap().schema_version,
             DURABILITY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v2_logs_migrate_to_v3_and_cancellation_remains_v3_only() {
+        let mut current =
+            RunState::new("session", "v2-cancellation", DurabilityMode::Sync).unwrap();
+        let (activity_id, attempt) = execute(
+            current
+                .prepare_activity(
+                    "v2-compatible-step",
+                    "work-1",
+                    json!({"value": 1}),
+                    SideEffectClass::Pure,
+                    None,
+                )
+                .unwrap(),
+        );
+        let mut v2_events = current.events().to_vec();
+        for event in &mut v2_events {
+            event.schema_version = TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION;
+        }
+
+        let mut forged_v2_cancellation = v2_events.clone();
+        forged_v2_cancellation.push(RunEvent {
+            schema_version: TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION,
+            run_id: current.run_id().into(),
+            sequence: current.next_sequence(),
+            event_id: "forged-v2-cancellation".into(),
+            kind: RunEventKind::ActivityAttemptCancelled {
+                activity_id: activity_id.clone(),
+                attempt,
+                reason: "v3-only transition".into(),
+            },
+        });
+        assert!(matches!(
+            RunState::from_events(forged_v2_cancellation),
+            Err(DurabilityError::InvalidEvent { .. })
+        ));
+
+        let mut migrated = RunState::from_events(v2_events).unwrap();
+        assert_eq!(migrated.schema_version(), DURABILITY_SCHEMA_VERSION);
+        assert!(migrated
+            .events()
+            .iter()
+            .all(|event| event.schema_version == TERMINAL_ACTIVITY_INVARIANT_SCHEMA_VERSION));
+        assert!(matches!(
+            migrated
+                .cancel_activity(&activity_id, attempt, "cancelled", false)
+                .unwrap(),
+            ActivityDecision::Cancelled { .. }
+        ));
+        assert_eq!(
+            migrated.events().last().unwrap().schema_version,
+            ACTIVITY_ATTEMPT_CANCELLED_SCHEMA_VERSION
+        );
+        assert_eq!(
+            RunState::from_events(migrated.events().to_vec()).unwrap(),
+            migrated
         );
     }
 

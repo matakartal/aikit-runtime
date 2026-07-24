@@ -7,9 +7,10 @@ pub mod fs;
 
 use crate::error::{AikitError, Result};
 use crate::governance::containment::{
-    containment_capabilities as probe_containment, ContainmentCapabilityReport, ContainmentPolicy,
+    containment_capabilities_with_environment as probe_containment, ContainmentCapabilityReport,
+    ContainmentPolicy,
 };
-use crate::governance::process::BashPolicy;
+use crate::governance::process::{child_environment, BashPolicy};
 use crate::governance::sandbox::Sandbox;
 use crate::tools::ToolExecutor;
 use crate::types::ToolSpec;
@@ -70,7 +71,13 @@ impl BuiltinTools {
     /// Actively probe the configured containment posture and report the selected backend and its
     /// mechanism-level guarantees.
     pub async fn containment_capabilities(&self) -> ContainmentCapabilityReport {
-        probe_containment(&self.bash_containment, self.sandbox.primary_root()).await
+        let environment = child_environment(&self.bash_policy);
+        probe_containment(
+            &self.bash_containment,
+            self.sandbox.primary_root(),
+            &environment,
+        )
+        .await
     }
 
     /// The tool names this suite answers to (for advertising to a model / registry).
@@ -449,5 +456,45 @@ mod tests {
             Some(ActiveContainmentBackend::Uncontained)
         );
         assert!(!report.fail_closed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn containment_preflight_uses_the_bash_policy_control_environment() {
+        use crate::governance::containment::{ActiveContainmentBackend, DockerConfig};
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let workspace = holder.path().join("workspace");
+        let executable = holder.path().join("fake-docker");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"${DOCKER_HOST:-}\" = tcp://policy-daemon ] || exit 91\ncase \"$1\" in info) printf '%s\\n' seccomp ;; image) printf '%s\\n' sha256:ready ;; *) exit 92 ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut bash_policy = BashPolicy::default();
+        bash_policy
+            .env_extra
+            .push(("DOCKER_HOST".into(), "tcp://policy-daemon".into()));
+        let tools = BuiltinTools::new(Sandbox::jail(&workspace).unwrap())
+            .with_bash_policy(bash_policy)
+            .with_containment_policy(ContainmentPolicy::required_docker(
+                DockerConfig::new(format!("example/aikit@sha256:{}", "a".repeat(64)))
+                    .with_executable(executable),
+            ));
+
+        let report = tools.containment_capabilities().await;
+        assert_eq!(
+            report.selected_backend,
+            Some(ActiveContainmentBackend::Docker)
+        );
+        assert!(report
+            .backends
+            .iter()
+            .find(|backend| backend.backend == ActiveContainmentBackend::Docker)
+            .is_some_and(|backend| backend.available));
     }
 }

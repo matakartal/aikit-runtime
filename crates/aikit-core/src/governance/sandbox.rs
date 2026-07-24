@@ -20,6 +20,7 @@ use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use cap_std::{ambient_authority, fs};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as StdOpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -166,17 +167,90 @@ impl Sandbox {
         if self.unrestricted {
             return open_ambient_file(path.as_ref(), FileMode::Edit);
         }
-        self.open_jailed_file(path.as_ref(), FileMode::Edit)
+        // Jailed edits read from this stable descriptor, then commit through `commit_edit` using
+        // atomic replacement. The descriptor is deliberately never truncated in jailed mode.
+        self.open_jailed_file(path.as_ref(), FileMode::Read)
     }
 
-    pub(crate) fn open_write(&self, path: impl AsRef<Path>) -> Result<File, SandboxError> {
+    pub(crate) fn replace_write(
+        &self,
+        path: impl AsRef<Path>,
+        content: &[u8],
+    ) -> Result<(), SandboxError> {
         if self.unrestricted {
             if let Some(parent) = path.as_ref().parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            return open_ambient_file(path.as_ref(), FileMode::Write);
+            let mut file = open_ambient_file(path.as_ref(), FileMode::Write)?;
+            file.write_all(content).map_err(|error| {
+                SandboxError::Io(format!("write {}: {error}", path.as_ref().display()))
+            })?;
+            return Ok(());
         }
-        self.open_jailed_file(path.as_ref(), FileMode::Write)
+        #[cfg(unix)]
+        {
+            self.replace_jailed_file(path.as_ref(), None, content, || {})
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = content;
+            Err(unsupported_platform())
+        }
+    }
+
+    pub(crate) fn commit_edit(
+        &self,
+        path: impl AsRef<Path>,
+        source: &mut File,
+        content: &[u8],
+    ) -> Result<(), SandboxError> {
+        if self.unrestricted {
+            use std::io::{Seek, SeekFrom};
+            source
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| source.set_len(0))
+                .and_then(|_| source.write_all(content))
+                .map_err(|error| {
+                    SandboxError::Io(format!("write {}: {error}", path.as_ref().display()))
+                })?;
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            self.replace_jailed_file(path.as_ref(), Some(source), content, || {})
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, content);
+            Err(unsupported_platform())
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn replace_write_with_hook<F>(
+        &self,
+        path: impl AsRef<Path>,
+        content: &[u8],
+        before_commit: F,
+    ) -> Result<(), SandboxError>
+    where
+        F: FnOnce(),
+    {
+        self.replace_jailed_file(path.as_ref(), None, content, before_commit)
+    }
+
+    #[cfg(all(test, unix))]
+    fn commit_edit_with_hook<F>(
+        &self,
+        path: impl AsRef<Path>,
+        source: &mut File,
+        content: &[u8],
+        before_commit: F,
+    ) -> Result<(), SandboxError>
+    where
+        F: FnOnce(),
+    {
+        self.replace_jailed_file(path.as_ref(), Some(source), content, before_commit)
     }
 
     /// Walk regular files below `base`. A missing `base` means the primary root. Jailed walks
@@ -253,6 +327,35 @@ impl Sandbox {
             let (parent, name) = open_parent_dir(&mapped, create_parents)?;
             open_file_at(&parent, &name, mode, &mapped.display)
         }
+    }
+
+    #[cfg(unix)]
+    fn replace_jailed_file<F>(
+        &self,
+        path: &Path,
+        expected_source: Option<&File>,
+        content: &[u8],
+        before_commit: F,
+    ) -> Result<(), SandboxError>
+    where
+        F: FnOnce(),
+    {
+        let mapped = self.map_jailed(path)?;
+        if mapped.relative == Path::new(".") {
+            return Err(SandboxError::Escape(format!(
+                "{} is not a regular file",
+                mapped.display.display()
+            )));
+        }
+        let (parent, name) = open_parent_dir(&mapped, expected_source.is_none())?;
+        replace_file_at(
+            &parent,
+            &name,
+            expected_source,
+            content,
+            &mapped.display,
+            before_commit,
+        )
     }
 
     fn map_jailed(&self, path: &Path) -> Result<JailedPath, SandboxError> {
@@ -424,7 +527,7 @@ fn open_ambient_file(path: &Path, mode: FileMode) -> Result<File, SandboxError> 
     let file = options
         .open(path)
         .map_err(|error| SandboxError::Io(format!("open {}: {error}", path.display())))?;
-    finish_regular_file(file, mode, path)
+    finish_regular_file(file, mode, path, false)
 }
 
 #[cfg(unix)]
@@ -563,7 +666,7 @@ fn open_file_at(
         .open_with(name, &options)
         .map(fs::File::into_std)
         .map_err(|error| capability_error("open file", display, error))?;
-    finish_regular_file(file, mode, display)
+    finish_regular_file(file, mode, display, true)
 }
 
 #[cfg(unix)]
@@ -595,7 +698,12 @@ fn reject_regular_file_boundary(
     }
 }
 
-fn finish_regular_file(file: File, mode: FileMode, display: &Path) -> Result<File, SandboxError> {
+fn finish_regular_file(
+    file: File,
+    mode: FileMode,
+    display: &Path,
+    jailed: bool,
+) -> Result<File, SandboxError> {
     let metadata = file.metadata().map_err(|error| {
         SandboxError::Io(format!("stat open file {}: {error}", display.display()))
     })?;
@@ -605,12 +713,280 @@ fn finish_regular_file(file: File, mode: FileMode, display: &Path) -> Result<Fil
             display.display()
         )));
     }
+    #[cfg(unix)]
+    if jailed {
+        use std::os::unix::fs::MetadataExt;
+        // A hard link inside the jail can name an inode that is also reachable outside it. Reads
+        // would disclose the outside file and writes/edits would mutate it despite every path
+        // component being descriptor-relative. There is no pathname proof that distinguishes a
+        // benign hard link from that escape, so the jail rejects multiply-linked regular files.
+        if metadata.nlink() > 1 {
+            return Err(SandboxError::Escape(format!(
+                "{} is a multiply-linked file",
+                display.display()
+            )));
+        }
+    }
     if matches!(mode, FileMode::Write) {
         file.set_len(0).map_err(|error| {
             SandboxError::Io(format!("truncate {}: {error}", display.display()))
         })?;
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn single_link_identity(file: &File, display: &Path) -> Result<FileIdentity, SandboxError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(|error| {
+        SandboxError::Io(format!("stat open file {}: {error}", display.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(SandboxError::Escape(format!(
+            "{} is not a regular file",
+            display.display()
+        )));
+    }
+    if metadata.nlink() != 1 {
+        return Err(SandboxError::Escape(format!(
+            "{} is a multiply-linked file",
+            display.display()
+        )));
+    }
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn open_optional_file_at(
+    dir: &Dir,
+    name: &OsStr,
+    display: &Path,
+) -> Result<Option<File>, SandboxError> {
+    match dir.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(SandboxError::Escape(format!(
+            "{} contains a symlink component",
+            display.display()
+        ))),
+        Ok(metadata) if !metadata.is_file() => Err(SandboxError::Escape(format!(
+            "{} is not a regular file",
+            display.display()
+        ))),
+        Ok(_) => open_file_at(dir, name, FileMode::Read, display).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(SandboxError::Io(format!(
+            "stat {}: {error}",
+            display.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+struct PrivateTemp<'a> {
+    parent: &'a Dir,
+    name: OsString,
+    file: File,
+    final_permissions: std::fs::Permissions,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl PrivateTemp<'_> {
+    fn commit(mut self, target: &OsStr, display: &Path) -> Result<FileIdentity, SandboxError> {
+        self.file
+            .set_permissions(self.final_permissions.clone())
+            .map_err(|error| {
+                SandboxError::Io(format!(
+                    "set replacement permissions for {}: {error}",
+                    display.display()
+                ))
+            })?;
+        let identity = single_link_identity(&self.file, display)?;
+        let by_name =
+            open_optional_file_at(self.parent, &self.name, display)?.ok_or_else(|| {
+                SandboxError::Io(format!("replacement for {} disappeared", display.display()))
+            })?;
+        if single_link_identity(&by_name, display)? != identity {
+            return Err(SandboxError::Escape(format!(
+                "replacement for {} changed before commit",
+                display.display()
+            )));
+        }
+        self.parent
+            .rename(&self.name, self.parent, target)
+            .map_err(|error| SandboxError::Io(format!("replace {}: {error}", display.display())))?;
+        self.committed = true;
+        Ok(identity)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PrivateTemp<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.parent.remove_file(&self.name);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_private_temp<'a>(
+    parent: &'a Dir,
+    display: &Path,
+) -> Result<PrivateTemp<'a>, SandboxError> {
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| {
+            SandboxError::Io(format!(
+                "generate private temporary name for {}: {error}",
+                display.display()
+            ))
+        })?;
+        let mut rendered = String::with_capacity(32);
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(rendered, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        let name = OsString::from(format!(".aikit-write-{rendered}"));
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        match parent.open_with(&name, &options) {
+            Ok(file) => {
+                let file = file.into_std();
+                let final_permissions = match file.metadata() {
+                    Ok(metadata) => metadata.permissions(),
+                    Err(error) => {
+                        let _ = parent.remove_file(&name);
+                        return Err(SandboxError::Io(format!(
+                            "stat replacement for {}: {error}",
+                            display.display()
+                        )));
+                    }
+                };
+                let temporary = PrivateTemp {
+                    parent,
+                    name,
+                    file,
+                    final_permissions,
+                    committed: false,
+                };
+                single_link_identity(&temporary.file, display)?;
+                use std::os::unix::fs::PermissionsExt;
+                temporary
+                    .file
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| {
+                        SandboxError::Io(format!(
+                            "make replacement private for {}: {error}",
+                            display.display()
+                        ))
+                    })?;
+                return Ok(temporary);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(SandboxError::Io(format!(
+                    "create private temporary file for {}: {error}",
+                    display.display()
+                )))
+            }
+        }
+    }
+    Err(SandboxError::Io(format!(
+        "could not create a unique private temporary file for {}",
+        display.display()
+    )))
+}
+
+#[cfg(unix)]
+fn replace_file_at<F>(
+    parent: &Dir,
+    name: &OsStr,
+    expected_source: Option<&File>,
+    content: &[u8],
+    display: &Path,
+    before_commit: F,
+) -> Result<(), SandboxError>
+where
+    F: FnOnce(),
+{
+    // Write obtains its own stable source descriptor; Edit passes the exact descriptor whose
+    // contents were checked by the caller. Either way, the old inode is never mutated.
+    let owned_source = if expected_source.is_none() {
+        open_optional_file_at(parent, name, display)?
+    } else {
+        None
+    };
+    let source = expected_source.or(owned_source.as_ref());
+    let expected_identity = source
+        .map(|file| single_link_identity(file, display))
+        .transpose()?;
+
+    let mut temporary = create_private_temp(parent, display)?;
+    if let Some(source) = source {
+        temporary.final_permissions = source
+            .metadata()
+            .map_err(|error| {
+                SandboxError::Io(format!("stat open file {}: {error}", display.display()))
+            })?
+            .permissions();
+    }
+    temporary.file.write_all(content).map_err(|error| {
+        SandboxError::Io(format!(
+            "write replacement for {}: {error}",
+            display.display()
+        ))
+    })?;
+
+    before_commit();
+
+    // Revalidate both names and descriptors immediately before the atomic replacement. A hard
+    // link created after the initial check is detected here. A link created after this check is
+    // still safe: rename replaces only the jailed directory entry and never writes the old inode.
+    let current = open_optional_file_at(parent, name, display)?;
+    match (expected_identity, current.as_ref()) {
+        (Some(expected), Some(current))
+            if single_link_identity(current, display)? == expected
+                && single_link_identity(source.expect("expected source exists"), display)?
+                    == expected => {}
+        (None, None) => {}
+        _ => {
+            return Err(SandboxError::Escape(format!(
+                "{} changed before atomic replacement",
+                display.display()
+            )))
+        }
+    }
+
+    let committed_identity = temporary.commit(name, display)?;
+    let installed = open_optional_file_at(parent, name, display)?.ok_or_else(|| {
+        SandboxError::Io(format!(
+            "{} disappeared after replacement",
+            display.display()
+        ))
+    })?;
+    if single_link_identity(&installed, display)? != committed_identity {
+        return Err(SandboxError::Escape(format!(
+            "{} changed during atomic replacement",
+            display.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -699,7 +1075,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     fn read(mut file: File) -> String {
         let mut value = String::new();
@@ -712,9 +1088,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::jail(dir.path()).unwrap();
 
-        let mut target = sb.open_write("nested/a.txt").unwrap();
-        target.write_all(b"hi").unwrap();
-        drop(target);
+        sb.replace_write("nested/a.txt", b"hi").unwrap();
 
         assert_eq!(read(sb.open_read("nested/a.txt").unwrap()), "hi");
         assert_eq!(
@@ -747,10 +1121,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::jail(dir.path()).unwrap();
         assert!(matches!(
-            sb.open_write("../evil.txt"),
+            sb.replace_write("../evil.txt", b"evil"),
             Err(SandboxError::Escape(_))
         ));
-        let error = sb.open_write("/etc/shadow").unwrap_err();
+        let error = sb.replace_write("/etc/shadow", b"evil").unwrap_err();
         assert!(matches!(error, SandboxError::Escape(_)));
         let typed: crate::error::AikitError = error.into();
         assert_eq!(typed.info().code, crate::error::ErrorCode::Sandbox);
@@ -771,12 +1145,87 @@ mod tests {
         for result in [
             sb.open_read("final.txt"),
             sb.open_edit("final.txt"),
-            sb.open_write("final.txt"),
             sb.open_read("middle/file.txt"),
-            sb.open_write("middle/new.txt"),
         ] {
             assert!(matches!(result, Err(SandboxError::Escape(_))));
         }
+        for result in [
+            sb.replace_write("final.txt", b"overwrite"),
+            sb.replace_write("middle/new.txt", b"escape"),
+        ] {
+            assert!(matches!(result, Err(SandboxError::Escape(_))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hard_links_that_alias_an_inode_outside_the_jail() {
+        let holder = tempfile::tempdir().unwrap();
+        let root = holder.path().join("root");
+        let outside = holder.path().join("outside-secret.txt");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, "outside secret").unwrap();
+        std::fs::hard_link(&outside, root.join("alias.txt")).unwrap();
+        let sb = Sandbox::jail(&root).unwrap();
+
+        for result in [sb.open_read("alias.txt"), sb.open_edit("alias.txt")] {
+            assert!(matches!(result, Err(SandboxError::Escape(_))));
+        }
+        assert!(matches!(
+            sb.replace_write("alias.txt", b"overwrite"),
+            Err(SandboxError::Escape(_))
+        ));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_rejects_hard_links_created_before_commit() {
+        let holder = tempfile::tempdir().unwrap();
+        let root = holder.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let sb = Sandbox::jail(&root).unwrap();
+
+        let edit_path = root.join("edit.txt");
+        let outside_edit = holder.path().join("outside-edit.txt");
+        std::fs::write(&edit_path, "edit original").unwrap();
+        let mut edit_source = sb.open_edit("edit.txt").unwrap();
+        let edit_result =
+            sb.commit_edit_with_hook("edit.txt", &mut edit_source, b"edit replacement", || {
+                std::fs::hard_link(&edit_path, &outside_edit).unwrap()
+            });
+        assert!(matches!(edit_result, Err(SandboxError::Escape(_))));
+        assert_eq!(
+            std::fs::read_to_string(&edit_path).unwrap(),
+            "edit original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_edit).unwrap(),
+            "edit original"
+        );
+
+        let write_path = root.join("write.txt");
+        let outside_write = holder.path().join("outside-write.txt");
+        std::fs::write(&write_path, "write original").unwrap();
+        let write_result = sb.replace_write_with_hook("write.txt", b"write replacement", || {
+            std::fs::hard_link(&write_path, &outside_write).unwrap()
+        });
+        assert!(matches!(write_result, Err(SandboxError::Escape(_))));
+        assert_eq!(
+            std::fs::read_to_string(&write_path).unwrap(),
+            "write original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_write).unwrap(),
+            "write original"
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aikit-write-")
+        }));
     }
 
     #[cfg(unix)]
@@ -832,9 +1281,7 @@ mod tests {
         assert!(sb.is_unrestricted());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ambient.txt");
-        let mut file = sb.open_write(&path).unwrap();
-        file.write_all(b"ambient").unwrap();
-        drop(file);
+        sb.replace_write(&path, b"ambient").unwrap();
         assert_eq!(read(sb.open_read(&path).unwrap()), "ambient");
     }
 
@@ -873,11 +1320,14 @@ mod tests {
         for result in [
             sb.open_read("pipe"),
             sb.open_edit("pipe"),
-            sb.open_write("pipe"),
             sb.open_read("."),
         ] {
             assert!(matches!(result, Err(SandboxError::Escape(_))));
         }
+        assert!(matches!(
+            sb.replace_write("pipe", b"blocked"),
+            Err(SandboxError::Escape(_))
+        ));
         assert!(std::fs::symlink_metadata(&fifo)
             .unwrap()
             .file_type()

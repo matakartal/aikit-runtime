@@ -598,9 +598,18 @@ impl EgressBroker {
         if !self.allowed_schemes.contains(&scheme) {
             return Err(EgressBrokerError::SchemeDenied);
         }
+        let domain_host = matches!(url.host(), Some(Host::Domain(_)));
         let host = canonical_url_host(&url)?;
-        url.set_host(Some(&host))
-            .map_err(|_| EgressBrokerError::InvalidUrl)?;
+        if domain_host {
+            url.set_host(Some(&host))
+                .map_err(|_| EgressBrokerError::InvalidUrl)?;
+        }
+        // `Url::set_host` reparses unbracketed IPv6 at the first colon (for example, the first
+        // hextet `2606` becomes legacy numeric IPv4 `0.0.10.46`). Preserve typed IP literals and
+        // fail closed if any future normalization changes the authority that policy and DNS pin.
+        if canonical_url_host(&url)? != host {
+            return Err(EgressBrokerError::InvalidUrl);
+        }
         if self.policy.evaluate_destination(&host) != EgressDecision::Allow {
             return Err(EgressBrokerError::DomainDenied);
         }
@@ -810,6 +819,37 @@ fn destination_ipv4_allowed(policy: &EgressPolicy, address: Ipv4Addr) -> bool {
         || first >= 240)
 }
 
+/// Whether a native IPv6 destination belongs to the currently delegated public-unicast space and
+/// is globally reachable under the IANA special-purpose registry. IPv4 embedding/translation and
+/// caller-configured loopback/private exceptions are handled before this shared final gate.
+pub(crate) fn ipv6_destination_is_public(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    let first = segments[0];
+
+    // IANA currently delegates global unicast from 2000::/3. Everything else is reserved,
+    // local, multicast, translation, or otherwise non-public and therefore fails closed.
+    if first & 0xe000 != 0x2000 {
+        return false;
+    }
+
+    if first == 0x2001 && segments[1] <= 0x01ff {
+        // 2001::/23 is non-global unless a more-specific IANA allocation says otherwise.
+        let protocol_anycast = segments[1] == 0x0001
+            && segments[2..7].iter().all(|segment| *segment == 0)
+            && matches!(segments[7], 0x0001 | 0x0002 | 0x0003);
+        let amt = segments[1] == 0x0003;
+        let as112 = segments[1] == 0x0004 && segments[2] == 0x0112;
+        let orchid_v2 = segments[1] & 0xfff0 == 0x0020;
+        let drone_remote_id = segments[1] & 0xfff0 == 0x0030;
+        return protocol_anycast || amt || as112 || orchid_v2 || drone_remote_id;
+    }
+
+    !(first == 0x2001 && segments[1] == 0x0db8
+        || first == 0x2002
+        || first == 0x3ffe
+        || first == 0x3fff && segments[1] & 0xf000 == 0)
+}
+
 fn destination_ipv6_allowed(policy: &EgressPolicy, address: Ipv6Addr) -> bool {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return destination_ipv4_allowed(policy, mapped);
@@ -830,14 +870,7 @@ fn destination_ipv6_allowed(policy: &EgressPolicy, address: Ipv6Addr) -> bool {
     if address.is_unique_local() {
         return policy.allow_private_networks;
     }
-    let first = segments[0];
-    !(address.is_unspecified()
-        || address.is_unicast_link_local()
-        || address.is_multicast()
-        || (first & 0xffc0) == 0xfec0
-        || (first == 0x0064 && segments[1] == 0xff9b)
-        || first == 0x2002
-        || (first == 0x2001 && matches!(segments[1], 0x0000 | 0x0db8)))
+    ipv6_destination_is_public(address)
 }
 
 #[cfg(test)]
@@ -995,6 +1028,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_ipv6_literal_keeps_its_authority_through_validation_and_pinning() {
+        let address: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let resolver = Arc::new(SequenceResolver::new([vec![SocketAddr::new(
+            IpAddr::V6(address),
+            443,
+        )]]));
+        let broker = EgressBroker::builder(policy(["2606:4700:4700::1111"]))
+            .allow_scheme(EgressScheme::Https)
+            .allow_port(443)
+            .allow_method(Method::GET)
+            .with_resolver(resolver)
+            .build()
+            .unwrap();
+        let request =
+            EgressRequest::new(Method::GET, "https://[2606:4700:4700::1111]/dns-query").unwrap();
+
+        let destination = broker.validate_url(request.url).unwrap();
+        assert_eq!(destination.host, address.to_string());
+        assert_eq!(destination.url.host(), Some(Host::Ipv6(address)));
+        assert_eq!(
+            destination.url.as_str(),
+            "https://[2606:4700:4700::1111]/dns-query"
+        );
+        assert_ne!(destination.url.host_str(), Some("0.0.10.46"));
+
+        broker
+            .pinned_client(&destination)
+            .await
+            .expect("the validated IPv6 destination must remain usable by the pinned client");
+    }
+
     #[test]
     fn public_address_policy_rejects_local_reserved_and_mixed_answers() {
         let public_only = policy(["example.com"]);
@@ -1011,24 +1076,70 @@ mod tests {
             "::1",
             "::ffff:127.0.0.1",
             "64:ff9b::7f00:1",
+            "::ffff:0:127.0.0.1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:1::4",
+            "2001:2::1",
+            "2001:4:111::1",
+            "2001:4:113::1",
+            "2001:10::1",
+            "2001:40::1",
             "2002:7f00:1::",
+            "3ffe::1",
+            "4000::1",
+            "6000::1",
             "fc00::1",
             "fe80::1",
             "fec0::1",
             "ff00::1",
             "2001:db8::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(
                 !destination_ip_allowed(&public_only, denied.parse().unwrap()),
                 "accepted {denied}"
             );
         }
-        for allowed in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+        for allowed in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2620:4f:8000::1",
+            "2606:4700:4700::1111",
+        ] {
             assert!(
                 destination_ip_allowed(&public_only, allowed.parse().unwrap()),
                 "rejected {allowed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn domain_resolution_to_non_global_ipv6_is_denied_before_connect() {
+        let reserved = SocketAddr::new("100:0:0:1::1".parse().unwrap(), 443);
+        let resolver = Arc::new(SequenceResolver::new([vec![reserved]]));
+        let broker = EgressBroker::builder(policy(["broker.test"]))
+            .allow_scheme(EgressScheme::Https)
+            .allow_port(443)
+            .allow_method(Method::GET)
+            .with_resolver(resolver)
+            .build()
+            .unwrap();
+
+        let error = broker
+            .execute(EgressRequest::new(Method::GET, "https://broker.test/").unwrap())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, EgressBrokerError::DestinationAddressDenied);
     }
 
     #[test]

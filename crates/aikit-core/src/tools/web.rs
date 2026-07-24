@@ -1,6 +1,9 @@
 //! Governed web and browser tools with deny-by-default network access.
 
-use crate::{AikitError, Result, ToolExecutor, ToolSpec};
+use crate::{
+    governance::egress_broker::ipv6_destination_is_public, AikitError, Result, ToolExecutor,
+    ToolSpec,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use regex::Regex;
@@ -11,7 +14,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     time::Duration,
 };
-use url::Url;
+use url::{Host, Url};
 
 const MAX_REDIRECTS: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -71,16 +74,7 @@ fn denied_ipv6(ip: Ipv6Addr) -> bool {
         );
         return denied_ipv4(embedded);
     }
-    let first = segments[0];
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        || ip.is_multicast()
-        || (first & 0xffc0) == 0xfec0
-        || (first == 0x0064 && segments[1] == 0xff9b)
-        || first == 0x2002
-        || (first == 0x2001 && matches!(segments[1], 0x0000 | 0x0db8))
+    !ipv6_destination_is_public(ip)
 }
 
 fn allowed_url(raw: &str, hosts: &BTreeSet<String>) -> Result<Url> {
@@ -96,41 +90,76 @@ fn allowed_url(raw: &str, hosts: &BTreeSet<String>) -> Result<Url> {
             "web URLs must use the standard HTTPS port 443".into(),
         ));
     }
-    let host = url
-        .host_str()
+    if url.fragment().is_some() {
+        return Err(AikitError::ToolExecution(
+            "URL fragments are not allowed".into(),
+        ));
+    }
+    let host = match url
+        .host()
         .ok_or_else(|| AikitError::ToolExecution("URL has no host".into()))?
-        .to_ascii_lowercase();
+    {
+        Host::Domain(domain) => domain.to_ascii_lowercase(),
+        Host::Ipv4(address) => {
+            if denied_ipv4(address) {
+                return Err(AikitError::ToolExecution(
+                    "private and local IP addresses are denied".into(),
+                ));
+            }
+            address.to_string()
+        }
+        Host::Ipv6(address) => {
+            if denied_ipv6(address) {
+                return Err(AikitError::ToolExecution(
+                    "private and local IP addresses are denied".into(),
+                ));
+            }
+            address.to_string()
+        }
+    };
     if !hosts.contains(&host) {
         return Err(AikitError::ToolExecution(format!(
             "host '{host}' is not allowlisted"
         )));
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if denied_ip(ip) {
-            return Err(AikitError::ToolExecution(
-                "private and local IP addresses are denied".into(),
-            ));
-        }
-    }
     Ok(url)
 }
 
 async fn pinned_https_client(url: &Url) -> Result<reqwest::Client> {
-    let host = url
-        .host_str()
+    let (host, addresses, needs_dns_override) = match url
+        .host()
         .ok_or_else(|| AikitError::ToolExecution("URL has no host".into()))?
-        .to_owned();
-    let lookup_host = host.clone();
-    let lookup = tokio::task::spawn_blocking(move || {
-        (lookup_host.as_str(), 443)
-            .to_socket_addrs()
-            .map(|addresses| addresses.collect::<Vec<_>>())
-    });
-    let addresses = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
-        .await
-        .map_err(|_| AikitError::ToolExecution("DNS lookup timed out".into()))?
-        .map_err(|error| AikitError::ToolExecution(format!("DNS lookup task failed: {error}")))?
-        .map_err(|error| AikitError::ToolExecution(format!("DNS lookup failed: {error}")))?;
+    {
+        Host::Domain(domain) => {
+            let host = domain.to_owned();
+            let lookup_host = host.clone();
+            let lookup = tokio::task::spawn_blocking(move || {
+                (lookup_host.as_str(), 443)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect::<Vec<_>>())
+            });
+            let addresses = tokio::time::timeout(CONNECT_TIMEOUT, lookup)
+                .await
+                .map_err(|_| AikitError::ToolExecution("DNS lookup timed out".into()))?
+                .map_err(|error| {
+                    AikitError::ToolExecution(format!("DNS lookup task failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AikitError::ToolExecution(format!("DNS lookup failed: {error}"))
+                })?;
+            (host, addresses, true)
+        }
+        Host::Ipv4(address) => (
+            address.to_string(),
+            vec![SocketAddr::new(IpAddr::V4(address), 443)],
+            false,
+        ),
+        Host::Ipv6(address) => (
+            address.to_string(),
+            vec![SocketAddr::new(IpAddr::V6(address), 443)],
+            false,
+        ),
+    };
     if addresses.is_empty() {
         return Err(AikitError::ToolExecution(
             "DNS lookup returned no addresses".into(),
@@ -145,12 +174,18 @@ async fn pinned_https_client(url: &Url) -> Result<reqwest::Client> {
         .into_iter()
         .map(|address| SocketAddr::new(address.ip(), 443))
         .collect();
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .resolve_to_addrs(&host, &pinned)
+        .timeout(REQUEST_TIMEOUT);
+    let builder = if needs_dns_override {
+        builder.resolve_to_addrs(&host, &pinned)
+    } else {
+        // Literal URLs already pin their authority to this exact address; reqwest bypasses DNS.
+        builder
+    };
+    builder
         .build()
         .map_err(|error| AikitError::ToolExecution(error.to_string()))
 }
@@ -220,11 +255,10 @@ impl WebTools {
         let mut redirects = 0usize;
         let response = loop {
             let client = pinned_https_client(&url).await?;
-            let response = client
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(|e| AikitError::ToolExecution(e.to_string()))?;
+            let response =
+                client.get(url.clone()).send().await.map_err(|_| {
+                    AikitError::ToolExecution("web request transport failed".into())
+                })?;
             if !response.status().is_redirection() {
                 // Keep this postcondition even though redirects are disabled on the client. It
                 // prevents a future client-policy change from silently bypassing the allowlist.
@@ -633,6 +667,13 @@ mod tests {
         assert!(allowed_url("https://example.com:8443/a", &hosts).is_err());
         assert!(allowed_url("https://other.example/a", &hosts).is_err());
         assert!(allowed_url("https://127.0.0.1/a", &BTreeSet::from(["127.0.0.1".into()])).is_err());
+        assert!(allowed_url("https://[::1]/a", &BTreeSet::from(["::1".into()])).is_err());
+        assert!(allowed_url(
+            "https://[2001:2::1]/a",
+            &BTreeSet::from(["2001:2::1".into()])
+        )
+        .is_err());
+        assert!(allowed_url("https://example.com/a#secret", &hosts).is_err());
     }
 
     #[test]
@@ -651,18 +692,58 @@ mod tests {
             "::ffff:127.0.0.1",
             "::127.0.0.1",
             "64:ff9b::7f00:1",
+            "::ffff:0:127.0.0.1",
+            "100::1",
+            "100:0:0:1::1",
+            "2001:1::4",
+            "2001:2::1",
+            "2001:4:111::1",
+            "2001:4:113::1",
+            "2001:10::1",
+            "2001:40::1",
             "2002:7f00:1::",
+            "3ffe::1",
+            "4000::1",
+            "6000::1",
             "fc00::1",
             "fe80::1",
             "fec0::1",
             "ff00::1",
             "2001:db8::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(denied_ip(address.parse().unwrap()), "accepted {address}");
         }
-        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2620:4f:8000::1",
+            "2606:4700:4700::1111",
+        ] {
             assert!(!denied_ip(address.parse().unwrap()), "rejected {address}");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_public_ipv6_literal_skips_dns_and_reaches_transport_stage() {
+        let hosts = BTreeSet::from(["2606:4700:4700::1111".into()]);
+        let url = allowed_url("https://[2606:4700:4700::1111]/dns-query", &hosts).unwrap();
+        let client = pinned_https_client(&url)
+            .await
+            .expect("an IPv6 literal must not be sent to DNS with square brackets");
+
+        // Poll the actual request path under a tiny outer deadline. Success, a connect/TLS error,
+        // or the deadline are all transport-stage outcomes and require no working internet; the
+        // regression was the earlier synchronous DNS failure while constructing `client`.
+        let _ = tokio::time::timeout(Duration::from_millis(25), client.get(url).send()).await;
     }
 
     #[test]

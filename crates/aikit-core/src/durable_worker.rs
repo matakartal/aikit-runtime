@@ -777,7 +777,7 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), DurableWorkerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durability::{DurabilityMode, RunEventKind, SideEffectClass};
+    use crate::durability::{DurabilityMode, DurableWorkerLease, RunEventKind, SideEffectClass};
     use crate::durable_runtime::{
         DurableActivity, DurableLegacyRunStoppedResolutionEnvelope, DurableRunStoppedReceipt,
         LEGACY_RUN_STOPPED_RESOLUTION_KIND, LEGACY_RUN_STOPPED_RESOLUTION_SCHEMA_VERSION,
@@ -1036,6 +1036,46 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {context}"));
+    }
+
+    async fn wait_for_fresh_worker_lease(
+        store: &dyn DurableStore,
+        run_id: &str,
+        heartbeat_after_unix_ms: u64,
+        not_before_unix_ms: u64,
+        minimum_headroom: Duration,
+        context: &str,
+    ) -> (DurableWorkerLease, u64) {
+        let minimum_headroom_ms = u64::try_from(minimum_headroom.as_millis())
+            .expect("test lease headroom fits in u64 milliseconds");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = store.load(run_id).expect("load worker lease while polling");
+                let now = store
+                    .worker_lease_clock_unix_ms()
+                    .expect("read worker lease clock while polling");
+                if let Some(lease) = state.worker_lease() {
+                    if now >= not_before_unix_ms
+                        && lease.heartbeat_at_unix_ms > heartbeat_after_unix_ms
+                        && lease.expires_at_unix_ms.saturating_sub(now) >= minimum_headroom_ms
+                    {
+                        return (lease.clone(), now);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let lease = store
+                .load(run_id)
+                .ok()
+                .and_then(|state| state.worker_lease().cloned());
+            let now = store.worker_lease_clock_unix_ms().ok();
+            panic!(
+                "timed out waiting for {context}; latest lease: {lease:?}, store clock: {now:?}"
+            );
+        })
     }
 
     impl DurableStore for ConstructorRaceStore {
@@ -1724,7 +1764,9 @@ mod tests {
     async fn heartbeat_renews_the_owner_bound_lease_and_excludes_a_contender() {
         let run_id = "heartbeat-owner-run";
         let store = seeded_store(run_id);
-        let first = DurableWorker::new(store.clone(), test_config("worker-a")).unwrap();
+        let first_config = test_config("worker-a");
+        let minimum_headroom = first_config.lease_ttl / 2;
+        let first = DurableWorker::new(store.clone(), first_config).unwrap();
         let started = Arc::new(Notify::new());
         let finish = Arc::new(Notify::new());
         let task = tokio::spawn({
@@ -1748,13 +1790,16 @@ mod tests {
             .worker_lease()
             .expect("worker owns a lease")
             .clone();
-        tokio::time::sleep(Duration::from_millis(230)).await;
-        let renewed_lease = store
-            .load(run_id)
-            .unwrap()
-            .worker_lease()
-            .expect("heartbeat keeps the lease active")
-            .clone();
+        let (renewed_lease, observed_at_unix_ms) = wait_for_fresh_worker_lease(
+            store.as_ref(),
+            run_id,
+            initial_lease.heartbeat_at_unix_ms,
+            initial_lease.expires_at_unix_ms,
+            minimum_headroom,
+            "a renewal beyond the initial lease window",
+        )
+        .await;
+        assert!(observed_at_unix_ms >= initial_lease.expires_at_unix_ms);
         assert_eq!(renewed_lease.owner_id, initial_lease.owner_id);
         assert_eq!(renewed_lease.lease_id, initial_lease.lease_id);
         assert!(renewed_lease.expires_at_unix_ms > initial_lease.expires_at_unix_ms);
@@ -1772,14 +1817,19 @@ mod tests {
                 }
             })
             .await;
-        assert!(matches!(
-            result,
-            Err(DurableWorkerError::ClaimUnavailable {
-                owner_id: Some(ref owner_id),
-                ..
-            }) if owner_id == "worker-a"
-        ));
+        assert!(
+            matches!(&result, Err(DurableWorkerError::ClaimUnavailable { .. })),
+            "unexpected contender outcome: {result:?}"
+        );
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let persisted_lease = store
+            .load(run_id)
+            .unwrap()
+            .worker_lease()
+            .expect("contender leaves the owner lease intact")
+            .clone();
+        assert_eq!(persisted_lease.owner_id, renewed_lease.owner_id);
+        assert_eq!(persisted_lease.lease_id, renewed_lease.lease_id);
 
         finish.notify_one();
         assert!(matches!(
@@ -1854,7 +1904,9 @@ mod tests {
     async fn dedicated_heartbeat_survives_a_blocking_callback_poll() {
         let run_id = "blocking-callback-run";
         let store = seeded_store(run_id);
-        let first = DurableWorker::new(store.clone(), test_config("worker-a")).unwrap();
+        let first_config = test_config("worker-a");
+        let minimum_headroom = first_config.lease_ttl / 2;
+        let first = DurableWorker::new(store.clone(), first_config).unwrap();
         let started = Arc::new(Notify::new());
         let first_task = tokio::spawn({
             let started = started.clone();
@@ -1869,22 +1921,51 @@ mod tests {
             }
         });
         wait_for_notification(&started, "blocking callback").await;
-        tokio::time::sleep(Duration::from_millis(230)).await;
+        let initial_lease = store
+            .load(run_id)
+            .unwrap()
+            .worker_lease()
+            .expect("worker owns a lease before the blocking poll")
+            .clone();
+        let (renewed_lease, observed_at_unix_ms) = wait_for_fresh_worker_lease(
+            store.as_ref(),
+            run_id,
+            initial_lease.heartbeat_at_unix_ms,
+            initial_lease.expires_at_unix_ms,
+            minimum_headroom,
+            "a dedicated heartbeat beyond the initial lease window",
+        )
+        .await;
+        assert!(observed_at_unix_ms >= initial_lease.expires_at_unix_ms);
 
         let mut contender_config = test_config("worker-b");
         contender_config.max_poll_attempts = 1;
-        let contender = DurableWorker::new(store, contender_config).unwrap();
-        assert!(matches!(
-            contender
-                .run(run_id, CancellationToken::new(), |_, _| async {
-                    panic!("blocking callback must not starve the independent heartbeat")
-                })
-                .await,
-            Err(DurableWorkerError::ClaimUnavailable {
-                owner_id: Some(ref owner_id),
-                ..
-            }) if owner_id == "worker-a"
-        ));
+        let contender = DurableWorker::new(store.clone(), contender_config).unwrap();
+        let contender_executions = Arc::new(AtomicUsize::new(0));
+        let contender_result = contender
+            .run(run_id, CancellationToken::new(), {
+                let contender_executions = contender_executions.clone();
+                move |_, _| async move {
+                    contender_executions.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        assert!(
+            matches!(
+                &contender_result,
+                Err(DurableWorkerError::ClaimUnavailable { .. })
+            ),
+            "unexpected contender outcome: {contender_result:?}"
+        );
+        assert_eq!(contender_executions.load(Ordering::SeqCst), 0);
+        let persisted_lease = store
+            .load(run_id)
+            .unwrap()
+            .worker_lease()
+            .expect("contender leaves the dedicated heartbeat lease intact")
+            .clone();
+        assert_eq!(persisted_lease.owner_id, renewed_lease.owner_id);
+        assert_eq!(persisted_lease.lease_id, renewed_lease.lease_id);
         assert!(matches!(
             first_task.await.unwrap().unwrap(),
             DurableWorkerOutcome::Executed {
@@ -2024,22 +2105,41 @@ mod tests {
             .await
             .expect("cancellation reaches future Drop")
             .expect("future reports Drop start");
+        let owner_lease = store
+            .load(run_id)
+            .unwrap()
+            .worker_lease()
+            .expect("worker lease remains held while the execution future is dropping")
+            .clone();
 
         let mut contender_config = test_config("worker-b");
         contender_config.max_poll_attempts = 1;
         let contender = DurableWorker::new(store.clone(), contender_config).unwrap();
+        let contender_executions = Arc::new(AtomicUsize::new(0));
         let contender_result = contender
-            .run(run_id, CancellationToken::new(), |_, _| async {
-                panic!("a contender cannot run while the old future is dropping")
+            .run(run_id, CancellationToken::new(), {
+                let contender_executions = contender_executions.clone();
+                move |_, _| async move {
+                    contender_executions.fetch_add(1, Ordering::SeqCst);
+                }
             })
             .await;
-        assert!(matches!(
-            contender_result,
-            Err(DurableWorkerError::ClaimUnavailable {
-                owner_id: Some(ref owner_id),
-                ..
-            }) if owner_id == "worker-a"
-        ));
+        assert!(
+            matches!(
+                &contender_result,
+                Err(DurableWorkerError::ClaimUnavailable { .. })
+            ),
+            "unexpected contender outcome: {contender_result:?}"
+        );
+        assert_eq!(contender_executions.load(Ordering::SeqCst), 0);
+        let persisted_lease = store
+            .load(run_id)
+            .unwrap()
+            .worker_lease()
+            .expect("contender leaves the dropping worker lease intact")
+            .clone();
+        assert_eq!(persisted_lease.owner_id, owner_lease.owner_id);
+        assert_eq!(persisted_lease.lease_id, owner_lease.lease_id);
         assert!(!drop_finished.load(Ordering::SeqCst));
 
         let (released, wake) = &*drop_gate;

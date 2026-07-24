@@ -31,7 +31,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
                 format!("{BWRAP} is missing"),
             );
         }
-        let mut prepared = match prepare("true", workdir) {
+        let mut prepared = match prepare("true", workdir, &[]) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return BackendCapability::unavailable(
@@ -45,6 +45,10 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
         prepared.command.stdout(std::process::Stdio::null());
         prepared.command.stderr(std::process::Stdio::piped());
         prepared.command.kill_on_drop(true);
+        prepared.command.env_clear();
+        prepared
+            .command
+            .envs(prepared.environment_overrides.clone());
         match tokio::time::timeout(std::time::Duration::from_secs(3), prepared.command.output())
             .await
         {
@@ -75,17 +79,20 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
     }
 }
 
-pub(super) fn prepare(command: &str, workdir: &Path) -> Result<PreparedCommand> {
+pub(super) fn prepare(
+    command: &str,
+    workdir: &Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<PreparedCommand> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (command, workdir);
+        let _ = (command, workdir, environment);
         Err(AikitError::Sandbox(
             "Linux namespace containment is unavailable on this platform".into(),
         ))
     }
     #[cfg(target_os = "linux")]
     {
-        use std::ffi::OsString;
         use std::io::Write;
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
@@ -99,6 +106,8 @@ pub(super) fn prepare(command: &str, workdir: &Path) -> Result<PreparedCommand> 
             .tempdir()
             .map_err(|error| AikitError::Sandbox(error.to_string()))?;
         let filter_path = artifacts.path().join("seccomp.bpf");
+        let environment_path = artifacts.path().join("workload-env.sh");
+        write_workload_environment(&environment_path, environment)?;
         let mut filter = std::fs::File::create(&filter_path)
             .map_err(|error| AikitError::Sandbox(error.to_string()))?;
         filter
@@ -110,31 +119,43 @@ pub(super) fn prepare(command: &str, workdir: &Path) -> Result<PreparedCommand> 
         drop(filter);
         let filter = std::fs::File::open(&filter_path)
             .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+        let workload_environment = std::fs::File::open(&environment_path)
+            .map_err(|error| AikitError::Sandbox(error.to_string()))?;
 
         let mut cmd = Command::new(BWRAP);
         cmd.args(bwrap_args(&workspace, command));
-        let fd = filter.as_raw_fd();
         // SAFETY: after fork and before exec, only async-signal-safe libc calls are used. The
-        // owned File stays captured until the hook finishes, and fd 3 is deliberately inherited
-        // by bubblewrap as its seccomp program.
+        // owned Files are moved into the hook and stay open until their descriptors are duplicated
+        // for bubblewrap as the seccomp program (fd 3) and private workload environment (fd 4).
         unsafe {
             cmd.as_std_mut().pre_exec(move || {
-                if libc::dup2(fd, 3) < 0 {
+                let filter_fd = libc::fcntl(filter.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10);
+                let environment_fd =
+                    libc::fcntl(workload_environment.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10);
+                if filter_fd < 0 || environment_fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(filter_fd, 3) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                if libc::dup2(environment_fd, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(4, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(filter_fd);
+                libc::close(environment_fd);
                 Ok(())
             });
         }
         Ok(PreparedCommand {
             command: cmd,
             backend: ActiveContainmentBackend::LinuxNamespace,
-            environment_overrides: vec![
-                (OsString::from("HOME"), workspace.clone().into_os_string()),
-                (OsString::from("TMPDIR"), OsString::from("/tmp")),
-            ],
+            environment_overrides: Vec::new(),
             cleanup: None,
             artifacts: vec![artifacts],
         })
@@ -149,7 +170,12 @@ fn bwrap_args(workspace: &Path, command: &str) -> Vec<std::ffi::OsString> {
 
     let ws = workspace.as_os_str();
     let mut args: Vec<OsString> = Vec::with_capacity(28);
-    for fixed in ["--unshare-all", "--die-with-parent", "--new-session"] {
+    for fixed in [
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+    ] {
         args.push(fixed.into());
     }
     for fixed in ["--ro-bind", "/", "/"] {
@@ -159,6 +185,9 @@ fn bwrap_args(workspace: &Path, command: &str) -> Vec<std::ffi::OsString> {
     args.push(ws.into());
     args.push(ws.into());
     for fixed in ["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"] {
+        args.push(fixed.into());
+    }
+    for fixed in ["--file", "4", "/tmp/aikit-workload-env.sh"] {
         args.push(fixed.into());
     }
     args.push("--chdir".into());
@@ -175,6 +204,8 @@ fn bwrap_args(workspace: &Path, command: &str) -> Vec<std::ffi::OsString> {
         "--",
         "/bin/sh",
         "-c",
+        ". /tmp/aikit-workload-env.sh; exec /bin/sh -c \"$1\"",
+        "aikit",
     ] {
         args.push(fixed.into());
     }
@@ -183,20 +214,89 @@ fn bwrap_args(workspace: &Path, command: &str) -> Vec<std::ffi::OsString> {
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
+fn write_workload_environment(
+    path: &Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+    for (key, value) in environment {
+        if key == "HOME" || key == "TMPDIR" {
+            continue;
+        }
+        let key = key.to_str().ok_or_else(|| {
+            AikitError::Sandbox("Linux workload environment names must be valid UTF-8".into())
+        })?;
+        if key.is_empty()
+            || !key.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            })
+        {
+            return Err(AikitError::Sandbox(format!(
+                "Linux workload environment name {key:?} is invalid"
+            )));
+        }
+        file.write_all(b"export ")
+            .and_then(|_| file.write_all(key.as_bytes()))
+            .and_then(|_| file.write_all(b"='"))
+            .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+        for byte in value.as_bytes() {
+            if *byte == 0 {
+                return Err(AikitError::Sandbox(
+                    "Linux workload environment values cannot contain NUL".into(),
+                ));
+            }
+            if *byte == b'\'' {
+                file.write_all(b"'\\''")
+                    .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+            } else {
+                file.write_all(&[*byte])
+                    .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+            }
+        }
+        file.write_all(b"'\n")
+            .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|error| AikitError::Sandbox(error.to_string()))
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn seccomp_filter() -> Result<Vec<u8>> {
     #[cfg(target_arch = "x86_64")]
     let denied: &[u32] = &[
         101, 155, 165, 166, 175, 176, 246, 250, 298, 304, 313, 321, 323,
     ];
+    #[cfg(target_arch = "x86_64")]
+    let audit_arch = 0xc000_003e; // AUDIT_ARCH_X86_64
     #[cfg(target_arch = "aarch64")]
     let denied: &[u32] = &[39, 40, 41, 104, 105, 106, 117, 219, 241, 265, 273, 280, 282];
+    #[cfg(target_arch = "aarch64")]
+    let audit_arch = 0xc000_00b7; // AUDIT_ARCH_AARCH64
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     return Err(AikitError::Sandbox(
         "seccomp filter is unsupported on this Linux architecture".into(),
     ));
 
     let mut out = Vec::new();
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    push_bpf(&mut out, 0x20, 0, 0, 4); // load seccomp_data.arch
+    push_bpf(&mut out, 0x15, 1, 0, audit_arch); // matching native ABI skips kill
+    push_bpf(&mut out, 0x06, 0, 0, RET_KILL_PROCESS);
     push_bpf(&mut out, 0x20, 0, 0, 0); // load seccomp_data.nr
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x32 shares AUDIT_ARCH_X86_64 but marks syscall numbers with bit 30. Reject the entire
+        // alternate ABI before applying the native-number deny list.
+        push_bpf(&mut out, 0x45, 0, 1, 0x4000_0000); // BPF_JSET
+        push_bpf(&mut out, 0x06, 0, 0, RET_KILL_PROCESS);
+    }
     for syscall in denied {
         push_bpf(&mut out, 0x15, 0, 1, *syscall); // if equal, return EPERM
         push_bpf(&mut out, 0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32);
@@ -253,9 +353,22 @@ mod tests {
                 "missing argv window {window:?}"
             );
         }
-        // The shell invocation terminates the argv: -- /bin/sh -c <command last>.
-        let tail: Vec<&str> = as_str[as_str.len() - 4..].to_vec();
-        assert_eq!(tail, ["--", "/bin/sh", "-c", "echo merhaba"]);
+        assert!(as_str.contains(&"--clearenv"));
+        assert!(as_str
+            .windows(3)
+            .any(|window| window == ["--file", "4", "/tmp/aikit-workload-env.sh"]));
+        let tail: Vec<&str> = as_str[as_str.len() - 6..].to_vec();
+        assert_eq!(
+            tail,
+            [
+                "--",
+                "/bin/sh",
+                "-c",
+                ". /tmp/aikit-workload-env.sh; exec /bin/sh -c \"$1\"",
+                "aikit",
+                "echo merhaba"
+            ]
+        );
     }
 
     #[test]
@@ -277,6 +390,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workload_environment_is_private_and_absent_from_bwrap_argv() {
+        let holder = tempfile::tempdir().unwrap();
+        let path = holder.path().join("workload-env.sh");
+        write_workload_environment(
+            &path,
+            &[(
+                OsString::from("LD_PRELOAD"),
+                OsString::from("./guest-only.so"),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "export LD_PRELOAD='./guest-only.so'\n"
+        );
+        let args = bwrap_args(Path::new("/work"), "true");
+        assert!(!args.iter().any(|arg| arg == "./guest-only.so"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn seccomp_filter_encodes_deny_list_and_allow_terminator() {
         let bytes = seccomp_filter().expect("supported test architectures have a filter");
         assert_eq!(bytes.len() % 8, 0, "BPF programs are 8-byte instructions");
@@ -292,19 +426,41 @@ mod tests {
             })
             .collect();
 
-        // Layout: 1 load of seccomp_data.nr, then (jump-if-equal, return-EPERM) per denied
-        // syscall, then the SECCOMP_RET_ALLOW terminator.
+        #[cfg(target_arch = "x86_64")]
+        let expected_arch = 0xc000_003e;
+        #[cfg(target_arch = "aarch64")]
+        let expected_arch = 0xc000_00b7;
+
+        // Architecture must be authenticated before syscall numbers are interpreted. Any compat
+        // ABI is killed rather than being compared against the wrong native syscall table.
         assert_eq!(
             insns[0],
-            (0x20, 0, 0, 0),
-            "first insn must load the syscall nr"
+            (0x20, 0, 0, 4),
+            "first insn loads seccomp_data.arch"
         );
+        assert_eq!(
+            insns[1],
+            (0x15, 1, 0, expected_arch),
+            "only the target native audit architecture may skip the kill"
+        );
+        assert_eq!(insns[2], (0x06, 0, 0, 0x8000_0000));
+        assert_eq!(insns[3], (0x20, 0, 0, 0), "native path loads syscall nr");
+
+        #[cfg(target_arch = "x86_64")]
+        let deny_start = {
+            assert_eq!(insns[4], (0x45, 0, 1, 0x4000_0000));
+            assert_eq!(insns[5], (0x06, 0, 0, 0x8000_0000));
+            6
+        };
+        #[cfg(target_arch = "aarch64")]
+        let deny_start = 4;
+
         assert_eq!(
             insns.last().unwrap(),
             &(0x06, 0, 0, 0x7fff_0000),
             "filter must terminate with SECCOMP_RET_ALLOW"
         );
-        let denied_pairs = &insns[1..insns.len() - 1];
+        let denied_pairs = &insns[deny_start..insns.len() - 1];
         assert_eq!(denied_pairs.len() % 2, 0);
         assert_eq!(
             denied_pairs.len() / 2,

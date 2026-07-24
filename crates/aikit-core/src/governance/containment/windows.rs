@@ -24,7 +24,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
                 "Windows Job containment requires a workspace root",
             );
         };
-        let mut prepared = match prepare("exit /b 0", workdir, ContainmentLimits::default()) {
+        let mut prepared = match prepare("exit /b 0", workdir, &[], ContainmentLimits::default()) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return BackendCapability::unavailable(
@@ -38,6 +38,7 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
         prepared.command.stdout(std::process::Stdio::null());
         prepared.command.stderr(std::process::Stdio::piped());
         prepared.command.kill_on_drop(true);
+        prepared.command.env_clear();
         prepared
             .command
             .envs(prepared.environment_overrides.clone());
@@ -69,25 +70,32 @@ pub(super) async fn capability(workdir: Option<&Path>) -> BackendCapability {
 pub(super) fn prepare(
     command: &str,
     workdir: &Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
     limits: ContainmentLimits,
 ) -> Result<PreparedCommand> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (command, workdir, limits);
+        let _ = (command, workdir, environment, limits);
         Err(AikitError::Sandbox(
             "Windows Job containment is unavailable on this platform".into(),
         ))
     }
     #[cfg(target_os = "windows")]
     {
-        use std::ffi::OsString;
         use tokio::process::Command;
 
         let workspace = std::fs::canonicalize(workdir).map_err(|error| {
             AikitError::Sandbox(format!("cannot canonicalize Windows workspace: {error}"))
         })?;
+        let system = resolve_windows_system_paths()?;
+        let artifacts = tempfile::Builder::new()
+            .prefix("aikit-windows-job-")
+            .tempdir()
+            .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+        let environment_file = artifacts.path().join("workload.env");
+        write_workload_environment(&environment_file, environment)?;
         let script = encode_powershell(WINDOWS_JOB_LAUNCHER);
-        let mut cmd = Command::new("powershell.exe");
+        let mut cmd = Command::new(&system.powershell);
         cmd.args([
             "-NoLogo",
             "-NoProfile",
@@ -97,19 +105,105 @@ pub(super) fn prepare(
             "-EncodedCommand",
             &script,
         ]);
-        let shell = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-            .join("System32")
-            .join("cmd.exe");
         Ok(PreparedCommand {
             command: cmd,
             backend: ActiveContainmentBackend::WindowsJob,
-            environment_overrides: job_environment(command, workspace, shell, limits),
+            environment_overrides: job_environment(
+                command,
+                workspace,
+                &system,
+                environment_file,
+                limits,
+            ),
             cleanup: None,
-            artifacts: Vec::new(),
+            artifacts: vec![artifacts],
         })
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct WindowsSystemPaths {
+    root: std::path::PathBuf,
+    powershell: std::path::PathBuf,
+    shell: std::path::PathBuf,
+    path: std::ffi::OsString,
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_system_paths() -> Result<WindowsSystemPaths> {
+    let configured_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    if !configured_root.is_absolute() {
+        return Err(AikitError::Sandbox(
+            "Windows SystemRoot must be an absolute path".into(),
+        ));
+    }
+    let root = std::fs::canonicalize(&configured_root).map_err(|error| {
+        AikitError::Sandbox(format!(
+            "cannot canonicalize Windows SystemRoot {}: {error}",
+            configured_root.display()
+        ))
+    })?;
+    let resolve_executable = |relative: &Path| -> Result<std::path::PathBuf> {
+        let candidate = root.join(relative);
+        let executable = std::fs::canonicalize(&candidate).map_err(|error| {
+            AikitError::Sandbox(format!(
+                "cannot resolve Windows system executable {}: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !executable.is_file() || !executable.starts_with(&root) {
+            return Err(AikitError::Sandbox(format!(
+                "Windows system executable is not a regular file under SystemRoot: {}",
+                executable.display()
+            )));
+        }
+        Ok(executable)
+    };
+    let powershell =
+        resolve_executable(Path::new(r"System32\WindowsPowerShell\v1.0\powershell.exe"))?;
+    let shell = resolve_executable(Path::new(r"System32\cmd.exe"))?;
+    let path = std::env::join_paths([
+        root.join("System32"),
+        root.clone(),
+        root.join(r"System32\WindowsPowerShell\v1.0"),
+    ])
+    .map_err(|error| AikitError::Sandbox(format!("invalid Windows control PATH: {error}")))?;
+    Ok(WindowsSystemPaths {
+        root,
+        powershell,
+        shell,
+        path,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn write_workload_environment(
+    path: &Path,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+
+    let encode = |value: &std::ffi::OsStr| {
+        let bytes = value
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        base64(&bytes)
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+    for (key, value) in environment {
+        writeln!(file, "{}\t{}", encode(key), encode(value))
+            .map_err(|error| AikitError::Sandbox(error.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|error| AikitError::Sandbox(error.to_string()))
 }
 
 /// The environment contract between `prepare` and the PowerShell launcher: the untrusted command,
@@ -119,7 +213,8 @@ pub(super) fn prepare(
 fn job_environment(
     command: &str,
     workspace: std::path::PathBuf,
-    shell: std::path::PathBuf,
+    system: &WindowsSystemPaths,
+    environment_file: std::path::PathBuf,
     limits: ContainmentLimits,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     use std::ffi::OsString;
@@ -127,12 +222,28 @@ fn job_environment(
     let process_limit = limits.max_processes.unwrap_or(64).clamp(1, u32::MAX as u64);
     let memory_limit = 512_u64 << 20;
     vec![
+        (
+            OsString::from("SystemRoot"),
+            system.root.clone().into_os_string(),
+        ),
+        (
+            OsString::from("WINDIR"),
+            system.root.clone().into_os_string(),
+        ),
+        (OsString::from("PATH"), system.path.clone()),
         (OsString::from("AIKIT_JOB_COMMAND"), OsString::from(command)),
         (
             OsString::from("AIKIT_JOB_WORKDIR"),
             workspace.into_os_string(),
         ),
-        (OsString::from("AIKIT_JOB_SHELL"), shell.into_os_string()),
+        (
+            OsString::from("AIKIT_JOB_SHELL"),
+            system.shell.clone().into_os_string(),
+        ),
+        (
+            OsString::from("AIKIT_JOB_ENV_FILE"),
+            environment_file.into_os_string(),
+        ),
         (
             OsString::from("AIKIT_JOB_PROCESS_LIMIT"),
             OsString::from(process_limit.to_string()),
@@ -191,7 +302,8 @@ public static class AikitJob {
   [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attr, string name);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int info, ref EXTENDED_LIMITS data, uint len);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-  [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
   [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
   [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
@@ -216,7 +328,15 @@ public static class AikitJob {
     var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(si); si.dwFlags = 0x100; si.hStdInput = GetStdHandle(-10); si.hStdOutput = GetStdHandle(-11); si.hStdError = GetStdHandle(-12);
     PROCESS_INFORMATION pi; var line = new StringBuilder("\"" + shell + "\" /d /s /c \"" + command.Replace("\"", "\\\"") + "\"");
     Check(CreateProcessW(shell, line, IntPtr.Zero, IntPtr.Zero, true, 0x4u | 0x400u, IntPtr.Zero, null, ref si, out pi), "CreateProcessW");
-    try { Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject"); ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, 0xffffffff); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code); }
+    try {
+      Check(AssignProcessToJobObject(job, pi.hProcess), "AssignProcessToJobObject");
+      uint resumed = ResumeThread(pi.hThread); if (resumed == 0xffffffffu) throw new Win32Exception(Marshal.GetLastWin32Error(), "ResumeThread");
+      uint completed = WaitForSingleObject(pi.hProcess, 0xffffffff); Check(completed == 0u, "WaitForSingleObject child"); uint code; GetExitCodeProcess(pi.hProcess, out code); return unchecked((int)code);
+    }
+    catch {
+      bool terminated = TerminateProcess(pi.hProcess, 1u); uint waited = WaitForSingleObject(pi.hProcess, 5000u);
+      Check(terminated, "TerminateProcess"); Check(waited == 0u, "WaitForSingleObject terminated child"); throw;
+    }
     finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); }
   }
 }
@@ -224,7 +344,19 @@ public static class AikitJob {
 Add-Type -TypeDefinition $src -Language CSharp
 $command = $env:AIKIT_JOB_COMMAND; $cwd = $env:AIKIT_JOB_WORKDIR; $shell = $env:AIKIT_JOB_SHELL
 $processes = [uint32]$env:AIKIT_JOB_PROCESS_LIMIT; $memory = [uint64]$env:AIKIT_JOB_MEMORY_LIMIT
+$environmentFile = $env:AIKIT_JOB_ENV_FILE
 $env:AIKIT_JOB_COMMAND = $null; $env:AIKIT_JOB_WORKDIR = $null; $env:AIKIT_JOB_SHELL = $null
+$env:AIKIT_JOB_PROCESS_LIMIT = $null; $env:AIKIT_JOB_MEMORY_LIMIT = $null; $env:AIKIT_JOB_ENV_FILE = $null
+if (![String]::IsNullOrWhiteSpace($environmentFile)) {
+  Get-Content -LiteralPath $environmentFile -Encoding ASCII | ForEach-Object {
+    $parts = $_ -split "`t", 2
+    if ($parts.Length -ne 2) { throw "invalid AIKit workload environment record" }
+    $key = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($parts[0]))
+    $value = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($parts[1]))
+    [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+  }
+  Remove-Item -LiteralPath $environmentFile -Force
+}
 exit [AikitJob]::Run($command, $cwd, $shell, $processes, $memory)
 "#;
 
@@ -264,13 +396,31 @@ mod tests {
     }
 
     #[test]
+    fn assignment_or_resume_failure_terminates_the_suspended_child() {
+        assert!(WINDOWS_JOB_LAUNCHER.contains("static extern bool TerminateProcess"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("resumed == 0xffffffffu"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("TerminateProcess(pi.hProcess, 1u)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("WaitForSingleObject(pi.hProcess, 5000u)"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("Check(waited == 0u"));
+    }
+
+    #[test]
     fn launcher_scrubs_job_environment_before_exec() {
-        for variable in ["AIKIT_JOB_COMMAND", "AIKIT_JOB_WORKDIR", "AIKIT_JOB_SHELL"] {
+        for variable in [
+            "AIKIT_JOB_COMMAND",
+            "AIKIT_JOB_WORKDIR",
+            "AIKIT_JOB_SHELL",
+            "AIKIT_JOB_PROCESS_LIMIT",
+            "AIKIT_JOB_MEMORY_LIMIT",
+            "AIKIT_JOB_ENV_FILE",
+        ] {
             assert!(
                 WINDOWS_JOB_LAUNCHER.contains(&format!("$env:{variable} = $null")),
                 "launcher must scrub {variable} before exec"
             );
         }
+        assert!(WINDOWS_JOB_LAUNCHER.contains("Get-Content -LiteralPath $environmentFile"));
+        assert!(WINDOWS_JOB_LAUNCHER.contains("SetEnvironmentVariable($key, $value, 'Process')"));
     }
 
     #[test]
@@ -283,15 +433,34 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
+        let system = WindowsSystemPaths {
+            root: std::path::PathBuf::from(r"C:\Windows"),
+            powershell: std::path::PathBuf::from(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ),
+            shell: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            path: std::ffi::OsString::from(
+                r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0",
+            ),
+        };
         let environment = job_environment(
             "echo merhaba",
             std::path::PathBuf::from("/w"),
-            std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            &system,
+            std::path::PathBuf::from(r"C:\private\workload.env"),
             ContainmentLimits::default(),
         );
+        assert_eq!(lookup(&environment, "SystemRoot"), r"C:\Windows");
+        assert_eq!(lookup(&environment, "WINDIR"), r"C:\Windows");
+        assert!(lookup(&environment, "PATH").contains("WindowsPowerShell"));
+        assert!(system
+            .powershell
+            .to_string_lossy()
+            .ends_with("powershell.exe"));
         assert_eq!(lookup(&environment, "AIKIT_JOB_COMMAND"), "echo merhaba");
         assert_eq!(lookup(&environment, "AIKIT_JOB_WORKDIR"), "/w");
         assert!(lookup(&environment, "AIKIT_JOB_SHELL").ends_with("cmd.exe"));
+        assert!(lookup(&environment, "AIKIT_JOB_ENV_FILE").ends_with("workload.env"));
         assert_eq!(lookup(&environment, "AIKIT_JOB_PROCESS_LIMIT"), "64");
         assert_eq!(lookup(&environment, "AIKIT_JOB_MEMORY_LIMIT"), "536870912");
 
@@ -300,7 +469,8 @@ mod tests {
             job_environment(
                 "x",
                 std::path::PathBuf::from("/w"),
-                std::path::PathBuf::from("cmd.exe"),
+                &system,
+                std::path::PathBuf::from(r"C:\private\workload.env"),
                 ContainmentLimits {
                     max_processes: Some(max),
                     ..Default::default()

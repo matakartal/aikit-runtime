@@ -365,9 +365,19 @@ fn a2a_list_tasks_is_governed_scoped_filtered_and_cursor_paginated() {
     }
     // The oldest task becomes the most recently updated one. Revision order is deterministic
     // across serialization and is the canonical mapper's stable ordering clock.
+    let oldest_dispatch = mapper
+        .dispatch_outbox()
+        .values()
+        .find(|dispatch| dispatch.task_id == owner_a_tasks[0])
+        .unwrap()
+        .dispatch_id
+        .clone();
+    mapper.mark_dispatch_running(&oldest_dispatch).unwrap();
+    let oldest_attempt = mapper.dispatch_outbox()[&oldest_dispatch].attempts;
     mapper
-        .transition_task(
-            &owner_a_tasks[0],
+        .transition_dispatch_task(
+            &oldest_dispatch,
+            oldest_attempt,
             A2aTaskState::Completed,
             Some("done".into()),
         )
@@ -510,9 +520,19 @@ fn a2a_list_tasks_is_governed_scoped_filtered_and_cursor_paginated() {
 
     // A same-owner task transition changes the authorized snapshot and invalidates the cursor
     // instead of silently duplicating or skipping work.
+    let changed_dispatch = mapper
+        .dispatch_outbox()
+        .values()
+        .find(|dispatch| dispatch.task_id == owner_a_tasks[1])
+        .expect("second owner task dispatch")
+        .dispatch_id
+        .clone();
+    mapper.mark_dispatch_running(&changed_dispatch).unwrap();
+    let changed_attempt = mapper.dispatch_outbox()[&changed_dispatch].attempts;
     mapper
-        .transition_task(
-            &owner_a_tasks[1],
+        .transition_dispatch_task(
+            &changed_dispatch,
+            changed_attempt,
             A2aTaskState::Completed,
             Some("completed after page one".into()),
         )
@@ -712,8 +732,20 @@ fn a2a_context_task_run_mapping_and_input_resume_are_stable() {
     for event in mapper.pending_events() {
         mapper.mark_event_settled(&event.event_id).unwrap();
     }
+    let initial_dispatch = mapper
+        .dispatch_for_message("message-initial", &actor)
+        .unwrap()
+        .dispatch_id
+        .clone();
+    mapper.mark_dispatch_running(&initial_dispatch).unwrap();
+    let initial_attempt = mapper.dispatch_outbox()[&initial_dispatch].attempts;
     mapper
-        .require_input(&mapping.task_id, "destination required")
+        .transition_dispatch_task(
+            &initial_dispatch,
+            initial_attempt,
+            A2aTaskState::InputRequired,
+            Some("destination required".into()),
+        )
         .unwrap();
     for event in mapper.pending_events() {
         mapper.mark_event_settled(&event.event_id).unwrap();

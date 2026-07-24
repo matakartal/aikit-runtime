@@ -6,6 +6,7 @@ use aikit_core::{
 use serde_json::{json, Value};
 use std::io::{Read as _, Write as _};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -173,26 +174,38 @@ async fn process_kill_fences_concurrent_owner_and_reuses_completed_result_after_
     let live_store: Arc<dyn DurableStore> =
         Arc::new(SqliteDurableStore::open(&database).expect("open live worker store"));
     let live_state = live_store.load(RUN_ID).expect("load child-owned run");
-    assert_eq!(
-        live_state
-            .worker_lease()
-            .map(|lease| lease.owner_id.as_str()),
-        Some("process-worker")
-    );
-    let contender = DurableWorker::new(live_store, worker_config("concurrent-worker"))
+    let live_lease = live_state
+        .worker_lease()
+        .expect("child owns a live worker lease")
+        .clone();
+    assert_eq!(Some(live_lease.owner_id.as_str()), Some("process-worker"));
+    let contender = DurableWorker::new(live_store.clone(), worker_config("concurrent-worker"))
         .expect("create contender");
+    let contender_executions = Arc::new(AtomicUsize::new(0));
     let contender_result = contender
-        .run(RUN_ID, CancellationToken::new(), |_, _| async {
-            panic!("concurrent worker must not execute while the child lease is active")
+        .run(RUN_ID, CancellationToken::new(), {
+            let contender_executions = contender_executions.clone();
+            move |_, _| async move {
+                contender_executions.fetch_add(1, Ordering::SeqCst);
+            }
         })
         .await;
-    assert!(matches!(
-        contender_result,
-        Err(DurableWorkerError::ClaimUnavailable {
-            owner_id: Some(ref owner_id),
-            ..
-        }) if owner_id == "process-worker"
-    ));
+    assert!(
+        matches!(
+            &contender_result,
+            Err(DurableWorkerError::ClaimUnavailable { .. })
+        ),
+        "unexpected concurrent-worker outcome: {contender_result:?}"
+    );
+    assert_eq!(contender_executions.load(Ordering::SeqCst), 0);
+    let persisted_lease = live_store
+        .load(RUN_ID)
+        .expect("reload child-owned run after contender")
+        .worker_lease()
+        .expect("contender leaves child lease intact")
+        .clone();
+    assert_eq!(persisted_lease.owner_id, live_lease.owner_id);
+    assert_eq!(persisted_lease.lease_id, live_lease.lease_id);
 
     let status = child
         .kill_and_wait()

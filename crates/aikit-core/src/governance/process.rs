@@ -17,7 +17,7 @@
 
 use crate::error::{AikitError, Result};
 use crate::governance::containment::{
-    prepare_command, CleanupAction, ContainmentLimits, ContainmentPolicy,
+    prepare_command, ActiveContainmentBackend, CleanupAction, ContainmentLimits, ContainmentPolicy,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -117,9 +117,20 @@ pub async fn run_bash_with_containment(
     };
     let prepared = prepare_command(command, workdir, containment, &environment, limits).await?;
     let mut cmd = prepared.command;
-    let _backend = prepared.backend;
-    let cleanup_action = prepared.cleanup.clone();
-    let mut cleanup_guard = CleanupGuard::new(prepared.cleanup);
+    let backend = prepared.backend;
+    if backend == ActiveContainmentBackend::Seatbelt {
+        if let Some((key, _)) = environment
+            .iter()
+            .find(|(key, _)| is_loader_control_environment_key(key))
+        {
+            return Err(AikitError::Sandbox(format!(
+                "Seatbelt cannot safely preserve loader-control environment variable {}",
+                key.to_string_lossy()
+            )));
+        }
+    }
+    let pending_cleanup = prepared.cleanup;
+    // Keep private cidfiles/environment artifacts alive until after the cancellation guard drops.
     let _artifacts = prepared.artifacts;
 
     cmd.stdin(std::process::Stdio::null());
@@ -130,14 +141,24 @@ pub async fn run_bash_with_containment(
         cmd.current_dir(dir);
     }
 
-    // 1. Environment scrubbing — the parent's secrets never reach the shell unless whitelisted.
-    if !policy.inherit_env {
+    // Host containment wrappers are control-plane processes. Docker and PowerShell receive only
+    // their explicit minimal environment; their workload environment travels through a private
+    // backend artifact. Native wrappers that directly exec the workload preserve prior semantics.
+    let isolated_wrapper = matches!(
+        backend,
+        ActiveContainmentBackend::Docker
+            | ActiveContainmentBackend::LinuxNamespace
+            | ActiveContainmentBackend::WindowsJob
+    );
+    if isolated_wrapper || !policy.inherit_env {
         cmd.env_clear();
     }
-    cmd.envs(merge_environment(
-        environment,
-        prepared.environment_overrides,
-    ));
+    let launch_environment = if isolated_wrapper {
+        prepared.environment_overrides
+    } else {
+        merge_environment(environment, prepared.environment_overrides)
+    };
+    cmd.envs(launch_environment);
 
     // 4. A separate process group plus rlimits, applied between fork and exec (Unix only).
     #[cfg(unix)]
@@ -166,6 +187,10 @@ pub async fn run_bash_with_containment(
     let mut child = cmd
         .spawn()
         .map_err(|e| AikitError::ToolExecution(format!("spawn failed: {e}")))?;
+    // A failed spawn cannot own a Docker container. Once the launcher exists, cleanup remains
+    // guarded by its private cidfile and can never target a merely predictable container name.
+    let cleanup_action = pending_cleanup.clone();
+    let mut cleanup_guard = CleanupGuard::new(pending_cleanup);
     // `Child::kill_on_drop` only targets the direct child. Keep a separate synchronous guard for
     // the whole Unix session so cancellation (which simply drops this future) cannot leave shell
     // descendants running. This also covers the Seatbelt wrapper and the Docker client process.
@@ -190,10 +215,14 @@ pub async fn run_bash_with_containment(
             process_group_guard.terminate();
             // `docker run --rm` normally removes itself, but a non-zero client exit or daemon
             // disconnect must not turn that expectation into a leaked containment container.
-            if let Some(cleanup) = &cleanup_action {
-                cleanup.force().await;
+            let cleaned = if let Some(cleanup) = &cleanup_action {
+                cleanup.force().await
+            } else {
+                true
+            };
+            if cleaned {
+                cleanup_guard.disarm();
             }
-            cleanup_guard.disarm();
             let mut body = String::new();
             body.push_str(&String::from_utf8_lossy(&out_buf));
             if !err_buf.is_empty() {
@@ -204,19 +233,27 @@ pub async fn run_bash_with_containment(
         }
         Ok(Err(e)) => {
             process_group_guard.terminate();
-            if let Some(cleanup) = &cleanup_action {
-                cleanup.force().await;
+            let cleaned = if let Some(cleanup) = &cleanup_action {
+                cleanup.force().await
+            } else {
+                true
+            };
+            if cleaned {
+                cleanup_guard.disarm();
             }
-            cleanup_guard.disarm();
             Err(AikitError::ToolExecution(format!("io error: {e}")))
         }
         // Timed out: kill the process group and force backend cleanup (notably `docker rm -f`).
         Err(_elapsed) => {
             process_group_guard.terminate();
-            if let Some(cleanup) = &cleanup_action {
-                cleanup.force().await;
+            let cleaned = if let Some(cleanup) = &cleanup_action {
+                cleanup.force().await
+            } else {
+                true
+            };
+            if cleaned {
+                cleanup_guard.disarm();
             }
-            cleanup_guard.disarm();
             Err(AikitError::ToolExecution(format!(
                 "command timed out after {:?}",
                 policy.timeout
@@ -225,7 +262,7 @@ pub async fn run_bash_with_containment(
     }
 }
 
-fn child_environment(policy: &BashPolicy) -> Vec<(OsString, OsString)> {
+pub(crate) fn child_environment(policy: &BashPolicy) -> Vec<(OsString, OsString)> {
     let mut environment = Vec::new();
     if policy.inherit_env {
         environment.extend(std::env::vars_os());
@@ -254,6 +291,12 @@ fn merge_environment(
         environment.push((key, value));
     }
     environment
+}
+
+fn is_loader_control_environment_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    key.starts_with("DYLD_")
+        || matches!(key.as_str(), "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT")
 }
 
 struct CleanupGuard {
@@ -372,6 +415,9 @@ fn apply_rlimit(resource: RlimitResource, value: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    static FAKE_DOCKER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn fast() -> BashPolicy {
         // A quick policy for tests: short timeout, tiny caps stay off unless a test sets them.
         BashPolicy {
@@ -444,6 +490,21 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("merhaba"));
+    }
+
+    #[test]
+    fn identifies_loader_control_environment_keys_for_seatbelt_fail_closed() {
+        for key in [
+            "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+        ] {
+            assert!(is_loader_control_environment_key(std::ffi::OsStr::new(key)));
+        }
+        assert!(!is_loader_control_environment_key(std::ffi::OsStr::new(
+            "PATH"
+        )));
     }
 
     #[tokio::test]
@@ -641,6 +702,178 @@ mod tests {
             !blocked.exists(),
             "Seatbelt allowed an out-of-workspace write"
         );
+    }
+
+    #[cfg(unix)]
+    fn fake_docker(holder: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = holder.join("fake-docker");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+log="${0}.log"
+if [ -n "${AIKIT_WORKLOAD_SECRET:-}" ] || [ -n "${LD_PRELOAD:-}" ] || [ -n "${DOCKER_CONFIG:-}" ]; then
+  printf '%s\n' HOST_ENV_LEAK >> "$log"
+  exit 97
+fi
+case "$1" in
+  info)
+    printf '%s\n' INFO >> "$log"
+    printf '%s\n' seccomp
+    ;;
+  image)
+    printf '%s\n' IMAGE >> "$log"
+    printf '%s\n' sha256:ready
+    ;;
+  run)
+    printf '%s\n' RUN >> "$log"
+    cidfile=
+    envfile=
+    while [ "$#" -gt 0 ]; do
+      printf 'ARG:%s\n' "$1" >> "$log"
+      case "$1" in
+        --cidfile)
+          shift
+          cidfile=$1
+          printf 'ARG:%s\n' "$1" >> "$log"
+          ;;
+        --env-file)
+          shift
+          envfile=$1
+          printf 'ARG:%s\n' "$1" >> "$log"
+          ;;
+      esac
+      shift
+    done
+    if [ -f "${0}.collision" ]; then
+      printf '%s\n' COLLISION >> "$log"
+      exit 125
+    fi
+    printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$cidfile"
+    while IFS= read -r line; do
+      printf 'GUEST_ENV:%s\n' "$line" >> "$log"
+    done < "$envfile"
+    printf '%s\n' 'fake container ran'
+    ;;
+  rm)
+    if [ -f "${0}.fail-first-rm" ] && [ ! -f "${0}.rm-attempted" ]; then
+      : > "${0}.rm-attempted"
+      printf 'REMOVE_FAILED:%s\n' "$3" >> "$log"
+      exit 86
+    fi
+    printf 'REMOVE:%s\n' "$3" >> "$log"
+    ;;
+  *)
+    exit 99
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    #[cfg(unix)]
+    fn fake_docker_policy(executable: &Path) -> (BashPolicy, ContainmentPolicy) {
+        use crate::governance::containment::DockerConfig;
+
+        let mut bash = fast();
+        bash.env_extra.extend([
+            ("DOCKER_HOST".into(), "tcp://trusted-daemon".into()),
+            ("AIKIT_WORKLOAD_SECRET".into(), "guest-only-secret".into()),
+            ("LD_PRELOAD".into(), "guest-preload.so".into()),
+            ("DOCKER_CONFIG".into(), "/workload-untrusted-config".into()),
+        ]);
+        let docker = DockerConfig::new(format!("example/aikit@sha256:{}", "a".repeat(64)))
+            .with_executable(executable);
+        (bash, ContainmentPolicy::required_docker(docker))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_launch_separates_control_and_workload_environment_and_cleans_owned_id() {
+        let _serial = FAKE_DOCKER_TEST_LOCK.lock().await;
+        let holder = tempfile::tempdir().unwrap();
+        let workspace = holder.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executable = fake_docker(holder.path());
+        let (bash, containment) = fake_docker_policy(&executable);
+
+        let output = run_bash_with_containment(
+            "printf '%s' \"$AIKIT_WORKLOAD_SECRET\"",
+            Some(&workspace),
+            &bash,
+            &containment,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("[exit 0]"));
+        let log = std::fs::read_to_string(executable.with_extension("log")).unwrap();
+        assert!(!log.contains("HOST_ENV_LEAK"));
+        assert!(log.contains("GUEST_ENV:AIKIT_WORKLOAD_SECRET=guest-only-secret"));
+        assert!(log.contains("GUEST_ENV:LD_PRELOAD=guest-preload.so"));
+        assert!(log.contains("GUEST_ENV:DOCKER_CONFIG=/workload-untrusted-config"));
+        assert!(log.contains(&format!("REMOVE:{}", "b".repeat(64))));
+        for line in log.lines().filter(|line| line.starts_with("ARG:")) {
+            assert!(!line.contains("guest-only-secret"));
+            assert!(!line.contains("guest-preload.so"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_name_collision_without_cidfile_never_deletes_unowned_container() {
+        let _serial = FAKE_DOCKER_TEST_LOCK.lock().await;
+        let holder = tempfile::tempdir().unwrap();
+        let workspace = holder.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executable = fake_docker(holder.path());
+        std::fs::write(executable.with_extension("collision"), "occupied").unwrap();
+        let (bash, containment) = fake_docker_policy(&executable);
+
+        let output = run_bash_with_containment("true", Some(&workspace), &bash, &containment)
+            .await
+            .unwrap();
+
+        assert!(output.contains("[exit 125]"));
+        let log = std::fs::read_to_string(executable.with_extension("log")).unwrap();
+        assert!(log.contains("COLLISION"));
+        assert!(!log.contains("REMOVE:"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_cleanup_guard_retries_after_synchronous_rm_failure() {
+        let _serial = FAKE_DOCKER_TEST_LOCK.lock().await;
+        let holder = tempfile::tempdir().unwrap();
+        let workspace = holder.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executable = fake_docker(holder.path());
+        std::fs::write(executable.with_extension("fail-first-rm"), "retry").unwrap();
+        let log_path = executable.with_extension("log");
+        let (bash, containment) = fake_docker_policy(&executable);
+
+        let output = run_bash_with_containment("true", Some(&workspace), &bash, &containment)
+            .await
+            .unwrap();
+        assert!(output.contains("[exit 0]"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&log_path).is_ok_and(|log| log.contains("REMOVE:")) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop cleanup did not retry the owned container ID");
+
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains(&format!("REMOVE_FAILED:{}", "b".repeat(64))));
+        assert!(log.contains(&format!("REMOVE:{}", "b".repeat(64))));
     }
 
     #[tokio::test]

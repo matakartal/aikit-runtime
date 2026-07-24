@@ -4,7 +4,7 @@
 use crate::error::{AikitError, Result};
 use crate::governance::sandbox::{Sandbox, SandboxError};
 use serde_json::Value;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
 use std::path::Path;
 
 const MAX_READ_BYTES: u64 = 1_000_000;
@@ -41,9 +41,7 @@ pub fn write(sb: &Sandbox, input: &Value) -> Result<String> {
             "write {path}: content exceeds {MAX_WRITE_BYTES} bytes"
         )));
     }
-    let mut file = sb.open_write(path).map_err(denied)?;
-    file.write_all(content.as_bytes())
-        .map_err(|error| AikitError::ToolExecution(format!("write {path}: {error}")))?;
+    sb.replace_write(path, content.as_bytes()).map_err(denied)?;
     Ok(format!("wrote {} bytes to {path}", content.len()))
 }
 
@@ -66,10 +64,8 @@ pub fn edit(sb: &Sandbox, input: &Value) -> Result<String> {
                     "edited content for {path} exceeds {MAX_READ_BYTES} bytes"
                 )));
             }
-            file.seek(SeekFrom::Start(0))
-                .and_then(|_| file.set_len(0))
-                .and_then(|_| file.write_all(updated.as_bytes()))
-                .map_err(|error| AikitError::ToolExecution(format!("write {path}: {error}")))?;
+            sb.commit_edit(path, &mut file, updated.as_bytes())
+                .map_err(denied)?;
             Ok(format!("edited {path}"))
         }
         n => Err(AikitError::ToolExecution(format!(
@@ -284,6 +280,81 @@ mod tests {
             glob(&sandbox, &json!({"pattern": "secret.txt"})).unwrap(),
             "no matches"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_file_tools_reject_hard_link_aliases_to_outside_inodes() {
+        let holder = tempfile::tempdir().unwrap();
+        let root = holder.path().join("root");
+        let outside = holder.path().join("outside.txt");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, "outside secret").unwrap();
+        std::fs::hard_link(&outside, root.join("alias.txt")).unwrap();
+        let sandbox = Sandbox::jail(&root).unwrap();
+
+        for result in [
+            read(&sandbox, &json!({"path": "alias.txt"})),
+            write(
+                &sandbox,
+                &json!({"path": "alias.txt", "content": "overwrite"}),
+            ),
+            edit(
+                &sandbox,
+                &json!({
+                    "path": "alias.txt",
+                    "old_string": "outside",
+                    "new_string": "changed"
+                }),
+            ),
+        ] {
+            assert!(matches!(result, Err(AikitError::Sandbox(_))));
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside secret");
+        assert_eq!(
+            grep(&sandbox, &json!({"pattern": "secret"})).unwrap(),
+            "no matches"
+        );
+        // Listing the name is harmless; the content-bearing open is the protected boundary.
+        assert!(glob(&sandbox, &json!({"pattern": "alias.txt"}))
+            .unwrap()
+            .ends_with("alias.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jailed_write_and_edit_replace_the_inode_and_preserve_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace.txt");
+        std::fs::write(&path, "first value").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sandbox = Sandbox::jail(dir.path()).unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+
+        write(
+            &sandbox,
+            &json!({"path": "replace.txt", "content": "second value"}),
+        )
+        .unwrap();
+        let after_write = std::fs::metadata(&path).unwrap();
+        assert_ne!(after_write.ino(), original.ino());
+        assert_eq!(after_write.permissions().mode() & 0o777, 0o640);
+
+        edit(
+            &sandbox,
+            &json!({
+                "path": "replace.txt",
+                "old_string": "second",
+                "new_string": "third"
+            }),
+        )
+        .unwrap();
+        let after_edit = std::fs::metadata(&path).unwrap();
+        assert_ne!(after_edit.ino(), after_write.ino());
+        assert_eq!(after_edit.permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "third value");
     }
 
     #[test]

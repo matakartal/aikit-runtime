@@ -148,7 +148,7 @@ impl MemoryStore for InMemoryMemoryStore {
             .map_err(|_| "memory mutex poisoned".to_string())?;
         if let Some(existing) = entries.get(&(entry.namespace.clone(), entry.key.clone())) {
             entry.created_unix_ms = existing.created_unix_ms;
-            entry.revision = existing.revision.saturating_add(1);
+            entry.revision = next_memory_revision(existing.revision)?;
         } else {
             entry.revision = 1;
         }
@@ -230,10 +230,15 @@ impl JsonFileMemoryStore {
         let loaded = if let Some(file) = open_existing_memory_file(&path)? {
             let values: Vec<MemoryEntry> =
                 serde_json::from_reader(file).map_err(|e| e.to_string())?;
-            values
-                .into_iter()
-                .map(|entry| ((entry.namespace.clone(), entry.key.clone()), entry))
-                .collect()
+            let mut loaded = HashMap::with_capacity(values.len());
+            for entry in values {
+                let entry = normalize_persisted_entry(entry)?;
+                let key = (entry.namespace.clone(), entry.key.clone());
+                if loaded.insert(key, entry).is_some() {
+                    return Err("memory file contains duplicate namespace/key entries".into());
+                }
+            }
+            loaded
         } else {
             HashMap::new()
         };
@@ -261,7 +266,7 @@ impl MemoryStore for JsonFileMemoryStore {
         let mut next = entries.clone();
         if let Some(existing) = next.get(&(entry.namespace.clone(), entry.key.clone())) {
             entry.created_unix_ms = existing.created_unix_ms;
-            entry.revision = existing.revision.saturating_add(1);
+            entry.revision = next_memory_revision(existing.revision)?;
         } else {
             entry.revision = 1;
         }
@@ -546,14 +551,41 @@ fn sync_memory_parent(parent: &Path) -> std::result::Result<(), String> {
 
 static MEMORY_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
-fn validate_entry(entry: &MemoryEntry) -> std::result::Result<(), String> {
+pub(crate) fn validate_entry(entry: &MemoryEntry) -> std::result::Result<(), String> {
     if entry.namespace.trim().is_empty() || entry.key.trim().is_empty() {
         return Err("memory namespace and key must be non-empty".into());
     }
     if entry.namespace.len() > 256 || entry.key.len() > 512 {
         return Err("memory namespace/key exceeds length limit".into());
     }
+    if entry.importance > 100 {
+        return Err("memory importance must be between 0 and 100".into());
+    }
     Ok(())
+}
+
+/// Migrate fields that older stores persisted before their current invariants existed.
+///
+/// This is intentionally separate from [`validate_entry`]: new caller writes remain strict,
+/// while already-persisted revision zero and out-of-range ranking weights get one deterministic
+/// compatibility interpretation. Every other invalid persisted field remains fail closed.
+pub(crate) fn normalize_persisted_entry(
+    mut entry: MemoryEntry,
+) -> std::result::Result<MemoryEntry, String> {
+    if entry.revision == 0 {
+        entry.revision = 1;
+    }
+    if entry.importance > 100 {
+        entry.importance = 100;
+    }
+    validate_entry(&entry)?;
+    Ok(entry)
+}
+
+fn next_memory_revision(revision: u64) -> std::result::Result<u64, String> {
+    revision
+        .checked_add(1)
+        .ok_or_else(|| "memory revision overflow".to_string())
 }
 
 fn rank_entries<'a>(
@@ -656,6 +688,31 @@ mod tests {
     }
 
     #[test]
+    fn put_rejects_revision_overflow_without_mutating_memory() {
+        let store = InMemoryMemoryStore::default();
+        let mut existing = MemoryEntry::new("agent", "stable", json!("old"));
+        existing.revision = u64::MAX;
+        store.entries.lock().unwrap().insert(
+            (existing.namespace.clone(), existing.key.clone()),
+            existing.clone(),
+        );
+
+        let error = store
+            .put(MemoryEntry::new("agent", "stable", json!("new")))
+            .unwrap_err();
+        assert!(error.contains("revision overflow"));
+        assert_eq!(store.get("agent", "stable").unwrap(), Some(existing));
+    }
+
+    #[test]
+    fn invalid_importance_is_rejected() {
+        let store = InMemoryMemoryStore::default();
+        let mut entry = MemoryEntry::new("agent", "unsafe", json!(true));
+        entry.importance = 101;
+        assert!(store.put(entry).is_err());
+    }
+
+    #[test]
     fn file_store_survives_reopen_and_uses_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.json");
@@ -678,6 +735,36 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn file_store_migrates_legacy_revision_before_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.json");
+        let mut legacy = MemoryEntry::new("agent", "legacy", json!("old"));
+        legacy.importance = u8::MAX;
+        assert_eq!(legacy.revision, 0);
+        std::fs::write(&path, serde_json::to_vec(&vec![legacy]).unwrap()).unwrap();
+
+        let store = JsonFileMemoryStore::open(&path).unwrap();
+        let migrated = store.get("agent", "legacy").unwrap().unwrap();
+        assert_eq!(migrated.revision, 1);
+        assert_eq!(migrated.importance, 100);
+        let update = MemoryEntry::new("agent", "legacy", json!("new"));
+        assert!(store.compare_and_swap(update.clone(), 0).is_err());
+        assert_eq!(store.compare_and_swap(update, 1), Ok(2));
+    }
+
+    #[test]
+    fn file_store_rejects_duplicate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.json");
+        let first = MemoryEntry::new("agent", "duplicate", json!(1));
+        let second = MemoryEntry::new("agent", "duplicate", json!(2));
+        std::fs::write(&path, serde_json::to_vec(&vec![first, second]).unwrap()).unwrap();
+
+        let error = JsonFileMemoryStore::open(&path).err().unwrap();
+        assert!(error.contains("duplicate namespace/key"));
     }
 
     #[cfg(unix)]

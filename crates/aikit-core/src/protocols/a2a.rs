@@ -2452,63 +2452,24 @@ impl A2aMapper {
         Ok(())
     }
 
-    fn settle_task_dispatches_at_revision(
+    fn settle_dispatch_at_revision(
         &mut self,
-        task_id: &str,
+        dispatch_id: &str,
         revision: u64,
     ) -> ProtocolResult<()> {
-        let replacements: Vec<_> = self
+        let current = self
             .dispatch_outbox
-            .iter()
-            .filter(|(_, record)| {
-                record.task_id == task_id && record.state != A2aDispatchOutboxState::Settled
-            })
-            .map(|(dispatch_id, record)| {
-                let mut replacement = record.clone();
-                replacement.state = A2aDispatchOutboxState::Settled;
-                replacement.last_error = None;
-                replacement.updated_revision = revision;
-                (dispatch_id.clone(), replacement)
-            })
-            .collect();
-        let mut next_bytes = self.dispatch_bytes;
-        let mut owner_bytes: BTreeMap<A2aContextOwner, usize> = BTreeMap::new();
-        for (dispatch_id, replacement) in &replacements {
-            let current = self
-                .dispatch_outbox
-                .get(dispatch_id)
-                .expect("A2A dispatch replacement was collected from the map");
-            let owner = dispatch_owner(current);
-            let current_owner_bytes = match owner_bytes.get(&owner) {
-                Some(bytes) => *bytes,
-                None => dispatch_bytes_for_owner(&self.dispatch_outbox, &owner)?,
-            };
-            let old_bytes = dispatch_entry_storage_bytes(dispatch_id, current)?;
-            let new_bytes = dispatch_entry_storage_bytes(dispatch_id, replacement)?;
-            next_bytes = next_bytes
-                .checked_sub(old_bytes)
-                .and_then(|bytes| bytes.checked_add(new_bytes))
-                .ok_or_else(|| ProtocolError::conflict("A2A dispatch bytes overflowed"))?;
-            let next_owner_bytes = current_owner_bytes
-                .checked_sub(old_bytes)
-                .and_then(|bytes| bytes.checked_add(new_bytes))
-                .ok_or_else(|| ProtocolError::conflict("A2A owner dispatch bytes overflowed"))?;
-            owner_bytes.insert(owner, next_owner_bytes);
+            .get(dispatch_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::not_found("A2A dispatch is not registered"))?;
+        if current.state == A2aDispatchOutboxState::Settled {
+            return Ok(());
         }
-        if next_bytes > A2A_MAX_DISPATCH_BYTES
-            || owner_bytes
-                .values()
-                .any(|bytes| *bytes > A2A_MAX_DISPATCH_BYTES_PER_OWNER)
-        {
-            return Err(ProtocolError::conflict(
-                "A2A dispatch byte capacity cannot represent settlement",
-            ));
-        }
-        self.dispatch_bytes = next_bytes;
-        for (dispatch_id, replacement) in replacements {
-            self.dispatch_outbox.insert(dispatch_id, replacement);
-        }
-        Ok(())
+        let mut replacement = current;
+        replacement.state = A2aDispatchOutboxState::Settled;
+        replacement.last_error = None;
+        replacement.updated_revision = revision;
+        self.replace_dispatch_record(dispatch_id, replacement)
     }
 
     fn settle_task_cancellation_at_revision(
@@ -4088,7 +4049,59 @@ impl A2aMapper {
         status_message: Option<String>,
     ) -> ProtocolResult<()> {
         let mut candidate = self.clone();
-        candidate.transition_task_candidate(task_id, next, status_message, None)?;
+        candidate.transition_task_candidate(task_id, next, status_message, None, None)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Apply a task transition only for the exact running dispatch attempt that caused it.
+    ///
+    /// This is the state-only counterpart to the fenced output-completion APIs. The caller must
+    /// provide both the dispatch identifier and its current attempt number so a delayed callback
+    /// cannot mutate or settle a newer retry.
+    pub fn transition_dispatch_task(
+        &mut self,
+        dispatch_id: &str,
+        expected_attempt: u32,
+        next: A2aTaskState,
+        status_message: Option<String>,
+    ) -> ProtocolResult<()> {
+        let dispatch = self
+            .dispatch_outbox
+            .get(dispatch_id)
+            .cloned()
+            .ok_or_else(|| ProtocolError::not_found("A2A dispatch is not registered"))?;
+        if dispatch.attempts != expected_attempt {
+            return Err(ProtocolError::invalid_transition(
+                "A2A dispatch transition generation is stale",
+            ));
+        }
+        let task = self
+            .tasks
+            .get(&dispatch.task_id)
+            .ok_or_else(|| ProtocolError::not_found("A2A task is not registered"))?;
+        if dispatch.state == A2aDispatchOutboxState::Settled {
+            return if task.state == next
+                && task.status_message == status_message
+                && task.updated_revision == dispatch.updated_revision
+            {
+                Ok(())
+            } else {
+                Err(ProtocolError::invalid_transition(
+                    "A2A dispatch transition is already settled with another task state",
+                ))
+            };
+        }
+
+        let task_id = dispatch.task_id;
+        let mut candidate = self.clone();
+        candidate.transition_task_candidate(
+            &task_id,
+            next,
+            status_message,
+            Some((dispatch_id, expected_attempt)),
+            None,
+        )?;
         *self = candidate;
         Ok(())
     }
@@ -4114,6 +4127,7 @@ impl A2aMapper {
             &task_id,
             A2aTaskState::Cancelled,
             status_message,
+            None,
             Some((cancellation_id, expected_attempt)),
         )?;
         *self = candidate;
@@ -4225,6 +4239,15 @@ impl A2aMapper {
                 "A2A dispatch completion cannot cross a durable cancellation fence",
             ));
         }
+        if self.dispatch_outbox.values().any(|record| {
+            record.task_id == dispatch.task_id
+                && record.dispatch_id != dispatch.dispatch_id
+                && record.state != A2aDispatchOutboxState::Settled
+        }) {
+            return Err(ProtocolError::invalid_transition(
+                "A2A dispatch completion cannot settle another open dispatch generation",
+            ));
+        }
         if !valid_transition(existing.state, A2aTaskState::Completed) {
             return Err(ProtocolError::invalid_transition(format!(
                 "invalid A2A task transition: {:?} -> {:?}",
@@ -4281,7 +4304,7 @@ impl A2aMapper {
         replacement.response = response;
         replacement.updated_revision = revision;
         self.replace_dispatch_record(dispatch_id, replacement)?;
-        self.settle_task_dispatches_at_revision(&projected.mapping.task_id, revision)?;
+        self.settle_dispatch_at_revision(dispatch_id, revision)?;
         self.settle_task_cancellation_at_revision(&projected.mapping.task_id, revision)?;
         self.insert_new_pending_event(event)
             .expect("A2A output completion event was preflighted");
@@ -4296,6 +4319,7 @@ impl A2aMapper {
         task_id: &str,
         next: A2aTaskState,
         status_message: Option<String>,
+        dispatch_ack: Option<(&str, u32)>,
         cancellation_ack: Option<(&str, u32)>,
     ) -> ProtocolResult<()> {
         let existing = self
@@ -4338,6 +4362,54 @@ impl A2aMapper {
                 "invalid A2A task transition: {current:?} -> {next:?}"
             )));
         }
+        let unsettled_dispatches: Vec<_> = self
+            .dispatch_outbox
+            .values()
+            .filter(|record| {
+                record.task_id == task_id && record.state != A2aDispatchOutboxState::Settled
+            })
+            .cloned()
+            .collect();
+        if unsettled_dispatches.len() > 1 {
+            return Err(ProtocolError::conflict(
+                "A2A task has more than one unsettled message dispatch",
+            ));
+        }
+        let unsettled_dispatch = unsettled_dispatches.into_iter().next();
+        let makes_dispatch_non_runnable = next.is_terminal()
+            || matches!(
+                next,
+                A2aTaskState::InputRequired | A2aTaskState::AuthRequired
+            );
+        if cancellation_ack.is_none() && dispatch_ack.is_none() && unsettled_dispatch.is_some() {
+            return Err(ProtocolError::invalid_transition(
+                "A2A task transition cannot mutate a task with an open dispatch without its exact fence",
+            ));
+        }
+        if cancellation_ack.is_none() {
+            match (unsettled_dispatch.as_ref(), dispatch_ack) {
+                (Some(dispatch), Some((dispatch_id, expected_attempt)))
+                    if dispatch.dispatch_id == dispatch_id
+                        && dispatch.state == A2aDispatchOutboxState::Running
+                        && dispatch.attempts == expected_attempt => {}
+                (Some(_), Some(_)) => {
+                    return Err(ProtocolError::invalid_transition(
+                        "A2A dispatch transition generation is stale",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(ProtocolError::invalid_transition(
+                        "A2A task transition cannot settle an open dispatch without its exact fence",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(ProtocolError::invalid_transition(
+                        "A2A dispatch transition is stale",
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
         let revision = self.next_revision()?;
         let mut projected = existing;
         projected.state = next;
@@ -4352,13 +4424,10 @@ impl A2aMapper {
             revision,
         );
         self.preflight_new_pending_event(&event)?;
-        if next.is_terminal()
-            || matches!(
-                next,
-                A2aTaskState::InputRequired | A2aTaskState::AuthRequired
-            )
-        {
-            self.settle_task_dispatches_at_revision(task_id, revision)?;
+        if makes_dispatch_non_runnable {
+            if let Some(dispatch) = unsettled_dispatch {
+                self.settle_dispatch_at_revision(&dispatch.dispatch_id, revision)?;
+            }
         }
         if next.is_terminal() {
             self.settle_task_cancellation_at_revision(task_id, revision)?;
@@ -5694,15 +5763,23 @@ mod capacity_tests {
             )
             .into_authorized()
             .unwrap();
-        let A2aAction::DispatchMessage { mapping, .. } = action else {
+        let A2aAction::DispatchMessage { .. } = action else {
             panic!("expected dispatch action");
         };
+        let dispatch_id = original
+            .dispatch_for_message("cow-candidate", &principal)
+            .unwrap()
+            .dispatch_id
+            .clone();
         let original_bytes = serde_json::to_vec(&original).unwrap();
         let mut candidate = original.clone();
+        candidate.mark_dispatch_running(&dispatch_id).unwrap();
+        let attempt = candidate.dispatch_outbox()[&dispatch_id].attempts;
 
         candidate
-            .transition_task(
-                &mapping.task_id,
+            .transition_dispatch_task(
+                &dispatch_id,
+                attempt,
                 A2aTaskState::InputRequired,
                 Some("need input".into()),
             )
@@ -6489,6 +6566,117 @@ mod capacity_tests {
     }
 
     #[test]
+    fn stale_dispatch_attempt_cannot_transition_or_settle_the_current_attempt() {
+        let principal = principal();
+        for next in [A2aTaskState::Completed, A2aTaskState::InputRequired] {
+            let mut mapper = A2aMapper::new();
+            let message_id = format!("attempt-fence-{next:?}");
+            let (_, action) = mapper
+                .prepare_send_message(
+                    message(&message_id),
+                    correlation(&message_id),
+                    Some(&principal),
+                )
+                .into_authorized()
+                .unwrap();
+            let A2aAction::DispatchMessage { mapping, .. } = action else {
+                panic!("expected dispatch action");
+            };
+            let dispatch_id = mapper
+                .dispatch_for_message(&message_id, &principal)
+                .unwrap()
+                .dispatch_id
+                .clone();
+            mapper.mark_dispatch_running(&dispatch_id).unwrap();
+            let attempt_one = mapper.dispatch_outbox()[&dispatch_id].attempts;
+            mapper
+                .mark_dispatch_reconcile_pending(&dispatch_id, "sanitized")
+                .unwrap();
+            mapper.mark_dispatch_running(&dispatch_id).unwrap();
+            let attempt_two = mapper.dispatch_outbox()[&dispatch_id].attempts;
+            assert_eq!((attempt_one, attempt_two), (1, 2));
+
+            let status_message = (next == A2aTaskState::InputRequired)
+                .then(|| "current attempt needs input".to_owned());
+            let before_late_attempt = mapper.clone();
+            let unfenced_working = mapper
+                .transition_task(
+                    &mapping.task_id,
+                    A2aTaskState::Working,
+                    Some("late attempt still working".into()),
+                )
+                .unwrap_err();
+            assert_eq!(unfenced_working.code, ProtocolErrorCode::InvalidTransition);
+            assert!(unfenced_working.message.contains("exact fence"));
+            assert_eq!(mapper, before_late_attempt);
+            let unfenced = mapper
+                .transition_task(&mapping.task_id, next, status_message.clone())
+                .unwrap_err();
+            assert_eq!(unfenced.code, ProtocolErrorCode::InvalidTransition);
+            assert!(unfenced.message.contains("exact fence"));
+            assert_eq!(mapper, before_late_attempt);
+
+            let stale = mapper
+                .transition_dispatch_task(&dispatch_id, attempt_one, next, status_message.clone())
+                .unwrap_err();
+            assert_eq!(stale.code, ProtocolErrorCode::InvalidTransition);
+            assert!(stale.message.contains("generation is stale"));
+            assert_eq!(mapper, before_late_attempt);
+            assert_eq!(
+                mapper.dispatch_outbox()[&dispatch_id].state,
+                A2aDispatchOutboxState::Running
+            );
+            assert_eq!(mapper.dispatch_outbox()[&dispatch_id].attempts, attempt_two);
+
+            let stale_progress = mapper
+                .transition_dispatch_task(
+                    &dispatch_id,
+                    attempt_one,
+                    A2aTaskState::Working,
+                    Some("stale progress".into()),
+                )
+                .unwrap_err();
+            assert_eq!(stale_progress.code, ProtocolErrorCode::InvalidTransition);
+            assert_eq!(mapper, before_late_attempt);
+
+            mapper
+                .transition_dispatch_task(
+                    &dispatch_id,
+                    attempt_two,
+                    A2aTaskState::Working,
+                    Some("current attempt is working".into()),
+                )
+                .unwrap();
+            assert_eq!(
+                mapper.dispatch_outbox()[&dispatch_id].state,
+                A2aDispatchOutboxState::Running
+            );
+            assert_eq!(
+                mapper.tasks()[&mapping.task_id].status_message.as_deref(),
+                Some("current attempt is working")
+            );
+
+            mapper
+                .transition_dispatch_task(&dispatch_id, attempt_two, next, status_message.clone())
+                .unwrap();
+            assert_eq!(
+                mapper.dispatch_outbox()[&dispatch_id].state,
+                A2aDispatchOutboxState::Settled
+            );
+            assert_eq!(mapper.tasks()[&mapping.task_id].state, next);
+            let settled_revision = mapper.revision();
+            mapper
+                .transition_dispatch_task(&dispatch_id, attempt_two, next, status_message)
+                .unwrap();
+            assert_eq!(mapper.revision(), settled_revision);
+
+            let restored: A2aMapper =
+                serde_json::from_value(serde_json::to_value(&mapper).unwrap()).unwrap();
+            assert_eq!(restored, mapper);
+        }
+    }
+
+    #[test]
     fn snapshot_restart_recovers_same_dispatch_identity_and_action() {
         let principal = principal();
         let mut mapper = A2aMapper::new();
@@ -6541,7 +6729,7 @@ mod capacity_tests {
                 )
                 .into_authorized()
                 .unwrap();
-            let A2aAction::DispatchMessage { mapping, .. } = action else {
+            let A2aAction::DispatchMessage { .. } = action else {
                 panic!("expected dispatch action");
             };
             let dispatch_id = mapper
@@ -6549,8 +6737,10 @@ mod capacity_tests {
                 .unwrap()
                 .dispatch_id
                 .clone();
+            mapper.mark_dispatch_running(&dispatch_id).unwrap();
+            let attempt = mapper.dispatch_outbox()[&dispatch_id].attempts;
             mapper
-                .transition_task(&mapping.task_id, state, None)
+                .transition_dispatch_task(&dispatch_id, attempt, state, None)
                 .unwrap();
             assert_eq!(
                 mapper.dispatch_outbox()[&dispatch_id].state,
@@ -6757,6 +6947,123 @@ mod capacity_tests {
 
         mapper.mark_dispatch_settled(&dispatch_id).unwrap();
         assert!(mapper.preflight_send_message(&next, &principal).is_ok());
+    }
+
+    #[test]
+    fn delayed_unfenced_transition_cannot_settle_a_newer_queued_dispatch() {
+        let principal = principal();
+        let mut mapper = A2aMapper::new();
+        let first = message("generation-fence-first");
+        let (_, action) = mapper
+            .prepare_send_message(
+                first.clone(),
+                correlation("generation-fence-first"),
+                Some(&principal),
+            )
+            .into_authorized()
+            .unwrap();
+        let A2aAction::DispatchMessage { mapping, .. } = action else {
+            panic!("expected initial dispatch action");
+        };
+        for event in mapper.pending_events() {
+            mapper.mark_event_settled(&event.event_id).unwrap();
+        }
+        let first_dispatch_id = mapper
+            .dispatch_for_message(&first.message_id, &principal)
+            .unwrap()
+            .dispatch_id
+            .clone();
+        mapper.mark_dispatch_settled(&first_dispatch_id).unwrap();
+
+        let second = targeted_message("generation-fence-second", &mapping);
+        mapper
+            .prepare_send_message(
+                second.clone(),
+                correlation("generation-fence-second"),
+                Some(&principal),
+            )
+            .into_authorized()
+            .unwrap();
+        let second_dispatch_id = mapper
+            .dispatch_for_message(&second.message_id, &principal)
+            .unwrap()
+            .dispatch_id
+            .clone();
+        assert_eq!(
+            mapper.dispatch_outbox()[&second_dispatch_id].state,
+            A2aDispatchOutboxState::Queued
+        );
+
+        // This task-only transition can be a delayed callback from the already-settled first
+        // generation. It has no proof that it owns the second dispatch and must be atomic on
+        // rejection instead of silently consuming that queued work.
+        let before_late_transition = mapper.clone();
+        let error = mapper
+            .transition_task(&mapping.task_id, A2aTaskState::Completed, None)
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidTransition);
+        assert!(error.message.contains("exact fence"));
+        assert_eq!(mapper, before_late_transition);
+        assert_eq!(
+            mapper.pending_dispatches()[0].dispatch_id,
+            second_dispatch_id
+        );
+
+        // Content-bound idempotency remains a read-only retry even while the newer generation is
+        // queued, and restart must recover that exact dispatch identity as pending work.
+        let (_, duplicate) = mapper
+            .prepare_send_message(
+                second,
+                correlation("generation-fence-second-retry"),
+                Some(&principal),
+            )
+            .into_authorized()
+            .unwrap();
+        assert!(matches!(duplicate, A2aAction::DuplicateMessage { .. }));
+        assert_eq!(mapper, before_late_transition);
+        let mut restored: A2aMapper = deserialize_a2a_mapper_snapshot_bounded(
+            &serialize_a2a_mapper_snapshot_bounded(&mapper, A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES)
+                .unwrap(),
+            A2A_DEFAULT_MAPPER_SNAPSHOT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.pending_dispatches()[0].dispatch_id,
+            second_dispatch_id
+        );
+
+        // An exact cancellation control is causally bound to the task/run and may still stop the
+        // queued generation before terminalizing the task.
+        restored
+            .prepare_cancel_task(
+                &mapping.task_id,
+                correlation("generation-fence-cancel"),
+                Some(&principal),
+            )
+            .into_authorized()
+            .unwrap();
+        let cancellation_id = restored
+            .cancellation_for_task(&mapping.task_id, &principal)
+            .unwrap()
+            .cancellation_id
+            .clone();
+        restored
+            .mark_cancellation_running(&cancellation_id)
+            .unwrap();
+        restored
+            .acknowledge_cancellation(&cancellation_id, 1, None)
+            .unwrap();
+        assert_eq!(
+            restored.dispatch_outbox()[&second_dispatch_id].state,
+            A2aDispatchOutboxState::Settled
+        );
+        assert_eq!(
+            restored.tasks()[&mapping.task_id].state,
+            A2aTaskState::Cancelled
+        );
+        let roundtrip: A2aMapper =
+            serde_json::from_value(serde_json::to_value(restored).unwrap()).unwrap();
+        assert!(roundtrip.pending_dispatches().is_empty());
     }
 
     #[test]
@@ -7104,14 +7411,21 @@ mod capacity_tests {
             )
             .into_authorized()
             .unwrap();
-        let A2aAction::DispatchMessage { mapping, .. } = action else {
+        let A2aAction::DispatchMessage { .. } = action else {
             panic!("expected dispatch action");
         };
         for event in mapper.pending_events() {
             mapper.mark_event_settled(&event.event_id).unwrap();
         }
+        let dispatch_id = mapper
+            .dispatch_for_message("terminal-event", &principal)
+            .unwrap()
+            .dispatch_id
+            .clone();
+        mapper.mark_dispatch_running(&dispatch_id).unwrap();
+        let attempt = mapper.dispatch_outbox()[&dispatch_id].attempts;
         mapper
-            .transition_task(&mapping.task_id, A2aTaskState::Completed, None)
+            .transition_dispatch_task(&dispatch_id, attempt, A2aTaskState::Completed, None)
             .unwrap();
         let restored: A2aMapper =
             serde_json::from_value(serde_json::to_value(&mapper).unwrap()).unwrap();

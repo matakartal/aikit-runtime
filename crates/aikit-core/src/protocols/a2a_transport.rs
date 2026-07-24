@@ -38,7 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{
-    broadcast, mpsc, oneshot, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore,
+    broadcast, mpsc, oneshot, Mutex, Notify, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock,
+    Semaphore,
 };
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep_until, timeout, Instant};
@@ -75,6 +76,7 @@ pub const DEFAULT_A2A_STREAM_EVENTS: usize = 4096;
 pub const DEFAULT_A2A_STREAM_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_A2A_EVENT_BUCKETS: usize = 4096;
 pub const DEFAULT_A2A_EVENT_BUCKETS_PER_OWNER: usize = 1024;
+const A2A_STREAM_HEAD_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 thread_local! {
     static A2A_UNTRUSTED_CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -2847,6 +2849,7 @@ struct DispatchAcceptance {
 struct DispatchCommit {
     expected_dispatch_attempt: Option<u32>,
     expected_cancellation_attempt: Option<u32>,
+    host_already_fenced: bool,
 }
 
 #[derive(Debug)]
@@ -2875,6 +2878,60 @@ enum CancellationReconciliationCache {
         attempts: u32,
         decision: A2aUnknownDispatchDecision,
     },
+}
+
+struct CancellationReconciliationOwnerGuard<'a> {
+    reconciliations: &'a StdMutex<BTreeMap<String, CancellationReconciliationCache>>,
+    notify: &'a Notify,
+    cancellation_id: String,
+    attempts: u32,
+    completed: bool,
+}
+
+impl CancellationReconciliationOwnerGuard<'_> {
+    fn complete(mut self, decision: A2aUnknownDispatchDecision) {
+        let mut reconciliations = self
+            .reconciliations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            reconciliations.get(&self.cancellation_id),
+            Some(CancellationReconciliationCache::InFlight { attempts })
+                if *attempts == self.attempts
+        ) {
+            reconciliations.insert(
+                self.cancellation_id.clone(),
+                CancellationReconciliationCache::Complete {
+                    attempts: self.attempts,
+                    decision,
+                },
+            );
+        }
+        self.completed = true;
+        drop(reconciliations);
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for CancellationReconciliationOwnerGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut reconciliations = self
+            .reconciliations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            reconciliations.get(&self.cancellation_id),
+            Some(CancellationReconciliationCache::InFlight { attempts })
+                if *attempts == self.attempts
+        ) {
+            reconciliations.remove(&self.cancellation_id);
+        }
+        drop(reconciliations);
+        self.notify.notify_waiters();
+    }
 }
 
 #[derive(Debug)]
@@ -3232,9 +3289,142 @@ impl A2aHttpJsonRpcServer {
         Ok(std::mem::take(&mut state.handles).into_values().collect())
     }
 
+    /// Bind the live mapper to the linearizable durable head before the listener becomes ready.
+    /// Read-only RPCs otherwise have no commit path on which to discover a stale or mis-restored
+    /// mapper and could serve divergent task state until the first later mutation.
+    async fn initialize_snapshot_store(&self) -> ProtocolResult<()> {
+        self.ensure_snapshot_available()?;
+        let _commit_guard = self.snapshot_commit.write().await;
+        self.ensure_snapshot_available()?;
+
+        if self
+            .snapshot_store_initialized
+            .load(AtomicOrdering::Acquire)
+        {
+            let live_revision = self.mapper.lock().await.revision();
+            let cached = self.cached_snapshot_version()?;
+            if cached.revision != live_revision {
+                let error = ProtocolError::conflict(
+                    "A2A live mapper revision diverged from its snapshot version",
+                );
+                self.fail_stop_snapshot(error.clone());
+                return Err(error);
+            }
+            let observed = self.snapshots.lookup_snapshot_version().await?;
+            if observed.as_ref() != Some(&cached) {
+                let error = ProtocolError::conflict(
+                    "A2A durable snapshot head diverged from the live mapper",
+                );
+                self.fail_stop_snapshot(error.clone());
+                return Err(error);
+            }
+            return Ok(());
+        }
+
+        let live = self.mapper.lock().await.clone();
+        let live_snapshot = A2aSerializedMapperSnapshot::from_mapper(&live)?;
+        let version = match self.snapshots.load_serialized_snapshot().await {
+            Ok(Some(stored_snapshot)) => {
+                let stored_version = stored_snapshot.version();
+                let stored_mapper = stored_snapshot.decode().map_err(|error| {
+                    self.fail_stop_snapshot(error.clone());
+                    error
+                })?;
+                if stored_version.revision != live.revision() || stored_mapper != live {
+                    let error = ProtocolError::conflict(
+                        "A2A durable snapshot content diverged from the restored live mapper",
+                    );
+                    self.fail_stop_snapshot(error.clone());
+                    return Err(error);
+                }
+                stored_version
+            }
+            Ok(None) => {
+                let version = live_snapshot.version();
+                match persist_snapshot_with_exact_probe(
+                    &self.snapshots,
+                    None,
+                    live_snapshot.bind_expected(None),
+                )
+                .await
+                {
+                    Ok(()) => version,
+                    Err(A2aSnapshotStoreError::DefiniteNotApplied(error)) => return Err(error),
+                    Err(A2aSnapshotStoreError::OutcomeUnknown(error)) => {
+                        self.fail_stop_snapshot(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                self.fail_stop_snapshot(error.clone());
+                return Err(error);
+            }
+        };
+
+        *self
+            .snapshot_version
+            .lock()
+            .map_err(|_| ProtocolError::conflict("A2A snapshot version lock poisoned"))? =
+            Some(version);
+        self.snapshot_store_initialized
+            .store(true, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    fn cached_snapshot_version(&self) -> ProtocolResult<A2aSnapshotVersion> {
+        self.snapshot_version
+            .lock()
+            .map_err(|_| ProtocolError::conflict("A2A snapshot version lock poisoned"))?
+            .clone()
+            .ok_or_else(|| ProtocolError::conflict("A2A snapshot version is unavailable"))
+    }
+
+    /// Give an externally served read a linearization point against the shared durable store.
+    /// The remote lookup intentionally runs before the local read barrier so an unavailable store
+    /// cannot block mapper writes or priority cancellation. If a local commit advances while the
+    /// lookup is in flight, retry against its new cached version before exposing mapper state.
+    async fn acquire_current_snapshot_read(&self) -> ProtocolResult<OwnedRwLockReadGuard<()>> {
+        if !self
+            .snapshot_store_initialized
+            .load(AtomicOrdering::Acquire)
+        {
+            self.initialize_snapshot_store().await?;
+        }
+        loop {
+            self.ensure_snapshot_available()?;
+            let before = self.cached_snapshot_version()?;
+            let observed = self.snapshots.lookup_snapshot_version().await?;
+            let guard = self.snapshot_commit.clone().read_owned().await;
+            self.ensure_snapshot_available()?;
+            let current = self.cached_snapshot_version()?;
+            if current != before {
+                drop(guard);
+                continue;
+            }
+            if observed.as_ref() != Some(&current) {
+                let error = ProtocolError::conflict(
+                    "A2A durable snapshot head diverged from the live mapper",
+                );
+                self.fail_stop_snapshot(error.clone());
+                return Err(error);
+            }
+            return Ok(guard);
+        }
+    }
+
     async fn persist_mapper_mutation<T>(
         &self,
         mutation: impl FnOnce(&mut A2aMapper) -> ProtocolResult<T>,
+    ) -> ProtocolResult<T> {
+        self.persist_mapper_mutation_with_post_commit(mutation, None)
+            .await
+    }
+
+    async fn persist_mapper_mutation_with_post_commit<T>(
+        &self,
+        mutation: impl FnOnce(&mut A2aMapper) -> ProtocolResult<T>,
+        post_commit: Option<Box<dyn FnOnce() -> ProtocolResult<()> + Send>>,
     ) -> ProtocolResult<T> {
         self.ensure_snapshot_available()?;
         // The owned guard moves into an independent commit task. Once the candidate is prepared,
@@ -3281,8 +3471,6 @@ impl A2aHttpJsonRpcServer {
                     self.fail_stop_snapshot(error.clone());
                     return Err(error);
                 }
-                self.snapshot_store_initialized
-                    .store(true, AtomicOrdering::Release);
                 (None, stored_version)
             } else {
                 let version = live_snapshot.version();
@@ -3311,6 +3499,12 @@ impl A2aHttpJsonRpcServer {
             }
             *cached = Some(expected.clone());
         }
+        if initialize_store && base.is_none() {
+            // Publish the cached version before the Release flag. Concurrent first-use readers
+            // that observe initialization must never see an unavailable snapshot version.
+            self.snapshot_store_initialized
+                .store(true, AtomicOrdering::Release);
+        }
         if expected.revision != expected_revision {
             let error = ProtocolError::conflict(
                 "A2A live mapper revision diverged from its snapshot version",
@@ -3320,6 +3514,36 @@ impl A2aHttpJsonRpcServer {
         }
         let output = mutation(&mut candidate)?;
         if candidate.revision() == expected_revision {
+            if let Some(base) = base {
+                match persist_snapshot_with_exact_probe(
+                    &self.snapshots,
+                    None,
+                    base.bind_expected(None),
+                )
+                .await
+                {
+                    Ok(()) => self
+                        .snapshot_store_initialized
+                        .store(true, AtomicOrdering::Release),
+                    Err(A2aSnapshotStoreError::DefiniteNotApplied(error)) => return Err(error),
+                    Err(A2aSnapshotStoreError::OutcomeUnknown(error)) => {
+                        self.fail_stop_snapshot(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+            // No-op retries still need a shared-store linearization point. Release the writer
+            // before remote I/O so a slow lookup cannot freeze cancellation or other mutations.
+            drop(commit_guard);
+            let _snapshot_read = self.acquire_current_snapshot_read().await?;
+            if self.cached_snapshot_version()? != expected {
+                return Err(ProtocolError::conflict(
+                    "A2A mapper changed while validating a no-op mutation",
+                ));
+            }
+            if let Some(post_commit) = post_commit {
+                post_commit()?;
+            }
             return Ok(output);
         }
         validate_new_pending_event_wire_bytes(
@@ -3362,6 +3586,9 @@ impl A2aHttpJsonRpcServer {
                         "A2A snapshot version lock poisoned",
                     ))
                 })? = Some(serialized.version());
+                if let Some(post_commit) = post_commit {
+                    post_commit().map_err(A2aSnapshotStoreError::definite)?;
+                }
                 Ok(())
             }
             .await;
@@ -3446,16 +3673,40 @@ impl A2aHttpJsonRpcServer {
         task_id: &str,
         detail: &str,
     ) -> ProtocolResult<()> {
-        self.persist_mapper_mutation(|candidate| {
-            candidate.acknowledge_cancellation(
-                cancellation_id,
-                expected_attempt,
-                Some(detail.to_owned()),
-            )
-        })
+        self.persist_cancellation_fence_with_post_commit(
+            cancellation_id,
+            expected_attempt,
+            task_id,
+            detail,
+            None,
+        )
         .await?;
         self.flush_pending_events_for_task(task_id).await?;
         Ok(())
+    }
+
+    async fn persist_cancellation_fence_with_post_commit(
+        &self,
+        cancellation_id: &str,
+        expected_attempt: u32,
+        task_id: &str,
+        detail: &str,
+        post_commit: Option<Box<dyn FnOnce() -> ProtocolResult<()> + Send>>,
+    ) -> ProtocolResult<A2aTaskRecord> {
+        self.persist_mapper_mutation_with_post_commit(
+            |candidate| {
+                candidate.acknowledge_cancellation(
+                    cancellation_id,
+                    expected_attempt,
+                    Some(detail.to_owned()),
+                )?;
+                candidate.tasks().get(task_id).cloned().ok_or_else(|| {
+                    ProtocolError::conflict("A2A cancellation task disappeared after its fence")
+                })
+            },
+            post_commit,
+        )
+        .await
     }
 
     async fn mark_task_dispatches_reconcile_pending(&self, task_id: &str) -> ProtocolResult<()> {
@@ -3546,6 +3797,7 @@ impl A2aHttpJsonRpcServer {
         &self,
         logical_event_id: &str,
     ) -> ProtocolResult<A2aPersistedEvent> {
+        let snapshot_read = self.acquire_current_snapshot_read().await?;
         let intent = self
             .mapper
             .lock()
@@ -3554,12 +3806,10 @@ impl A2aHttpJsonRpcServer {
             .get(logical_event_id)
             .cloned()
             .ok_or_else(|| ProtocolError::not_found("A2A event intent is not registered"))?;
-        if matches!(
-            intent.state,
-            A2aPendingEventState::Settled | A2aPendingEventState::Quarantined
-        ) {
+        drop(snapshot_read);
+        if intent.state == A2aPendingEventState::Quarantined {
             return Err(ProtocolError::invalid_transition(
-                "terminal A2A event intent cannot be delivered again",
+                "quarantined A2A event intent cannot be delivered",
             ));
         }
         if intent
@@ -3881,25 +4131,21 @@ impl A2aHttpJsonRpcServer {
                 continue;
             }
 
+            // The reconciliation future is owned by the surrounding request/recovery task. If
+            // that task is aborted by an outer timeout, leaving `InFlight` behind would poison
+            // this cancellation generation until process restart. The guard releases only the
+            // exact generation it owns and wakes waiters on every drop path.
+            let owner_guard = CancellationReconciliationOwnerGuard {
+                reconciliations: &self.cancellation_reconciliations,
+                notify: &self.cancellation_reconciliation_notify,
+                cancellation_id: record.cancellation_id.clone(),
+                attempts: record.attempts,
+                completed: false,
+            };
             let decision = self
                 .reconcile_unknown_cancellation(record, cancellation, recovery_deadline)
                 .await;
-            if let Ok(mut reconciliations) = self.cancellation_reconciliations.lock() {
-                if matches!(
-                    reconciliations.get(&record.cancellation_id),
-                    Some(CancellationReconciliationCache::InFlight { attempts })
-                        if *attempts == record.attempts
-                ) {
-                    reconciliations.insert(
-                        record.cancellation_id.clone(),
-                        CancellationReconciliationCache::Complete {
-                            attempts: record.attempts,
-                            decision,
-                        },
-                    );
-                }
-            }
-            self.cancellation_reconciliation_notify.notify_waiters();
+            owner_guard.complete(decision);
             return decision;
         }
     }
@@ -4078,6 +4324,7 @@ impl A2aHttpJsonRpcServer {
                 .send(DispatchCommit {
                     expected_dispatch_attempt: None,
                     expected_cancellation_attempt: Some(expected_attempt),
+                    host_already_fenced: false,
                 })
                 .is_err()
             {
@@ -4282,6 +4529,7 @@ impl A2aHttpJsonRpcServer {
                 .send(DispatchCommit {
                     expected_dispatch_attempt: Some(expected_attempt),
                     expected_cancellation_attempt: None,
+                    host_already_fenced: false,
                 })
                 .is_err()
             {
@@ -4473,6 +4721,7 @@ impl A2aHttpJsonRpcServer {
         correlation: CorrelationIdentity,
         principal: &ProtocolPrincipal,
     ) -> ProtocolResult<A2aPersistedEvent> {
+        let snapshot_read = self.acquire_current_snapshot_read().await?;
         let mapper = self.mapper.lock().await;
         let governed = mapper.prepare_get_task(task_id, correlation, Some(principal));
         let (_, action) = governed.into_authorized()?;
@@ -4482,6 +4731,7 @@ impl A2aHttpJsonRpcServer {
             ));
         };
         drop(mapper);
+        drop(snapshot_read);
         self.flush_pending_events_for_task(task_id)
             .await?
             .ok_or_else(|| {
@@ -4506,6 +4756,55 @@ impl A2aHttpJsonRpcServer {
         self.flush_pending_events_for_task(task_id)
             .await?
             .ok_or_else(|| ProtocolError::conflict("A2A transition created no event intent"))
+    }
+
+    /// Persist a non-runnable task transition for the exact host callback generation and publish
+    /// its durable event intent. A stale callback cannot transition a replacement dispatch
+    /// attempt, and an exact idempotent retry returns the already persisted task.
+    pub async fn transition_dispatch_task(
+        &self,
+        context: &A2aDispatchContext,
+        next: A2aTaskState,
+        status_message: Option<String>,
+    ) -> ProtocolResult<A2aTaskRecord> {
+        let fence = context.dispatch_fence.as_ref().ok_or_else(|| {
+            ProtocolError::invalid_transition(
+                "A2A dispatch transition requires a message dispatch context",
+            )
+        })?;
+        self.transition_dispatch_fence(fence, next, status_message)
+            .await
+    }
+
+    async fn transition_dispatch_fence(
+        &self,
+        fence: &A2aDispatchFence,
+        next: A2aTaskState,
+        status_message: Option<String>,
+    ) -> ProtocolResult<A2aTaskRecord> {
+        let task = self
+            .persist_mapper_mutation(|candidate| {
+                let task_id = candidate
+                    .dispatch_outbox()
+                    .get(&fence.dispatch_id)
+                    .map(|dispatch| dispatch.task_id.clone())
+                    .ok_or_else(|| ProtocolError::not_found("A2A dispatch is not registered"))?;
+                candidate.transition_dispatch_task(
+                    &fence.dispatch_id,
+                    fence.expected_attempt,
+                    next,
+                    status_message,
+                )?;
+                candidate
+                    .tasks()
+                    .get(&task_id)
+                    .cloned()
+                    .ok_or_else(|| ProtocolError::not_found("A2A task is not registered"))
+            })
+            .await?;
+        self.flush_pending_events_for_task(&task.mapping.task_id)
+            .await?;
+        Ok(task)
     }
 
     /// Complete the exact host callback generation with durable task artifacts. Artifact output,
@@ -4607,6 +4906,11 @@ impl A2aHttpJsonRpcServer {
             .take()
             .ok_or_else(|| ProtocolError::conflict("A2A control server is already serving"))?;
         self.ensure_snapshot_available()?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(()),
+            initialized = self.initialize_snapshot_store() => initialized?,
+        }
         self.serving.store(true, AtomicOrdering::Release);
         let service_cancellation = CancellationToken::new();
         let (mut protected_listener, protected_authenticator) = protected_control.map_or_else(
@@ -5758,6 +6062,11 @@ impl A2aHttpJsonRpcServer {
         } else {
             None
         };
+        // Exact retries may be read-only and bypass the mapper CAS below. Linearize them against
+        // the shared store before consulting the local receipt/dispatch projection.
+        {
+            let _snapshot_read = self.acquire_current_snapshot_read().await?;
+        }
         let duplicate_governed = {
             let mut live = self.mapper.lock().await;
             if let Some(task_id) = message.task_id.as_deref() {
@@ -6001,6 +6310,7 @@ impl A2aHttpJsonRpcServer {
                     .send(DispatchCommit {
                         expected_dispatch_attempt: expected_attempt,
                         expected_cancellation_attempt: None,
+                        host_already_fenced: false,
                     })
                     .is_err()
                 {
@@ -6566,34 +6876,44 @@ impl A2aHttpJsonRpcServer {
                 .map_err(|_| ProtocolError::conflict("A2A global dispatch gate closed"))?;
             Ok::<_, ProtocolError>((_task_permit, _owner_permit, _global_permit))
         };
-        let gates = tokio::select! {
-            () = server_cancellation.cancelled() => Err(ProtocolError::new(
-                ProtocolErrorCode::Cancelled,
-                "A2A queued dispatch was interrupted during server shutdown",
-            )),
-            result = timeout(
-                match lane {
-                    DispatchLane::Message => self.config.background_dispatch_timeout,
-                    DispatchLane::Cancellation => self.config.blocking_dispatch_timeout,
-                },
-                acquire_gates,
-            ) => {
-                result.unwrap_or_else(|_| Err(ProtocolError::conflict(
-                    "A2A dispatch timed out while waiting for a scheduler gate",
-                )))
+        let result = if commit.host_already_fenced {
+            if lane == DispatchLane::Cancellation {
+                Ok(())
+            } else {
+                Err(ProtocolError::conflict(
+                    "A2A message dispatch cannot bypass its host fence",
+                ))
             }
-        };
-        let result = match gates {
-            Err(error) => Err(error),
-            Ok(_permits) => {
-                self.invoke_scheduled_host(
-                    &scheduled.job,
-                    &task_id,
-                    &owner,
-                    commit,
-                    server_cancellation,
-                )
-                .await
+        } else {
+            let gates = tokio::select! {
+                () = server_cancellation.cancelled() => Err(ProtocolError::new(
+                    ProtocolErrorCode::Cancelled,
+                    "A2A queued dispatch was interrupted during server shutdown",
+                )),
+                result = timeout(
+                    match lane {
+                        DispatchLane::Message => self.config.background_dispatch_timeout,
+                        DispatchLane::Cancellation => self.config.blocking_dispatch_timeout,
+                    },
+                    acquire_gates,
+                ) => {
+                    result.unwrap_or_else(|_| Err(ProtocolError::conflict(
+                        "A2A dispatch timed out while waiting for a scheduler gate",
+                    )))
+                }
+            };
+            match gates {
+                Err(error) => Err(error),
+                Ok(_permits) => {
+                    self.invoke_scheduled_host(
+                        &scheduled.job,
+                        &task_id,
+                        &owner,
+                        commit,
+                        server_cancellation,
+                    )
+                    .await
+                }
             }
         };
         let result = match (lane, result) {
@@ -6866,8 +7186,20 @@ impl A2aHttpJsonRpcServer {
                 if current.state.is_terminal() {
                     return Ok(());
                 }
-                self.transition_task(
-                    task_id,
+                let fence = A2aDispatchFence {
+                    dispatch_id: job.durable_dispatch_id.clone().ok_or_else(|| {
+                        ProtocolError::conflict(
+                            "A2A stopped message acknowledgement has no durable dispatch identity",
+                        )
+                    })?,
+                    expected_attempt: commit.expected_dispatch_attempt.ok_or_else(|| {
+                        ProtocolError::conflict(
+                            "A2A stopped message acknowledgement has no dispatch generation",
+                        )
+                    })?,
+                };
+                self.transition_dispatch_fence(
+                    &fence,
                     A2aTaskState::Cancelled,
                     Some("host acknowledged the cancellation fence".to_owned()),
                 )
@@ -6968,8 +7300,7 @@ impl A2aHttpJsonRpcServer {
             Ok(value) => value,
             Err(error) => return Ok(rpc_invalid_params(rpc.id, &error.message)),
         };
-        let _snapshot_read = self.snapshot_commit.read().await;
-        self.ensure_snapshot_available()?;
+        let _snapshot_read = self.acquire_current_snapshot_read().await?;
         let mapper = self.mapper.lock().await;
         let action = mapper.prepare_get_task(&wire.id, correlation, Some(&principal));
         let (_, action) = match governed_action(action, OperationKind::Get) {
@@ -7024,8 +7355,7 @@ impl A2aHttpJsonRpcServer {
             page_size: wire.page_size,
             page_token: wire.page_token,
         };
-        let _snapshot_read = self.snapshot_commit.read().await;
-        self.ensure_snapshot_available()?;
+        let _snapshot_read = self.acquire_current_snapshot_read().await?;
         let mapper = self.mapper.lock().await;
         let action = mapper.prepare_list_tasks(request, correlation, Some(&principal));
         let (_, action) = match governed_action(action, OperationKind::List) {
@@ -7066,6 +7396,11 @@ impl A2aHttpJsonRpcServer {
             Ok(value) => value,
             Err(error) => return Ok(rpc_invalid_params(rpc.id, &error.message)),
         };
+        // An exact cancellation retry can also be a mapper no-op. It must not reconstruct or
+        // schedule control work from a stale local projection after another CAS writer advanced.
+        {
+            let _snapshot_read = self.acquire_current_snapshot_read().await?;
+        }
         let retry_action = {
             let mut live = self.mapper.lock().await;
             live.cancellation_for_task(&wire.id, &principal)
@@ -7191,34 +7526,68 @@ impl A2aHttpJsonRpcServer {
                     .await;
                 match decision {
                     A2aUnknownDispatchDecision::AlreadyStopped => {
-                        let settled = self
-                            .acknowledge_cancellation_fence(
+                        let Some(commit) = acceptance.commit.take() else {
+                            return Ok(rpc_reconciliation_error(
+                                rpc.id,
+                                &task,
+                                "reconciled cancellation lost its scheduler commit",
+                            ));
+                        };
+                        let cancellation_id = cancellation_record.cancellation_id.clone();
+                        let expected_attempt = cancellation_record.attempts;
+                        let commit_server = self.clone();
+                        let post_commit = Box::new(move || {
+                            // This hook runs inside the detached snapshot commit task after both
+                            // durable CAS and live mapper install. A request abort can no longer
+                            // drop the scheduler sender after the cancellation became durable.
+                            commit_server.quarantine_recovery(&cancellation_id);
+                            if commit
+                                .send(DispatchCommit {
+                                    expected_dispatch_attempt: None,
+                                    expected_cancellation_attempt: Some(expected_attempt),
+                                    host_already_fenced: true,
+                                })
+                                .is_err()
+                            {
+                                commit_server.release_recovery_attempt(&cancellation_id);
+                                return Err(ProtocolError::conflict(
+                                    "reconciled cancellation scheduler commit failed",
+                                ));
+                            }
+                            Ok(())
+                        });
+                        let current = match self
+                            .persist_cancellation_fence_with_post_commit(
                                 &cancellation_record.cancellation_id,
                                 cancellation_record.attempts,
                                 &task.mapping.task_id,
                                 "host reconciled the previously stopped cancellation fence",
+                                Some(post_commit),
                             )
-                            .await;
-                        let current = self
-                            .mapper
-                            .lock()
                             .await
-                            .tasks()
-                            .get(&task.mapping.task_id)
-                            .cloned()
-                            .unwrap_or(task);
-                        return if settled.is_ok() {
-                            Ok(ConnectionOutcome::Response(HttpResponse::json(
-                                200,
-                                jsonrpc_result(rpc.id, json!(A2aWireTask::from(&current))),
-                            )))
-                        } else {
-                            Ok(rpc_reconciliation_error(
+                        {
+                            Ok(current) => current,
+                            Err(_) => return Ok(rpc_reconciliation_error(
+                                rpc.id,
+                                &task,
+                                "persisting or scheduling the reconciled cancellation fence failed",
+                            )),
+                        };
+                        if self
+                            .flush_pending_events_for_task(&task.mapping.task_id)
+                            .await
+                            .is_err()
+                        {
+                            return Ok(rpc_reconciliation_error(
                                 rpc.id,
                                 &current,
-                                "persisting the reconciled cancellation fence failed",
-                            ))
-                        };
+                                "host cancellation was fenced but its event is pending reconciliation",
+                            ));
+                        }
+                        return Ok(ConnectionOutcome::Response(HttpResponse::json(
+                            200,
+                            jsonrpc_result(rpc.id, json!(A2aWireTask::from(&current))),
+                        )));
                     }
                     A2aUnknownDispatchDecision::SafeToRetry => {}
                     A2aUnknownDispatchDecision::ReconcileRequired => {
@@ -7282,6 +7651,7 @@ impl A2aHttpJsonRpcServer {
                 .send(DispatchCommit {
                     expected_dispatch_attempt: None,
                     expected_cancellation_attempt,
+                    host_already_fenced: false,
                 })
                 .is_err()
             {
@@ -7386,8 +7756,7 @@ impl A2aHttpJsonRpcServer {
         };
         // Subscribe before reading/replaying so the replay-to-live handoff cannot lose an event.
         let receiver = self.live.subscribe();
-        let _snapshot_read = self.snapshot_commit.read().await;
-        self.ensure_snapshot_available()?;
+        let _snapshot_read = self.acquire_current_snapshot_read().await?;
         let mapper = self.mapper.lock().await;
         let action = mapper.prepare_get_task(&wire.id, correlation, Some(&principal));
         let (_, action) = match governed_action(action, OperationKind::Get) {
@@ -7510,6 +7879,13 @@ impl A2aHttpJsonRpcServer {
                 .and_then(|event| event.event_id.checked_sub(1))
         });
         let mut idle_deadline = Instant::now() + self.config.stream_idle_timeout;
+        let half_idle = self.config.stream_idle_timeout / 2;
+        let head_probe_interval = if half_idle.is_zero() {
+            self.config.stream_idle_timeout
+        } else {
+            half_idle.min(A2A_STREAM_HEAD_PROBE_INTERVAL)
+        };
+        let mut head_probe_deadline = Instant::now() + head_probe_interval;
         let mut deferred_initial = None;
         if plan.defer_initial_until_response {
             if let Some((event_id, response)) = plan.initial.take() {
@@ -7602,6 +7978,19 @@ impl A2aHttpJsonRpcServer {
             let received = tokio::select! {
                 () = cancellation.cancelled() => return Ok(()),
                 () = sleep_until(idle_deadline) => return Ok(()),
+                () = sleep_until(head_probe_deadline) => {
+                    let probe = async {
+                        let _snapshot_read = self.acquire_current_snapshot_read().await?;
+                        Ok::<(), ProtocolError>(())
+                    };
+                    timeout(self.config.control_probe_timeout, probe)
+                        .await
+                        .map_err(|_| ProtocolError::conflict(
+                            "A2A SSE durable-head probe timed out",
+                        ))??;
+                    head_probe_deadline = Instant::now() + head_probe_interval;
+                    continue;
+                }
                 result = plan.receiver.recv() => result,
             };
             let event = match received {
@@ -9297,7 +9686,7 @@ mod tests {
         async fn handle(
             &self,
             server: Arc<A2aHttpJsonRpcServer>,
-            _context: &A2aDispatchContext,
+            context: &A2aDispatchContext,
             _envelope: &GovernanceEnvelope,
             action: &A2aAction,
         ) -> ProtocolResult<A2aDispatchAck> {
@@ -9324,10 +9713,53 @@ mod tests {
                     .is_some_and(|task| !task.state.is_terminal())
                 {
                     server
-                        .transition_task(task_id, A2aTaskState::Completed, None)
+                        .transition_dispatch_task(context, A2aTaskState::Completed, None)
                         .await?;
                 }
             }
+            Ok(A2aDispatchAck::Settled)
+        }
+    }
+
+    struct ExactStateTransitionHost {
+        next: A2aTaskState,
+        status_message: String,
+        calls: AtomicUsize,
+    }
+
+    impl ExactStateTransitionHost {
+        fn new(next: A2aTaskState, status_message: impl Into<String>) -> Self {
+            Self {
+                next,
+                status_message: status_message.into(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl A2aDispatchHost for ExactStateTransitionHost {
+        async fn handle(
+            &self,
+            server: Arc<A2aHttpJsonRpcServer>,
+            context: &A2aDispatchContext,
+            _envelope: &GovernanceEnvelope,
+            action: &A2aAction,
+        ) -> ProtocolResult<A2aDispatchAck> {
+            if !matches!(
+                action,
+                A2aAction::DispatchMessage { .. } | A2aAction::DuplicateMessage { .. }
+            ) {
+                return if matches!(action, A2aAction::CancelTask { .. }) {
+                    Ok(A2aDispatchAck::Stopped)
+                } else {
+                    Ok(A2aDispatchAck::Settled)
+                };
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            server
+                .transition_dispatch_task(context, self.next, Some(self.status_message.clone()))
+                .await?;
             Ok(A2aDispatchAck::Settled)
         }
     }
@@ -9475,7 +9907,7 @@ mod tests {
                 .is_some_and(|task| !task.state.is_terminal())
             {
                 server
-                    .transition_task(task_id, A2aTaskState::Completed, None)
+                    .transition_dispatch_task(context, A2aTaskState::Completed, None)
                     .await?;
             }
             self.finished.notify_one();
@@ -9629,6 +10061,74 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingAlreadyStoppedCancelHost {
+        reconcile_cancel_calls: AtomicUsize,
+        reconcile_started: Notify,
+        release_reconcile: Notify,
+        cancel_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl A2aDispatchHost for BlockingAlreadyStoppedCancelHost {
+        async fn reconcile_unknown_cancel(
+            &self,
+            _server: Arc<A2aHttpJsonRpcServer>,
+            _record: &A2aCancellationOutboxRecord,
+        ) -> ProtocolResult<A2aUnknownDispatchDecision> {
+            self.reconcile_cancel_calls.fetch_add(1, Ordering::SeqCst);
+            self.reconcile_started.notify_one();
+            self.release_reconcile.notified().await;
+            Ok(A2aUnknownDispatchDecision::AlreadyStopped)
+        }
+
+        async fn handle(
+            &self,
+            _server: Arc<A2aHttpJsonRpcServer>,
+            _context: &A2aDispatchContext,
+            _envelope: &GovernanceEnvelope,
+            action: &A2aAction,
+        ) -> ProtocolResult<A2aDispatchAck> {
+            if matches!(action, A2aAction::CancelTask { .. }) {
+                self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(A2aDispatchAck::Stopped)
+        }
+    }
+
+    #[derive(Default)]
+    struct AbortableCancellationReconcileHost {
+        reconcile_cancel_calls: AtomicUsize,
+        first_reconcile_started: Notify,
+        release_first_reconcile: Notify,
+    }
+
+    #[async_trait]
+    impl A2aDispatchHost for AbortableCancellationReconcileHost {
+        async fn reconcile_unknown_cancel(
+            &self,
+            _server: Arc<A2aHttpJsonRpcServer>,
+            _record: &A2aCancellationOutboxRecord,
+        ) -> ProtocolResult<A2aUnknownDispatchDecision> {
+            let call = self.reconcile_cancel_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_reconcile_started.notify_one();
+                self.release_first_reconcile.notified().await;
+            }
+            Ok(A2aUnknownDispatchDecision::SafeToRetry)
+        }
+
+        async fn handle(
+            &self,
+            _server: Arc<A2aHttpJsonRpcServer>,
+            _context: &A2aDispatchContext,
+            _envelope: &GovernanceEnvelope,
+            _action: &A2aAction,
+        ) -> ProtocolResult<A2aDispatchAck> {
+            Ok(A2aDispatchAck::Stopped)
+        }
+    }
+
     struct CancelRegressionHost {
         safe_retry_unknown_cancel: bool,
         fail_first_cancel: bool,
@@ -9738,21 +10238,20 @@ mod tests {
             _envelope: &GovernanceEnvelope,
             action: &A2aAction,
         ) -> ProtocolResult<A2aDispatchAck> {
-            let task_id = match action {
-                A2aAction::DispatchMessage { mapping, .. } => mapping.task_id.clone(),
-                A2aAction::DuplicateMessage { receipt } => receipt.mapping.task_id.clone(),
+            match action {
+                A2aAction::DispatchMessage { .. } | A2aAction::DuplicateMessage { .. } => {}
                 A2aAction::CancelTask { .. } => {
                     self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                     return Ok(A2aDispatchAck::Stopped);
                 }
                 _ => return Ok(A2aDispatchAck::Settled),
-            };
+            }
             self.message_started.notify_one();
             context.cancellation.cancelled().await;
             self.completion_attempts.fetch_add(1, Ordering::SeqCst);
             match server
-                .transition_task(
-                    &task_id,
+                .transition_dispatch_task(
+                    context,
                     A2aTaskState::Completed,
                     Some("late completion after cancellation".into()),
                 )
@@ -9869,19 +10368,14 @@ mod tests {
         async fn handle(
             &self,
             server: Arc<A2aHttpJsonRpcServer>,
-            _context: &A2aDispatchContext,
+            context: &A2aDispatchContext,
             _envelope: &GovernanceEnvelope,
             action: &A2aAction,
         ) -> ProtocolResult<A2aDispatchAck> {
             self.handle_calls.fetch_add(1, Ordering::SeqCst);
-            let (message_id, task_id) = match action {
-                A2aAction::DispatchMessage {
-                    message, mapping, ..
-                } => (message.message_id.as_str(), mapping.task_id.as_str()),
-                A2aAction::DuplicateMessage { receipt } => (
-                    receipt.message.message_id.as_str(),
-                    receipt.mapping.task_id.as_str(),
-                ),
+            let message_id = match action {
+                A2aAction::DispatchMessage { message, .. } => message.message_id.as_str(),
+                A2aAction::DuplicateMessage { receipt } => receipt.message.message_id.as_str(),
                 A2aAction::CancelTask { .. } => return Ok(A2aDispatchAck::Stopped),
                 _ => return Ok(A2aDispatchAck::Settled),
             };
@@ -9890,7 +10384,7 @@ mod tests {
             }
             self.healthy_calls.fetch_add(1, Ordering::SeqCst);
             server
-                .transition_task(task_id, A2aTaskState::Completed, None)
+                .transition_dispatch_task(context, A2aTaskState::Completed, None)
                 .await?;
             Ok(A2aDispatchAck::Settled)
         }
@@ -10187,6 +10681,71 @@ mod tests {
                 self.terminal_inserted.fetch_add(1, Ordering::SeqCst);
             }
             Ok(outcome)
+        }
+
+        async fn replay_page(
+            &self,
+            owner: &A2aEventOwner,
+            task_id: &str,
+            after_event_id: Option<u64>,
+            through_high_water: Option<u64>,
+            limits: A2aReplayLimits,
+        ) -> Result<A2aReplayPage, A2aEventStoreError> {
+            self.inner
+                .replay_page(owner, task_id, after_event_id, through_high_water, limits)
+                .await
+        }
+    }
+
+    struct BlockingAppendEventStore {
+        inner: InMemoryA2aEventStore,
+        blocked: AtomicBool,
+        attempts: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl Default for BlockingAppendEventStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemoryA2aEventStore::default(),
+                blocked: AtomicBool::new(true),
+                attempts: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+            }
+        }
+    }
+
+    impl BlockingAppendEventStore {
+        fn release(&self) {
+            self.blocked.store(false, Ordering::SeqCst);
+            self.release.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl A2aEventStore for BlockingAppendEventStore {
+        async fn append(
+            &self,
+            logical_event_id: &str,
+            owner: &A2aEventOwner,
+            task_id: &str,
+            response: &A2aStreamResponse,
+            retention: A2aEventRetention,
+        ) -> Result<A2aEventAppendOutcome, A2aEventAppendError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            loop {
+                let released = self.release.notified();
+                if !self.blocked.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+            self.inner
+                .append(logical_event_id, owner, task_id, response, retention)
+                .await
         }
 
         async fn replay_page(
@@ -10541,7 +11100,7 @@ mod tests {
     struct FinalProbeFailureSnapshotStore {
         inner: InMemoryA2aMapperSnapshotStore,
         candidate_cas_calls: AtomicUsize,
-        probe_calls: AtomicUsize,
+        fail_next_probe: AtomicBool,
     }
 
     #[async_trait]
@@ -10565,6 +11124,7 @@ mod tests {
                     self.inner
                         .compare_and_swap_snapshot(expected, candidate)
                         .await?;
+                    self.fail_next_probe.store(true, Ordering::SeqCst);
                     Err(A2aSnapshotStoreError::unknown(ProtocolError::conflict(
                         "injected second ambiguous snapshot outcome after apply",
                     )))
@@ -10578,7 +11138,7 @@ mod tests {
         }
 
         async fn lookup_snapshot_version(&self) -> ProtocolResult<Option<A2aSnapshotVersion>> {
-            if self.probe_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            if self.fail_next_probe.swap(false, Ordering::SeqCst) {
                 return Err(ProtocolError::conflict(
                     "injected final snapshot version probe failure",
                 ));
@@ -10954,15 +11514,19 @@ mod tests {
     }
 
     async fn raw_http(address: SocketAddr, request: Vec<u8>) -> String {
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        stream.write_all(&request).await.unwrap();
-        stream.shutdown().await.unwrap();
+        try_raw_http(address, request).await.unwrap()
+    }
+
+    async fn try_raw_http(address: SocketAddr, request: Vec<u8>) -> std::io::Result<String> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(&request).await?;
+        stream.shutdown().await?;
         let mut response = Vec::new();
         timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
             .await
-            .expect("response timed out")
-            .unwrap();
-        String::from_utf8(response).unwrap()
+            .expect("response timed out")?;
+        String::from_utf8(response)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
@@ -11700,6 +12264,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_exact_dispatch_transition_accepts_input_auth_and_failed_states() {
+        for (suffix, next) in [
+            ("input", A2aTaskState::InputRequired),
+            ("auth", A2aTaskState::AuthRequired),
+            ("failed", A2aTaskState::Failed),
+        ] {
+            let status_message = format!("exact {suffix} transition");
+            let host = Arc::new(ExactStateTransitionHost::new(next, &status_message));
+            let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+            let (address, server, handle, task) = start_server_with_dependencies(
+                A2aHttpConfig::default(),
+                Arc::new(Mutex::new(A2aMapper::new())),
+                snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                host.clone(),
+                agent_card(),
+            )
+            .await;
+            let message_id = format!("exact-state-{suffix}");
+            let response = raw_http(
+                address,
+                request(
+                    "POST",
+                    "/a2a",
+                    &rpc_headers("application/json"),
+                    &send_body(&message_id, false, None),
+                ),
+            )
+            .await;
+            let response_body = body(&response);
+            assert!(response_body.get("error").is_none(), "{response_body}");
+            let task_id = response_body["result"]["task"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            wait_for_scheduler_idle(&server).await;
+
+            let persisted = snapshots.load_snapshot().await.unwrap();
+            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(persisted.tasks()[&task_id].state, next);
+            assert_eq!(
+                persisted.tasks()[&task_id].status_message.as_deref(),
+                Some(status_message.as_str())
+            );
+            let dispatch = persisted
+                .dispatch_for_message(&message_id, &owner_principal())
+                .unwrap();
+            assert_eq!(dispatch.state, A2aDispatchOutboxState::Settled);
+            assert_eq!(dispatch.attempts, 1);
+            assert_eq!(
+                dispatch.updated_revision,
+                persisted.tasks()[&task_id].updated_revision
+            );
+
+            handle.cancel();
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_dispatch_transition_rejects_stale_attempt_without_mutation() {
+        for (suffix, next) in [
+            ("input", A2aTaskState::InputRequired),
+            ("auth", A2aTaskState::AuthRequired),
+            ("failed", A2aTaskState::Failed),
+        ] {
+            let principal = owner_principal();
+            let message_id = format!("stale-exact-state-{suffix}");
+            let mut seeded = A2aMapper::new();
+            let mapping = prepare_seeded_message_for(&mut seeded, &message_id, &principal);
+            let event_id = event_id_for_message(&seeded, &message_id, &principal);
+            seeded.mark_event_settled(&event_id).unwrap();
+            let dispatch_id = seeded
+                .dispatch_for_message(&message_id, &principal)
+                .unwrap()
+                .dispatch_id
+                .clone();
+            seeded.mark_dispatch_running(&dispatch_id).unwrap();
+            let stale_attempt = seeded.dispatch_outbox()[&dispatch_id].attempts;
+            let stale_context = A2aDispatchContext {
+                mode: A2aExecutionMode::Immediate,
+                cancellation: CancellationToken::new(),
+                dispatch_fence: Some(A2aDispatchFence {
+                    dispatch_id: dispatch_id.clone(),
+                    expected_attempt: stale_attempt,
+                }),
+            };
+            seeded
+                .mark_dispatch_reconcile_pending(&dispatch_id, "seed replacement attempt")
+                .unwrap();
+            seeded.mark_dispatch_running(&dispatch_id).unwrap();
+            let current_attempt = seeded.dispatch_outbox()[&dispatch_id].attempts;
+            assert_eq!(current_attempt, stale_attempt + 1);
+
+            let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+            snapshots.persist_snapshot(&seeded).await.unwrap();
+            let server = Arc::new(
+                A2aHttpJsonRpcServer::new(
+                    Arc::new(Mutex::new(seeded)),
+                    snapshots.clone(),
+                    Arc::new(InMemoryA2aEventStore::default()),
+                    Arc::new(TestAuthenticator),
+                    Arc::new(CompletingHost::default()),
+                    agent_card(),
+                    A2aHttpConfig::default(),
+                )
+                .unwrap(),
+            );
+            let before = server.mapper_snapshot().await;
+            let error = server
+                .transition_dispatch_task(
+                    &stale_context,
+                    next,
+                    Some(format!("stale {suffix} transition")),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::InvalidTransition);
+            assert!(error.message.contains("stale"));
+            assert_eq!(server.mapper_snapshot().await, before);
+            assert_eq!(snapshots.load_snapshot().await.unwrap(), before);
+
+            let current_context = A2aDispatchContext {
+                mode: A2aExecutionMode::Immediate,
+                cancellation: CancellationToken::new(),
+                dispatch_fence: Some(A2aDispatchFence {
+                    dispatch_id: dispatch_id.clone(),
+                    expected_attempt: current_attempt,
+                }),
+            };
+            let progress = server
+                .transition_dispatch_task(
+                    &current_context,
+                    A2aTaskState::Working,
+                    Some(format!("current {suffix} progress")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(progress.state, A2aTaskState::Working);
+            assert_eq!(
+                server.mapper_snapshot().await.dispatch_outbox()[&dispatch_id].state,
+                A2aDispatchOutboxState::Running
+            );
+            let status_message = format!("current {suffix} transition");
+            let task = server
+                .transition_dispatch_task(&current_context, next, Some(status_message.clone()))
+                .await
+                .unwrap();
+            assert_eq!(task.mapping.task_id, mapping.task_id);
+            assert_eq!(task.state, next);
+            assert_eq!(
+                task.status_message.as_deref(),
+                Some(status_message.as_str())
+            );
+            let after = server.mapper_snapshot().await;
+            assert_eq!(
+                after.dispatch_outbox()[&dispatch_id].state,
+                A2aDispatchOutboxState::Settled
+            );
+            assert_eq!(
+                after.dispatch_outbox()[&dispatch_id].attempts,
+                current_attempt
+            );
+            assert_eq!(
+                after.dispatch_outbox()[&dispatch_id].updated_revision,
+                after.tasks()[&mapping.task_id].updated_revision
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn restored_dispatch_waits_for_exact_event_settlement_then_runs_once() {
         let principal = owner_principal();
         let message_id = "restored-dispatch-event-gate";
@@ -12353,6 +13088,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_already_stopped_retries_share_successful_control_completion() {
+        let (mut seeded, mapping, cancellation_record) = seeded_cancellation(
+            "parallel-already-stopped-cancel",
+            A2aTaskState::Working,
+            true,
+        );
+        seeded
+            .mark_cancellation_reconcile_pending(
+                &cancellation_record.cancellation_id,
+                "seed parallel unknown cancellation outcome",
+            )
+            .unwrap();
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        snapshots.persist_snapshot(&seeded).await.unwrap();
+        let host = Arc::new(BlockingAlreadyStoppedCancelHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(seeded)),
+                snapshots,
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        let _saturated_control = server
+            .control_global
+            .clone()
+            .acquire_many_owned(server.config.max_control_dispatches.try_into().unwrap())
+            .await
+            .unwrap();
+        let mut control_receiver = server.control_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            let scheduled = control_receiver
+                .recv()
+                .await
+                .expect("parallel cancellation was not scheduled");
+            let completion = scheduler_server
+                .clone()
+                .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                .await;
+            scheduler_server
+                .finish_scheduled_dispatch(completion)
+                .unwrap();
+        });
+
+        let first_server = server.clone();
+        let first_task_id = mapping.task_id.clone();
+        let first = tokio::spawn(async move {
+            first_server
+                .handle_cancel_task(
+                    JsonRpcRequest {
+                        id: json!("parallel-already-stopped-first"),
+                        method: "CancelTask".into(),
+                        params: json!({"tenant": "tenant-a", "id": first_task_id}),
+                        correlation_id: None,
+                        last_event_id: None,
+                    },
+                    owner_principal(),
+                    CancellationIngress::Public("127.0.0.1".parse().unwrap()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        timeout(Duration::from_secs(1), host.reconcile_started.notified())
+            .await
+            .expect("AlreadyStopped reconciliation did not start");
+
+        let second_server = server.clone();
+        let second_task_id = mapping.task_id.clone();
+        let second = tokio::spawn(async move {
+            second_server
+                .handle_cancel_task(
+                    JsonRpcRequest {
+                        id: json!("parallel-already-stopped-second"),
+                        method: "CancelTask".into(),
+                        params: json!({"tenant": "tenant-a", "id": second_task_id}),
+                        correlation_id: None,
+                        last_event_id: None,
+                    },
+                    owner_principal(),
+                    CancellationIngress::Public("127.0.0.1".parse().unwrap()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        wait_for_cancel_completion_subscribers(&server, 2).await;
+        host.release_reconcile.notify_one();
+
+        for outcome in [first.await.unwrap(), second.await.unwrap()] {
+            let ConnectionOutcome::Response(response) = outcome else {
+                panic!("parallel AlreadyStopped cancellation unexpectedly streamed")
+            };
+            let payload: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(payload["result"]["status"]["state"], "TASK_STATE_CANCELED");
+        }
+        timeout(Duration::from_secs(1), scheduler)
+            .await
+            .expect("parallel cancellation scheduler did not finish")
+            .unwrap();
+        assert_eq!(host.reconcile_cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn already_stopped_commit_survives_owner_abort_during_event_flush() {
+        let (mut seeded, mapping, cancellation_record) = seeded_cancellation(
+            "already-stopped-aborted-event-flush",
+            A2aTaskState::Working,
+            true,
+        );
+        seeded
+            .mark_cancellation_reconcile_pending(
+                &cancellation_record.cancellation_id,
+                "seed unknown cancellation before blocked event delivery",
+            )
+            .unwrap();
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        snapshots.persist_snapshot(&seeded).await.unwrap();
+        let events = Arc::new(BlockingAppendEventStore::default());
+        let host = Arc::new(BlockingAlreadyStoppedCancelHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(seeded)),
+                snapshots.clone(),
+                events.clone(),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut control_receiver = server.control_receiver.lock().await.take().unwrap();
+        let scheduler_server = server.clone();
+        let scheduler = tokio::spawn(async move {
+            let scheduled = control_receiver
+                .recv()
+                .await
+                .expect("blocked-flush cancellation was not scheduled");
+            let completion = scheduler_server
+                .clone()
+                .run_scheduled_dispatch(scheduled, CancellationToken::new())
+                .await;
+            scheduler_server
+                .finish_scheduled_dispatch(completion)
+                .unwrap();
+        });
+
+        let first_server = server.clone();
+        let first_task_id = mapping.task_id.clone();
+        let first = tokio::spawn(async move {
+            first_server
+                .handle_cancel_task(
+                    JsonRpcRequest {
+                        id: json!("already-stopped-aborted-flush-first"),
+                        method: "CancelTask".into(),
+                        params: json!({"tenant": "tenant-a", "id": first_task_id}),
+                        correlation_id: None,
+                        last_event_id: None,
+                    },
+                    owner_principal(),
+                    CancellationIngress::Public("127.0.0.1".parse().unwrap()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        timeout(Duration::from_secs(1), host.reconcile_started.notified())
+            .await
+            .expect("blocked-flush AlreadyStopped reconciliation did not start");
+
+        let second_server = server.clone();
+        let second_task_id = mapping.task_id.clone();
+        let second = tokio::spawn(async move {
+            second_server
+                .handle_cancel_task(
+                    JsonRpcRequest {
+                        id: json!("already-stopped-aborted-flush-second"),
+                        method: "CancelTask".into(),
+                        params: json!({"tenant": "tenant-a", "id": second_task_id}),
+                        correlation_id: None,
+                        last_event_id: None,
+                    },
+                    owner_principal(),
+                    CancellationIngress::Public("127.0.0.1".parse().unwrap()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        wait_for_cancel_completion_subscribers(&server, 2).await;
+        host.release_reconcile.notify_one();
+        timeout(Duration::from_secs(1), async {
+            while events.attempts.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both cancellation requests did not reach blocked event delivery");
+
+        timeout(Duration::from_secs(1), async {
+            while !scheduler.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable AlreadyStopped proof did not commit its scheduler flight before event delivery");
+        let durable = snapshots.load_snapshot().await.unwrap();
+        assert_eq!(
+            durable.tasks()[&mapping.task_id].state,
+            A2aTaskState::Cancelled
+        );
+        assert_eq!(
+            durable
+                .cancellation_for_task(&mapping.task_id, &owner_principal())
+                .unwrap()
+                .state,
+            A2aCancellationOutboxState::Settled
+        );
+        assert!(server
+            .mapper_snapshot()
+            .await
+            .pending_events()
+            .into_iter()
+            .any(|event| {
+                event.task_id == mapping.task_id && event.task.state == A2aTaskState::Cancelled
+            }));
+
+        first.abort();
+        let _ = first.await;
+        events.release();
+        let outcome = timeout(Duration::from_secs(2), second)
+            .await
+            .expect("duplicate cancellation did not resume after event delivery recovered")
+            .unwrap();
+        let ConnectionOutcome::Response(response) = outcome else {
+            panic!("duplicate blocked-flush cancellation unexpectedly streamed")
+        };
+        let payload: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["result"]["status"]["state"], "TASK_STATE_CANCELED");
+        scheduler.await.unwrap();
+
+        server
+            .flush_pending_events_for_task(&mapping.task_id)
+            .await
+            .unwrap();
+        assert!(server
+            .mapper_snapshot()
+            .await
+            .pending_events()
+            .into_iter()
+            .all(|event| event.task_id != mapping.task_id));
+        assert_eq!(host.reconcile_cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.cancel_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn recovery_already_stopped_proof_settles_running_cancel_without_host_replay() {
         let (seeded, mapping, cancellation) = seeded_cancellation(
             "recovery-cancel-already-stopped",
@@ -12385,6 +13383,61 @@ mod tests {
 
         handle.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_cancellation_reconcile_owner_releases_single_flight_for_retry() {
+        let (seeded, _mapping, cancellation_record) = seeded_cancellation(
+            "aborted-cancel-reconcile-owner",
+            A2aTaskState::Working,
+            true,
+        );
+        let host = Arc::new(AbortableCancellationReconcileHost::default());
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new(
+                Arc::new(Mutex::new(seeded)),
+                Arc::new(InMemoryA2aMapperSnapshotStore::default()),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                host.clone(),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let first_server = server.clone();
+        let first_record = cancellation_record.clone();
+        let first = tokio::spawn(async move {
+            first_server
+                .reconcile_unknown_cancellation_once(
+                    &first_record,
+                    &CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+        });
+        timeout(
+            Duration::from_secs(1),
+            host.first_reconcile_started.notified(),
+        )
+        .await
+        .expect("first cancellation reconciliation did not acquire the single flight");
+        first.abort();
+        let _ = first.await;
+
+        let decision = timeout(
+            Duration::from_secs(1),
+            server.reconcile_unknown_cancellation_once(
+                &cancellation_record,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("retry remained stuck behind an aborted reconciliation owner");
+        assert_eq!(decision, A2aUnknownDispatchDecision::SafeToRetry);
+        assert_eq!(host.reconcile_cancel_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12763,7 +13816,8 @@ mod tests {
         .await;
         assert_eq!(
             body(&cancelled)["result"]["status"]["state"],
-            "TASK_STATE_CANCELED"
+            "TASK_STATE_CANCELED",
+            "unexpected cancellation response: {cancelled}"
         );
         wait_for_scheduler_idle(&server).await;
         let settled = server.mapper_snapshot().await;
@@ -14387,7 +15441,7 @@ mod tests {
             max_retained_event_bytes: 2 * DEFAULT_A2A_EVENT_BYTES,
             ..A2aHttpConfig::default()
         };
-        let (address, server, handle, task) = start_server(config).await;
+        let (address, _server, handle, task) = start_server(config).await;
 
         let mut streaming: Value =
             serde_json::from_str(&send_body("stream-1", true, None)).unwrap();
@@ -14416,8 +15470,19 @@ mod tests {
         );
         assert!(!streamed.contains("\"final\""));
 
+        let gap_config = A2aHttpConfig {
+            max_retained_events: 2,
+            max_retained_event_bytes: 2 * DEFAULT_A2A_EVENT_BYTES,
+            ..A2aHttpConfig::default()
+        };
+        let gap_host = Arc::new(ExactStateTransitionHost::new(
+            A2aTaskState::InputRequired,
+            "input",
+        ));
+        let (gap_address, gap_server, gap_handle, gap_task) =
+            start_server_with_host(gap_config, gap_host).await;
         let working = raw_http(
-            address,
+            gap_address,
             request(
                 "POST",
                 "/a2a",
@@ -14430,16 +15495,30 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        server
-            .transition_task(&task_id, A2aTaskState::InputRequired, Some("input".into()))
+        wait_for_task_state(&gap_server, &task_id, A2aTaskState::InputRequired).await;
+        wait_for_scheduler_idle(&gap_server).await;
+        gap_server
+            .persist_mapper_mutation(|candidate| {
+                candidate.transition_task(&task_id, A2aTaskState::Working, None)
+            })
             .await
             .unwrap();
-        server
-            .transition_task(&task_id, A2aTaskState::Working, None)
+        gap_server
+            .flush_pending_events_for_task(&task_id)
             .await
             .unwrap();
-        server
-            .transition_task(&task_id, A2aTaskState::InputRequired, Some("again".into()))
+        gap_server
+            .persist_mapper_mutation(|candidate| {
+                candidate.transition_task(
+                    &task_id,
+                    A2aTaskState::InputRequired,
+                    Some("again".into()),
+                )
+            })
+            .await
+            .unwrap();
+        gap_server
+            .flush_pending_events_for_task(&task_id)
             .await
             .unwrap();
         let subscribe = json!({
@@ -14449,7 +15528,7 @@ mod tests {
         .to_string();
         let mut headers = rpc_headers("text/event-stream");
         headers.push(("Last-Event-ID", "1"));
-        let gap = raw_http(address, request("POST", "/a2a", &headers, &subscribe)).await;
+        let gap = raw_http(gap_address, request("POST", "/a2a", &headers, &subscribe)).await;
         assert_eq!(body(&gap)["error"]["code"], -32004);
         assert!(body(&gap)["error"]["data"][0]["@type"]
             .as_str()
@@ -14462,6 +15541,8 @@ mod tests {
 
         handle.cancel();
         task.await.unwrap().unwrap();
+        gap_handle.cancel();
+        gap_task.await.unwrap().unwrap();
     }
 
     #[test]
@@ -16670,6 +17751,390 @@ mod tests {
             );
             assert_eq!(stored.decode().unwrap(), server.mapper_snapshot().await);
         }
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_a_divergent_durable_head_before_readiness_or_reads() {
+        let (durable, durable_mapping) = seeded_task("startup-durable-head", A2aTaskState::Working);
+        let (stale_live, stale_mapping) = seeded_task("startup-stale-live", A2aTaskState::Working);
+        assert_eq!(durable.revision(), stale_live.revision());
+        assert_ne!(durable, stale_live);
+        assert_ne!(durable_mapping.message_id, stale_mapping.message_id);
+        let stale_live_before_serve = stale_live.clone();
+
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        snapshots.persist_snapshot(&durable).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new_owned(
+                stale_live,
+                snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                Arc::new(CompletingHost::default()),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let error = timeout(
+            Duration::from_secs(1),
+            server.clone().serve(listener, CancellationToken::new()),
+        )
+        .await
+        .expect("startup durable-head verification hung")
+        .unwrap_err();
+        assert!(error.message.contains("durable snapshot content diverged"));
+        assert!(!server.is_ready());
+        let stored = snapshots.load_snapshot().await.unwrap();
+        assert_eq!(stored, durable);
+        assert_ne!(stored, stale_live_before_serve);
+        assert!(
+            timeout(Duration::from_millis(100), TcpStream::connect(address))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_snapshot_initialization_is_cancellable_while_the_store_is_blocked() {
+        let snapshots = Arc::new(BlockingSnapshotStore::default());
+        snapshots.block_next.store(true, Ordering::SeqCst);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let handle = cancellation.handle();
+        let server = Arc::new(
+            A2aHttpJsonRpcServer::new_owned(
+                A2aMapper::new(),
+                snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                Arc::new(CompletingHost::default()),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        let serve = tokio::spawn(server.clone().serve(listener, cancellation));
+        timeout(Duration::from_secs(1), snapshots.entered.notified())
+            .await
+            .expect("startup snapshot initialization did not reach the blocked store");
+
+        handle.cancel();
+        timeout(Duration::from_millis(250), serve)
+            .await
+            .expect("startup ignored cancellation while snapshot initialization was blocked")
+            .unwrap()
+            .unwrap();
+        assert!(!server.is_ready());
+        assert!(
+            timeout(Duration::from_millis(100), TcpStream::connect(address))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn externally_served_reads_fail_stop_after_a_competing_head_advance() {
+        for method in ["GetTask", "ListTasks", "SubscribeToTask"] {
+            let message_id = format!("shared-head-{}", method.to_ascii_lowercase());
+            let (seeded, mapping) = seeded_task(&message_id, A2aTaskState::Working);
+            let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+            snapshots.persist_snapshot(&seeded).await.unwrap();
+            let (address, server, _handle, task) = start_server_with_dependencies(
+                A2aHttpConfig::default(),
+                Arc::new(Mutex::new(seeded.clone())),
+                snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(CompletingHost::default()),
+                agent_card(),
+            )
+            .await;
+            timeout(Duration::from_secs(1), async {
+                while !server.is_ready() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("server never became ready");
+
+            let current = snapshots.load_serialized_snapshot().await.unwrap().unwrap();
+            let mut advanced = current.decode().unwrap();
+            advanced
+                .transition_task(
+                    &mapping.task_id,
+                    A2aTaskState::InputRequired,
+                    Some("advanced by a competing writer".into()),
+                )
+                .unwrap();
+            snapshots
+                .compare_and_swap_snapshot(
+                    Some(current.version()),
+                    A2aSerializedMapperSnapshot::from_mapper(&advanced).unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let params = if method == "ListTasks" {
+                json!({"tenant": "tenant-a"})
+            } else {
+                json!({"tenant": "tenant-a", "id": mapping.task_id})
+            };
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": format!("{method}-shared-head"),
+                "method": method,
+                "params": params,
+            })
+            .to_string();
+            let accept = if method == "SubscribeToTask" {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let response = try_raw_http(
+                address,
+                request("POST", "/a2a", &rpc_headers(accept), &body),
+            )
+            .await
+            .unwrap_or_default();
+
+            assert!(
+                !response.starts_with("HTTP/1.1 200"),
+                "{method} served a stale result after a competing durable-head advance: {response}"
+            );
+            let serve_error = timeout(Duration::from_secs(2), task)
+                .await
+                .expect("divergent shared head did not stop the listener")
+                .unwrap()
+                .unwrap_err();
+            assert!(serve_error
+                .message
+                .contains("durable snapshot head diverged"));
+            assert!(!server.is_ready());
+            assert_eq!(snapshots.load_snapshot().await.unwrap(), advanced);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_send_and_cancel_retries_probe_the_shared_head_before_fast_paths() {
+        let (seeded_send, send_mapping) =
+            seeded_task("shared-head-send-retry", A2aTaskState::Working);
+        let send_snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        send_snapshots.persist_snapshot(&seeded_send).await.unwrap();
+        let send_initial = send_snapshots
+            .load_serialized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let send_server = Arc::new(
+            A2aHttpJsonRpcServer::new_owned(
+                seeded_send.clone(),
+                send_snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                Arc::new(CompletingHost::default()),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        send_server.initialize_snapshot_store().await.unwrap();
+        let mut advanced_send = seeded_send;
+        advanced_send
+            .transition_task(
+                &send_mapping.task_id,
+                A2aTaskState::InputRequired,
+                Some("advanced send head".into()),
+            )
+            .unwrap();
+        send_snapshots
+            .compare_and_swap_snapshot(
+                Some(send_initial.version()),
+                A2aSerializedMapperSnapshot::from_mapper(&advanced_send).unwrap(),
+            )
+            .await
+            .unwrap();
+        let send_error = send_server
+            .handle_send(
+                JsonRpcRequest {
+                    id: json!("shared-head-send-retry"),
+                    method: "SendMessage".into(),
+                    params: json!({
+                        "tenant": "tenant-a",
+                        "message": {
+                            "messageId": "shared-head-send-retry",
+                            "role": "ROLE_USER",
+                            "parts": [{"text": "recovery"}],
+                            "metadata": {"complete": true},
+                        },
+                    }),
+                    correlation_id: None,
+                    last_event_id: None,
+                },
+                owner_principal(),
+                false,
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("exact SendMessage retry served a stale fast-path result");
+        assert!(send_error
+            .message
+            .contains("durable snapshot head diverged"));
+
+        let (seeded_cancel, cancel_mapping, cancellation_record) =
+            seeded_cancellation("shared-head-cancel-retry", A2aTaskState::Working, false);
+        let cancel_snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        cancel_snapshots
+            .persist_snapshot(&seeded_cancel)
+            .await
+            .unwrap();
+        let cancel_initial = cancel_snapshots
+            .load_serialized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel_server = Arc::new(
+            A2aHttpJsonRpcServer::new_owned(
+                seeded_cancel.clone(),
+                cancel_snapshots.clone(),
+                Arc::new(InMemoryA2aEventStore::default()),
+                Arc::new(TestAuthenticator),
+                Arc::new(CompletingHost::default()),
+                agent_card(),
+                A2aHttpConfig::default(),
+            )
+            .unwrap(),
+        );
+        cancel_server.initialize_snapshot_store().await.unwrap();
+        let mut advanced_cancel = seeded_cancel;
+        advanced_cancel
+            .mark_cancellation_running(&cancellation_record.cancellation_id)
+            .unwrap();
+        cancel_snapshots
+            .compare_and_swap_snapshot(
+                Some(cancel_initial.version()),
+                A2aSerializedMapperSnapshot::from_mapper(&advanced_cancel).unwrap(),
+            )
+            .await
+            .unwrap();
+        let cancel_error = cancel_server
+            .handle_cancel_task(
+                JsonRpcRequest {
+                    id: json!("shared-head-cancel-retry"),
+                    method: "CancelTask".into(),
+                    params: json!({"tenant": "tenant-a", "id": cancel_mapping.task_id}),
+                    correlation_id: None,
+                    last_event_id: None,
+                },
+                owner_principal(),
+                CancellationIngress::Public("127.0.0.1".parse().unwrap()),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("exact CancelTask retry served a stale fast-path result");
+        assert!(cancel_error
+            .message
+            .contains("durable snapshot head diverged"));
+    }
+
+    #[tokio::test]
+    async fn open_sse_stream_probes_and_fail_stops_after_a_competing_head_advance() {
+        let (seeded, mapping) = seeded_task("shared-head-open-stream", A2aTaskState::Working);
+        let snapshots = Arc::new(InMemoryA2aMapperSnapshotStore::default());
+        snapshots.persist_snapshot(&seeded).await.unwrap();
+        let config = A2aHttpConfig {
+            stream_idle_timeout: Duration::from_millis(500),
+            ..A2aHttpConfig::default()
+        };
+        let (address, server, _handle, task) = start_server_with_dependencies(
+            config,
+            Arc::new(Mutex::new(seeded)),
+            snapshots.clone(),
+            Arc::new(InMemoryA2aEventStore::default()),
+            Arc::new(CompletingHost::default()),
+            agent_card(),
+        )
+        .await;
+        timeout(Duration::from_secs(1), async {
+            while !server.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server never became ready");
+
+        let subscribe_body = json!({
+            "jsonrpc": "2.0",
+            "id": "shared-head-open-stream",
+            "method": "SubscribeToTask",
+            "params": {"tenant": "tenant-a", "id": mapping.task_id},
+        })
+        .to_string();
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(&request(
+                "POST",
+                "/a2a",
+                &rpc_headers("text/event-stream"),
+                &subscribe_body,
+            ))
+            .await
+            .unwrap();
+        let mut initial_bytes = Vec::new();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "SSE stream closed before its initial event");
+                initial_bytes.extend_from_slice(&chunk[..read]);
+                let initial = String::from_utf8_lossy(&initial_bytes);
+                if initial.contains("HTTP/1.1 200") && initial.contains("data:") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("SSE initial event was not written");
+
+        let current = snapshots.load_serialized_snapshot().await.unwrap().unwrap();
+        let mut advanced = current.decode().unwrap();
+        advanced
+            .transition_task(
+                &mapping.task_id,
+                A2aTaskState::InputRequired,
+                Some("advanced while SSE was open".into()),
+            )
+            .unwrap();
+        snapshots
+            .compare_and_swap_snapshot(
+                Some(current.version()),
+                A2aSerializedMapperSnapshot::from_mapper(&advanced).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut tail = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut tail))
+            .await
+            .expect("open SSE stream did not close after durable-head divergence")
+            .unwrap();
+        let serve_error = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("SSE durable-head divergence did not stop the listener")
+            .unwrap()
+            .unwrap_err();
+        assert!(serve_error
+            .message
+            .contains("durable snapshot head diverged"));
+        assert!(!server.is_ready());
     }
 
     #[tokio::test]

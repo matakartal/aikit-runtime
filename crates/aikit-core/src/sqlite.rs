@@ -9,7 +9,9 @@ use crate::durable_store::{
     validate_append_only, validate_approval_resolution_deadline, validate_worker_lease_fence,
     DurableStore, DurableStoreError, DurableStoreLeaseAuthority, DurableStoreResult,
 };
-use crate::memory::{MemoryEntry, MemoryQuery, MemoryStore};
+use crate::memory::{
+    normalize_persisted_entry, validate_entry, MemoryEntry, MemoryQuery, MemoryStore,
+};
 use crate::session::{
     validate_execution_lease_claim, validate_stored_execution_lease, Session,
     SessionExecutionLease, SessionExecutionLeaseRecord, SessionStore, SessionStoreError,
@@ -262,17 +264,15 @@ impl SqliteMemoryStore {
 
 impl MemoryStore for SqliteMemoryStore {
     fn put(&self, mut entry: MemoryEntry) -> std::result::Result<(), String> {
-        if entry.namespace.trim().is_empty() || entry.key.trim().is_empty() {
-            return Err("memory namespace and key must be non-empty".into());
-        }
-        if entry.namespace.len() > 256 || entry.key.len() > 512 {
-            return Err("memory namespace/key exceeds length limit".into());
-        }
-        let connection = self
+        validate_entry(&entry)?;
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| "SQLite mutex poisoned")?;
-        let created: Option<String> = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let created: Option<String> = transaction
             .query_row(
                 "SELECT entry_json FROM aikit_memory WHERE namespace=?1 AND key=?2",
                 params![entry.namespace, entry.key],
@@ -281,20 +281,25 @@ impl MemoryStore for SqliteMemoryStore {
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(created) = created {
-            let existing: MemoryEntry =
-                serde_json::from_str(&created).map_err(|e| e.to_string())?;
+            let existing = normalize_persisted_entry(
+                serde_json::from_str(&created).map_err(|e| e.to_string())?,
+            )?;
             entry.created_unix_ms = existing.created_unix_ms;
-            entry.revision = existing.revision.saturating_add(1);
+            entry.revision = existing
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| "memory revision overflow".to_string())?;
         } else {
             entry.revision = 1;
         }
         entry.updated_unix_ms = now_ms() as u128;
         let json = serde_json::to_string(&entry).map_err(|e| e.to_string())?;
-        connection.execute(
+        transaction.execute(
             "INSERT INTO aikit_memory(namespace,key,entry_json,importance,updated_ms) VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(namespace,key) DO UPDATE SET entry_json=excluded.entry_json, importance=excluded.importance, updated_ms=excluded.updated_ms",
             params![entry.namespace, entry.key, json, entry.importance, entry.updated_unix_ms.to_string()],
         ).map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -311,8 +316,11 @@ impl MemoryStore for SqliteMemoryStore {
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        json.map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
-            .transpose()
+        json.map(|json| {
+            let entry = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            normalize_persisted_entry(entry)
+        })
+        .transpose()
     }
 
     fn search(&self, query: &MemoryQuery) -> std::result::Result<Vec<MemoryEntry>, String> {
@@ -321,7 +329,7 @@ impl MemoryStore for SqliteMemoryStore {
             .lock()
             .map_err(|_| "SQLite mutex poisoned")?;
         let mut statement = connection.prepare(
-            "SELECT entry_json FROM aikit_memory WHERE namespace=?1 ORDER BY importance DESC, length(updated_ms) DESC, updated_ms DESC, key ASC",
+            "SELECT entry_json FROM aikit_memory WHERE namespace=?1 ORDER BY min(importance, 100) DESC, length(updated_ms) DESC, updated_ms DESC, key ASC",
         ).map_err(|e| e.to_string())?;
         let entries = statement
             .query_map(params![query.namespace], |row| row.get::<_, String>(0))
@@ -334,8 +342,10 @@ impl MemoryStore for SqliteMemoryStore {
             .collect();
         let mut found = Vec::new();
         for json in entries {
-            let entry: MemoryEntry = serde_json::from_str(&json.map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+            let entry = normalize_persisted_entry(
+                serde_json::from_str(&json.map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            )?;
             if !query.tags.is_subset(&entry.tags) {
                 continue;
             }
@@ -372,9 +382,7 @@ impl MemoryStore for SqliteMemoryStore {
         mut entry: MemoryEntry,
         expected_revision: u64,
     ) -> std::result::Result<u64, String> {
-        if entry.namespace.trim().is_empty() || entry.key.trim().is_empty() {
-            return Err("memory namespace and key must be non-empty".into());
-        }
+        validate_entry(&entry)?;
         let mut connection = self
             .connection
             .lock()
@@ -392,7 +400,9 @@ impl MemoryStore for SqliteMemoryStore {
             .map_err(|error| error.to_string())?;
         let existing = existing
             .map(|json| {
-                serde_json::from_str::<MemoryEntry>(&json).map_err(|error| error.to_string())
+                let entry = serde_json::from_str::<MemoryEntry>(&json)
+                    .map_err(|error| error.to_string())?;
+                normalize_persisted_entry(entry)
             })
             .transpose()?;
         let actual = existing.as_ref().map_or(0, |existing| existing.revision);
@@ -1173,7 +1183,9 @@ fn sqlite_lease_conflict(session: &Session) -> SessionStoreError {
     SessionStoreError::Conflict {
         id: session.id.clone(),
         expected_revision: session.revision,
-        actual_revision: session.revision.saturating_add(1),
+        // SQLite stores this lease outside the session row, so report a synthetic conflicting
+        // revision that remains distinct even for externally constructed max-revision sessions.
+        actual_revision: session.revision.checked_add(1).unwrap_or(0),
     }
 }
 
@@ -1231,6 +1243,199 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].revision, 1);
+    }
+
+    #[test]
+    fn sqlite_memory_put_and_cas_share_backend_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-validation.db");
+        let store = SqliteMemoryStore::open(&path).unwrap();
+
+        let mut invalid_importance = MemoryEntry::new("agent", "unsafe", json!(true));
+        invalid_importance.importance = 101;
+        assert_eq!(
+            store.put(invalid_importance.clone()),
+            Err("memory importance must be between 0 and 100".into())
+        );
+        assert_eq!(
+            store.compare_and_swap(invalid_importance, 0),
+            Err("memory importance must be between 0 and 100".into())
+        );
+
+        let overlong = MemoryEntry::new("n".repeat(257), "key", json!(true));
+        assert_eq!(
+            store.compare_and_swap(overlong, 0),
+            Err("memory namespace/key exceeds length limit".into())
+        );
+        assert!(store.get("agent", "unsafe").unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_memory_migrates_legacy_revision_and_importance_across_all_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-legacy.db");
+        let store = SqliteMemoryStore::open(&path).unwrap();
+        let mut legacy = MemoryEntry::new("agent", "legacy", json!("old"));
+        legacy.importance = u8::MAX;
+        assert_eq!(legacy.revision, 0);
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO aikit_memory(namespace,key,entry_json,importance,updated_ms) VALUES(?1,?2,?3,?4,?5)",
+                params!["agent", "legacy", legacy_json, u8::MAX, "1"],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = SqliteMemoryStore::open(&path).unwrap();
+        let migrated = store.get("agent", "legacy").unwrap().unwrap();
+        assert_eq!(migrated.revision, 1);
+        assert_eq!(migrated.importance, 100);
+        let searched = store.search(&MemoryQuery::new("agent", "old", 10)).unwrap();
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].revision, 1);
+        assert_eq!(searched[0].importance, 100);
+
+        let update = MemoryEntry::new("agent", "legacy", json!("cas update"));
+        assert_eq!(
+            store.compare_and_swap(update.clone(), 0),
+            Err("memory revision conflict: expected 0, found 1".into())
+        );
+        assert_eq!(store.compare_and_swap(update, 1), Ok(2));
+        assert_eq!(store.get("agent", "legacy").unwrap().unwrap().revision, 2);
+
+        let mut legacy_put = MemoryEntry::new("agent", "legacy-put", json!("old"));
+        legacy_put.importance = 200;
+        let legacy_put_json = serde_json::to_string(&legacy_put).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO aikit_memory(namespace,key,entry_json,importance,updated_ms) VALUES(?1,?2,?3,?4,?5)",
+                params!["agent", "legacy-put", legacy_put_json, 200, "1"],
+            )
+            .unwrap();
+        store
+            .put(MemoryEntry::new("agent", "legacy-put", json!("put update")))
+            .unwrap();
+        assert_eq!(
+            store.get("agent", "legacy-put").unwrap().unwrap().revision,
+            2
+        );
+    }
+
+    #[test]
+    fn sqlite_memory_keeps_non_migratable_legacy_fields_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-invalid-legacy.db");
+        let store = SqliteMemoryStore::open(&path).unwrap();
+        let mut invalid = MemoryEntry::new("agent", "row-key", json!(true));
+        invalid.key.clear();
+        let invalid_json = serde_json::to_string(&invalid).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO aikit_memory(namespace,key,entry_json,importance,updated_ms) VALUES(?1,?2,?3,?4,?5)",
+                params!["agent", "row-key", invalid_json, 50, "1"],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("agent", "row-key"),
+            Err("memory namespace and key must be non-empty".into())
+        );
+        assert_eq!(
+            store.search(&MemoryQuery::new("agent", "", 10)),
+            Err("memory namespace and key must be non-empty".into())
+        );
+    }
+
+    #[test]
+    fn sqlite_memory_cross_instance_puts_assign_unique_monotonic_revisions() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-concurrent-put.db");
+        let first = Arc::new(SqliteMemoryStore::open(&path).unwrap());
+        let second = Arc::new(SqliteMemoryStore::open(&path).unwrap());
+        first
+            .put(MemoryEntry::new("agent", "shared", json!("initial")))
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for (worker, store) in [("first", first.clone()), ("second", second.clone())] {
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for write in 0..25 {
+                    store
+                        .put(MemoryEntry::new(
+                            "agent",
+                            "shared",
+                            json!({"worker": worker, "write": write}),
+                        ))
+                        .unwrap();
+                }
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let persisted = first.get("agent", "shared").unwrap().unwrap();
+        assert_eq!(persisted.revision, 51);
+    }
+
+    #[test]
+    fn sqlite_memory_revision_overflow_preserves_the_persisted_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-overflow.db");
+        let store = SqliteMemoryStore::open(&path).unwrap();
+        let mut persisted = MemoryEntry::new("agent", "overflow", json!("original"));
+        persisted.revision = u64::MAX;
+        let persisted_json = serde_json::to_string(&persisted).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO aikit_memory(namespace,key,entry_json,importance,updated_ms) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    persisted.namespace,
+                    persisted.key,
+                    persisted_json,
+                    persisted.importance,
+                    persisted.updated_unix_ms.to_string()
+                ],
+            )
+            .unwrap();
+
+        let replacement = MemoryEntry::new("agent", "overflow", json!("must not replace"));
+        assert_eq!(
+            store.put(replacement),
+            Err("memory revision overflow".into())
+        );
+        assert_eq!(store.get("agent", "overflow").unwrap().unwrap(), persisted);
+    }
+
+    #[test]
+    fn sqlite_lease_conflict_revision_remains_distinct_at_u64_max() {
+        let mut session = Session::new("max-revision-lease", Vec::new());
+        session.revision = u64::MAX;
+        assert_eq!(
+            sqlite_lease_conflict(&session),
+            SessionStoreError::Conflict {
+                id: "max-revision-lease".into(),
+                expected_revision: u64::MAX,
+                actual_revision: 0,
+            }
+        );
     }
 
     #[test]

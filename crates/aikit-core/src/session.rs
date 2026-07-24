@@ -660,7 +660,7 @@ impl SessionStore for InMemorySessionStore {
                 })?;
         validate_revision(&replacement.id, expected_revision, current.revision)?;
 
-        prepare_replacement(&current, &mut replacement);
+        prepare_replacement(&current, &mut replacement)?;
         sessions.insert(replacement.id.clone(), replacement.clone());
         Ok(replacement)
     }
@@ -774,7 +774,7 @@ impl SessionStore for InMemorySessionStore {
             });
             current.and_then(|current| {
                 validate_revision(&lease.session.id, lease.session.revision, current.revision)?;
-                prepare_replacement(&current, &mut lease.session);
+                prepare_replacement(&current, &mut lease.session)?;
                 sessions.insert(lease.session.id.clone(), lease.session.clone());
                 Ok(lease.session)
             })
@@ -997,7 +997,7 @@ impl SessionStore for JsonFileSessionStore {
             })?;
         validate_revision(&replacement.id, expected_revision, current.revision)?;
 
-        prepare_replacement(&current, &mut replacement);
+        prepare_replacement(&current, &mut replacement)?;
         database
             .sessions
             .insert(replacement.id.clone(), replacement.clone());
@@ -1113,7 +1113,7 @@ impl SessionStore for JsonFileSessionStore {
                 });
             current.and_then(|current| {
                 validate_revision(&lease.session.id, lease.session.revision, current.revision)?;
-                prepare_replacement(&current, &mut lease.session);
+                prepare_replacement(&current, &mut lease.session)?;
                 Ok(lease.session)
             })
         };
@@ -1262,7 +1262,10 @@ fn execution_lease_conflict(session: &Session) -> SessionStoreError {
     SessionStoreError::Conflict {
         id: session.id.clone(),
         expected_revision: session.revision,
-        actual_revision: session.revision.saturating_add(1),
+        // This is a synthetic conflicting revision because the lease is stored separately from
+        // the session CAS. It must still differ at u64::MAX or diagnostics would claim that equal
+        // revisions conflicted.
+        actual_revision: session.revision.checked_add(1).unwrap_or(0),
     }
 }
 
@@ -1290,12 +1293,19 @@ fn initialize_created_session(session: &mut Session) {
     synchronize_outcome_messages(session);
 }
 
-fn prepare_replacement(current: &Session, replacement: &mut Session) {
-    replacement.revision = current.revision.saturating_add(1);
+fn prepare_replacement(current: &Session, replacement: &mut Session) -> SessionStoreResult<()> {
+    replacement.revision =
+        current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| SessionStoreError::Io {
+                message: format!("session `{}` revision overflow", current.id),
+            })?;
     replacement.created_at_unix_ms = current.created_at_unix_ms;
     replacement.updated_at_unix_ms =
         now_unix_ms().max(current.updated_at_unix_ms.saturating_add(1));
     synchronize_outcome_messages(replacement);
+    Ok(())
 }
 
 fn synchronize_outcome_messages(session: &mut Session) {
@@ -1697,6 +1707,42 @@ mod tests {
         );
         let typed: crate::error::AikitError = missing.into();
         assert_eq!(typed.info().code, crate::error::ErrorCode::Session);
+    }
+
+    #[test]
+    fn in_memory_revision_overflow_fails_without_replacing_the_session() {
+        let store = InMemorySessionStore::default();
+        let mut persisted = Session::new("max-revision", vec![Message::user("original")]);
+        persisted.revision = u64::MAX;
+        persisted.created_at_unix_ms = 1;
+        persisted.updated_at_unix_ms = 2;
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(persisted.id.clone(), persisted.clone());
+
+        let mut replacement = persisted.clone();
+        replacement.messages = vec![Message::user("must not replace")];
+        let error = store
+            .compare_and_swap(u64::MAX, replacement)
+            .expect_err("a max revision cannot advance");
+        assert_eq!(
+            error,
+            SessionStoreError::Io {
+                message: "session `max-revision` revision overflow".into(),
+            }
+        );
+        assert_eq!(store.load_session("max-revision").unwrap(), persisted);
+
+        assert_eq!(
+            execution_lease_conflict(&persisted),
+            SessionStoreError::Conflict {
+                id: "max-revision".into(),
+                expected_revision: u64::MAX,
+                actual_revision: 0,
+            }
+        );
     }
 
     #[test]
