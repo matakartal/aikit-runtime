@@ -35,6 +35,7 @@ jobs:
   guard:
     name: Publishing is prepared but disabled
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Enforce the enablement checklist in docs/RELEASE.md
         env:
@@ -67,6 +68,7 @@ jobs:
     if: inputs.registry == 'crates'
     needs: guard
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: registry-publish
     permissions:
       contents: read
@@ -105,6 +107,7 @@ jobs:
     if: inputs.registry == 'pypi'
     needs: guard
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: registry-publish
     permissions:
       actions: read
@@ -151,6 +154,7 @@ jobs:
     if: inputs.registry == 'npm'
     needs: guard
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: registry-publish
     permissions:
       actions: read

@@ -12,6 +12,7 @@ streaming, tools, policy, routing, budgets, audit, memory, or sessions in every 
 [![CI](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/ci.yml)
 [![A2A conformance](https://github.com/matakartal/aikit-runtime/actions/workflows/a2a-conformance.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/a2a-conformance.yml)
 [![Security](https://github.com/matakartal/aikit-runtime/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/matakartal/aikit-runtime/actions/workflows/security.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/matakartal/aikit-runtime/badge)](https://scorecard.dev/viewer/?uri=github.com/matakartal/aikit-runtime)
 [![Artifacts](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml/badge.svg)](https://github.com/matakartal/aikit-runtime/actions/workflows/release.yml)
 [![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-000000?logo=rust)](Cargo.toml)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](crates/aikit-py/pyproject.toml)
