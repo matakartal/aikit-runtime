@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn aikit() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aikit"));
@@ -81,6 +83,57 @@ fn providers_never_print_secret_values() {
         .find(|entry| entry["provider"] == "xai")
         .unwrap();
     assert_eq!(xai["active"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_discovery_inspects_but_never_executes_explicit_binary() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("gemini");
+    let marker = directory.path().join("executed");
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = aikit()
+        .args([
+            "--format",
+            "json",
+            "agents",
+            "discover",
+            "gemini",
+            "--path",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let candidates: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let explicit = candidates
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["executable"] == executable.to_string_lossy().as_ref())
+        .expect("explicit Gemini candidate must be present");
+    assert_eq!(explicit["kind"], "gemini");
+    assert!(!marker.exists(), "discovery executed the candidate binary");
+}
+
+#[test]
+fn external_agent_run_rejects_single_json_document_mode_before_launch() {
+    let output = aikit()
+        .args(["--format", "json", "agents", "run", "codex", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("jsonl"));
 }
 
 #[test]

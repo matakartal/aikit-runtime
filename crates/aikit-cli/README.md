@@ -68,6 +68,50 @@ cargo run -p aikit-cli -- --format json capabilities
 Supported provider names are Anthropic, OpenAI, Google, DeepSeek, xAI/Grok, OpenRouter, Groq, and
 Mistral. An inactive provider means no non-empty conventional environment variable was found.
 
+### Existing Codex, Gemini, Claude, and Grok CLI sessions
+
+External coding-agent runtimes are separate from API-key providers: the vendor CLI owns its
+account session, conversation, tool loop, and approval requests. AIKit does not read, copy, print,
+or exchange the CLI's OAuth tokens.
+
+```bash
+# Read-only discovery: candidates are inspected, never executed.
+cargo run -p aikit-cli -- agents discover
+
+# Initialize an existing vendor session without issuing a model prompt.
+cargo run -p aikit-cli -- agents status codex
+cargo run -p aikit-cli -- agents status gemini
+cargo run -p aikit-cli -- agents status grok
+
+# Start the vendor-owned login flow when required.
+cargo run -p aikit-cli -- agents login codex
+
+# Run through the CLI account rather than an API key.
+cargo run -p aikit-cli -- agents run codex --mode workspace_write "Fix the focused test"
+cargo run -p aikit-cli -- agents run gemini "Explain this workspace"
+cargo run -p aikit-cli -- agents run grok "Review the current diff"
+```
+
+`agents run` defaults to interactive approval. Automation must select `--approval deny` or
+explicitly opt into `--approval allow-once`; multi-event automation uses `--format jsonl`.
+Ctrl-C sends protocol cancellation before the managed child process is shut down.
+
+Codex uses the official app-server protocol. Gemini and Grok use their native ACP stdio modes;
+Grok is launched with its self-updater disabled so a session cannot change binary mid-run. Claude
+CLI does not expose native ACP, so AIKit launches the official bridge through the exact package pin
+`@agentclientprotocol/claude-agent-acp@0.61.0`. It passes the discovered Claude CLI as
+`CLAUDE_CODE_EXECUTABLE` and masks inherited Anthropic API credentials so a PAYG key cannot silently
+win over the logged-in subscription. Node.js 22+ and `npx` are required. An air-gapped or
+preinstalled bridge can be supplied explicitly; `@latest` bridge arguments are rejected:
+
+```bash
+cargo run -p aikit-cli -- agents status claude --bridge /absolute/path/to/pinned-claude-acp
+```
+
+`agents models` never sends a paid probe. Codex can return its catalog directly; ACP runtimes may
+publish their model selector only after `session/new`, so an initially empty list is not treated as
+an authentication failure.
+
 ### Doctor
 
 ```bash
@@ -134,5 +178,6 @@ Stable process codes:
 | `3` | Agent/provider/runtime failure, including evaluation infrastructure |
 | `4` | Evaluation dataset ran but at least one case failed |
 
-Real-provider commands can make billable network calls. Keyless checks and CI continue to use
-`mock-1`; no live provider is contacted implicitly.
+`run`, `chat`, and `agents run` can make billable network calls. Discovery, status, update checks,
+and keyless CI do not issue model prompts. `mock-1` remains the offline default; no live provider
+or external agent is selected implicitly.

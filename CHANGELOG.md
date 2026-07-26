@@ -88,7 +88,8 @@ All notable changes to this project will be documented in this file. The format 
 - Governed MCP 2025-11-25 JSON-RPC server with real stdio and Streamable HTTP listeners, bounded
   SSE replay, Origin/auth/session/version/Host/Accept enforcement, SQLite CAS persistence,
   restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 now has a
-  bounded experimental Rust JSON-RPC/SSE listener; ACP v1 remains mapping-only.
+  bounded experimental Rust JSON-RPC/SSE listener. The SDK-neutral ACP DTO mapper remains, and a
+  separate external-agent runtime now provides real vendor CLI stdio transport.
 - Canonical A2A `ListTasks` with subject+tenant isolation before filters/counts/cursor pagination,
   bounded pages, stable ordering, snapshot recovery, and shared Rust/Python/Node mapper surfaces.
 - A2A artifact and direct-`Message` projection, durable SSE event replay, isolated protected
@@ -130,6 +131,13 @@ All notable changes to this project will be documented in this file. The format 
   xAI wire-contract regression test.
 - Source-first `aikit` CLI with one-shot runs, canonical multi-turn chat, provider/capability
   discovery, containment doctor, text/JSON/JSONL output, stable exit codes, and shell completions.
+- Vendor-owned Codex, Gemini, Claude, and Grok CLI sessions behind a distinct external-agent
+  contract: secret-safe executable discovery, Codex app-server, official ACP v1 transport,
+  correlated approvals/cancellation, an exact official Claude ACP bridge package pin with PAYG-key
+  masking, `aikit agents` commands, and no token extraction. Managed
+  runtimes add detached Ed25519 compatibility manifests, content-addressed side-by-side artifacts,
+  persisted refresh/backoff state, exact artifact session pins, atomic activation, and rollback;
+  external Homebrew/npm/vendor installs remain check-only by default.
 - CI security gates: cargo-deny (RustSec advisories, license policy, duplicate/wildcard bans, and
   registry-source pinning via `deny.toml`), an independent cargo-audit run, a full-history Gitleaks
   committed-secret scan, deterministic SBOM/provenance checks, and repository-level CodeQL default

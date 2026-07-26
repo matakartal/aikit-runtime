@@ -99,7 +99,7 @@ the commit and re-review the license together.
 | MCP tools/resources/prompts/auth/progress/cancel server | MCP 2025-11-25 JSON-RPC dispatcher with stdio and Streamable HTTP, Origin/auth/session/version/Host/Accept enforcement and bounded SSE replay | 33 protocol tests with real socket/subprocess and official-shaped fixtures | `Equivalent` locally | official external SDK/OAuth discovery conformance |
 | Durable MCP Tasks | task/receipt/dedupe/session/SSE state persisted through SQLite CAS; expired side-effect replay evidence retires the old connection namespace fail-closed | restart, duplicate, retention-expiry, cancellation, schema drift and `Last-Event-ID` tests | `Equivalent` locally | PostgreSQL MCP store and official external conformance |
 | A2A 1.0 canonical mapping and JSON-RPC/SSE | owner-scoped `context_id → Session`, `task_id → Run`, dedupe/input-required, authenticated ListTasks, artifact/direct-Message projection, protected cancel ingress and Rust/Python/Node mapper surfaces | protocol/binding parity, 75 transport tests, and pinned official TCK raw plus exact-set verification | `Partial` | complete timestamps/history/artifact updates, production journal wiring, authenticated deployment proof, and removal of six pinned upstream TCK waivers |
-| Zed ACP v1 adapter | session/prompt/cancel and runtime event mapping | protocol tests | `Equivalent` for mapping | thin CLI/editor transport and Zed acceptance |
+| Vendor CLI sessions over Codex app-server and ACP v1 | secret-safe discovery; bounded bidirectional RPC; auth/session/prompt/cancel/approval; exact official Claude bridge pin; signed managed-runtime updates and rollback | external-agent core/process tests plus CLI discovery/format tests | `Partial` | live no-prompt acceptance is local-host evidence only; Python/Node projections, editor acceptance, subscription-policy drift checks, and cross-platform update rehearsal remain |
 
 ## Phase 5 — evals, telemetry, hardening and release
 
@@ -120,7 +120,7 @@ the commit and re-review the license together.
 
 `v1.0` is **not eligible** at this snapshot. Mandatory `Partial/Absent` rows remain, principally:
 schema-generated full SDK declarations, live provider/modality acceptance, Linux microVM/egress proof,
-PostgreSQL failover and a real Temporal worker, production A2A journal persistence, ACP wire transport, unwaived external protocol conformance, cross-platform signed artifacts,
+PostgreSQL failover and a real Temporal worker, production A2A journal persistence, unwaived external protocol conformance, Claude bridge distribution, cross-platform signed artifacts,
 registry publication, and rollback rehearsal.
 
 The local implementation must not turn missing credentials, registry ownership, signing identity,

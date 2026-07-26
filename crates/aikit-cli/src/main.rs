@@ -1,7 +1,11 @@
 use aikit::{
-    evaluate_outcome, tool, Agent, BuiltinTools, ErrorCode, ErrorInfo, EvalCaseReport, EvalDataset,
-    EvalReport, EvalVerdict, Governance, Message, NoTools, PermissionEngine, PermissionMode, Rule,
-    RunConfig, RunRecorder, Sandbox, StreamDelta, ToolExecutor, ToolSpec,
+    discover_runtime_candidates, discover_support_executable, evaluate_outcome, tool,
+    vendor_session_environment, AcpExternalRuntime, AcpRuntimeConfig, Agent, BuiltinTools,
+    CodexAppServerConfig, CodexAppServerRuntime, ErrorCode, ErrorInfo, EvalCaseReport, EvalDataset,
+    EvalReport, EvalVerdict, ExternalAgentKind, ExternalAgentRuntime, ExternalApprovalDecision,
+    ExternalPrompt, ExternalPromptBlock, Governance, Message, NewRuntimeSession, NoTools,
+    PermissionEngine, PermissionMode, Rule, RunConfig, RunRecorder, RuntimeEvent, RuntimeEventKind,
+    RuntimeInstanceId, RuntimeProfile, Sandbox, StreamDelta, ToolExecutor, ToolSpec,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
@@ -9,6 +13,7 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -71,6 +76,8 @@ enum Command {
     Chat(ChatArgs),
     /// List supported providers without exposing credentials.
     Providers,
+    /// Discover and use vendor CLI sessions without copying their credentials.
+    Agents(AgentsArgs),
     /// Show currently active provider and runtime capabilities.
     Capabilities,
     /// Diagnose credentials, workspace access, and containment.
@@ -113,6 +120,113 @@ struct ChatArgs {
     /// Optional system instruction retained across the conversation.
     #[arg(long)]
     system: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentsArgs {
+    #[command(subcommand)]
+    command: AgentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Find installed Codex, Gemini, Claude, and Grok executables.
+    Discover(AgentDiscoverArgs),
+    /// Initialize a runtime and report normalized health/auth status.
+    Status(AgentRuntimeArgs),
+    /// Start the vendor-owned login flow without reading or copying tokens.
+    Login(AgentRuntimeArgs),
+    /// Ask the vendor runtime to invalidate its current login.
+    Logout(AgentRuntimeArgs),
+    /// Report models advertised by the runtime without issuing a billable prompt.
+    Models(AgentRuntimeArgs),
+    /// Run one coding-agent session through the vendor CLI.
+    Run(AgentRunArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum AgentKindArg {
+    Codex,
+    Gemini,
+    Claude,
+    Grok,
+}
+
+impl From<AgentKindArg> for ExternalAgentKind {
+    fn from(value: AgentKindArg) -> Self {
+        match value {
+            AgentKindArg::Codex => Self::Codex,
+            AgentKindArg::Gemini => Self::Gemini,
+            AgentKindArg::Claude => Self::Claude,
+            AgentKindArg::Grok => Self::Grok,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AgentDiscoverArgs {
+    /// Restrict discovery to one vendor runtime.
+    #[arg(value_enum)]
+    kind: Option<AgentKindArg>,
+
+    /// Exact executable path. Requires KIND and never falls back to PATH if invalid.
+    #[arg(long, requires = "kind")]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AgentRuntimeArgs {
+    /// Vendor coding-agent runtime.
+    #[arg(value_enum)]
+    kind: AgentKindArg,
+
+    /// Exact vendor CLI executable. Invalid paths fail instead of falling back to PATH.
+    #[arg(long)]
+    path: Option<PathBuf>,
+
+    /// Exact, pinned ACP bridge executable for Claude; otherwise AIKit uses its pinned npx bridge.
+    #[arg(long)]
+    bridge: Option<PathBuf>,
+
+    /// Argument passed to a custom pinned Claude ACP bridge. Requires --bridge; @latest is rejected.
+    #[arg(long = "bridge-arg", allow_hyphen_values = true)]
+    bridge_args: Vec<String>,
+
+    /// Default workspace used when ACP session/load requires a cwd.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum AgentApprovalMode {
+    /// Ask on the terminal for each vendor permission request.
+    Prompt,
+    /// Reject every permission request.
+    Deny,
+    /// Accept each request once. This must be selected explicitly.
+    AllowOnce,
+}
+
+#[derive(Debug, Args)]
+struct AgentRunArgs {
+    #[command(flatten)]
+    runtime: AgentRuntimeArgs,
+
+    /// Prompt text. Use '-' or omit it to read stdin.
+    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
+    prompt: Vec<String>,
+
+    /// Runtime model id. ACP runtimes validate it against advertised session options.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Runtime session mode. Codex supports analysis_only, workspace_write, or full_access.
+    #[arg(long)]
+    mode: Option<String>,
+
+    /// Permission behavior for vendor tool calls.
+    #[arg(long, value_enum, default_value_t = AgentApprovalMode::Prompt)]
+    approval: AgentApprovalMode,
 }
 
 #[derive(Debug, Args)]
@@ -255,19 +369,470 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<(), CliError> {
-    let agent = process_agent();
     match cli.command {
-        Command::Run(args) => run_once(&agent, args, cli.format).await,
-        Command::Chat(args) => chat(&agent, args, cli.format, cli.quiet).await,
-        Command::Providers => print_providers(&agent, cli.format),
-        Command::Capabilities => print_value(&agent.capabilities(), cli.format),
-        Command::Doctor(args) => doctor(&agent, args, cli.format).await,
-        Command::Eval(args) => run_eval(&agent, args, cli.format).await,
+        Command::Run(args) => run_once(&process_agent(), args, cli.format).await,
+        Command::Chat(args) => chat(&process_agent(), args, cli.format, cli.quiet).await,
+        Command::Providers => print_providers(&process_agent(), cli.format),
+        Command::Agents(args) => run_agent_command(args, cli.format, cli.quiet).await,
+        Command::Capabilities => print_value(&process_agent().capabilities(), cli.format),
+        Command::Doctor(args) => doctor(&process_agent(), args, cli.format).await,
+        Command::Eval(args) => run_eval(&process_agent(), args, cli.format).await,
         Command::Completions(args) => {
             generate(args.shell, &mut Cli::command(), "aikit", &mut io::stdout());
             Ok(())
         }
     }
+}
+
+async fn run_agent_command(
+    args: AgentsArgs,
+    format: OutputFormat,
+    quiet: bool,
+) -> Result<(), CliError> {
+    match args.command {
+        AgentCommand::Discover(args) => discover_agents(args, format),
+        AgentCommand::Status(args) => {
+            let runtime = open_external_runtime(&args).await?;
+            let operation = async {
+                runtime.initialize().await.map_err(external_runtime_error)?;
+                runtime
+                    .auth_status(false)
+                    .await
+                    .map_err(external_runtime_error)?;
+                print_runtime_descriptor(&runtime.descriptor(), format)
+            }
+            .await;
+            finish_external_runtime(runtime.as_ref(), operation).await
+        }
+        AgentCommand::Login(args) => {
+            let runtime = open_external_runtime(&args).await?;
+            let mut events = runtime.subscribe();
+            let operation = async {
+                let auth = runtime.login().await.map_err(external_runtime_error)?;
+                drain_login_events(&mut events, format)?;
+                match format {
+                    OutputFormat::Text => println!("auth: {:?}", auth.state),
+                    OutputFormat::Json | OutputFormat::Jsonl => print_value(&auth, format)?,
+                }
+                Ok(())
+            }
+            .await;
+            finish_external_runtime(runtime.as_ref(), operation).await
+        }
+        AgentCommand::Logout(args) => {
+            let runtime = open_external_runtime(&args).await?;
+            let operation = async {
+                runtime.logout().await.map_err(external_runtime_error)?;
+                if !quiet && format == OutputFormat::Text {
+                    println!("vendor CLI session logged out");
+                } else if format != OutputFormat::Text {
+                    print_value(&json!({"logged_out":true}), format)?;
+                }
+                Ok(())
+            }
+            .await;
+            finish_external_runtime(runtime.as_ref(), operation).await
+        }
+        AgentCommand::Models(args) => {
+            let runtime = open_external_runtime(&args).await?;
+            let operation = async {
+                let models = runtime
+                    .list_models()
+                    .await
+                    .map_err(external_runtime_error)?;
+                match format {
+                    OutputFormat::Text => {
+                        if models.models.is_empty() {
+                            println!(
+                                "no non-billable model catalog advertised yet (ACP may publish it after session/new)"
+                            );
+                        } else {
+                            for model in &models.models {
+                                println!(
+                                    "{:<32} {}",
+                                    model.id,
+                                    model.display_name.as_deref().unwrap_or("")
+                                );
+                            }
+                        }
+                    }
+                    OutputFormat::Json | OutputFormat::Jsonl => print_value(&models, format)?,
+                }
+                Ok(())
+            }
+            .await;
+            finish_external_runtime(runtime.as_ref(), operation).await
+        }
+        AgentCommand::Run(args) => run_external_agent(args, format).await,
+    }
+}
+
+async fn finish_external_runtime(
+    runtime: &dyn ExternalAgentRuntime,
+    operation: Result<(), CliError>,
+) -> Result<(), CliError> {
+    let shutdown = runtime.shutdown().await.map_err(external_runtime_error);
+    operation.and(shutdown)
+}
+
+fn discover_agents(args: AgentDiscoverArgs, format: OutputFormat) -> Result<(), CliError> {
+    let kinds = args
+        .kind
+        .map(|kind| vec![ExternalAgentKind::from(kind)])
+        .unwrap_or_else(|| ExternalAgentKind::ALL.to_vec());
+    let mut candidates = Vec::new();
+    for kind in kinds {
+        candidates.extend(
+            discover_runtime_candidates(kind, args.path.as_deref())
+                .map_err(external_runtime_error)?,
+        );
+    }
+    match format {
+        OutputFormat::Text => {
+            println!("AGENT   ORIGIN              EXECUTABLE");
+            for candidate in candidates {
+                println!(
+                    "{:<7} {:<19?} {}",
+                    candidate.kind,
+                    candidate.origin,
+                    candidate.executable.display()
+                );
+            }
+            Ok(())
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => print_value(&candidates, format),
+    }
+}
+
+async fn open_external_runtime(
+    args: &AgentRuntimeArgs,
+) -> Result<Box<dyn ExternalAgentRuntime>, CliError> {
+    let kind = ExternalAgentKind::from(args.kind);
+    let candidate = discover_runtime_candidates(kind, args.path.as_deref())
+        .map_err(external_runtime_error)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "no {} CLI executable found; install it or pass --path",
+                kind.command_name()
+            ))
+        })?;
+    let workspace = args.workspace.canonicalize().map_err(|error| {
+        CliError::Input(format!("workspace {}: {error}", args.workspace.display()))
+    })?;
+    let instance_id = RuntimeInstanceId::default_for(kind);
+    match kind {
+        ExternalAgentKind::Codex => {
+            if args.bridge.is_some() || !args.bridge_args.is_empty() {
+                return Err(CliError::Input(
+                    "--bridge and --bridge-arg apply only to Claude".into(),
+                ));
+            }
+            let runtime = CodexAppServerRuntime::spawn(CodexAppServerConfig {
+                instance_id,
+                candidate,
+                profile: RuntimeProfile::External,
+                environment: vendor_session_environment(ExternalAgentKind::Codex),
+                inherit_env: true,
+                artifact_hash: None,
+            })
+            .await
+            .map_err(external_runtime_error)?;
+            Ok(Box::new(runtime))
+        }
+        ExternalAgentKind::Gemini | ExternalAgentKind::Grok => {
+            if args.bridge.is_some() || !args.bridge_args.is_empty() {
+                return Err(CliError::Input(
+                    "--bridge and --bridge-arg apply only to Claude".into(),
+                ));
+            }
+            let mut config =
+                AcpRuntimeConfig::native(instance_id, candidate, RuntimeProfile::External)
+                    .map_err(external_runtime_error)?;
+            config.default_workspace = Some(workspace);
+            let runtime = AcpExternalRuntime::spawn(config)
+                .await
+                .map_err(external_runtime_error)?;
+            Ok(Box::new(runtime))
+        }
+        ExternalAgentKind::Claude => {
+            let mut config = if let Some(bridge) = &args.bridge {
+                let bridge = bridge.canonicalize().map_err(|error| {
+                    CliError::Input(format!("Claude ACP bridge {}: {error}", bridge.display()))
+                })?;
+                AcpRuntimeConfig::pinned_bridge(
+                    instance_id,
+                    candidate,
+                    RuntimeProfile::External,
+                    bridge,
+                    args.bridge_args.clone(),
+                )
+                .map_err(external_runtime_error)?
+            } else {
+                if !args.bridge_args.is_empty() {
+                    return Err(CliError::Input(
+                        "--bridge-arg requires an explicit --bridge".into(),
+                    ));
+                }
+                let npx = discover_support_executable("npx").map_err(external_runtime_error)?;
+                AcpRuntimeConfig::pinned_claude_npx_bridge(
+                    instance_id,
+                    candidate,
+                    RuntimeProfile::External,
+                    npx,
+                )
+                .map_err(external_runtime_error)?
+            };
+            config.default_workspace = Some(workspace);
+            let runtime = AcpExternalRuntime::spawn(config)
+                .await
+                .map_err(external_runtime_error)?;
+            Ok(Box::new(runtime))
+        }
+    }
+}
+
+fn print_runtime_descriptor(
+    descriptor: &aikit::RuntimeDescriptor,
+    format: OutputFormat,
+) -> Result<(), CliError> {
+    match format {
+        OutputFormat::Text => {
+            println!("agent:     {}", descriptor.kind);
+            println!("health:    {:?}", descriptor.health);
+            println!("auth:      {:?}", descriptor.auth.state);
+            println!("protocol:  {}", descriptor.protocol);
+            println!(
+                "version:   {}",
+                descriptor.version.as_deref().unwrap_or("unknown")
+            );
+            println!("executable: {}", descriptor.real_executable.display());
+            Ok(())
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => print_value(descriptor, format),
+    }
+}
+
+fn drain_login_events(
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    format: OutputFormat,
+) -> Result<(), CliError> {
+    loop {
+        match events.try_recv() {
+            Ok(event) => match (&event.event, format) {
+                (RuntimeEventKind::LoginStarted { url, .. }, OutputFormat::Text) => {
+                    if let Some(url) = url {
+                        println!("open: {url}");
+                    } else {
+                        println!("complete login in the vendor flow");
+                    }
+                }
+                (_, OutputFormat::Jsonl) => print_value(&event, format)?,
+                _ => {}
+            },
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Ok(()),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                return Err(CliError::Runtime(
+                    "external-agent login event queue overflowed".into(),
+                ));
+            }
+        }
+    }
+}
+
+async fn run_external_agent(args: AgentRunArgs, format: OutputFormat) -> Result<(), CliError> {
+    if format == OutputFormat::Json {
+        return Err(CliError::Input(
+            "agents run emits multiple events; use --format text or --format jsonl".into(),
+        ));
+    }
+    if args.approval == AgentApprovalMode::Prompt && !io::stdin().is_terminal() {
+        return Err(CliError::Input(
+            "--approval prompt requires a terminal; use deny or allow-once for automation".into(),
+        ));
+    }
+    let prompt_text = read_prompt(args.prompt)?;
+    let workspace = args.runtime.workspace.canonicalize().map_err(|error| {
+        CliError::Input(format!(
+            "workspace {}: {error}",
+            args.runtime.workspace.display()
+        ))
+    })?;
+    let runtime = open_external_runtime(&args.runtime).await?;
+    let mut events = runtime.subscribe();
+    let operation = async {
+        runtime
+            .initialize()
+            .await
+            .map_err(external_runtime_error)?;
+        let session = runtime
+            .new_session(NewRuntimeSession {
+                cwd: workspace,
+                additional_directories: Vec::new(),
+                model: args.model,
+                mode: args.mode,
+            })
+            .await
+            .map_err(external_runtime_error)?;
+        runtime
+            .prompt(ExternalPrompt {
+                session_id: session.session_id.clone(),
+                prompt_id: format!("cli-{}", unix_millis()),
+                blocks: vec![ExternalPromptBlock::Text { text: prompt_text }],
+            })
+            .await
+            .map_err(external_runtime_error)?;
+
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        loop {
+            tokio::select! {
+                interrupt_result = &mut interrupt => {
+                    interrupt_result.map_err(CliError::Io)?;
+                    runtime.cancel(&session.session_id, None).await.map_err(external_runtime_error)?;
+                    if format == OutputFormat::Text {
+                        eprintln!("\nexternal-agent run cancelled");
+                    }
+                    return Ok(());
+                }
+                event = events.recv() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            runtime.cancel(&session.session_id, None).await.map_err(external_runtime_error)?;
+                            return Err(CliError::Runtime("external-agent event queue overflowed; run cancelled fail-closed".into()));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(CliError::Runtime("external-agent event channel closed before completion".into()));
+                        }
+                    };
+                    if format == OutputFormat::Jsonl {
+                        print_value(&event, format)?;
+                    }
+                    match &event.event {
+                        RuntimeEventKind::ContentDelta { stream, text }
+                            if format == OutputFormat::Text && stream.contains("assistant") =>
+                        {
+                            print!("{text}");
+                            io::stdout().flush()?;
+                        }
+                        RuntimeEventKind::ApprovalRequested { request_id, detail } => {
+                            let decision = approval_decision(args.approval, detail.clone()).await?;
+                            runtime.respond_approval(
+                                event.session_id.as_deref().unwrap_or(&session.session_id),
+                                request_id,
+                                decision,
+                            ).await.map_err(external_runtime_error)?;
+                        }
+                        RuntimeEventKind::UserInputRequested { request_id, detail } => {
+                            if args.approval != AgentApprovalMode::Prompt {
+                                runtime.cancel(&session.session_id, None).await.map_err(external_runtime_error)?;
+                                return Err(CliError::Runtime("vendor requested user input in non-interactive mode; run cancelled".into()));
+                            }
+                            let answers = user_input_answers(detail.clone()).await?;
+                            runtime.respond_user_input(
+                                event.session_id.as_deref().unwrap_or(&session.session_id),
+                                request_id,
+                                answers,
+                            ).await.map_err(external_runtime_error)?;
+                        }
+                        RuntimeEventKind::Warning { message } if format == OutputFormat::Text => {
+                            eprintln!("\nwarning: {message}");
+                        }
+                        RuntimeEventKind::Completed => {
+                            if format == OutputFormat::Text { println!(); }
+                            return Ok(());
+                        }
+                        RuntimeEventKind::Cancelled => return Ok(()),
+                        RuntimeEventKind::Failed { message } => {
+                            return Err(CliError::Runtime(message.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let shutdown = runtime.shutdown().await.map_err(external_runtime_error);
+    operation.and(shutdown)
+}
+
+async fn approval_decision(
+    mode: AgentApprovalMode,
+    detail: Value,
+) -> Result<ExternalApprovalDecision, CliError> {
+    match mode {
+        AgentApprovalMode::Deny => Ok(ExternalApprovalDecision::Decline),
+        AgentApprovalMode::AllowOnce => Ok(ExternalApprovalDecision::Accept),
+        AgentApprovalMode::Prompt => tokio::task::spawn_blocking(move || {
+            eprintln!(
+                "\npermission requested:\n{}",
+                serde_json::to_string_pretty(&detail).unwrap_or_else(|_| "{}".into())
+            );
+            eprint!("allow once [y], allow for session [a], deny [n], cancel [c]? ");
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => Ok(ExternalApprovalDecision::Accept),
+                "a" | "always" => Ok(ExternalApprovalDecision::AcceptForSession),
+                "n" | "no" | "" => Ok(ExternalApprovalDecision::Decline),
+                "c" | "cancel" => Ok(ExternalApprovalDecision::Cancel),
+                _ => Err(CliError::Input("unknown approval response".into())),
+            }
+        })
+        .await
+        .map_err(|error| CliError::Runtime(format!("approval prompt task failed: {error}")))?,
+    }
+}
+
+async fn user_input_answers(detail: Value) -> Result<BTreeMap<String, String>, CliError> {
+    let questions = detail
+        .get("questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::Runtime("vendor user-input request omitted questions".into()))?
+        .iter()
+        .map(|question| {
+            let id = question
+                .get("id")
+                .or_else(|| question.get("questionId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::Runtime("vendor question omitted id".into()))?;
+            let prompt = question
+                .get("prompt")
+                .or_else(|| question.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or(id);
+            Ok((id.to_string(), prompt.to_string()))
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    tokio::task::spawn_blocking(move || {
+        let mut answers = BTreeMap::new();
+        for (id, prompt) in questions {
+            eprint!("{prompt}: ");
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            answers.insert(id, answer.trim_end().to_string());
+        }
+        Ok(answers)
+    })
+    .await
+    .map_err(|error| CliError::Runtime(format!("user-input prompt task failed: {error}")))?
+}
+
+fn external_runtime_error(error: impl std::fmt::Display) -> CliError {
+    CliError::Runtime(error.to_string())
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result<(), CliError> {
@@ -827,6 +1392,29 @@ mod tests {
         };
         assert_eq!(args.model, "grok-4.5");
         assert_eq!(args.prompt, ["hello"]);
+    }
+
+    #[test]
+    fn cli_contract_separates_external_agent_run_from_provider_run() {
+        let cli = Cli::try_parse_from([
+            "aikit",
+            "agents",
+            "run",
+            "grok",
+            "--approval",
+            "deny",
+            "inspect",
+        ])
+        .unwrap();
+        let Command::Agents(AgentsArgs {
+            command: AgentCommand::Run(args),
+        }) = cli.command
+        else {
+            panic!("expected external-agent run")
+        };
+        assert_eq!(args.runtime.kind, AgentKindArg::Grok);
+        assert_eq!(args.approval, AgentApprovalMode::Deny);
+        assert_eq!(args.prompt, ["inspect"]);
     }
 
     #[test]
