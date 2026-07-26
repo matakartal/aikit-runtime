@@ -883,6 +883,11 @@ mod tests {
         assert_eq!(snapshot.committed_input_tokens, 20);
         assert_eq!(snapshot.committed_output_tokens, 10);
         assert_eq!(snapshot.committed_cost_micro_usd, 40);
-        assert_eq!(ledger.snapshot().unwrap(), snapshot);
+        let mut observed = ledger.snapshot().unwrap();
+        assert!(observed.elapsed_ms >= snapshot.elapsed_ms);
+        // The two snapshots are sampled on different clock ticks. Compare the ledger state while
+        // separately asserting that elapsed time is monotonic.
+        observed.elapsed_ms = snapshot.elapsed_ms;
+        assert_eq!(observed, snapshot);
     }
 }

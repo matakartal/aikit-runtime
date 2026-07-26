@@ -88,6 +88,28 @@ value and emit a typed compatibility warning; neither mode silently removes a fi
 uses the same fail-closed boundary: inline bytes are hash/size verified, while URL/artifact inputs
 must first be resolved to verified bytes by host-governed egress or artifact storage.
 
+## External coding-agent boundary
+
+Vendor CLI accounts are not translated into `Provider` credentials. `ExternalAgentRuntime` is a
+separate session/process contract because Codex, Gemini, Claude, and Grok own their conversation,
+tool loop, permission requests, account state, and cancellation protocol. Codex uses app-server;
+Gemini and Grok use native ACP stdio; Claude uses an exact pinned official ACP bridge. The runtime
+normalizes bounded events and correlates approvals but does not claim that vendor-contained tool
+effects passed through AIKit's normal `ToolExecutor` governance.
+
+Discovery canonicalizes an executable without running it. Launch is shell-free, PAYG credentials
+that could override the CLI subscription are masked, queues and frames are bounded, and shutdown
+owns the child process group. Gemini launch additionally requires an explicit vendor-terms
+acknowledgement; AIKit does not extract or persist vendor OAuth tokens.
+
+Signed update configuration is also separate from provider routing. External/vendor-managed
+installations are report-only. An explicitly AIKit-managed `sync` verifies a detached Ed25519
+signature before strict manifest parsing, streams the exact target artifact under size/hash bounds,
+health-checks the staged executable, then atomically changes the active pointer. Persisted
+TTL/backoff state, an advisory process lock, interrupted-activation recovery, version quarantine,
+and a previous pointer make the transition deterministic without overwriting a running binary.
+Importing an SDK never starts this network flow.
+
 ## Governance and tool execution
 
 The enforcement order is intentionally layered:

@@ -134,10 +134,13 @@ All notable changes to this project will be documented in this file. The format 
 - Vendor-owned Codex, Gemini, Claude, and Grok CLI sessions behind a distinct external-agent
   contract: secret-safe executable discovery, Codex app-server, official ACP v1 transport,
   correlated approvals/cancellation, an exact official Claude ACP bridge package pin with PAYG-key
-  masking, `aikit agents` commands, and no token extraction. Managed
-  runtimes add detached Ed25519 compatibility manifests, content-addressed side-by-side artifacts,
-  persisted refresh/backoff state, exact artifact session pins, atomic activation, and rollback;
-  external Homebrew/npm/vendor installs remain check-only by default.
+  masking, explicit Gemini terms acknowledgement, `aikit agents discover|status|login|logout|models|run`,
+  and no token extraction. Signed runtime-update `configure|status|sync|rollback` persists
+  TTL/backoff state, serializes concurrent operations, verifies detached Ed25519 signatures before
+  strict manifest parsing, streams bounded SHA-256 artifacts into a content-addressed store,
+  health-checks staged binaries, recovers interrupted activation, quarantines failed/rolled-back
+  versions, pins exact artifact hashes, atomically switches the active pointer, and retains the
+  previous artifact. External and vendor-managed installations are never mutated implicitly.
 - CI security gates: cargo-deny (RustSec advisories, license policy, duplicate/wildcard bans, and
   registry-source pinning via `deny.toml`), an independent cargo-audit run, a full-history Gitleaks
   committed-secret scan, deterministic SBOM/provenance checks, and repository-level CodeQL default

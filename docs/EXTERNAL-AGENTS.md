@@ -30,6 +30,13 @@ flowchart LR
   are not forwarded because they can contain prompts, tool arguments, or credentials.
 - PAYG API-key variables are masked in child environments. This matters especially for Claude,
   whose API key otherwise takes priority over an authenticated Pro/Max CLI subscription.
+- Gemini requires `--acknowledge-vendor-terms` (or
+  `AIKIT_ACKNOWLEDGE_GEMINI_CLI_TERMS=true`) before AIKit launches the CLI. Google's official
+  [ACP guide](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md) describes
+  developer-tool integration, while its official
+  [terms/privacy guide](https://github.com/google-gemini/gemini-cli/blob/main/docs/resources/tos-privacy.md)
+  warns about third-party access to OAuth-backed services. AIKit cannot resolve that account-policy
+  ambiguity for the user; the normal Google provider with an API key remains the alternative.
 
 ## Process and session safety
 
@@ -50,7 +57,7 @@ flowchart LR
 aikit agents discover
 aikit agents status codex
 aikit agents login codex
-aikit agents run gemini "Review this workspace"
+aikit agents run gemini --acknowledge-vendor-terms "Review this workspace"
 aikit agents run grok --approval deny "Explain this diff"
 ```
 
@@ -60,15 +67,36 @@ another PATH candidate. Claude uses the exact official npm bridge pin
 `CLAUDE_CODE_EXECUTABLE`; Node.js 22+ is required. An exact `--bridge PATH` remains available for
 air-gapped/preinstalled use, and bridge arguments containing `@latest` are rejected.
 
-## Runtime updates
+## Signed runtime updates
 
 Runtime discovery, model-catalog refresh, compatibility checks, and binary installation are
 separate operations. Importing an AIKit SDK does not start a background updater.
 
+An operator first pins a manifest location and public signing key. These are placeholder URLs and
+key material; this repository does not claim a production update feed:
+
+```bash
+aikit agents update configure gemini \
+  --manifest-url https://updates.example.com/aikit/gemini/manifest.json \
+  --signature-url https://updates.example.com/aikit/gemini/manifest.sig \
+  --key-id stable-2026 \
+  --public-key-base64 BASE64_RAW_ED25519_PUBLIC_KEY \
+  --policy aikit-managed
+
+aikit agents update status gemini
+aikit agents update sync gemini --acknowledge-vendor-terms
+aikit agents update rollback gemini --acknowledge-vendor-terms
+```
+
+`sync` is the automation entrypoint: a host scheduler may run it daily, while the persisted
+24-hour TTL avoids unnecessary checks. Failures back off for 1 hour, 6 hours, then 24 hours;
+`--force` is an explicit operator override. AIKit does not install a daemon. A cross-process
+advisory lock serializes configuration, sync, activation, and rollback for one runtime root.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Checking: "24h manifest TTL"
+    Idle --> Checking: "sync; 24h manifest TTL"
     Checking --> Current: "signed manifest; no newer compatible release"
     Checking --> Available: "signed compatible release"
     Checking --> Failed: "network, signature, schema, or compatibility error"
@@ -76,35 +104,53 @@ stateDiagram-v2
     Available --> ReportOnly: "external Homebrew/npm/vendor install"
     Available --> Downloading: "AIKit-managed profile"
     Downloading --> Staged: "size + SHA-256 verified"
-    Staged --> Current: "atomic active pointer"
-    Current --> RolledBack: "new runtime health check fails"
-    RolledBack --> Current: "previous artifact restored"
+    Staged --> Failed: "bounded initialize/auth health check fails"
+    Staged --> Activating: "health check succeeds"
+    Activating --> Current: "atomic active pointer + persisted state"
+    Activating --> Current: "next sync recovers interrupted state write"
+    Current --> RolledBack: "operator restores previous artifact"
+    Failed --> Quarantined: "rejected version is remembered"
+    RolledBack --> Quarantined: "rolled-back version is remembered"
+    Quarantined --> Available: "strictly newer release appears"
 ```
 
 The manifest is verified over its raw bytes with a trusted detached Ed25519 signature before JSON
 parsing. It is strict and expiry-bound, declares the external-agent contract/protocol, and selects
-one OS/architecture artifact. Artifact URLs must be credential-free HTTPS; size and lowercase
-SHA-256 must match.
+one OS/architecture artifact. Manifest/signature URLs must be HTTPS without persisted query
+credentials. Artifact URLs must be HTTPS without userinfo or fragments; signed-CDN queries are
+allowed because the signed manifest authenticates the exact URL. Response and file sizes are
+bounded, downloads stream to a temporary file, and lowercase SHA-256 must match before persistence.
 
 Managed artifacts are stored side-by-side under their content hash. Activation changes a small
 state pointer instead of overwriting a running executable. A runtime descriptor carries the exact
 artifact hash used to start it, so existing sessions can pin that hash while new sessions use the
-new active pointer. Garbage collection protects active, previous, and host-supplied session pins.
+new active pointer. Normal agent commands prefer the active managed artifact unless the operator
+passes an exact `--path`. Garbage collection protects active, previous, and host-supplied session
+pins. State/config files are strict, bounded regular files under a hashed instance directory.
 
 External installations default to `check_only`: AIKit reports that a newer compatible runtime is
 available but does not mutate Homebrew, npm, or vendor-managed files. A host may explicitly choose
-vendor-managed update behavior. Stable is the default channel; preview must be selected.
+`vendor_managed`, which still reports rather than silently invoking a package manager. Only an
+explicit `aikit_managed` policy downloads and activates artifacts. Stable is the default channel;
+preview must be selected. Staged binaries must initialize and answer a non-billable auth-status
+check before activation. Health failures leave the previous pointer untouched; explicit rollback
+atomically restores the previous artifact and quarantines the rejected version.
+
+Default roots are `AIKIT_HOME/runtimes` when configured, the platform user-data directory
+otherwise, or an explicit `--root`. `--instance` separates multiple accounts for the same vendor.
+Normal agent commands use the corresponding `--runtime-root` and `--instance` values.
 
 ## Current proof boundary
 
 Deterministic tests cover discovery without execution, app-server/ACP message handling, event and
-permission correlation, signature tampering, target/version selection, retry timing, artifact
-hash/size checks, side-by-side activation, persisted update state, and rollback. Local no-prompt
-smoke tests have initialized installed Codex, Gemini, and Grok binaries. Claude's exact official
-bridge pin is separately checked without a prompt. Those checks are not a billable model acceptance
-run, a cross-platform packaging proof, or a signed production release rehearsal. Claude
-subscription billing rules are vendor-controlled and must be rechecked when the pinned bridge or
-Anthropic policy changes. Recheck the official
+permission correlation, terms gating, signature tampering, strict source configuration,
+target/version selection, retry timing, update locking, artifact hash/size checks, side-by-side
+activation, persisted state, quarantine, and rollback. Local no-prompt smoke tests previously
+initialized installed Codex, Gemini, and Grok binaries. Claude's exact official bridge pin was
+separately checked without a prompt. Those checks are not a billable model acceptance run, a
+cross-platform managed-update proof, or a signed production-feed rehearsal. Claude subscription
+billing rules and all vendor account policies remain vendor-controlled and must be rechecked when
+the pinned bridge or policies change. Recheck the official
 [`claude-agent-acp` package pin](https://github.com/agentclientprotocol/claude-agent-acp/blob/main/package.json),
 [Claude API-key precedence guidance](https://support.claude.com/en/articles/12304248-manage-api-key-environment-variables-in-claude-code),
 and the latest [subscription/ACP status note](https://zed.dev/blog/anthropic-subscription-changes)

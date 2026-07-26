@@ -93,7 +93,7 @@ implementation matrix, and `CHANGELOG.md` for what the tree does today.
 | Surface | Local docs |
 |---|---|
 | `aikit` CLI | [`crates/aikit-cli/README.md`](../crates/aikit-cli/README.md) |
-| Vendor CLI sessions | [`EXTERNAL-AGENTS.md`](EXTERNAL-AGENTS.md) |
+| Vendor CLI sessions and signed updates | [`EXTERNAL-AGENTS.md`](EXTERNAL-AGENTS.md) |
 
 ## Documentation maintenance
 

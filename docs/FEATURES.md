@@ -16,10 +16,14 @@ The CLI also has a separate `agents` surface for reusing vendor-owned Codex, Gem
 Grok CLI sessions without extracting credentials. Codex uses app-server; Gemini and Grok use ACP;
 Claude uses the exact official ACP bridge package pin (or an explicit exact bridge path). The shared
 Rust core owns bounded bidirectional RPC, approval correlation, session cancellation, normalized
-events, and secret-safe discovery.
-External installations are check-only by default. Managed installations use signed compatibility
-manifests, content-addressed side-by-side artifacts, session hash pinning, atomic activation, and
-rollback. Importing the SDK never starts a background updater.
+events, secret-safe discovery, and explicit Gemini vendor-terms acknowledgement.
+External installations are check-only by default. `aikit agents update configure|status|sync|rollback`
+is the host surface for persisted signed sources. A due `sync` applies only an explicitly
+`aikit-managed` policy: downloads are bounded and streamed, the detached signature is verified
+before JSON parsing, artifacts are content-addressed, staged binaries must initialize successfully,
+activation is atomic, crash-interrupted activation is recovered, and failed/rolled-back versions
+are quarantined. Normal agent commands prefer the active managed artifact. SDK import never starts
+a background updater; operators schedule `sync` when unattended checks are desired.
 
 Text is the human output; JSON is the single-document automation format; JSONL is the streaming
 chat format. Input errors and runtime errors use distinct stable exit codes. The CLI never prints

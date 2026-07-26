@@ -6,18 +6,23 @@ use super::{
     RuntimeProfile, EXTERNAL_AGENT_CONTRACT_VERSION,
 };
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use fs2::FileExt as _;
+use futures::StreamExt as _;
+use ring::signature::{UnparsedPublicKey, ED25519};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 pub const UPDATE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const UPDATE_MANIFEST_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const UPDATE_SIGNATURE_MAX_BYTES: usize = 8 * 1024;
+pub const UPDATE_STATE_MAX_BYTES: u64 = 256 * 1024;
 pub const UPDATE_ARTIFACT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const UPDATE_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 pub const MANIFEST_REFRESH_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -64,6 +69,172 @@ impl RuntimeUpdatePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuntimeUpdateSource {
+    pub manifest_url: String,
+    pub signature_url: String,
+    pub key_id: String,
+    /// Base64-encoded raw 32-byte Ed25519 public key. This is public trust material, not a secret.
+    pub public_key_base64: String,
+}
+
+impl RuntimeUpdateSource {
+    pub fn validate(&self) -> ExternalAgentResult<()> {
+        for (label, value) in [
+            ("manifest", self.manifest_url.as_str()),
+            ("signature", self.signature_url.as_str()),
+        ] {
+            let url = validate_update_url(label, value)?;
+            if url.query().is_some() {
+                return Err(update_error(format!(
+                    "{label} URL cannot persist query credentials"
+                )));
+            }
+        }
+        validate_component("manifest key id", &self.key_id)?;
+        self.public_key()?;
+        Ok(())
+    }
+
+    pub fn trusted_keys(&self) -> ExternalAgentResult<TrustedManifestKeys> {
+        let mut keys = TrustedManifestKeys::default();
+        keys.insert(self.key_id.clone(), self.public_key()?)?;
+        Ok(keys)
+    }
+
+    fn public_key(&self) -> ExternalAgentResult<[u8; 32]> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(self.public_key_base64.trim())
+            .map_err(|_| update_error("manifest public key is not valid base64"))?;
+        decoded
+            .try_into()
+            .map_err(|_| update_error("manifest public key must contain 32 bytes"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeUpdateConfig {
+    pub schema_version: u32,
+    pub instance_id: RuntimeInstanceId,
+    pub kind: ExternalAgentKind,
+    pub profile: RuntimeProfile,
+    pub policy: RuntimeUpdatePolicy,
+    pub channel: RuntimeUpdateChannel,
+    pub source: RuntimeUpdateSource,
+}
+
+impl RuntimeUpdateConfig {
+    pub fn validate(&self) -> ExternalAgentResult<()> {
+        if self.schema_version != EXTERNAL_AGENT_CONTRACT_VERSION {
+            return Err(update_error(
+                "unsupported runtime update configuration schema version",
+            ));
+        }
+        if self.profile == RuntimeProfile::External
+            && self.policy == RuntimeUpdatePolicy::AikitManaged
+        {
+            return Err(update_error(
+                "external runtimes cannot use the AIKit-managed update policy",
+            ));
+        }
+        self.source.validate()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeUpdateClient {
+    client: reqwest::Client,
+}
+
+impl RuntimeUpdateClient {
+    pub fn new() -> ExternalAgentResult<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .user_agent(concat!("aikit-runtime/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| update_error("cannot construct runtime update HTTP client"))?;
+        Ok(Self { client })
+    }
+
+    pub async fn fetch_manifest(
+        &self,
+        source: &RuntimeUpdateSource,
+        now_unix_ms: u64,
+    ) -> ExternalAgentResult<RuntimeUpdateManifest> {
+        source.validate()?;
+        let manifest = self
+            .fetch_limited(&source.manifest_url, UPDATE_MANIFEST_MAX_BYTES)
+            .await?;
+        let signature = self
+            .fetch_limited(&source.signature_url, UPDATE_SIGNATURE_MAX_BYTES)
+            .await?;
+        let signature = std::str::from_utf8(&signature)
+            .map_err(|_| update_error("update manifest signature response is not UTF-8"))?;
+        verify_update_manifest(
+            &manifest,
+            signature,
+            &source.key_id,
+            &source.trusted_keys()?,
+            now_unix_ms,
+        )
+    }
+
+    pub async fn download_and_stage(
+        &self,
+        store: &ManagedRuntimeArtifactStore,
+        selection: &RuntimeUpdateSelection,
+    ) -> ExternalAgentResult<InstalledRuntimeArtifact> {
+        validate_artifact(&selection.artifact)?;
+        let response = self
+            .client
+            .get(&selection.artifact.url)
+            .send()
+            .await
+            .map_err(|_| update_error("runtime artifact request failed"))?;
+        store.stage_response(selection, response).await
+    }
+
+    async fn fetch_limited(&self, url: &str, maximum_bytes: usize) -> ExternalAgentResult<Vec<u8>> {
+        validate_update_url("update metadata", url)?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| update_error("runtime update metadata request failed"))?;
+        if !response.status().is_success() {
+            return Err(update_error(format!(
+                "runtime update metadata returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(update_error("runtime update metadata is too large"));
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|_| update_error("runtime update metadata response was interrupted"))?;
+            if bytes.len().saturating_add(chunk.len()) > maximum_bytes {
+                return Err(update_error("runtime update metadata is too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(update_error("runtime update metadata response is empty"));
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateManifest {
     pub schema_version: u32,
     pub generated_unix_ms: u64,
@@ -102,7 +273,7 @@ pub struct RuntimeArtifact {
 
 #[derive(Debug, Clone, Default)]
 pub struct TrustedManifestKeys {
-    keys: BTreeMap<String, VerifyingKey>,
+    keys: BTreeMap<String, [u8; 32]>,
 }
 
 impl TrustedManifestKeys {
@@ -113,12 +284,9 @@ impl TrustedManifestKeys {
     ) -> ExternalAgentResult<()> {
         let key_id = key_id.into();
         validate_component("manifest key id", &key_id)?;
-        let key = VerifyingKey::from_bytes(&public_key).map_err(|error| {
-            update_error(format!("invalid Ed25519 manifest public key: {error}"))
-        })?;
         match self.keys.entry(key_id) {
             Entry::Vacant(entry) => {
-                entry.insert(key);
+                entry.insert(public_key);
             }
             Entry::Occupied(_) => return Err(update_error("duplicate manifest key id")),
         }
@@ -149,9 +317,13 @@ pub fn verify_update_manifest(
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(signature_base64.trim())
         .map_err(|_| update_error("update manifest signature is not valid base64"))?;
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| update_error("update manifest signature must contain 64 bytes"))?;
-    key.verify(manifest_bytes, &signature)
+    if signature_bytes.len() != 64 {
+        return Err(update_error(
+            "update manifest signature must contain 64 bytes",
+        ));
+    }
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(manifest_bytes, &signature_bytes)
         .map_err(|_| update_error("update manifest signature verification failed"))?;
 
     // Parse only after detached signature verification. This keeps attacker-controlled structures
@@ -232,19 +404,25 @@ fn validate_artifact(artifact: &RuntimeArtifact) -> ExternalAgentResult<()> {
             "runtime artifact size is outside the allowed range",
         ));
     }
-    let url = url::Url::parse(&artifact.url)
-        .map_err(|error| update_error(format!("invalid runtime artifact URL: {error}")))?;
-    if url.scheme() != "https" || url.host_str().is_none() || url.username() != "" {
-        return Err(update_error(
-            "runtime artifact URL must be credential-free HTTPS",
-        ));
-    }
-    if url.password().is_some() || url.fragment().is_some() {
-        return Err(update_error(
-            "runtime artifact URL cannot contain credentials or a fragment",
-        ));
-    }
+    validate_update_url("runtime artifact", &artifact.url)?;
     Ok(())
+}
+
+fn validate_update_url(label: &str, value: &str) -> ExternalAgentResult<url::Url> {
+    if value.len() > 4_096 || value.chars().any(char::is_control) {
+        return Err(update_error(format!("{label} URL is too long or invalid")));
+    }
+    let url =
+        url::Url::parse(value).map_err(|_| update_error(format!("{label} URL is invalid")))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(update_error(format!("{label} URL must use HTTPS")));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(update_error(format!(
+            "{label} URL cannot contain userinfo credentials or a fragment"
+        )));
+    }
+    Ok(url)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +514,9 @@ pub struct RuntimeUpdateState {
     pub current_version: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_version: Option<Version>,
+    /// A version whose staged health check failed or which was explicitly rolled back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_version: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_manifest_check_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,6 +542,7 @@ impl RuntimeUpdateState {
             phase: RuntimeUpdatePhase::Idle,
             current_version: None,
             available_version: None,
+            quarantined_version: None,
             last_manifest_check_unix_ms: None,
             last_model_refresh_unix_ms: None,
             last_discovery_unix_ms: None,
@@ -444,20 +626,56 @@ impl RuntimeUpdateState {
         Ok(())
     }
 
-    pub fn record_activated(&mut self) -> ExternalAgentResult<()> {
+    pub fn begin_activation(&mut self) -> ExternalAgentResult<()> {
         if self.phase != RuntimeUpdatePhase::Staged {
             return Err(update_error(
                 "runtime update can be activated only from a staged artifact",
             ));
         }
+        self.phase = RuntimeUpdatePhase::Activating;
+        Ok(())
+    }
+
+    pub fn record_activated(&mut self) -> ExternalAgentResult<()> {
+        if self.phase != RuntimeUpdatePhase::Activating {
+            return Err(update_error(
+                "runtime update can be completed only after activation begins",
+            ));
+        }
         self.current_version = self.available_version.take();
+        self.quarantined_version = None;
         self.phase = RuntimeUpdatePhase::Current;
         Ok(())
     }
 
-    pub fn record_rollback(&mut self, restored_version: Version) {
+    /// Finish the state write after a process crashed between atomic activation and persistence.
+    pub fn recover_activated(&mut self, active_version: &Version) -> ExternalAgentResult<bool> {
+        if !matches!(
+            self.phase,
+            RuntimeUpdatePhase::Staged | RuntimeUpdatePhase::Activating
+        ) || self.available_version.as_ref() != Some(active_version)
+        {
+            return Ok(false);
+        }
+        if self.phase == RuntimeUpdatePhase::Staged {
+            self.begin_activation()?;
+        }
+        self.record_activated()?;
+        Ok(true)
+    }
+
+    pub fn quarantine_available(&mut self) {
+        self.quarantined_version = self.available_version.clone();
+    }
+
+    pub fn record_rollback(
+        &mut self,
+        restored_version: Version,
+        rejected_version: Option<Version>,
+    ) {
         self.current_version = Some(restored_version);
         self.available_version = None;
+        self.quarantined_version = rejected_version;
         self.phase = RuntimeUpdatePhase::RolledBack;
     }
 
@@ -532,6 +750,17 @@ pub struct ManagedRuntimeLaunch {
     pub artifact_hash: String,
 }
 
+#[derive(Debug)]
+pub struct ManagedRuntimeUpdateLock {
+    file: File,
+}
+
+impl Drop for ManagedRuntimeUpdateLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManagedRuntimeArtifactStore {
     root: PathBuf,
@@ -552,6 +781,27 @@ impl ManagedRuntimeArtifactStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Prevent two host processes from racing update state or activation pointers.
+    /// The advisory lock is released by the OS if the process exits unexpectedly.
+    pub fn try_update_lock(&self) -> ExternalAgentResult<ManagedRuntimeUpdateLock> {
+        let path = self.root.join("update.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(store_io)?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                update_error("another runtime update is already in progress")
+            } else {
+                store_io(error)
+            }
+        })?;
+        Ok(ManagedRuntimeUpdateLock { file })
     }
 
     pub fn stage_bytes(
@@ -584,6 +834,91 @@ impl ManagedRuntimeArtifactStore {
         } else {
             let mut temporary = tempfile::NamedTempFile::new_in(&directory).map_err(store_io)?;
             temporary.write_all(bytes).map_err(store_io)?;
+            temporary.as_file_mut().sync_all().map_err(store_io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                temporary
+                    .as_file_mut()
+                    .set_permissions(fs::Permissions::from_mode(0o755))
+                    .map_err(store_io)?;
+            }
+            match temporary.persist_noclobber(&executable) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    verify_file(&executable, &selection.artifact)?;
+                }
+                Err(error) => return Err(store_io(error.error)),
+            }
+        }
+        let installed = InstalledRuntimeArtifact {
+            schema_version: EXTERNAL_AGENT_CONTRACT_VERSION,
+            sha256: selection.artifact.sha256.clone(),
+            version: selection.version.clone(),
+            executable,
+        };
+        write_json_atomic(&directory.join("artifact.json"), &installed)?;
+        Ok(installed)
+    }
+
+    async fn stage_response(
+        &self,
+        selection: &RuntimeUpdateSelection,
+        response: reqwest::Response,
+    ) -> ExternalAgentResult<InstalledRuntimeArtifact> {
+        if !response.status().is_success() {
+            return Err(update_error(format!(
+                "runtime artifact returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length != selection.artifact.size_bytes)
+        {
+            return Err(update_error(
+                "runtime artifact Content-Length does not match manifest",
+            ));
+        }
+        let directory = self
+            .root
+            .join("artifacts")
+            .join("sha256")
+            .join(&selection.artifact.sha256);
+        fs::create_dir_all(&directory).map_err(store_io)?;
+        ensure_beneath(&self.root, &directory)?;
+        let executable = directory.join(&selection.artifact.executable_name);
+        if executable.exists() {
+            verify_file(&executable, &selection.artifact)?;
+        } else {
+            let mut temporary = tempfile::NamedTempFile::new_in(&directory).map_err(store_io)?;
+            let mut stream = response.bytes_stream();
+            let mut size = 0_u64;
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|_| update_error("runtime artifact response was interrupted"))?;
+                size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| update_error("runtime artifact size overflow"))?;
+                if size > selection.artifact.size_bytes {
+                    return Err(update_error(
+                        "downloaded runtime artifact exceeds manifest size",
+                    ));
+                }
+                hasher.update(&chunk);
+                temporary.write_all(&chunk).map_err(store_io)?;
+            }
+            if size != selection.artifact.size_bytes {
+                return Err(update_error(
+                    "downloaded runtime artifact size does not match manifest",
+                ));
+            }
+            if lowercase_hex(&hasher.finalize()) != selection.artifact.sha256 {
+                return Err(update_error(
+                    "downloaded runtime artifact hash does not match manifest",
+                ));
+            }
             temporary.as_file_mut().sync_all().map_err(store_io)?;
             #[cfg(unix)]
             {
@@ -661,7 +996,7 @@ impl ManagedRuntimeArtifactStore {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(store_io)?;
+        let bytes = read_state_file(&path, "runtime activation state")?;
         let activation: RuntimeActivation = serde_json::from_slice(&bytes)
             .map_err(|error| update_error(format!("invalid runtime activation state: {error}")))?;
         if activation.schema_version != EXTERNAL_AGENT_CONTRACT_VERSION
@@ -703,6 +1038,56 @@ impl ManagedRuntimeArtifactStore {
         })
     }
 
+    pub fn installed_launch(
+        &self,
+        instance_id: &RuntimeInstanceId,
+        kind: ExternalAgentKind,
+        artifact: &InstalledRuntimeArtifact,
+    ) -> ExternalAgentResult<ManagedRuntimeLaunch> {
+        self.verify_installed(artifact)?;
+        Ok(ManagedRuntimeLaunch {
+            instance_id: instance_id.clone(),
+            kind,
+            candidate: RuntimeCandidate {
+                kind,
+                executable: artifact.executable.clone(),
+                real_executable: artifact.executable.clone(),
+                origin: RuntimeInstallOrigin::AikitManaged,
+                discovered_by: vec![RuntimeDiscoverySource::KnownLocation],
+                aliases: Vec::new(),
+            },
+            version: artifact.version.clone(),
+            artifact_hash: artifact.sha256.clone(),
+        })
+    }
+
+    pub fn write_update_config(&self, config: &RuntimeUpdateConfig) -> ExternalAgentResult<()> {
+        config.validate()?;
+        write_json_atomic(&self.update_config_path(&config.instance_id)?, config)
+    }
+
+    pub fn read_update_config(
+        &self,
+        instance_id: &RuntimeInstanceId,
+    ) -> ExternalAgentResult<Option<RuntimeUpdateConfig>> {
+        let path = self.update_config_path(instance_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let config: RuntimeUpdateConfig =
+            serde_json::from_slice(&read_state_file(&path, "runtime update configuration")?)
+                .map_err(|error| {
+                    update_error(format!("invalid runtime update configuration: {error}"))
+                })?;
+        if config.instance_id != *instance_id {
+            return Err(update_error(
+                "runtime update configuration identity does not match",
+            ));
+        }
+        config.validate()?;
+        Ok(Some(config))
+    }
+
     pub fn write_update_state(&self, state: &RuntimeUpdateState) -> ExternalAgentResult<()> {
         if state.schema_version != EXTERNAL_AGENT_CONTRACT_VERSION {
             return Err(update_error(
@@ -720,8 +1105,9 @@ impl ManagedRuntimeArtifactStore {
         if !path.is_file() {
             return Ok(None);
         }
-        let state: RuntimeUpdateState = serde_json::from_slice(&fs::read(path).map_err(store_io)?)
-            .map_err(|error| update_error(format!("invalid runtime update state: {error}")))?;
+        let state: RuntimeUpdateState =
+            serde_json::from_slice(&read_state_file(&path, "runtime update state")?)
+                .map_err(|error| update_error(format!("invalid runtime update state: {error}")))?;
         if state.schema_version != EXTERNAL_AGENT_CONTRACT_VERSION
             || state.instance_id != *instance_id
         {
@@ -743,7 +1129,7 @@ impl ManagedRuntimeArtifactStore {
                 if !state.is_file() {
                     continue;
                 }
-                let bytes = fs::read(state).map_err(store_io)?;
+                let bytes = read_state_file(&state, "runtime activation state")?;
                 let activation: RuntimeActivation =
                     serde_json::from_slice(&bytes).map_err(|error| {
                         update_error(format!(
@@ -787,6 +1173,12 @@ impl ManagedRuntimeArtifactStore {
             .join("update-state.json"))
     }
 
+    fn update_config_path(&self, instance_id: &RuntimeInstanceId) -> ExternalAgentResult<PathBuf> {
+        Ok(self
+            .instance_directory(instance_id)?
+            .join("update-config.json"))
+    }
+
     fn instance_directory(&self, instance_id: &RuntimeInstanceId) -> ExternalAgentResult<PathBuf> {
         // Runtime IDs allow `:` for namespacing, but that is not a portable path character.
         // Hashing also avoids case-folding collisions on default macOS and Windows filesystems.
@@ -802,8 +1194,16 @@ impl ManagedRuntimeArtifactStore {
     fn verify_installed(&self, artifact: &InstalledRuntimeArtifact) -> ExternalAgentResult<()> {
         validate_sha256(&artifact.sha256)?;
         ensure_beneath(&self.root, &artifact.executable)?;
-        let bytes = fs::read(&artifact.executable).map_err(store_io)?;
-        if hex_sha256(&bytes) != artifact.sha256 {
+        let metadata = fs::symlink_metadata(&artifact.executable).map_err(store_io)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() == 0
+            || metadata.len() > UPDATE_ARTIFACT_MAX_BYTES
+        {
+            return Err(update_error(
+                "installed runtime artifact has unexpected file metadata",
+            ));
+        }
+        if hash_file(&artifact.executable)? != artifact.sha256 {
             return Err(update_error(
                 "installed runtime artifact failed hash verification",
             ));
@@ -819,6 +1219,15 @@ fn verify_file(path: &Path, artifact: &RuntimeArtifact) -> ExternalAgentResult<(
             "staged runtime artifact has unexpected file metadata",
         ));
     }
+    if hash_file(path)? != artifact.sha256 {
+        return Err(update_error(
+            "staged runtime artifact failed hash verification",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> ExternalAgentResult<String> {
     let mut file = File::open(path).map_err(store_io)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -829,12 +1238,17 @@ fn verify_file(path: &Path, artifact: &RuntimeArtifact) -> ExternalAgentResult<(
         }
         hasher.update(&buffer[..read]);
     }
-    if lowercase_hex(&hasher.finalize()) != artifact.sha256 {
-        return Err(update_error(
-            "staged runtime artifact failed hash verification",
-        ));
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn read_state_file(path: &Path, label: &str) -> ExternalAgentResult<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(store_io)?;
+    if !metadata.file_type().is_file() || metadata.len() > UPDATE_STATE_MAX_BYTES {
+        return Err(update_error(format!(
+            "{label} is not a bounded regular file"
+        )));
     }
-    Ok(())
+    fs::read(path).map_err(store_io)
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> ExternalAgentResult<()> {
@@ -965,7 +1379,15 @@ fn store_io(error: std::io::Error) -> ExternalAgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn signing_key(seed: u8) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
+    }
+
+    fn public_key(key: &Ed25519KeyPair) -> [u8; 32] {
+        key.public_key().as_ref().try_into().unwrap()
+    }
 
     fn artifact(bytes: &[u8]) -> RuntimeArtifact {
         RuntimeArtifact {
@@ -999,13 +1421,12 @@ mod tests {
 
     #[test]
     fn signature_is_verified_before_manifest_is_accepted() {
-        let signing = SigningKey::from_bytes(&[7_u8; 32]);
+        let signing = signing_key(7);
         let bytes = serde_json::to_vec(&manifest(b"runtime")).unwrap();
         let signature = signing.sign(&bytes);
         let mut keys = TrustedManifestKeys::default();
-        keys.insert("stable-2026", signing.verifying_key().to_bytes())
-            .unwrap();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        keys.insert("stable-2026", public_key(&signing)).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
         assert!(verify_update_manifest(&bytes, &encoded, "stable-2026", &keys, 2_000).is_ok());
         let mut tampered = bytes;
         tampered.push(b' ');
@@ -1014,18 +1435,17 @@ mod tests {
 
     #[test]
     fn duplicate_key_ids_do_not_replace_the_trusted_key() {
-        let first = SigningKey::from_bytes(&[7_u8; 32]);
-        let replacement = SigningKey::from_bytes(&[8_u8; 32]);
+        let first = signing_key(7);
+        let replacement = signing_key(8);
         let mut keys = TrustedManifestKeys::default();
-        keys.insert("stable-2026", first.verifying_key().to_bytes())
-            .unwrap();
+        keys.insert("stable-2026", public_key(&first)).unwrap();
         assert!(keys
-            .insert("stable-2026", replacement.verifying_key().to_bytes())
+            .insert("stable-2026", public_key(&replacement))
             .is_err());
 
         let bytes = serde_json::to_vec(&manifest(b"runtime")).unwrap();
         let signature = first.sign(&bytes);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
         assert!(verify_update_manifest(&bytes, &encoded, "stable-2026", &keys, 2_000).is_ok());
     }
 
@@ -1086,6 +1506,34 @@ mod tests {
     }
 
     #[test]
+    fn update_source_rejects_downgrade_query_credentials_and_bad_keys() {
+        let valid_key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let source = RuntimeUpdateSource {
+            manifest_url: "http://updates.example.test/manifest.json".into(),
+            signature_url: "https://updates.example.test/manifest.sig".into(),
+            key_id: "stable-2026".into(),
+            public_key_base64: valid_key.clone(),
+        };
+        assert!(source.validate().is_err());
+
+        let source = RuntimeUpdateSource {
+            manifest_url: "https://updates.example.test/manifest.json?token=secret".into(),
+            signature_url: "https://updates.example.test/manifest.sig".into(),
+            key_id: "stable-2026".into(),
+            public_key_base64: valid_key,
+        };
+        assert!(source.validate().is_err());
+
+        let source = RuntimeUpdateSource {
+            manifest_url: "https://updates.example.test/manifest.json".into(),
+            signature_url: "https://updates.example.test/manifest.sig".into(),
+            key_id: "stable-2026".into(),
+            public_key_base64: "too-short".into(),
+        };
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
     fn managed_update_phase_transitions_fail_closed() {
         let mut state = RuntimeUpdateState::new(
             RuntimeInstanceId::new("gemini:managed").unwrap(),
@@ -1096,9 +1544,42 @@ mod tests {
         state.available_version = Some(Version::new(2, 0, 0));
         state.begin_download().unwrap();
         state.record_staged().unwrap();
+        state.begin_activation().unwrap();
         state.record_activated().unwrap();
         assert_eq!(state.phase, RuntimeUpdatePhase::Current);
         assert_eq!(state.current_version, Some(Version::new(2, 0, 0)));
+        assert_eq!(state.quarantined_version, None);
+    }
+
+    #[test]
+    fn failed_or_rolled_back_versions_are_quarantined() {
+        let mut state = RuntimeUpdateState::new(
+            RuntimeInstanceId::new("gemini:managed").unwrap(),
+            RuntimeProfile::Managed,
+        );
+        state.available_version = Some(Version::new(2, 0, 0));
+        state.quarantine_available();
+        assert_eq!(state.quarantined_version, Some(Version::new(2, 0, 0)));
+
+        state.record_rollback(Version::new(1, 5, 0), Some(Version::new(2, 1, 0)));
+        assert_eq!(state.current_version, Some(Version::new(1, 5, 0)));
+        assert_eq!(state.quarantined_version, Some(Version::new(2, 1, 0)));
+        assert_eq!(state.phase, RuntimeUpdatePhase::RolledBack);
+    }
+
+    #[test]
+    fn interrupted_activation_is_reconciled_only_for_the_exact_active_version() {
+        let mut state = RuntimeUpdateState::new(
+            RuntimeInstanceId::new("gemini:managed").unwrap(),
+            RuntimeProfile::Managed,
+        );
+        state.phase = RuntimeUpdatePhase::Staged;
+        state.available_version = Some(Version::new(2, 0, 0));
+        assert!(!state.recover_activated(&Version::new(1, 0, 0)).unwrap());
+        assert_eq!(state.phase, RuntimeUpdatePhase::Staged);
+        assert!(state.recover_activated(&Version::new(2, 0, 0)).unwrap());
+        assert_eq!(state.current_version, Some(Version::new(2, 0, 0)));
+        assert_eq!(state.phase, RuntimeUpdatePhase::Current);
     }
 
     #[test]
@@ -1154,5 +1635,33 @@ mod tests {
         store.write_update_state(&state).unwrap();
         assert_eq!(store.read_update_state(&instance).unwrap(), Some(state));
         assert!(!root.path().join("instances/gemini:personal").exists());
+    }
+
+    #[test]
+    fn update_configuration_round_trips_and_lock_is_exclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ManagedRuntimeArtifactStore::new(root.path().to_path_buf()).unwrap();
+        let instance = RuntimeInstanceId::new("gemini:managed").unwrap();
+        let config = RuntimeUpdateConfig {
+            schema_version: EXTERNAL_AGENT_CONTRACT_VERSION,
+            instance_id: instance.clone(),
+            kind: ExternalAgentKind::Gemini,
+            profile: RuntimeProfile::Managed,
+            policy: RuntimeUpdatePolicy::AikitManaged,
+            channel: RuntimeUpdateChannel::Stable,
+            source: RuntimeUpdateSource {
+                manifest_url: "https://updates.example.test/manifest.json".into(),
+                signature_url: "https://updates.example.test/manifest.sig".into(),
+                key_id: "stable-2026".into(),
+                public_key_base64: base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
+            },
+        };
+        store.write_update_config(&config).unwrap();
+        assert_eq!(store.read_update_config(&instance).unwrap(), Some(config));
+
+        let first = store.try_update_lock().unwrap();
+        assert!(store.try_update_lock().is_err());
+        drop(first);
+        assert!(store.try_update_lock().is_ok());
     }
 }

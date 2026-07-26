@@ -120,6 +120,21 @@ multi-turn history, secret-safe provider discovery, containment diagnostics, det
 gates, and shell completion generation. See the [CLI guide](crates/aikit-cli/README.md) for the
 full contract.
 
+It can also reuse vendor-owned Codex, Claude, Gemini, and Grok CLI sessions without copying OAuth
+tokens into AIKit. Those coding-agent runtimes remain separate from normal API-key providers:
+
+```bash
+cargo run -p aikit-cli -- agents discover
+cargo run -p aikit-cli -- agents status codex
+cargo run -p aikit-cli -- agents run claude "Review this repository"
+```
+
+Signed runtime sources can be configured as report-only, vendor-managed, or AIKit-managed. A
+managed `agents update sync` streams and verifies the artifact, health-checks it before activation,
+and preserves the previous version for rollback. See the
+[external-agent and update guide](docs/EXTERNAL-AGENTS.md) for trust setup, Gemini account terms,
+and scheduling behavior.
+
 ### Rust
 
 ```rust
