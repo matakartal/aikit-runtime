@@ -191,6 +191,33 @@ assertion does not configure or verify that boundary; a false assertion restores
 Postcondition URL checks are retained only as defense in depth. WebDriver responses and browser
 inputs are bounded, and protocol failure bodies are not reflected into tool errors.
 
+### External coding agents and signed updates
+
+Vendor CLI processes are trusted executables selected by the operator, but their protocol payloads
+and tool requests remain untrusted. AIKit launches a canonical regular executable without a shell,
+masks PAYG environment credentials, bounds JSON-RPC frames/queues/stderr, correlates permission and
+user-input responses to the exact session, cancels on overflow, and kills its process group on
+shutdown. It never reads or copies vendor OAuth files. Vendor-contained tool execution is not
+automatically equivalent to AIKit's normal schema/hook/permission/sandbox pipeline; the host must
+choose the vendor's workspace and approval mode accordingly.
+
+Gemini OAuth integration has an account-policy ambiguity between Google's documented ACP
+integration surface and its third-party OAuth warning. Launch therefore requires explicit terms
+acknowledgement. That acknowledgement records user intent; it is not legal advice, a policy waiver,
+or proof that Google permits a particular account/use case. API-key provider mode is the separate
+alternative.
+
+Runtime-update configuration treats the pinned public key as the trust root. Manifest/signature
+URLs require HTTPS and cannot persist query credentials; redirects are disabled. Manifest and
+signature responses, state files, RPC, and artifacts are bounded. Raw manifest bytes are signature
+verified before strict JSON parsing; the selected artifact's OS, architecture, protocol, contract,
+size, and SHA-256 are checked. Downloads stream into a temporary content-addressed directory,
+staged executables must initialize before atomic activation, and update state is serialized with an
+advisory cross-process lock. A failed or rolled-back version is quarantined. These controls do not
+make a malicious artifact safe after a trusted signing key signs it, replace code-signing/notarized
+release policy, protect a compromised update host that also controls the signing key, or prove
+cross-platform packaging. External Homebrew/npm/vendor paths are never overwritten.
+
 ### MCP servers
 
 MCP stdio and HTTP peers are untrusted protocol endpoints. Aikit caps one response/stdio line at

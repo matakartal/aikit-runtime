@@ -25,6 +25,7 @@ pub mod durable_worker;
 pub mod dx;
 pub mod error;
 pub mod eval;
+pub mod external_agent;
 pub mod governance;
 pub mod mcp;
 pub mod media_runtime;
@@ -105,6 +106,7 @@ pub use eval::{
     evaluate_outcome, EvalCase, EvalCaseReport, EvalCheck, EvalDataset, EvalGate, EvalReport,
     EvalVerdict, EVAL_SCHEMA_VERSION,
 };
+pub use external_agent::*;
 pub use governance::capability::{
     request_capability_tool, CapabilityBroker, CapabilityDecision, CapabilityGate,
     REQUEST_CAPABILITY_TOOL,

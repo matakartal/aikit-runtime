@@ -54,6 +54,7 @@ skip = [
     { crate = "hashbrown@<0.17", reason = "older line via transitive deps" },
     { crate = "io-lifetimes@<3", reason = "older line via transitive deps" },
     { crate = "fallible-iterator@0.2", reason = "postgres 0.19 requires 0.2 while rusqlite 0.39 requires 0.3" },
+    { crate = "convert_case@0.10", reason = "agent-client-protocol-schema 1.5 pins derive_more 2.1 to convert_case 0.10; remove when ACP aligns with the NAPI convert_case 0.11 line" },
 ]
 
 [sources]

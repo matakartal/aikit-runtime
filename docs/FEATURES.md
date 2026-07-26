@@ -12,6 +12,19 @@ one-shot runs, canonical multi-turn chat, secret-safe provider discovery, capabi
 workspace/containment diagnostics, deterministic eval datasets, and shell completion generation.
 `mock-1` is the offline default.
 
+The CLI also has a separate `agents` surface for reusing vendor-owned Codex, Gemini, Claude, and
+Grok CLI sessions without extracting credentials. Codex uses app-server; Gemini and Grok use ACP;
+Claude uses the exact official ACP bridge package pin (or an explicit exact bridge path). The shared
+Rust core owns bounded bidirectional RPC, approval correlation, session cancellation, normalized
+events, secret-safe discovery, and explicit Gemini vendor-terms acknowledgement.
+External installations are check-only by default. `aikit agents update configure|status|sync|rollback`
+is the host surface for persisted signed sources. A due `sync` applies only an explicitly
+`aikit-managed` policy: downloads are bounded and streamed, the detached signature is verified
+before JSON parsing, artifacts are content-addressed, staged binaries must initialize successfully,
+activation is atomic, crash-interrupted activation is recovered, and failed/rolled-back versions
+are quarantined. Normal agent commands prefer the active managed artifact. SDK import never starts
+a background updater; operators schedule `sync` when unattended checks are desired.
+
 Text is the human output; JSON is the single-document automation format; JSONL is the streaming
 chat format. Input errors and runtime errors use distinct stable exit codes. The CLI never prints
 credential values and does not silently choose a billable provider.
@@ -106,10 +119,13 @@ protected cancellation ingress. It still omits complete timestamp/history and ar
 coverage. The typed delta-journal/checkpoint contract is exposed but not yet wired into the
 transport hot path, which still uses bounded full-snapshot CAS. The pinned official TCK therefore
 keeps its raw six false negatives visible and uses a separate exact-set verification gate rather
-than claiming an unqualified pass. ACP remains mapping-only. The envelope
+than claiming an unqualified pass. The SDK-neutral ACP mapper remains separate from the real
+external-agent stdio runtime. The envelope
 operation `tasks/list` is an internal policy/audit key; transports must call the governed mapper and
 explicitly project official DTOs rather than serializing internal records or reading `tasks()`
-directly.
+directly. ACP is no longer mapping-only for vendor CLI sessions: the external-agent module has a
+real official-SDK stdio client for Gemini/Grok and pinned bridges, while the older protocol mapper
+remains the SDK-neutral DTO layer.
 
 The optional Firecracker lifecycle validates immutable kernel/rootfs/VMM/jailer inputs, constructs
 shell-free jailer arguments, checks trusted paths and Linux prerequisites, waits for the API socket,

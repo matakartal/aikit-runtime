@@ -6,6 +6,19 @@ use std::process::{Command, Stdio};
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+use aikit::{
+    ExternalAgentKind, ManagedRuntimeArtifactStore, RuntimeArtifact, RuntimeInstanceId,
+    RuntimeProfile, RuntimeUpdateChannel, RuntimeUpdateConfig, RuntimeUpdatePolicy,
+    RuntimeUpdateSelection, RuntimeUpdateSource, EXTERNAL_AGENT_CONTRACT_VERSION,
+};
+#[cfg(unix)]
+use semver::Version;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 
 fn aikit() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aikit"));
@@ -81,6 +94,197 @@ fn providers_never_print_secret_values() {
         .find(|entry| entry["provider"] == "xai")
         .unwrap();
     assert_eq!(xai["active"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_discovery_inspects_but_never_executes_explicit_binary() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("gemini");
+    let marker = directory.path().join("executed");
+    std::fs::write(
+        &executable,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = aikit()
+        .args([
+            "--format",
+            "json",
+            "agents",
+            "discover",
+            "gemini",
+            "--path",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let candidates: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let explicit = candidates
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["executable"] == executable.to_string_lossy().as_ref())
+        .expect("explicit Gemini candidate must be present");
+    assert_eq!(explicit["kind"], "gemini");
+    assert!(!marker.exists(), "discovery executed the candidate binary");
+}
+
+#[test]
+fn external_agent_run_rejects_single_json_document_mode_before_launch() {
+    let output = aikit()
+        .args(["--format", "json", "agents", "run", "codex", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("jsonl"));
+}
+
+#[test]
+fn gemini_cli_account_use_requires_explicit_terms_acknowledgement() {
+    let output = aikit()
+        .args(["agents", "status", "gemini"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("acknowledge-vendor-terms"));
+}
+
+#[test]
+fn signed_runtime_update_configuration_round_trips_without_network() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().to_str().unwrap();
+    let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let configured = aikit()
+        .args([
+            "--format",
+            "json",
+            "agents",
+            "update",
+            "configure",
+            "gemini",
+            "--root",
+            root,
+            "--manifest-url",
+            "https://updates.example.test/manifest.json",
+            "--signature-url",
+            "https://updates.example.test/manifest.sig",
+            "--key-id",
+            "stable-2026",
+            "--public-key-base64",
+            key,
+            "--policy",
+            "aikit-managed",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let configured: Value = serde_json::from_slice(&configured.stdout).unwrap();
+    assert_eq!(configured["outcome"], "configured");
+    assert_eq!(configured["config"]["policy"], "aikit_managed");
+    assert_eq!(configured["state"]["phase"], "idle");
+
+    let status = aikit()
+        .args([
+            "--format", "json", "agents", "update", "status", "gemini", "--root", root,
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["outcome"], "status");
+    assert_eq!(status["config"]["kind"], "gemini");
+}
+
+#[cfg(unix)]
+#[test]
+fn normal_agent_commands_prefer_the_active_managed_artifact() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("managed-runtime-executed");
+    let script = format!(
+        "#!/bin/sh\n\
+         touch '{}'\n\
+         IFS= read -r initialize\n\
+         id=$(printf '%s' \"$initialize\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+         printf '{{\"id\":%s,\"result\":{{\"serverInfo\":{{\"version\":\"9.9.9\"}}}}}}\\n' \"$id\"\n\
+         IFS= read -r initialized\n\
+         IFS= read -r account\n\
+         id=$(printf '%s' \"$account\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+         printf '{{\"id\":%s,\"result\":{{\"account\":{{\"authMode\":\"chatgpt\"}}}}}}\\n' \"$id\"\n",
+        marker.display()
+    );
+    let bytes = script.as_bytes();
+    let hash = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let instance = RuntimeInstanceId::default_for(ExternalAgentKind::Codex);
+    let store = ManagedRuntimeArtifactStore::new(root.path().to_path_buf()).unwrap();
+    let selection = RuntimeUpdateSelection {
+        kind: ExternalAgentKind::Codex,
+        version: Version::new(9, 9, 9),
+        channel: RuntimeUpdateChannel::Stable,
+        protocol: "codex-app-server".into(),
+        artifact: RuntimeArtifact {
+            target_os: std::env::consts::OS.into(),
+            target_arch: std::env::consts::ARCH.into(),
+            url: "https://updates.example.test/codex".into(),
+            sha256: hash,
+            size_bytes: bytes.len() as u64,
+            executable_name: "codex".into(),
+        },
+    };
+    let installed = store.stage_bytes(&selection, bytes).unwrap();
+    store.activate(&instance, installed, 1_000).unwrap();
+    store
+        .write_update_config(&RuntimeUpdateConfig {
+            schema_version: EXTERNAL_AGENT_CONTRACT_VERSION,
+            instance_id: instance,
+            kind: ExternalAgentKind::Codex,
+            profile: RuntimeProfile::Managed,
+            policy: RuntimeUpdatePolicy::AikitManaged,
+            channel: RuntimeUpdateChannel::Stable,
+            source: RuntimeUpdateSource {
+                manifest_url: "https://updates.example.test/manifest.json".into(),
+                signature_url: "https://updates.example.test/manifest.sig".into(),
+                key_id: "stable-2026".into(),
+                public_key_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            },
+        })
+        .unwrap();
+
+    let output = aikit()
+        .args([
+            "--format",
+            "json",
+            "agents",
+            "status",
+            "codex",
+            "--runtime-root",
+            root.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["profile"], "managed");
+    assert_eq!(status["version"], "9.9.9");
+    assert!(marker.exists());
 }
 
 #[test]

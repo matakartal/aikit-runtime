@@ -88,7 +88,8 @@ All notable changes to this project will be documented in this file. The format 
 - Governed MCP 2025-11-25 JSON-RPC server with real stdio and Streamable HTTP listeners, bounded
   SSE replay, Origin/auth/session/version/Host/Accept enforcement, SQLite CAS persistence,
   restart-safe request dedupe, durable Tasks, and schema-drift reapproval. A2A 1.0 now has a
-  bounded experimental Rust JSON-RPC/SSE listener; ACP v1 remains mapping-only.
+  bounded experimental Rust JSON-RPC/SSE listener. The SDK-neutral ACP DTO mapper remains, and a
+  separate external-agent runtime now provides real vendor CLI stdio transport.
 - Canonical A2A `ListTasks` with subject+tenant isolation before filters/counts/cursor pagination,
   bounded pages, stable ordering, snapshot recovery, and shared Rust/Python/Node mapper surfaces.
 - A2A artifact and direct-`Message` projection, durable SSE event replay, isolated protected
@@ -130,6 +131,16 @@ All notable changes to this project will be documented in this file. The format 
   xAI wire-contract regression test.
 - Source-first `aikit` CLI with one-shot runs, canonical multi-turn chat, provider/capability
   discovery, containment doctor, text/JSON/JSONL output, stable exit codes, and shell completions.
+- Vendor-owned Codex, Gemini, Claude, and Grok CLI sessions behind a distinct external-agent
+  contract: secret-safe executable discovery, Codex app-server, official ACP v1 transport,
+  correlated approvals/cancellation, an exact official Claude ACP bridge package pin with PAYG-key
+  masking, explicit Gemini terms acknowledgement, `aikit agents discover|status|login|logout|models|run`,
+  and no token extraction. Signed runtime-update `configure|status|sync|rollback` persists
+  TTL/backoff state, serializes concurrent operations, verifies detached Ed25519 signatures before
+  strict manifest parsing, streams bounded SHA-256 artifacts into a content-addressed store,
+  health-checks staged binaries, recovers interrupted activation, quarantines failed/rolled-back
+  versions, pins exact artifact hashes, atomically switches the active pointer, and retains the
+  previous artifact. External and vendor-managed installations are never mutated implicitly.
 - CI security gates: cargo-deny (RustSec advisories, license policy, duplicate/wildcard bans, and
   registry-source pinning via `deny.toml`), an independent cargo-audit run, a full-history Gitleaks
   committed-secret scan, deterministic SBOM/provenance checks, and repository-level CodeQL default
@@ -172,6 +183,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Allow the bounded Windows Job capability probe up to two minutes for the cold PowerShell 5.1
+  `Add-Type` compilation seen on fresh hosted runners; the probed child and launcher cleanup remain
+  independently limited to five seconds.
 - A2A host dispatches use exact dispatch/attempt fences, restart and read paths verify the
   linearizable durable head before serving, and cancellation/single-flight cleanup remains
   restart-safe across aborted owners and competing processes.
