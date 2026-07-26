@@ -103,17 +103,18 @@ identity, registry ownership, or another operating system.
 
 | Workflow | Result | Evidence |
 |---|---|---|
-| A2A conformance | Passed | [run 30200504622](https://github.com/matakartal/aikit-runtime/actions/runs/30200504622) |
-| Chaos | Passed | [run 30200504623](https://github.com/matakartal/aikit-runtime/actions/runs/30200504623) |
-| Security | Passed | [run 30200504636](https://github.com/matakartal/aikit-runtime/actions/runs/30200504636) |
-| CodeQL main push | Passed | [run 30200504452](https://github.com/matakartal/aikit-runtime/actions/runs/30200504452) |
-| General CI | Passed | [run 30200504624](https://github.com/matakartal/aikit-runtime/actions/runs/30200504624) |
+| A2A conformance | Passed | [run 30202557089](https://github.com/matakartal/aikit-runtime/actions/runs/30202557089) |
+| Chaos | Passed | [run 30202557088](https://github.com/matakartal/aikit-runtime/actions/runs/30202557088) |
+| Security | Passed | [run 30202557113](https://github.com/matakartal/aikit-runtime/actions/runs/30202557113) |
+| CodeQL main push | Passed | [run 30202556954](https://github.com/matakartal/aikit-runtime/actions/runs/30202556954) |
+| General CI | Passed | [run 30202557096](https://github.com/matakartal/aikit-runtime/actions/runs/30202557096) |
+| OpenSSF Scorecard | Passed | [run 30202667158](https://github.com/matakartal/aikit-runtime/actions/runs/30202667158) |
 
-These runs passed for commit `8d80ffaf076e0fe2b585c5bb63ff1692283d6a42` and include the
-external-agent/update change described above. They do not prove later GitHub-hardening changes
-until those changes receive their own PR and post-merge results. The Python and Node A2A mapper
-scenarios assert snapshot schema version `4`, and their public type contracts cover the durable
-outbox and pending-event fields.
+These historical runs passed for code-bearing commit
+`d4d463c76d240abb9cdbf5859e482b6b789f5ba3` and include the external-agent/update and GitHub
+hardening changes described above. They are not evidence for later code changes; use the repository
+Actions page for the current head. The Python and Node A2A mapper scenarios assert snapshot schema
+version `4`, and their public type contracts cover the durable outbox and pending-event fields.
 
 ## Not yet v1-complete
 
