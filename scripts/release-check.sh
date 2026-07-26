@@ -376,6 +376,9 @@ if [ -f requirements/maturin.txt ] \
   && grep -Fq -- '--require-hashes -r requirements/maturin.txt' .github/workflows/ci.yml \
   && grep -Fq -- '--require-hashes -r requirements/maturin.txt' .github/workflows/release.yml \
   && grep -Fq 'npm ci --prefix .github/node-test-deps --ignore-scripts' .github/workflows/ci.yml \
+  && grep -Fq '"typescript": "5.9.3"' .github/node-test-deps/package.json \
+  && grep -Fq './.github/node-test-deps/node_modules/.bin/tsc' .github/workflows/ci.yml \
+  && ! grep -Fq 'npx --yes --package typescript@' .github/workflows/ci.yml \
   && grep -Fq '"integrity": "sha512-' .github/node-test-deps/package-lock.json; then
   pass "CI registry dependencies are version- and integrity-locked"
 else

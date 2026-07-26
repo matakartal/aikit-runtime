@@ -149,12 +149,12 @@ jobs:
           node crates/aikit-node/tests/production-state.cjs
           node crates/aikit-node/tests/multimodal-messages.cjs
           node crates/aikit-node/tests/a2a-mapper.cjs
-          npx --yes --package typescript@5.9.3 tsc --noEmit --strict --target ES2020 \
+          ./.github/node-test-deps/node_modules/.bin/tsc --noEmit --strict --target ES2020 \
             --module commonjs --moduleResolution node crates/aikit-node/tests/typing.ts
       - name: Canonical three-language parity
         env:
           PYTHON: .venv/bin/python
-          NODE_PATH: ${{ runner.temp }}/aikit-node-test-deps/node_modules
+          NODE_PATH: ${{ github.workspace }}/.github/node-test-deps/node_modules
         run: ./scripts/parity-check.sh
 
   node-native:
