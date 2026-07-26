@@ -103,16 +103,17 @@ identity, registry ownership, or another operating system.
 
 | Workflow | Result | Evidence |
 |---|---|---|
-| A2A conformance | Passed | [run 30060414399](https://github.com/matakartal/aikit-runtime/actions/runs/30060414399) |
-| Chaos | Passed | [run 30060414351](https://github.com/matakartal/aikit-runtime/actions/runs/30060414351) |
-| Security | Passed | [run 30060414388](https://github.com/matakartal/aikit-runtime/actions/runs/30060414388) |
-| CodeQL main push | Passed | [run 30060414054](https://github.com/matakartal/aikit-runtime/actions/runs/30060414054) |
-| General CI | Passed | [run 30060414507](https://github.com/matakartal/aikit-runtime/actions/runs/30060414507) |
+| A2A conformance | Passed | [run 30200504622](https://github.com/matakartal/aikit-runtime/actions/runs/30200504622) |
+| Chaos | Passed | [run 30200504623](https://github.com/matakartal/aikit-runtime/actions/runs/30200504623) |
+| Security | Passed | [run 30200504636](https://github.com/matakartal/aikit-runtime/actions/runs/30200504636) |
+| CodeQL main push | Passed | [run 30200504452](https://github.com/matakartal/aikit-runtime/actions/runs/30200504452) |
+| General CI | Passed | [run 30200504624](https://github.com/matakartal/aikit-runtime/actions/runs/30200504624) |
 
-These historical runs passed for commit `ac023c6837d3f235b98f60b51969aa74ebd4a0a3`; they are not
-evidence for the external-agent/update change described above. The current change requires its own
-PR and post-merge workflow results. The Python and Node A2A mapper scenarios assert snapshot schema
-version `4`, and their public type contracts cover the durable outbox and pending-event fields.
+These runs passed for commit `8d80ffaf076e0fe2b585c5bb63ff1692283d6a42` and include the
+external-agent/update change described above. They do not prove later GitHub-hardening changes
+until those changes receive their own PR and post-merge results. The Python and Node A2A mapper
+scenarios assert snapshot schema version `4`, and their public type contracts cover the durable
+outbox and pending-event fields.
 
 ## Not yet v1-complete
 

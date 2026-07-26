@@ -109,7 +109,9 @@ See [`docs/README.md`](docs/README.md) for the full documentation map.
 
 ## Pull requests
 
-Use the repository PR template. Keep commits reviewable and explain:
+`main` is protected. Use the repository PR template and wait for every required check before
+merging. Review conversations must be resolved, and accepted pull requests are squash-merged to
+keep one auditable commit per change. Keep commits reviewable and explain:
 
 - the user-visible outcome;
 - the safety/fidelity boundary affected;

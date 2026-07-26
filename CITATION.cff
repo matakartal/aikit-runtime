@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use AIKit Runtime, please cite this software."
+type: software
+title: "AIKit Runtime"
+abstract: >-
+  A governed, provider-aware AI agent runtime with one Rust core and native
+  Rust, Python, and TypeScript interfaces.
+authors:
+  - family-names: "Kartal"
+    given-names: "Mehmet Ata"
+    alias: "matakartal"
+version: "0.3.0-alpha.1"
+license:
+  - "Apache-2.0"
+  - "MIT"
+repository-code: "https://github.com/matakartal/aikit-runtime"
+url: "https://github.com/matakartal/aikit-runtime"
