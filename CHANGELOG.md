@@ -183,6 +183,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Allow the bounded Windows Job capability probe up to two minutes for the cold PowerShell 5.1
+  `Add-Type` compilation seen on fresh hosted runners; the probed child and launcher cleanup remain
+  independently limited to five seconds.
 - A2A host dispatches use exact dispatch/attempt fences, restart and read paths verify the
   linearizable durable head before serving, and cancellation/single-flight cleanup remains
   restart-safe across aborted owners and competing processes.

@@ -9,7 +9,7 @@ use std::path::Path;
 // control-plane startup gets its own realistic outer budget; once native Run starts, the probe's
 // child remains independently bounded to five seconds and cleanup remains bounded in the launcher.
 #[cfg(any(target_os = "windows", test))]
-const WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_JOB_PROBE_CHILD_WAIT_MS: u32 = 5_000;
 
@@ -552,7 +552,7 @@ mod tests {
     fn probe_separates_cold_compiler_child_and_cleanup_budgets() {
         assert_eq!(
             WINDOWS_JOB_PROBE_LAUNCHER_TIMEOUT,
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_secs(120)
         );
         assert_eq!(WINDOWS_JOB_PROBE_CHILD_WAIT_MS, 5_000);
         assert!(
@@ -669,7 +669,7 @@ mod tests {
     async fn native_job_probe_compiles_launcher_in_private_temp_and_completes() {
         let workspace = tempfile::tempdir().unwrap();
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(70),
+            std::time::Duration::from_secs(130),
             capability(Some(workspace.path())),
         )
         .await
