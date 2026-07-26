@@ -112,7 +112,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --disable-pip-version-check \
-            "maturin==1.14.1" "mypy==1.19.1" "pydantic==2.13.4"
+            --require-hashes -r requirements/ci-tools.txt
           .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml --locked
       - name: Python FFI and governed-agent scenarios
         run: |
@@ -132,12 +132,10 @@ jobs:
       - name: Build Node binding
         run: ./scripts/build-node.sh
       - name: Install pinned Node runtime-test dependency
-        run: >-
-          npm install --prefix "$RUNNER_TEMP/aikit-node-test-deps"
-          --no-save --package-lock=false --ignore-scripts zod@4.1.12
+        run: npm ci --prefix .github/node-test-deps --ignore-scripts
       - name: Node governed-agent and conformance scenarios
         env:
-          NODE_PATH: ${{ runner.temp }}/aikit-node-test-deps/node_modules
+          NODE_PATH: ${{ github.workspace }}/.github/node-test-deps/node_modules
         run: |
           node -e "const { z } = require('zod'); if (typeof z.toJSONSchema !== 'function') throw new Error('pinned Zod v4 did not load')"
           node examples/node/agent_governance.cjs
@@ -253,7 +251,8 @@ jobs:
           grep -Fxq src/lib.rs /tmp/aikit-package-files.txt
       - name: Python wheel
         run: |
-          python -m pip install --disable-pip-version-check "maturin==1.14.1"
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r requirements/maturin.txt
           maturin build --manifest-path crates/aikit-py/Cargo.toml --release --locked --out dist/python
           wheel="$(find dist/python -name '*.whl' -print -quit)"
           test -n "$wheel"

@@ -164,7 +164,7 @@ Build the native binding once, then use the same core from Python:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "maturin==1.14.1"
+.venv/bin/pip install --require-hashes -r requirements/maturin.txt
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ```
 
