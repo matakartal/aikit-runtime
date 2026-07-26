@@ -35,7 +35,7 @@ To build and verify the language bindings:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "maturin==1.14.1"
+.venv/bin/pip install --require-hashes -r requirements/maturin.txt
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
 ./scripts/build-node.sh
 ./scripts/parity-check.sh
@@ -47,6 +47,22 @@ Optional end-to-end release-candidate invariants (still keyless):
 ```bash
 ./scripts/release-check.sh --candidate
 ```
+
+### CI dependency locks
+
+CI-installed Python and Node tools are integrity-locked. Update the small input files first, then
+regenerate and review the lockfile diff:
+
+```bash
+uv pip compile requirements/maturin.in --generate-hashes --universal \
+  --python-version 3.9 --output-file requirements/maturin.txt
+uv pip compile requirements/ci-tools.in --generate-hashes --universal \
+  --python-version 3.11 --output-file requirements/ci-tools.txt
+npm install --package-lock-only --ignore-scripts --prefix .github/node-test-deps
+```
+
+Do not hand-edit integrity hashes. Dependabot may propose version changes, but the generated locks
+must still be reviewed and the corresponding CI jobs must pass.
 
 Protocol changes should also run the relevant external-shaped gate. For A2A, start the local
 fixture in one terminal and run the pinned official suite from another:

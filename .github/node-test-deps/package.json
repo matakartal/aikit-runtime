@@ -1,0 +1,9 @@
+{
+  "name": "aikit-ci-node-test-deps",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "typescript": "5.9.3",
+    "zod": "4.1.12"
+  }
+}

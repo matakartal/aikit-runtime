@@ -369,6 +369,22 @@ else
   fail "$workflow_pin_output"
 fi
 
+if [ -f requirements/maturin.txt ] \
+  && [ -f requirements/ci-tools.txt ] \
+  && [ -f .github/node-test-deps/package-lock.json ] \
+  && grep -Fq -- '--require-hashes -r requirements/ci-tools.txt' .github/workflows/ci.yml \
+  && grep -Fq -- '--require-hashes -r requirements/maturin.txt' .github/workflows/ci.yml \
+  && grep -Fq -- '--require-hashes -r requirements/maturin.txt' .github/workflows/release.yml \
+  && grep -Fq 'npm ci --prefix .github/node-test-deps --ignore-scripts' .github/workflows/ci.yml \
+  && grep -Fq '"typescript": "5.9.3"' .github/node-test-deps/package.json \
+  && grep -Fq './.github/node-test-deps/node_modules/.bin/tsc' .github/workflows/ci.yml \
+  && ! grep -Fq 'npx --yes --package typescript@' .github/workflows/ci.yml \
+  && grep -Fq '"integrity": "sha512-' .github/node-test-deps/package-lock.json; then
+  pass "CI registry dependencies are version- and integrity-locked"
+else
+  fail "CI registry dependencies lack a reviewed hash lock or locked install path"
+fi
+
 for architecture in x86_64 aarch64; do
   if grep -Eq "manylinux_2_28_${architecture}@sha256:[0-9a-f]{64}" .github/workflows/release.yml; then
     pass "manylinux_2_28 ${architecture} image is digest-pinned"
