@@ -11,6 +11,12 @@ updates:
     labels: [dependencies, rust]
     commit-message:
       prefix: "deps(rust)"
+    ignore:
+      # base64 0.23+ duplicates the dependency tree while reqwest, hyper-util, and
+      # wiremock still pin 0.22, tripping the cargo-deny multiple-versions ban.
+      # Patch updates stay enabled; revisit once the ecosystem moves to 0.23.
+      - dependency-name: base64
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: pip
     directory: /crates/aikit-py
