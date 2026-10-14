@@ -1,6 +1,6 @@
 # A2A conformance
 
-**Evidence snapshot:** 2026-07-24
+**Evidence snapshot:** 2026-08-05
 
 AIKit includes a credentials-free localhost fixture for the official A2A Technology
 Compatibility Kit (TCK). The fixture advertises only the implemented A2A 1.0 `JSONRPC`
@@ -43,9 +43,11 @@ state, real authentication, authorization policy, and their own task executor.
 ## Current proof boundary
 
 This fixture is not a full A2A implementation and the verified-waiver result is not an
-unqualified official conformance claim. The 2026-07-24 raw JSON-RPC MUST run completed with 63
-pytest cases passing, 6 failing, 166 skipped, and 30 deselected. The raw JUnit/HTML/compatibility
-reports remain the authoritative upstream result.
+unqualified official conformance claim. The 2026-08-05 raw JSON-RPC MUST run — including the
+persisted status timestamps, `statusTimestampAfter` filtering, receipt-projected `historyLength`
+history, and durable `TaskArtifactUpdateEvent` frames — retained exactly the six pinned upstream
+false negatives, and the direct plus isolated verification gates passed. The raw
+JUnit/HTML/compatibility reports remain the authoritative upstream result.
 
 The six failures have two verified false-negative patterns that must not be hidden by weakening
 the runtime. Five requirements reuse one `messageId` for different message contents in the same
@@ -54,7 +56,9 @@ fresh TCK process. `CORE-SEND-003` sends an unsupported media type but does not 
 error to the generic runner, so the correct `ContentTypeNotSupportedError` is recorded as a
 failure. Keep the upstream commit and raw reports visible when evaluating future runs.
 
-The dedicated remote workflow passed for this source snapshot: [GitHub Actions run
-30060414399](https://github.com/matakartal/aikit-runtime/actions/runs/30060414399). The repository's
-[general CI workflow](https://github.com/matakartal/aikit-runtime/actions/runs/30060414507) also
-passed for the same commit.
+The 2026-08-05 result above is a local verified-waiver run against the pinned TCK commit; the
+last recorded remote runs are [GitHub Actions run
+30060414399](https://github.com/matakartal/aikit-runtime/actions/runs/30060414399) and the
+[general CI workflow](https://github.com/matakartal/aikit-runtime/actions/runs/30060414507) for an
+earlier commit that predates the timestamp/history/artifact-update work. Use the repository
+Actions page for the current head.

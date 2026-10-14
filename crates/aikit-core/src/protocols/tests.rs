@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::{json, Value};
 
+/// Deterministic wall-clock instant injected wherever a mutation records a status timestamp.
+const TEST_STATUS_TS: u64 = 1_754_000_000_000;
+
 fn correlation(request_id: &str) -> CorrelationIdentity {
     CorrelationIdentity::new(format!("corr-{request_id}"), request_id).unwrap()
 }
@@ -180,6 +183,301 @@ fn mcp_approval_resume_preserves_task_and_correlation_identity() {
 }
 
 #[test]
+fn a2a_v4_snapshot_restores_without_status_timestamps_and_upgrades_schema() {
+    // A v4 snapshot predates status timestamps. Restore must keep the absent instants absent —
+    // never invent one — while upgrading the schema version on the next write.
+    let mut source = A2aMapper::new();
+    let actor = principal(&["a2a:message:send", "a2a:tasks:read"]);
+    let action = source.prepare_send_message(
+        a2a_text_message("v4-message", Some("context-v4"), None),
+        correlation("v4-send"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
+    assert!(action.is_authorized());
+    let mut snapshot = serde_json::to_value(&source).unwrap();
+    snapshot["schema_version"] = json!(4);
+    let tasks = snapshot["tasks"].as_object_mut().unwrap();
+    for (_, task) in tasks.iter_mut() {
+        task.as_object_mut()
+            .unwrap()
+            .remove("status_timestamp_unix_ms");
+    }
+    // The v4 pending event embedded the same timestampless task snapshot, and its payload hash
+    // was computed over exactly that shape.
+    if let Some(events) = snapshot["pending_events"].as_object_mut() {
+        for (_, event) in events.iter_mut() {
+            event["task"]
+                .as_object_mut()
+                .unwrap()
+                .remove("status_timestamp_unix_ms");
+            let recomputed = crate::durability::stable_input_hash(&json!({
+                "kind": event["kind"],
+                "task": event["task"],
+            }));
+            event["payload_hash"] = json!(recomputed);
+        }
+    }
+    let restored: A2aMapper = serde_json::from_value(snapshot).unwrap();
+    assert_eq!(restored.schema_version(), A2A_MAPPER_SCHEMA_VERSION);
+    let task = restored.tasks().values().next().unwrap();
+    assert_eq!(task.status_timestamp_unix_ms, None);
+
+    // Absent timestamps honestly never match an inclusive lower-bound filter.
+    let filtered = restored.clone().prepare_list_tasks(
+        A2aListTasksRequest {
+            status_timestamp_after_unix_ms: Some(0),
+            ..A2aListTasksRequest::default()
+        },
+        correlation("v4-list"),
+        Some(&actor),
+    );
+    match filtered.action().unwrap() {
+        A2aAction::ListTasks { page } => {
+            assert_eq!(page.total_size, 0);
+            assert!(page.tasks.is_empty());
+        }
+        other => panic!("unexpected action: {other:?}"),
+    }
+}
+
+#[test]
+fn a2a_status_timestamps_follow_each_injected_mutation_instant() {
+    let mut mapper = A2aMapper::new();
+    let actor = principal(&["a2a:message:send", "a2a:tasks:read"]);
+    let action = mapper.prepare_send_message(
+        a2a_text_message("ts-message", Some("context-ts"), None),
+        correlation("ts-send"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
+    let task_id = match action.action().unwrap() {
+        A2aAction::DispatchMessage { mapping, .. } => mapping.task_id.clone(),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    assert_eq!(
+        mapper.tasks()[&task_id].status_timestamp_unix_ms,
+        Some(TEST_STATUS_TS)
+    );
+
+    // A later transition persists its own distinct instant.
+    let dispatch_id = mapper
+        .dispatch_for_message("ts-message", &actor)
+        .unwrap()
+        .dispatch_id
+        .clone();
+    mapper.mark_dispatch_running(&dispatch_id).unwrap();
+    mapper
+        .transition_dispatch_task(
+            &dispatch_id,
+            1,
+            A2aTaskState::InputRequired,
+            Some("need input".into()),
+            TEST_STATUS_TS + 1_500,
+        )
+        .unwrap();
+    assert_eq!(
+        mapper.tasks()[&task_id].status_timestamp_unix_ms,
+        Some(TEST_STATUS_TS + 1_500)
+    );
+
+    // The inclusive filter keeps the task at its exact persisted instant and drops it beyond.
+    for (after, expected) in [(TEST_STATUS_TS + 1_500, 1), (TEST_STATUS_TS + 1_501, 0)] {
+        let listed = mapper.clone().prepare_list_tasks(
+            A2aListTasksRequest {
+                status_timestamp_after_unix_ms: Some(after),
+                ..A2aListTasksRequest::default()
+            },
+            correlation("ts-list"),
+            Some(&actor),
+        );
+        match listed.action().unwrap() {
+            A2aAction::ListTasks { page } => {
+                assert_eq!(page.total_size, expected, "filter at {after}");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a2a_journal_diff_and_replay_reconstruct_every_mutation_exactly() {
+    // Drive a realistic mutation sequence and, after every step, derive the journal delta and
+    // replay it onto a shadow mapper. The shadow must stay byte-identical to the live mapper, so
+    // the diff projection and the fail-closed replay are exact inverses on real state shapes.
+    let actor = principal(&["a2a:message:send", "a2a:tasks:read", "a2a:tasks:cancel"]);
+    let mut live = A2aMapper::new();
+    let mut shadow = A2aMapper::new();
+    let mut token = A2aJournalToken::genesis();
+
+    let replicate = |live: &A2aMapper,
+                     previous: &A2aMapper,
+                     shadow: &mut A2aMapper,
+                     token: &mut A2aJournalToken,
+                     step: &str| {
+        let operations = live.journal_operations_since(previous).unwrap();
+        assert!(!operations.is_empty(), "step {step} produced no operations");
+        let delta = A2aMapperDelta::new(
+            format!("mutation-{step}"),
+            token.clone(),
+            live.revision(),
+            operations,
+        )
+        .unwrap();
+        *shadow = shadow.apply_journal_delta(&delta).unwrap();
+        *token = delta.token().unwrap();
+        assert_eq!(shadow, live, "shadow diverged after step {step}");
+        assert_eq!(
+            serde_json::to_vec(shadow).unwrap(),
+            serde_json::to_vec(live).unwrap(),
+            "serialized shadow diverged after step {step}"
+        );
+    };
+
+    // Step 1: accept a new message (creates context, task, receipt, dispatch, pending event).
+    let mut previous = live.clone();
+    let action = live.prepare_send_message(
+        a2a_text_message("journal-first", Some("context-journal"), None),
+        correlation("journal-send"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
+    let (task_id, dispatch_id) = match action.action().unwrap() {
+        A2aAction::DispatchMessage { mapping, .. } => (
+            mapping.task_id.clone(),
+            live.dispatch_for_message("journal-first", &actor)
+                .unwrap()
+                .dispatch_id
+                .clone(),
+        ),
+        other => panic!("unexpected action: {other:?}"),
+    };
+    replicate(&live, &previous, &mut shadow, &mut token, "send");
+
+    // Step 2: claim the dispatch for the host attempt.
+    previous = live.clone();
+    live.mark_dispatch_running(&dispatch_id).unwrap();
+    replicate(&live, &previous, &mut shadow, &mut token, "running");
+
+    // Step 3: park the task at input-required through the attempt fence.
+    previous = live.clone();
+    live.transition_dispatch_task(
+        &dispatch_id,
+        1,
+        A2aTaskState::InputRequired,
+        Some("need input".into()),
+        TEST_STATUS_TS + 1_000,
+    )
+    .unwrap();
+    replicate(&live, &previous, &mut shadow, &mut token, "input-required");
+
+    // Settle the delivered events exactly like transport publication would, so the mapper
+    // accepts the follow-up message. Settlement itself is one more replicated journal step.
+    previous = live.clone();
+    let pending_ids: Vec<String> = live
+        .pending_events()
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect();
+    for event_id in &pending_ids {
+        live.mark_event_settled(event_id).unwrap();
+    }
+    replicate(&live, &previous, &mut shadow, &mut token, "settle");
+
+    // Step 4: resume the same task with a follow-up message.
+    previous = live.clone();
+    let resume = live.prepare_send_message(
+        a2a_text_message("journal-second", Some("context-journal"), Some(&task_id)),
+        correlation("journal-resume"),
+        Some(&actor),
+        TEST_STATUS_TS + 2_000,
+    );
+    assert!(
+        resume.is_authorized(),
+        "resume denied: {:?}",
+        resume.envelope.authorization
+    );
+    let second_dispatch = live
+        .dispatch_for_message("journal-second", &actor)
+        .unwrap()
+        .dispatch_id
+        .clone();
+    replicate(&live, &previous, &mut shadow, &mut token, "resume");
+
+    // Step 5: complete the second attempt with durable artifacts (settles dispatch, creates
+    // artifact + terminal pending events).
+    previous = live.clone();
+    live.mark_dispatch_running(&second_dispatch).unwrap();
+    replicate(&live, &previous, &mut shadow, &mut token, "running-2");
+    previous = live.clone();
+    live.complete_dispatch_with_artifacts(
+        &second_dispatch,
+        1,
+        vec![A2aArtifact {
+            artifact_id: "journal-artifact".into(),
+            name: Some("journal".into()),
+            description: None,
+            parts: vec![A2aContentPart::Text {
+                text: "journal artifact body".into(),
+                media_type: None,
+            }],
+            metadata: Default::default(),
+        }],
+        TEST_STATUS_TS + 3_000,
+    )
+    .unwrap();
+    replicate(&live, &previous, &mut shadow, &mut token, "complete");
+
+    // The replayed terminal state is a full mapper: settled dispatches, artifact events, and the
+    // persisted status timestamp all round-tripped through typed journal deltas.
+    let replayed_task = shadow.tasks().get(&task_id).unwrap();
+    assert_eq!(replayed_task.state, A2aTaskState::Completed);
+    assert_eq!(
+        replayed_task.status_timestamp_unix_ms,
+        Some(TEST_STATUS_TS + 3_000)
+    );
+    assert_eq!(shadow.artifacts_for_task(&task_id).len(), 1);
+    assert_eq!(shadow.history_for_task(&task_id).len(), 2);
+}
+
+#[test]
+fn a2a_journal_replay_rejects_a_tampered_delta() {
+    // A delta whose operations violate a mapper invariant must fail closed on replay instead of
+    // installing a corrupt state.
+    let actor = principal(&["a2a:message:send"]);
+    let mut live = A2aMapper::new();
+    let base = live.clone();
+    let action = live.prepare_send_message(
+        a2a_text_message("journal-tamper", Some("context-tamper"), None),
+        correlation("journal-tamper"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
+    assert!(action.is_authorized());
+    let mut operations = live.journal_operations_since(&base).unwrap();
+    // Tamper: drop every receipt operation so the dispatch loses its acceptance receipt.
+    operations.retain(|operation| {
+        !matches!(
+            operation,
+            crate::protocols::A2aMapperOperation::PutReceipt { .. }
+        )
+    });
+    let delta = A2aMapperDelta::new(
+        "mutation-tampered",
+        A2aJournalToken::genesis(),
+        live.revision(),
+        operations,
+    )
+    .unwrap();
+    let error = base.apply_journal_delta(&delta).unwrap_err();
+    assert!(
+        error.message.contains("invalid mapper snapshot"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[test]
 fn a2a_duplicate_message_is_idempotent() {
     let mut mapper = A2aMapper::new();
     let actor = principal(&["a2a:message:send"]);
@@ -194,15 +492,24 @@ fn a2a_duplicate_message_is_idempotent() {
         metadata: Default::default(),
     };
 
-    let first =
-        mapper.prepare_send_message(message.clone(), correlation("a2a-first"), Some(&actor));
+    let first = mapper.prepare_send_message(
+        message.clone(),
+        correlation("a2a-first"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
     assert!(matches!(
         first.action(),
         Some(A2aAction::DispatchMessage { .. })
     ));
     let revision = mapper.revision();
 
-    let duplicate = mapper.prepare_send_message(message, correlation("a2a-retry"), Some(&actor));
+    let duplicate = mapper.prepare_send_message(
+        message,
+        correlation("a2a-retry"),
+        Some(&actor),
+        TEST_STATUS_TS,
+    );
     assert!(matches!(
         duplicate.action(),
         Some(A2aAction::DuplicateMessage { .. })
@@ -233,11 +540,13 @@ fn a2a_common_ingress_rejects_invalid_identity_and_unknown_part_fields() {
             a2a_text_message("invalid-principal-message", None, None),
             correlation("invalid-principal"),
             Some(&invalid_principal),
+            TEST_STATUS_TS,
         ),
         mapper.prepare_send_message(
             a2a_text_message("invalid-correlation-message", None, None),
             invalid_correlation,
             Some(&actor),
+            TEST_STATUS_TS,
         ),
     ] {
         assert!(matches!(
@@ -274,6 +583,7 @@ fn a2a_foreign_and_unknown_tasks_are_indistinguishable_and_do_not_leak_runtime_i
         a2a_text_message("private-message", Some("private-context"), None),
         correlation("private-create"),
         Some(&owner),
+        TEST_STATUS_TS,
     );
     let mapping = match created.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -305,11 +615,13 @@ fn a2a_foreign_and_unknown_tasks_are_indistinguishable_and_do_not_leak_runtime_i
         a2a_text_message("foreign-resume-message", None, Some(&mapping.task_id)),
         correlation("foreign-resume"),
         Some(&foreign),
+        TEST_STATUS_TS,
     ));
     let unknown_resume = assert_a2a_not_found(mapper.prepare_send_message(
         a2a_text_message("unknown-resume-message", None, Some(unknown_task_id)),
         correlation("unknown-resume"),
         Some(&foreign),
+        TEST_STATUS_TS,
     ));
 
     for reason in [
@@ -354,6 +666,7 @@ fn a2a_list_tasks_is_governed_scoped_filtered_and_cursor_paginated() {
             },
             correlation(message_id),
             Some(actor),
+            TEST_STATUS_TS,
         );
         assert!(created.is_authorized());
         if actor.tenant_id.as_deref() == Some("tenant-a") {
@@ -380,6 +693,7 @@ fn a2a_list_tasks_is_governed_scoped_filtered_and_cursor_paginated() {
             oldest_attempt,
             A2aTaskState::Completed,
             Some("done".into()),
+            TEST_STATUS_TS,
         )
         .unwrap();
 
@@ -535,6 +849,7 @@ fn a2a_list_tasks_is_governed_scoped_filtered_and_cursor_paginated() {
             changed_attempt,
             A2aTaskState::Completed,
             Some("completed after page one".into()),
+            TEST_STATUS_TS,
         )
         .unwrap();
     let stale_cursor = mapper.prepare_list_tasks(
@@ -568,6 +883,7 @@ fn a2a_list_tasks_cursor_ignores_unrelated_tenant_mutations() {
             a2a_text_message(message_id, Some("cursor-context-a"), None),
             correlation(message_id),
             Some(&owner_a),
+            TEST_STATUS_TS,
         );
         assert!(created.is_authorized());
     }
@@ -589,6 +905,7 @@ fn a2a_list_tasks_cursor_ignores_unrelated_tenant_mutations() {
         a2a_text_message("cursor-b-1", Some("cursor-context-b"), None),
         correlation("cursor-b-create"),
         Some(&owner_b),
+        TEST_STATUS_TS,
     );
     assert!(unrelated.is_authorized());
 
@@ -631,6 +948,7 @@ fn a2a_list_tasks_rejects_cross_identity_tenant_and_cursor_inputs() {
         },
         correlation("private-create"),
         Some(&owner),
+        TEST_STATUS_TS,
     );
     assert!(created.is_authorized());
 
@@ -715,6 +1033,7 @@ fn a2a_context_task_run_mapping_and_input_resume_are_stable() {
         },
         correlation("a2a-initial"),
         Some(&actor),
+        TEST_STATUS_TS,
     );
     let mapping = match first.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -745,6 +1064,7 @@ fn a2a_context_task_run_mapping_and_input_resume_are_stable() {
             initial_attempt,
             A2aTaskState::InputRequired,
             Some("destination required".into()),
+            TEST_STATUS_TS,
         )
         .unwrap();
     for event in mapper.pending_events() {
@@ -763,6 +1083,7 @@ fn a2a_context_task_run_mapping_and_input_resume_are_stable() {
         },
         correlation("a2a-follow-up"),
         Some(&actor),
+        TEST_STATUS_TS,
     );
     match follow_up.action().unwrap() {
         A2aAction::DispatchMessage {
@@ -793,6 +1114,7 @@ fn a2a_generated_context_cannot_reuse_a_precreated_predictable_context() {
         a2a_text_message("precreated-context-message", Some(precreated_context), None),
         correlation("precreated-context"),
         Some(&actor),
+        TEST_STATUS_TS,
     );
     let Some(A2aAction::DispatchMessage {
         mapping: precreated_mapping,
@@ -806,6 +1128,7 @@ fn a2a_generated_context_cannot_reuse_a_precreated_predictable_context() {
         a2a_text_message("contextless-message", None, None),
         correlation("generated-context"),
         Some(&actor),
+        TEST_STATUS_TS,
     );
     let Some(A2aAction::DispatchMessage {
         mapping: generated_mapping,
@@ -848,6 +1171,7 @@ fn a2a_restores_legacy_context_and_receipt_keys_without_cross_tenant_reuse() {
         },
         correlation("legacy-first"),
         Some(&actor_a),
+        TEST_STATUS_TS,
     );
     let Some(A2aAction::DispatchMessage { mapping, .. }) = first.action() else {
         panic!("expected an A2A dispatch action");
@@ -901,6 +1225,7 @@ fn a2a_restores_legacy_context_and_receipt_keys_without_cross_tenant_reuse() {
         },
         correlation("legacy-same-owner"),
         Some(&actor_a),
+        TEST_STATUS_TS,
     );
     assert!(matches!(
         same_owner.action(),
@@ -921,6 +1246,7 @@ fn a2a_restores_legacy_context_and_receipt_keys_without_cross_tenant_reuse() {
         },
         correlation("legacy-other-tenant"),
         Some(&actor_b),
+        TEST_STATUS_TS,
     );
     assert!(matches!(
         other_tenant.action(),
@@ -942,6 +1268,7 @@ fn a2a_legacy_raw_context_that_looks_canonical_cannot_block_another_owner() {
             a2a_text_message("shape-message", Some("shape-context"), None),
             correlation("shape-create"),
             Some(&actor_a),
+            TEST_STATUS_TS
         )
         .is_authorized());
     let crafted_context_id = shape_source
@@ -956,6 +1283,7 @@ fn a2a_legacy_raw_context_that_looks_canonical_cannot_block_another_owner() {
         a2a_text_message("crafted-message-b", Some(&crafted_context_id), None),
         correlation("crafted-create-b"),
         Some(&actor_b),
+        TEST_STATUS_TS,
     );
     let mapping_b = match created.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -987,6 +1315,7 @@ fn a2a_legacy_raw_context_that_looks_canonical_cannot_block_another_owner() {
         a2a_text_message("crafted-message-a", Some(&crafted_context_id), None),
         correlation("crafted-create-a"),
         Some(&actor_a),
+        TEST_STATUS_TS,
     );
     assert!(matches!(
         created_a.action(),
@@ -1004,6 +1333,7 @@ fn a2a_snapshot_tampering_is_rejected_before_state_can_be_reused() {
         a2a_text_message("snapshot-message", Some("snapshot-context"), None),
         correlation("snapshot-create"),
         Some(&actor),
+        TEST_STATUS_TS,
     );
     let mapping = match created.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -1060,6 +1390,7 @@ fn a2a_snapshot_tampering_is_rejected_before_state_can_be_reused() {
         a2a_text_message("snapshot-message-b", Some("snapshot-context-b"), None),
         correlation("snapshot-create-b"),
         Some(&other),
+        TEST_STATUS_TS,
     );
     let second_mapping = match second.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -1265,6 +1596,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
         initial.clone(),
         correlation("a2a-tenant-create"),
         Some(&owner),
+        TEST_STATUS_TS,
     );
     let mapping = match created.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -1287,6 +1619,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
         initial.clone(),
         correlation("a2a-cross-tenant-receipt"),
         Some(&attacker),
+        TEST_STATUS_TS,
     );
     let cross_tenant_mapping = match cross_tenant_same_message.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
@@ -1308,6 +1641,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
         initial.clone(),
         correlation("a2a-owner-duplicate"),
         Some(&owner),
+        TEST_STATUS_TS,
     );
     assert!(matches!(
         owner_duplicate.action(),
@@ -1317,6 +1651,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
         initial,
         correlation("a2a-attacker-duplicate"),
         Some(&attacker),
+        TEST_STATUS_TS,
     );
     assert!(matches!(
         attacker_duplicate.action(),
@@ -1339,6 +1674,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
         },
         correlation("a2a-cross-tenant-context"),
         Some(&attacker),
+        TEST_STATUS_TS,
     );
     let isolated_mapping = match isolated_context.action().unwrap() {
         A2aAction::DispatchMessage { mapping, .. } => mapping,
@@ -1367,6 +1703,7 @@ fn a2a_same_subject_in_another_tenant_isolates_receipts_contexts_and_tasks() {
             },
             correlation("a2a-cross-tenant-resume"),
             Some(&attacker),
+            TEST_STATUS_TS
         )
         .is_authorized());
     assert!(!mapper

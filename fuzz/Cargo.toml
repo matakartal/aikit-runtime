@@ -33,5 +33,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "a2a_journal_replay"
+path = "fuzz_targets/a2a_journal_replay.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const { A2aMapper } = require("..");
 
-const EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 4;
+const EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 5;
 
 const mapper = new A2aMapper();
 const tenantA = {

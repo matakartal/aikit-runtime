@@ -34,3 +34,5 @@ jobs:
         run: cargo fuzz run durable_replay -- -runs=10000 -max_len=65536
       - name: Mutate provider cassettes
         run: cargo fuzz run provider_cassette -- -runs=10000 -max_len=262144
+      - name: Mutate A2A journal replay
+        run: cargo fuzz run a2a_journal_replay -- -runs=10000 -max_len=262144

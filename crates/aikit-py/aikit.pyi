@@ -1692,6 +1692,7 @@ class A2aMapper:
         message: A2aMessage,
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
+        now_unix_ms: Optional[int] = ...,
     ) -> A2aGovernedAction: ...
     def list_tasks(
         self,
@@ -1721,12 +1722,14 @@ class A2aMapper:
         expected_attempt: int,
         state: A2aTaskState,
         status_message: Optional[str] = ...,
+        now_unix_ms: Optional[int] = ...,
     ) -> A2aMapperState: ...
     def transition_task(
         self,
         task_id: str,
         state: A2aTaskState,
         status_message: Optional[str] = ...,
+        now_unix_ms: Optional[int] = ...,
     ) -> A2aMapperState: ...
 
 

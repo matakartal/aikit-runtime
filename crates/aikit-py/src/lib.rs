@@ -419,20 +419,23 @@ impl PyA2aMapper {
         python_a2a_mapper_snapshot(py, &self.inner)
     }
 
-    #[pyo3(signature = (message, correlation, principal=None))]
+    #[pyo3(signature = (message, correlation, principal=None, now_unix_ms=None))]
     fn send_message<'py>(
         &mut self,
         py: Python<'py>,
         message: Bound<'_, PyAny>,
         correlation: Bound<'_, PyAny>,
         principal: Option<Bound<'_, PyAny>>,
+        now_unix_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         let message: A2aMessage = python_protocol_value(&message, "canonical A2A message")?;
         let correlation: CorrelationIdentity =
             python_protocol_value(&correlation, "A2A correlation identity")?;
         let principal = python_protocol_principal(principal)?;
+        let now_unix_ms = resolve_a2a_now_unix_ms(now_unix_ms);
         let mut candidate = self.inner.clone();
-        let action = candidate.prepare_send_message(message, correlation, principal.as_ref());
+        let action =
+            candidate.prepare_send_message(message, correlation, principal.as_ref(), now_unix_ms);
         let action = python_json(py, &action)?;
         python_a2a_mapper_snapshot(py, &candidate)?;
         self.inner = candidate;
@@ -527,7 +530,7 @@ impl PyA2aMapper {
         Ok(snapshot)
     }
 
-    #[pyo3(signature = (dispatch_id, expected_attempt, state, status_message=None))]
+    #[pyo3(signature = (dispatch_id, expected_attempt, state, status_message=None, now_unix_ms=None))]
     fn transition_dispatch_task<'py>(
         &mut self,
         py: Python<'py>,
@@ -535,12 +538,20 @@ impl PyA2aMapper {
         expected_attempt: Bound<'_, PyAny>,
         state: Bound<'_, PyAny>,
         status_message: Option<String>,
+        now_unix_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         let expected_attempt = python_a2a_dispatch_attempt(&expected_attempt)?;
         let state: A2aTaskState = python_protocol_value(&state, "canonical A2A task state")?;
+        let now_unix_ms = resolve_a2a_now_unix_ms(now_unix_ms);
         let mut candidate = self.inner.clone();
         candidate
-            .transition_dispatch_task(dispatch_id, expected_attempt, state, status_message)
+            .transition_dispatch_task(
+                dispatch_id,
+                expected_attempt,
+                state,
+                status_message,
+                now_unix_ms,
+            )
             .map_err(py_protocol_error)?;
         let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
         self.inner = candidate;
@@ -549,23 +560,38 @@ impl PyA2aMapper {
 
     /// Admin-only state change. An open host dispatch must use `transition_dispatch_task` so a
     /// stale callback cannot settle a newer attempt.
-    #[pyo3(signature = (task_id, state, status_message=None))]
+    #[pyo3(signature = (task_id, state, status_message=None, now_unix_ms=None))]
     fn transition_task<'py>(
         &mut self,
         py: Python<'py>,
         task_id: &str,
         state: Bound<'_, PyAny>,
         status_message: Option<String>,
+        now_unix_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
         let state: A2aTaskState = python_protocol_value(&state, "canonical A2A task state")?;
+        let now_unix_ms = resolve_a2a_now_unix_ms(now_unix_ms);
         let mut candidate = self.inner.clone();
         candidate
-            .transition_task(task_id, state, status_message)
+            .transition_task(task_id, state, status_message, now_unix_ms)
             .map_err(py_protocol_error)?;
         let snapshot = python_a2a_mapper_snapshot(py, &candidate)?;
         self.inner = candidate;
         Ok(snapshot)
     }
+}
+
+/// Resolve the caller-supplied status-timestamp instant, defaulting to the host wall clock. The
+/// canonical mapper never reads a clock itself, so the binding owns this single injection point.
+fn resolve_a2a_now_unix_ms(now_unix_ms: Option<u64>) -> u64 {
+    now_unix_ms.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    })
 }
 
 /// Thin stateful binding over the canonical append-only Rust durability engine.

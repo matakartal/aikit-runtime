@@ -48,6 +48,7 @@ fn legacy_public_api_compatibility_sentinel(part: A2aPart) -> A2aTaskRecord {
         created_revision: 1,
         updated_revision: 1,
         status_message: None,
+        status_timestamp_unix_ms: None,
     }
 }
 

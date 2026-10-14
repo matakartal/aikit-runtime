@@ -605,6 +605,363 @@ impl A2aMapperSnapshotStore for InMemoryA2aMapperSnapshotStore {
     }
 }
 
+use super::a2a_journal::{
+    A2aCheckpointInstallRequest, A2aJournalAppendOutcome, A2aJournalError, A2aJournalGcRequest,
+    A2aJournalPageRequest, A2aJournalToken, A2aMapperCheckpoint, A2aMapperDelta,
+    A2aMapperJournalStore,
+};
+
+/// Number of appended deltas after which the journal store captures a fresh checkpoint and
+/// garbage-collects the covered prefix. Bounded restore replays at most this many deltas plus one
+/// in-flight tail page.
+const A2A_JOURNAL_DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
+const A2A_JOURNAL_RESTORE_PAGE_DELTAS: u16 = 64;
+const A2A_JOURNAL_RESTORE_PAGE_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Production wiring of the typed A2A mapper delta journal.
+///
+/// This store satisfies the transport's [`A2aMapperSnapshotStore`] contract while persisting
+/// O(changed-entries) hash-chained deltas instead of full snapshots. Every accepted mutation is
+/// one [`A2aMapperDelta`] whose `mutation_id` is the transport's deterministic commit identity,
+/// so a crash-retry resolves through the journal's exact-idempotent append. A checkpoint is
+/// captured every `A2A_JOURNAL_DEFAULT_CHECKPOINT_INTERVAL` deltas and the covered prefix is
+/// garbage-collected; restore decodes the active checkpoint and replays the bounded tail through
+/// the canonical mapper validator, failing closed on any hash-chain or invariant violation.
+pub struct A2aJournalMapperSnapshotStore {
+    journal: Arc<dyn A2aMapperJournalStore>,
+    checkpoint_interval: u64,
+    state: Mutex<JournalStoreState>,
+}
+
+#[derive(Default)]
+struct JournalStoreState {
+    /// Journal head this cache mirrors; `None` until the first successful synchronization.
+    token: Option<A2aJournalToken>,
+    /// Snapshot version of the mirrored head; `None` while the journal is empty.
+    version: Option<A2aSnapshotVersion>,
+    /// Decoded mapper at the mirrored head; the diff base for the next delta.
+    mapper: Option<A2aMapper>,
+    deltas_since_checkpoint: u64,
+    /// A write whose outcome the journal reported as unknown. The next linearizable head probe
+    /// resolves it exactly: if the head equals the pending token the write was applied.
+    pending: Option<PendingJournalWrite>,
+}
+
+struct PendingJournalWrite {
+    token: A2aJournalToken,
+    version: A2aSnapshotVersion,
+    mapper: A2aMapper,
+}
+
+impl A2aJournalMapperSnapshotStore {
+    pub fn new(journal: Arc<dyn A2aMapperJournalStore>) -> Self {
+        Self {
+            journal,
+            checkpoint_interval: A2A_JOURNAL_DEFAULT_CHECKPOINT_INTERVAL,
+            state: Mutex::new(JournalStoreState::default()),
+        }
+    }
+
+    /// Override the checkpoint cadence. A zero interval is clamped to one: every delta then
+    /// produces a checkpoint, which is valid but maximizes checkpoint I/O.
+    pub fn with_checkpoint_interval(mut self, interval: u64) -> Self {
+        self.checkpoint_interval = interval.max(1);
+        self
+    }
+
+    /// Mirror the exact durable journal head into the local cache, replaying checkpoint + tail
+    /// through the canonical mapper validator.
+    async fn sync_locked(&self, state: &mut JournalStoreState) -> ProtocolResult<()> {
+        let head = self
+            .journal
+            .lookup_head()
+            .await
+            .map_err(journal_protocol_error)?;
+        if state.token.as_ref() == Some(&head) {
+            return Ok(());
+        }
+        if head == A2aJournalToken::genesis() {
+            state.token = Some(head);
+            state.version = None;
+            state.mapper = None;
+            state.deltas_since_checkpoint = 0;
+            state.pending = None;
+            return Ok(());
+        }
+        let restore = self
+            .journal
+            .begin_restore()
+            .await
+            .map_err(journal_protocol_error)?;
+        let restore_result = self.replay_restore_point(&restore).await;
+        // Always release the GC pin, even when replay fails.
+        let finish = self.journal.finish_restore(restore.restore_id()).await;
+        let (mapper, replayed) = restore_result?;
+        finish.map_err(journal_protocol_error)?;
+        let serialized = A2aSerializedMapperSnapshot::from_mapper(&mapper)?;
+        let restored_head = restore.manifest().head().clone();
+        if serialized.revision() != restored_head.revision() {
+            return Err(ProtocolError::conflict(
+                "A2A journal replay revision does not match the journal head",
+            ));
+        }
+        state.deltas_since_checkpoint = replayed;
+        state.token = Some(restored_head);
+        state.version = Some(serialized.version());
+        state.mapper = Some(mapper);
+        state.pending = None;
+        Ok(())
+    }
+
+    async fn replay_restore_point(
+        &self,
+        restore: &super::a2a_journal::A2aJournalRestorePoint,
+    ) -> ProtocolResult<(A2aMapper, u64)> {
+        let mut mapper = match restore.checkpoint() {
+            Some(checkpoint) => checkpoint.decode_mapper().map_err(journal_protocol_error)?,
+            None => A2aMapper::new(),
+        };
+        let mut after = restore.start().clone();
+        let mut replayed = 0_u64;
+        while after != *restore.manifest().head() {
+            let request = A2aJournalPageRequest::new(
+                restore.restore_id(),
+                after.clone(),
+                A2A_JOURNAL_RESTORE_PAGE_DELTAS,
+                A2A_JOURNAL_RESTORE_PAGE_BYTES,
+            )
+            .map_err(journal_protocol_error)?;
+            let page = self
+                .journal
+                .read_delta_page(request)
+                .await
+                .map_err(journal_protocol_error)?;
+            for delta in page.deltas() {
+                mapper = mapper.apply_journal_delta(delta)?;
+                replayed = replayed.saturating_add(1);
+            }
+            after = page.next_after().clone();
+            if page.is_done() {
+                break;
+            }
+        }
+        Ok((mapper, replayed))
+    }
+
+    /// Capture and install a checkpoint at the current head, then garbage-collect the covered
+    /// prefix. Failures leave the counter unchanged so the next append retries the maintenance.
+    async fn rotate_checkpoint_locked(&self, state: &mut JournalStoreState) -> ProtocolResult<()> {
+        let (token, mapper) = match (&state.token, &state.mapper) {
+            (Some(token), Some(mapper)) => (token.clone(), mapper),
+            _ => return Ok(()),
+        };
+        let manifest = self
+            .journal
+            .manifest()
+            .await
+            .map_err(journal_protocol_error)?;
+        let checkpoint =
+            A2aMapperCheckpoint::from_mapper(token, mapper).map_err(journal_protocol_error)?;
+        let request =
+            A2aCheckpointInstallRequest::new(manifest.active_checkpoint().cloned(), checkpoint);
+        self.journal
+            .install_checkpoint(request)
+            .await
+            .map_err(journal_protocol_error)?;
+        state.deltas_since_checkpoint = 0;
+        let manifest = self
+            .journal
+            .manifest()
+            .await
+            .map_err(journal_protocol_error)?;
+        if let Some(gc) = A2aJournalGcRequest::from_manifest(&manifest) {
+            self.journal
+                .garbage_collect(gc)
+                .await
+                .map_err(journal_protocol_error)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a previously unknown write outcome against the linearizable journal head.
+    fn resolve_pending(state: &mut JournalStoreState, head: &A2aJournalToken) {
+        if let Some(pending) = state.pending.take() {
+            if pending.token == *head {
+                state.token = Some(pending.token);
+                state.version = Some(pending.version);
+                state.mapper = Some(pending.mapper);
+                state.deltas_since_checkpoint = state.deltas_since_checkpoint.saturating_add(1);
+            } else {
+                state.pending = None;
+            }
+        }
+    }
+}
+
+fn journal_protocol_error(error: A2aJournalError) -> ProtocolError {
+    ProtocolError::conflict(format!("A2A mapper journal: {error}"))
+}
+
+fn journal_store_error(error: A2aJournalError) -> A2aSnapshotStoreError {
+    match error {
+        A2aJournalError::OutcomeUnknown { .. } => {
+            A2aSnapshotStoreError::unknown(journal_protocol_error(error))
+        }
+        other => A2aSnapshotStoreError::definite(journal_protocol_error(other)),
+    }
+}
+
+#[async_trait]
+impl A2aMapperSnapshotStore for A2aJournalMapperSnapshotStore {
+    async fn compare_and_swap_snapshot(
+        &self,
+        expected: Option<A2aSnapshotVersion>,
+        candidate: A2aSerializedMapperSnapshot,
+    ) -> Result<A2aSnapshotCommitOutcome, A2aSnapshotStoreError> {
+        let mut state = self.state.lock().await;
+        let head = self
+            .journal
+            .lookup_head()
+            .await
+            .map_err(journal_store_error)?;
+        Self::resolve_pending(&mut state, &head);
+        if state.token.as_ref() != Some(&head) {
+            self.sync_locked(&mut state)
+                .await
+                .map_err(A2aSnapshotStoreError::definite)?;
+        }
+
+        if let Some(current) = state.version.clone() {
+            if current.revision == candidate.revision() {
+                return if current.digest == candidate.digest() {
+                    Ok(A2aSnapshotCommitOutcome::AlreadyApplied)
+                } else {
+                    Err(A2aSnapshotStoreError::definite(ProtocolError::conflict(
+                        "A2A snapshot revision already exists with a different digest",
+                    )))
+                };
+            }
+            if expected.as_ref() != Some(&current) || candidate.revision() <= current.revision {
+                return Err(A2aSnapshotStoreError::definite(ProtocolError::conflict(
+                    "A2A snapshot compare-and-swap revision conflict",
+                )));
+            }
+        } else if expected.is_some() {
+            return Err(A2aSnapshotStoreError::definite(ProtocolError::conflict(
+                "A2A snapshot compare-and-swap expected a missing revision",
+            )));
+        }
+
+        let next = candidate
+            .decode()
+            .map_err(A2aSnapshotStoreError::definite)?;
+        let (next_token, applied) = match state.mapper.as_ref() {
+            None => {
+                // Empty journal: import the first accepted snapshot as the bootstrap checkpoint.
+                let checkpoint = A2aMapperCheckpoint::bootstrap_from_mapper(&next)
+                    .map_err(journal_store_error)?;
+                let token = checkpoint.metadata().high_water().clone();
+                match self
+                    .journal
+                    .install_checkpoint(A2aCheckpointInstallRequest::new(None, checkpoint))
+                    .await
+                {
+                    Ok(_) => (token, true),
+                    Err(error @ A2aJournalError::OutcomeUnknown { .. }) => {
+                        state.pending = Some(PendingJournalWrite {
+                            token,
+                            version: candidate.version(),
+                            mapper: next,
+                        });
+                        return Err(journal_store_error(error));
+                    }
+                    Err(error) => return Err(journal_store_error(error)),
+                }
+            }
+            Some(previous) => {
+                let operations = next
+                    .journal_operations_since(previous)
+                    .map_err(A2aSnapshotStoreError::definite)?;
+                let expected_token = state.token.clone().ok_or_else(|| {
+                    A2aSnapshotStoreError::definite(ProtocolError::conflict(
+                        "A2A journal head cache is unavailable",
+                    ))
+                })?;
+                let delta = A2aMapperDelta::new(
+                    candidate.mutation_id(),
+                    expected_token,
+                    candidate.revision(),
+                    operations,
+                )
+                .map_err(journal_store_error)?;
+                let token = delta.token().map_err(journal_store_error)?;
+                match self.journal.append_delta(delta).await {
+                    Ok(A2aJournalAppendOutcome::Applied) => (token, true),
+                    Ok(A2aJournalAppendOutcome::AlreadyApplied) => (token, false),
+                    Err(error @ A2aJournalError::OutcomeUnknown { .. }) => {
+                        state.pending = Some(PendingJournalWrite {
+                            token,
+                            version: candidate.version(),
+                            mapper: next,
+                        });
+                        return Err(journal_store_error(error));
+                    }
+                    Err(error) => return Err(journal_store_error(error)),
+                }
+            }
+        };
+
+        state.token = Some(next_token);
+        state.version = Some(candidate.version());
+        state.mapper = Some(next);
+        state.pending = None;
+        if applied {
+            state.deltas_since_checkpoint = state.deltas_since_checkpoint.saturating_add(1);
+            if state.deltas_since_checkpoint >= self.checkpoint_interval {
+                // Maintenance must not turn an applied commit into an error; the unchanged
+                // counter makes the next append retry a failed rotation.
+                let _ = self.rotate_checkpoint_locked(&mut state).await;
+            }
+            Ok(A2aSnapshotCommitOutcome::Applied)
+        } else {
+            Ok(A2aSnapshotCommitOutcome::AlreadyApplied)
+        }
+    }
+
+    async fn lookup_snapshot_version(&self) -> ProtocolResult<Option<A2aSnapshotVersion>> {
+        let mut state = self.state.lock().await;
+        let head = self
+            .journal
+            .lookup_head()
+            .await
+            .map_err(journal_protocol_error)?;
+        Self::resolve_pending(&mut state, &head);
+        if state.token.as_ref() != Some(&head) {
+            self.sync_locked(&mut state).await?;
+        }
+        Ok(state.version.clone())
+    }
+
+    async fn load_serialized_snapshot(
+        &self,
+    ) -> ProtocolResult<Option<A2aSerializedMapperSnapshot>> {
+        let mut state = self.state.lock().await;
+        let head = self
+            .journal
+            .lookup_head()
+            .await
+            .map_err(journal_protocol_error)?;
+        Self::resolve_pending(&mut state, &head);
+        if state.token.as_ref() != Some(&head) {
+            self.sync_locked(&mut state).await?;
+        }
+        match state.mapper.as_ref() {
+            None => Ok(None),
+            Some(mapper) => Ok(Some(A2aSerializedMapperSnapshot::from_mapper(mapper)?)),
+        }
+    }
+}
+
 fn snapshot_digest(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(64);
@@ -688,6 +1045,25 @@ async fn classify_definite_snapshot_failure(
     }
 }
 
+/// Resolve the settled-dispatch artifact an `ArtifactProduced` intent publishes. The intent
+/// carries only the identity; the bytes live once, in the durable dispatch record.
+fn resolve_intent_artifact<'mapper>(
+    mapper: &'mapper A2aMapper,
+    intent: &A2aPendingEventIntent,
+) -> ProtocolResult<&'mapper A2aArtifact> {
+    let artifact_id = intent
+        .artifact_id
+        .as_deref()
+        .ok_or_else(|| ProtocolError::conflict("A2A artifact event lost its artifact identity"))?;
+    mapper
+        .artifacts_for_task(&intent.task_id)
+        .iter()
+        .find(|artifact| artifact.artifact_id == artifact_id)
+        .ok_or_else(|| {
+            ProtocolError::conflict("A2A artifact event references a missing durable artifact")
+        })
+}
+
 fn validate_new_pending_event_wire_bytes(
     mapper: &A2aMapper,
     after_revision: u64,
@@ -710,6 +1086,10 @@ fn validate_new_pending_event_wire_bytes(
                     .response_message
                     .as_ref()
                     .ok_or_else(|| ProtocolError::conflict("A2A direct event lost its message"))?,
+            ),
+            A2aPendingEventKind::ArtifactProduced => A2aStreamResponse::artifact_update(
+                &intent.task,
+                resolve_intent_artifact(mapper, intent)?,
             ),
         };
         let bytes = serde_json::to_vec(&response)
@@ -1281,8 +1661,12 @@ mod in_memory_event_store_tests {
         A2aStreamResponse::Task(A2aWireTask {
             id: task_id.to_owned(),
             context_id: format!("context-{task_id}"),
-            status: A2aWireTaskStatus { state },
+            status: A2aWireTaskStatus {
+                state,
+                timestamp: None,
+            },
             artifacts: None,
+            history: None,
         })
     }
 
@@ -1606,6 +1990,19 @@ mod in_memory_event_store_tests {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct A2aWireTaskStatus {
     pub state: A2aTaskState,
+    /// RFC 3339 instant of the most recent status change. Omitted only for tasks persisted
+    /// before the mapper recorded status timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+impl A2aWireTaskStatus {
+    fn from_task(task: &A2aTaskRecord) -> Self {
+        Self {
+            state: task.state,
+            timestamp: task.status_timestamp_unix_ms.map(unix_millis_rfc3339),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1754,23 +2151,59 @@ pub struct A2aWireTask {
     pub status: A2aWireTaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<A2aWireArtifact>>,
+    /// Accepted-message history, oldest first, bounded by the caller's `historyLength`. Omitted
+    /// when the caller requested zero messages or the task has none, matching proto3 JSON's
+    /// empty-repeated omission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<A2aWireMessage>>,
 }
 
 impl From<&A2aTaskRecord> for A2aWireTask {
     fn from(task: &A2aTaskRecord) -> Self {
-        Self::from_task(task, &[], false)
+        Self::from_task(task, &[], false, &[])
     }
 }
 
 impl A2aWireTask {
-    fn from_task(task: &A2aTaskRecord, artifacts: &[A2aArtifact], include_artifacts: bool) -> Self {
+    fn from_task(
+        task: &A2aTaskRecord,
+        artifacts: &[A2aArtifact],
+        include_artifacts: bool,
+        history: &[A2aMessage],
+    ) -> Self {
         Self {
             id: task.mapping.task_id.clone(),
             context_id: task.mapping.context_id.clone(),
-            status: A2aWireTaskStatus { state: task.state },
+            status: A2aWireTaskStatus::from_task(task),
             artifacts: include_artifacts
                 .then(|| artifacts.iter().map(A2aWireArtifact::from).collect()),
+            history: (!history.is_empty())
+                .then(|| history.iter().map(A2aWireMessage::from).collect()),
         }
+    }
+}
+
+/// Bound one task's projected history to the validated wire `historyLength`.
+///
+/// `None` imposes no limit; `Some(limit)` keeps only the `limit` most recent accepted messages
+/// while preserving oldest-first order, exactly as A2A 1.0 defines the field.
+fn bounded_history(history: Vec<A2aMessage>, limit: Option<usize>) -> Vec<A2aMessage> {
+    match limit {
+        None => history,
+        Some(limit) => {
+            let skip = history.len().saturating_sub(limit);
+            history.into_iter().skip(skip).collect()
+        }
+    }
+}
+
+/// Validate the wire `historyLength` parameter: absent means unlimited, zero means none, and
+/// negatives are rejected before any mapper work.
+fn validated_history_limit(history_length: Option<i64>) -> Result<Option<usize>, String> {
+    match history_length {
+        None => Ok(None),
+        Some(value) if value >= 0 => Ok(Some(usize::try_from(value).unwrap_or(usize::MAX))),
+        Some(_) => Err("historyLength must not be negative".to_owned()),
     }
 }
 
@@ -1782,11 +2215,27 @@ pub struct A2aTaskStatusUpdateEvent {
     pub status: A2aWireTaskStatus,
 }
 
+/// Official A2A 1.0 `TaskArtifactUpdateEvent`. AIKit artifacts are durably published in one
+/// terminal batch, so every emitted event is a complete artifact: `append` is always `false` and
+/// `last_chunk` is always `true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct A2aTaskArtifactUpdateEvent {
+    pub task_id: String,
+    pub context_id: String,
+    pub artifact: A2aWireArtifact,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub append: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_chunk: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum A2aStreamResponse {
     Task(A2aWireTask),
     StatusUpdate(A2aTaskStatusUpdateEvent),
+    ArtifactUpdate(A2aTaskArtifactUpdateEvent),
     Message(A2aWireMessage),
 }
 
@@ -1799,7 +2248,17 @@ impl A2aStreamResponse {
         Self::StatusUpdate(A2aTaskStatusUpdateEvent {
             task_id: task.mapping.task_id.clone(),
             context_id: task.mapping.context_id.clone(),
-            status: A2aWireTaskStatus { state: task.state },
+            status: A2aWireTaskStatus::from_task(task),
+        })
+    }
+
+    fn artifact_update(task: &A2aTaskRecord, artifact: &A2aArtifact) -> Self {
+        Self::ArtifactUpdate(A2aTaskArtifactUpdateEvent {
+            task_id: task.mapping.task_id.clone(),
+            context_id: task.mapping.context_id.clone(),
+            artifact: A2aWireArtifact::from(artifact),
+            append: false,
+            last_chunk: true,
         })
     }
 
@@ -1811,6 +2270,8 @@ impl A2aStreamResponse {
         match self {
             Self::Task(task) => task.status.state.is_terminal(),
             Self::StatusUpdate(update) => update.status.state.is_terminal(),
+            // Artifact updates precede the terminal frame that carries the same completion.
+            Self::ArtifactUpdate(_) => false,
             Self::Message(_) => true,
         }
     }
@@ -1849,6 +2310,9 @@ fn validate_stream_response_binding(
     let matches = match response {
         A2aStreamResponse::Task(task) => task.id == task_id && task.context_id == context_id,
         A2aStreamResponse::StatusUpdate(update) => {
+            update.task_id == task_id && update.context_id == context_id
+        }
+        A2aStreamResponse::ArtifactUpdate(update) => {
             update.task_id == task_id && update.context_id == context_id
         }
         A2aStreamResponse::Message(message) => {
@@ -2679,6 +3143,154 @@ fn current_unix_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Format a persisted Unix-millisecond instant as the RFC 3339 UTC profile A2A 1.0 uses for
+/// `TaskStatus.timestamp` (proto3 JSON `google.protobuf.Timestamp`), e.g.
+/// `2026-08-05T10:15:30.250Z`.
+fn unix_millis_rfc3339(unix_ms: u64) -> String {
+    let seconds = unix_ms / 1_000;
+    let millis = unix_ms % 1_000;
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    // Howard Hinnant's civil-from-days algorithm, with day zero at 1970-01-01.
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Parse the RFC 3339 profile accepted for `statusTimestampAfter` into Unix milliseconds.
+///
+/// Accepts `YYYY-MM-DDTHH:MM:SS`, an optional fractional-second part (truncated to millisecond
+/// precision, as persisted timestamps carry no more), and a mandatory `Z` or `±HH:MM` offset,
+/// matching the proto3 JSON `google.protobuf.Timestamp` encoding. Instants before the Unix epoch
+/// clamp to zero: every persisted status timestamp already satisfies such a lower bound.
+fn parse_rfc3339_unix_millis(value: &str) -> Result<u64, String> {
+    let error = || format!("statusTimestampAfter is not a valid RFC 3339 timestamp: {value}");
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(error());
+    }
+    if !matches!(bytes[10], b'T' | b't') || bytes[13] != b':' || bytes[16] != b':' {
+        return Err(error());
+    }
+    let digits = |range: std::ops::Range<usize>| -> Result<i64, String> {
+        let slice = value.get(range).ok_or_else(error)?;
+        if slice.bytes().all(|byte| byte.is_ascii_digit()) {
+            slice.parse::<i64>().map_err(|_| error())
+        } else {
+            Err(error())
+        }
+    };
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    let hour = digits(11..13)?;
+    let minute = digits(14..16)?;
+    let second = digits(17..19)?;
+    if !(1..=12).contains(&month) {
+        return Err(error());
+    }
+    let leap_year = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap_year {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(error());
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(error());
+    }
+    let mut cursor = 19;
+    let mut millis: i64 = 0;
+    if bytes.get(cursor) == Some(&b'.') {
+        let fraction_start = cursor + 1;
+        let mut fraction_end = fraction_start;
+        while bytes
+            .get(fraction_end)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            fraction_end += 1;
+        }
+        if fraction_end == fraction_start {
+            return Err(error());
+        }
+        let fraction = &value[fraction_start..fraction_end];
+        let mut padded = [b'0'; 3];
+        for (index, byte) in fraction.bytes().take(3).enumerate() {
+            padded[index] = byte;
+        }
+        millis = std::str::from_utf8(&padded)
+            .expect("padded fraction is ASCII")
+            .parse::<i64>()
+            .map_err(|_| error())?;
+        cursor = fraction_end;
+    }
+    let offset_minutes: i64 = match bytes.get(cursor) {
+        Some(b'Z' | b'z') if cursor + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-')) if cursor + 6 == bytes.len() => {
+            if bytes[cursor + 3] != b':' {
+                return Err(error());
+            }
+            let offset_hour = digits(cursor + 1..cursor + 3)?;
+            let offset_minute = digits(cursor + 4..cursor + 6)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return Err(error());
+            }
+            let magnitude = offset_hour * 60 + offset_minute;
+            if *sign == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        _ => return Err(error()),
+    };
+    // Howard Hinnant's days-from-civil algorithm, the inverse of the formatter above.
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let unix_ms = days
+        .checked_mul(86_400_000)
+        .and_then(|day_ms| {
+            let time_ms = (hour * 3_600_000) + (minute * 60_000) + (second * 1_000) + millis;
+            day_ms.checked_add(time_ms)
+        })
+        .and_then(|total| total.checked_sub(offset_minutes * 60_000))
+        .ok_or_else(error)?;
+    Ok(u64::try_from(unix_ms).unwrap_or(0))
 }
 
 #[derive(Debug, Default)]
@@ -3795,12 +4407,14 @@ impl A2aHttpJsonRpcServer {
         detail: &str,
         post_commit: Option<Box<dyn FnOnce() -> ProtocolResult<()> + Send>>,
     ) -> ProtocolResult<A2aTaskRecord> {
+        let now_unix_ms = current_unix_millis();
         self.persist_mapper_mutation_with_post_commit(
             |candidate| {
                 candidate.acknowledge_cancellation(
                     cancellation_id,
                     expected_attempt,
                     Some(detail.to_owned()),
+                    now_unix_ms,
                 )?;
                 candidate.tasks().get(task_id).cloned().ok_or_else(|| {
                     ProtocolError::conflict("A2A cancellation task disappeared after its fence")
@@ -3900,14 +4514,18 @@ impl A2aHttpJsonRpcServer {
         logical_event_id: &str,
     ) -> ProtocolResult<A2aPersistedEvent> {
         let snapshot_read = self.acquire_current_snapshot_read().await?;
-        let intent = self
-            .mapper
-            .lock()
-            .await
-            .pending_event_intents()
-            .get(logical_event_id)
-            .cloned()
-            .ok_or_else(|| ProtocolError::not_found("A2A event intent is not registered"))?;
+        let (intent, intent_artifact) = {
+            let mapper = self.mapper.lock().await;
+            let intent = mapper
+                .pending_event_intents()
+                .get(logical_event_id)
+                .cloned()
+                .ok_or_else(|| ProtocolError::not_found("A2A event intent is not registered"))?;
+            let intent_artifact = (intent.kind == A2aPendingEventKind::ArtifactProduced)
+                .then(|| resolve_intent_artifact(&mapper, &intent).cloned())
+                .transpose()?;
+            (intent, intent_artifact)
+        };
         drop(snapshot_read);
         if intent.state == A2aPendingEventState::Quarantined {
             return Err(ProtocolError::invalid_transition(
@@ -3938,6 +4556,12 @@ impl A2aHttpJsonRpcServer {
                     .response_message
                     .as_ref()
                     .ok_or_else(|| ProtocolError::conflict("A2A direct event lost its message"))?,
+            ),
+            A2aPendingEventKind::ArtifactProduced => A2aStreamResponse::artifact_update(
+                &intent.task,
+                intent_artifact.as_ref().ok_or_else(|| {
+                    ProtocolError::conflict("A2A artifact event lost its durable artifact")
+                })?,
             ),
         };
         let appended = match self
@@ -4828,6 +5452,11 @@ impl A2aHttpJsonRpcServer {
             })
     }
 
+    /// Project the task's accepted-message history from the live mapper under its own lock.
+    async fn history_for_task_snapshot(&self, task_id: &str) -> Vec<A2aMessage> {
+        self.mapper.lock().await.history_for_task(task_id)
+    }
+
     /// Persist and publish a receiver-side task transition to all bound SSE subscribers.
     pub async fn transition_task(
         &self,
@@ -4835,8 +5464,9 @@ impl A2aHttpJsonRpcServer {
         next: A2aTaskState,
         status_message: Option<String>,
     ) -> ProtocolResult<A2aPersistedEvent> {
+        let now_unix_ms = current_unix_millis();
         self.persist_mapper_mutation(|candidate| {
-            candidate.transition_task(task_id, next, status_message)
+            candidate.transition_task(task_id, next, status_message, now_unix_ms)
         })
         .await?;
         self.flush_pending_events_for_task(task_id)
@@ -4868,6 +5498,7 @@ impl A2aHttpJsonRpcServer {
         next: A2aTaskState,
         status_message: Option<String>,
     ) -> ProtocolResult<A2aTaskRecord> {
+        let now_unix_ms = current_unix_millis();
         let task = self
             .persist_mapper_mutation(|candidate| {
                 let task_id = candidate
@@ -4880,6 +5511,7 @@ impl A2aHttpJsonRpcServer {
                     fence.expected_attempt,
                     next,
                     status_message,
+                    now_unix_ms,
                 )?;
                 candidate
                     .tasks()
@@ -4906,12 +5538,14 @@ impl A2aHttpJsonRpcServer {
                 "A2A output completion requires a message dispatch context",
             )
         })?;
+        let now_unix_ms = current_unix_millis();
         let task = self
             .persist_mapper_mutation(|candidate| {
                 candidate.complete_dispatch_with_artifacts(
                     &fence.dispatch_id,
                     fence.expected_attempt,
                     artifacts,
+                    now_unix_ms,
                 )
             })
             .await?;
@@ -4933,12 +5567,14 @@ impl A2aHttpJsonRpcServer {
                 "A2A direct response requires a message dispatch context",
             )
         })?;
+        let now_unix_ms = current_unix_millis();
         let task = self
             .persist_mapper_mutation(|candidate| {
                 candidate.complete_dispatch_with_message(
                     &fence.dispatch_id,
                     fence.expected_attempt,
                     message,
+                    now_unix_ms,
                 )
             })
             .await?;
@@ -6107,10 +6743,12 @@ impl A2aHttpJsonRpcServer {
         if let Err(message) = bind_tenant(wire.tenant.as_deref(), &principal) {
             return Ok(rpc_invalid_params(rpc.id, &message));
         }
-        let return_immediately = match wire.validate_configuration() {
+        let send_configuration = match wire.validate_configuration() {
             Ok(value) => value,
             Err(message) => return Ok(rpc_unsupported(rpc.id, &message)),
         };
+        let return_immediately = send_configuration.return_immediately;
+        let history_limit = send_configuration.history_limit;
         let mode = if streaming {
             A2aExecutionMode::Streaming
         } else if return_immediately {
@@ -6178,12 +6816,14 @@ impl A2aHttpJsonRpcServer {
             live.message_receipt(&message.message_id, &principal)
                 .is_some()
                 .then(|| {
-                    // Exact retries do not clone, serialize, or write the durable snapshot.
+                    // Exact retries do not clone, serialize, or write the durable snapshot. The
+                    // duplicate path never mutates task state, so its clock value is unused.
                     live.prepare_send_message_candidate_with_response_policy(
                         message.clone(),
                         correlation.clone(),
                         Some(&principal),
                         response_policy,
+                        current_unix_millis(),
                     )
                 })
         };
@@ -6203,6 +6843,7 @@ impl A2aHttpJsonRpcServer {
                 let stage_server = self.clone();
                 let stage_message_id = message.message_id.clone();
                 let stage_principal = principal.clone();
+                let accept_unix_ms = current_unix_millis();
                 let governed = self
                     .persist_mapper_mutation_with_post_commit(
                         move |candidate| {
@@ -6213,6 +6854,7 @@ impl A2aHttpJsonRpcServer {
                                     correlation,
                                     Some(&stage_principal),
                                     response_policy,
+                                    accept_unix_ms,
                                 );
                             if governed.is_authorized() && candidate.revision() != before_revision {
                                 let record = candidate
@@ -6529,9 +7171,13 @@ impl A2aHttpJsonRpcServer {
             ));
         }
         if mode == A2aExecutionMode::Immediate {
+            let history = bounded_history(
+                self.history_for_task_snapshot(&task_id).await,
+                history_limit,
+            );
             return Ok(ConnectionOutcome::Response(HttpResponse::json(
                 200,
-                jsonrpc_result(rpc.id, send_result_value(&task, &record)),
+                jsonrpc_result(rpc.id, send_result_value(&task, &record, &history)),
             )));
         }
         if mode == A2aExecutionMode::Blocking {
@@ -6567,27 +7213,35 @@ impl A2aHttpJsonRpcServer {
                     &reconciliation.join("; "),
                 ));
             }
-            let result_record = self
-                .mapper
-                .lock()
-                .await
-                .dispatch_outbox()
-                .get(&record.dispatch_id)
-                .cloned()
-                .ok_or_else(|| ProtocolError::conflict("A2A completed send lost its response"))?;
+            let (result_record, history) = {
+                let mapper = self.mapper.lock().await;
+                let result_record = mapper
+                    .dispatch_outbox()
+                    .get(&record.dispatch_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProtocolError::conflict("A2A completed send lost its response")
+                    })?;
+                let history = bounded_history(mapper.history_for_task(&task_id), history_limit);
+                (result_record, history)
+            };
             return Ok(ConnectionOutcome::Response(HttpResponse::json(
                 200,
-                jsonrpc_result(rpc.id, send_result_value(&task, &result_record)),
+                jsonrpc_result(rpc.id, send_result_value(&task, &result_record, &history)),
             )));
         }
         let dispatch_start = acceptance.and_then(|acceptance| acceptance.start);
+        let settled_history = bounded_history(
+            self.history_for_task_snapshot(&task_id).await,
+            history_limit,
+        );
         let settled_stream_response = (record.state == A2aDispatchOutboxState::Settled
             && task.state.is_terminal()
             && record.immediate_response.is_none())
         .then(|| match &record.response {
             A2aDispatchResponse::Message { message } => A2aStreamResponse::message(message),
             A2aDispatchResponse::Task { artifacts, .. } => A2aStreamResponse::Task(
-                A2aWireTask::from_task(&task, artifacts, !artifacts.is_empty()),
+                A2aWireTask::from_task(&task, artifacts, !artifacts.is_empty(), &settled_history),
             ),
         });
         let plan = SsePlan {
@@ -7528,9 +8182,12 @@ impl A2aHttpJsonRpcServer {
         if let Err(message) = bind_tenant(wire.tenant.as_deref(), &principal) {
             return Ok(rpc_invalid_params(rpc.id, &message));
         }
-        // The canonical mapper stores no message history. Omitting the field returns zero
-        // messages, which is within every validated non-negative historyLength limit.
-        let _history_limit = wire.history_length;
+        // A2A 1.0 §3.2.4: absent means no client-imposed limit, zero omits the field, and a
+        // positive value bounds the most recent accepted messages.
+        let history_limit = match validated_history_limit(wire.history_length) {
+            Ok(limit) => limit,
+            Err(message) => return Ok(rpc_invalid_params(rpc.id, &message)),
+        };
         let correlation = match correlation_identity(&rpc) {
             Ok(value) => value,
             Err(error) => return Ok(rpc_invalid_params(rpc.id, &error.message)),
@@ -7546,6 +8203,10 @@ impl A2aHttpJsonRpcServer {
             return Err(ProtocolError::conflict("unexpected A2A GetTask action"));
         };
         let artifacts = mapper.artifacts_for_task(&task.mapping.task_id);
+        let history = bounded_history(
+            mapper.history_for_task(&task.mapping.task_id),
+            history_limit,
+        );
         Ok(ConnectionOutcome::Response(HttpResponse::json(
             200,
             jsonrpc_result(
@@ -7554,6 +8215,7 @@ impl A2aHttpJsonRpcServer {
                     &task,
                     artifacts,
                     !artifacts.is_empty(),
+                    &history,
                 )),
             ),
         )))
@@ -7571,13 +8233,29 @@ impl A2aHttpJsonRpcServer {
         if let Err(message) = bind_tenant(wire.tenant.as_deref(), &principal) {
             return Ok(rpc_invalid_params(rpc.id, &message));
         }
-        let _history_limit = wire.history_length;
-        if wire.status_timestamp_after.is_some() {
-            return Ok(rpc_unsupported(
-                rpc.id,
-                "statusTimestampAfter is not available",
-            ));
-        }
+        // Listing defaults to omitting history so a wide page cannot multiply its payload; an
+        // explicit historyLength is honored exactly, per A2A 1.0 §3.2.4's implementation-defined
+        // default.
+        let history_limit = match wire.history_length {
+            None => Some(0),
+            Some(_) => match validated_history_limit(wire.history_length) {
+                Ok(limit) => limit,
+                Err(message) => return Ok(rpc_invalid_params(rpc.id, &message)),
+            },
+        };
+        let status_timestamp_after_unix_ms = match wire.status_timestamp_after.as_ref() {
+            None => None,
+            Some(Value::String(value)) => match parse_rfc3339_unix_millis(value) {
+                Ok(unix_ms) => Some(unix_ms),
+                Err(message) => return Ok(rpc_invalid_params(rpc.id, &message)),
+            },
+            Some(_) => {
+                return Ok(rpc_invalid_params(
+                    rpc.id,
+                    "statusTimestampAfter must be an RFC 3339 timestamp string",
+                ));
+            }
+        };
         let include_artifacts = wire.include_artifacts.unwrap_or(false);
         let correlation = match correlation_identity(&rpc) {
             Ok(value) => value,
@@ -7587,6 +8265,7 @@ impl A2aHttpJsonRpcServer {
             tenant: wire.tenant,
             context_id: wire.context_id,
             status: wire.status,
+            status_timestamp_after_unix_ms,
             page_size: wire.page_size,
             page_token: wire.page_token,
         };
@@ -7602,7 +8281,10 @@ impl A2aHttpJsonRpcServer {
         };
         Ok(ConnectionOutcome::Response(HttpResponse::json(
             200,
-            jsonrpc_result(rpc.id, page_to_wire(page, &mapper, include_artifacts)),
+            jsonrpc_result(
+                rpc.id,
+                page_to_wire(page, &mapper, include_artifacts, history_limit),
+            ),
         )))
     }
 
@@ -8666,6 +9348,24 @@ impl JsonRpcRequest {
     }
 }
 
+/// Validated `SendMessageConfiguration` projection. `history_limit` follows
+/// [`validated_history_limit`], except that an absent `historyLength` resolves to zero for send
+/// responses instead of unlimited.
+#[derive(Debug, Clone, Copy)]
+struct SendConfiguration {
+    return_immediately: bool,
+    history_limit: Option<usize>,
+}
+
+impl Default for SendConfiguration {
+    fn default() -> Self {
+        Self {
+            return_immediately: false,
+            history_limit: Some(0),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WireSendMessageRequest {
     tenant: Option<String>,
@@ -8689,7 +9389,7 @@ impl WireSendMessageRequest {
         })
     }
 
-    fn validate_configuration(&self) -> Result<bool, String> {
+    fn validate_configuration(&self) -> Result<SendConfiguration, String> {
         if self
             .metadata
             .as_ref()
@@ -8698,7 +9398,7 @@ impl WireSendMessageRequest {
             return Err("request metadata is not supported".into());
         }
         let Some(mut configuration) = self.configuration.clone() else {
-            return Ok(false);
+            return Ok(SendConfiguration::default());
         };
         let accepted = take_optional_array(
             &mut configuration,
@@ -8720,11 +9420,18 @@ impl WireSendMessageRequest {
         {
             return Err("push notification configuration is not supported".into());
         }
-        let _history = take_optional_i64(
+        let history_length = take_optional_i64(
             &mut configuration,
             &["historyLength", "history_length"],
             "historyLength",
         )?;
+        // SendMessage responses default to omitting history: an unset limit is
+        // implementation-defined per A2A 1.0 §3.2.4, and the accepted message is already echoed
+        // by the request itself. An explicit limit is honored exactly.
+        let history_limit = match history_length {
+            None => Some(0),
+            Some(_) => validated_history_limit(history_length)?,
+        };
         let return_immediately = take_optional_bool(
             &mut configuration,
             &["returnImmediately", "return_immediately"],
@@ -8732,7 +9439,10 @@ impl WireSendMessageRequest {
         )?;
         // A2A 1.0 recommends ignoring fields added by newer protocol revisions. Known fields
         // remain strictly typed above; an unknown field cannot alter the authenticated tenant.
-        Ok(return_immediately.unwrap_or(false))
+        Ok(SendConfiguration {
+            return_immediately: return_immediately.unwrap_or(false),
+            history_limit,
+        })
     }
 
     fn into_message(self) -> Result<A2aMessage, String> {
@@ -9201,29 +9911,45 @@ fn governed_action<T>(
     }
 }
 
-fn send_result_value(task: &A2aTaskRecord, dispatch: &A2aDispatchOutboxRecord) -> Value {
+fn send_result_value(
+    task: &A2aTaskRecord,
+    dispatch: &A2aDispatchOutboxRecord,
+    history: &[A2aMessage],
+) -> Value {
     if let Some(immediate) = &dispatch.immediate_response {
-        return json!({"task": A2aWireTask::from_task(immediate, &[], false)});
+        return json!({"task": A2aWireTask::from_task(immediate, &[], false, history)});
     }
     match &dispatch.response {
         A2aDispatchResponse::Message { message } => {
             json!({"message": A2aWireMessage::from(message)})
         }
         A2aDispatchResponse::Task { artifacts, .. } => json!({
-            "task": A2aWireTask::from_task(task, artifacts, !artifacts.is_empty())
+            "task": A2aWireTask::from_task(task, artifacts, !artifacts.is_empty(), history)
         }),
     }
 }
 
-fn page_to_wire(page: A2aTaskPage, mapper: &A2aMapper, include_artifacts: bool) -> Value {
+fn page_to_wire(
+    page: A2aTaskPage,
+    mapper: &A2aMapper,
+    include_artifacts: bool,
+    history_limit: Option<usize>,
+) -> Value {
     json!({
         "tasks": page.tasks
             .iter()
-            .map(|task| A2aWireTask::from_task(
-                task,
-                mapper.artifacts_for_task(&task.mapping.task_id),
-                include_artifacts,
-            ))
+            .map(|task| {
+                let history = bounded_history(
+                    mapper.history_for_task(&task.mapping.task_id),
+                    history_limit,
+                );
+                A2aWireTask::from_task(
+                    task,
+                    mapper.artifacts_for_task(&task.mapping.task_id),
+                    include_artifacts,
+                    &history,
+                )
+            })
             .collect::<Vec<_>>(),
         "nextPageToken": page.next_page_token,
         "pageSize": page.page_size,
@@ -9769,6 +10495,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::Notify;
+
+    /// Deterministic wall-clock instant injected wherever a mutation records a status timestamp.
+    const TEST_STATUS_TS: u64 = 1_754_000_000_000;
 
     struct TestAuthenticator;
 
@@ -10724,6 +11453,9 @@ mod tests {
                     A2aStreamResponse::StatusUpdate(update) => {
                         update.context_id = "context-evil".into();
                     }
+                    A2aStreamResponse::ArtifactUpdate(update) => {
+                        update.context_id = "context-evil".into();
+                    }
                     A2aStreamResponse::Message(message) => {
                         message.context_id = Some("context-evil".into());
                     }
@@ -10800,8 +11532,10 @@ mod tests {
                             context_id: "context-replay".into(),
                             status: A2aWireTaskStatus {
                                 state: A2aTaskState::Working,
+                                timestamp: None,
                             },
                             artifacts: None,
+                            history: None,
                         }),
                     }],
                     high_water: 2,
@@ -11327,6 +12061,7 @@ mod tests {
                         &task_id,
                         A2aTaskState::Failed,
                         Some("competing writer".into()),
+                        TEST_STATUS_TS,
                     )
                     .map_err(A2aSnapshotStoreError::unknown)?;
                 let competing = A2aSerializedMapperSnapshot::from_mapper(&competing)
@@ -11650,6 +12385,9 @@ mod tests {
                     A2aStreamResponse::StatusUpdate(update) => {
                         update.context_id = "poisoned-context".into();
                     }
+                    A2aStreamResponse::ArtifactUpdate(update) => {
+                        update.context_id = "poisoned-context".into();
+                    }
                     A2aStreamResponse::Message(message) => {
                         message.context_id = Some("poisoned-context".into());
                     }
@@ -11958,6 +12696,7 @@ mod tests {
                 )
                 .unwrap(),
                 Some(principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -11998,6 +12737,7 @@ mod tests {
                 )
                 .unwrap(),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -12016,6 +12756,7 @@ mod tests {
                     &mapping.task_id,
                     task_state,
                     Some(format!("waiting in {task_state:?}")),
+                    TEST_STATUS_TS,
                 )
                 .unwrap();
         }
@@ -12468,6 +13209,7 @@ mod tests {
                 exact_message,
                 CorrelationIdentity::new("quarantine-correlation", "quarantine-request").unwrap(),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -12764,6 +13506,7 @@ mod tests {
                 )
                 .unwrap(),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -12968,6 +13711,7 @@ mod tests {
                     )
                     .unwrap(),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -16069,6 +16813,553 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_backed_server_persists_deltas_checkpoints_and_survives_restart() {
+        use crate::protocols::InMemoryA2aMapperJournalStore;
+
+        journal_backed_server_roundtrip(Arc::new(InMemoryA2aMapperJournalStore::default())).await;
+    }
+
+    /// The same transport scenario over the durable SQLite journal: deltas, checkpoint rotation,
+    /// and restart recovery all happen through the on-disk store.
+    #[tokio::test]
+    async fn sqlite_journal_backed_server_survives_restart_from_disk() {
+        use crate::protocols::SqliteA2aMapperJournalStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            SqliteA2aMapperJournalStore::open(directory.path().join("journal.db")).unwrap(),
+        );
+        journal_backed_server_roundtrip(journal).await;
+    }
+
+    async fn journal_backed_server_roundtrip(journal: Arc<dyn A2aMapperJournalStore>) {
+        let store = Arc::new(
+            A2aJournalMapperSnapshotStore::new(journal.clone()).with_checkpoint_interval(2),
+        );
+        let host = Arc::new(DurableOutputHost::default());
+        let (address, _server, handle, task) = start_server_with_dependencies(
+            A2aHttpConfig::default(),
+            Arc::new(Mutex::new(A2aMapper::new())),
+            store,
+            Arc::new(InMemoryA2aEventStore::default()),
+            host.clone(),
+            agent_card(),
+        )
+        .await;
+
+        let artifact_payload = send_body("journal-artifacts", true, None);
+        let artifact_response = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &artifact_payload,
+            ),
+        )
+        .await;
+        let artifact_result = body(&artifact_response)["result"]["task"].clone();
+        let task_id = artifact_result["id"].as_str().unwrap().to_owned();
+        assert_eq!(artifact_result["artifacts"].as_array().unwrap().len(), 4);
+        let status_timestamp = artifact_result["status"]["timestamp"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let direct_payload = send_body("durable-direct-journal", true, None);
+        let direct = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &direct_payload,
+            ),
+        )
+        .await;
+        let direct_body = body(&direct);
+        assert_eq!(
+            direct_body["result"]["message"]["parts"][0]["text"], "Direct message response",
+            "unexpected direct response: {direct_body}"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+
+        handle.cancel();
+        task.await.unwrap().unwrap();
+
+        // The journal itself now holds hash-chained deltas behind a rotated checkpoint.
+        let manifest = journal.manifest().await.unwrap();
+        assert!(manifest.head().sequence() >= 4);
+        let checkpoint = manifest
+            .active_checkpoint()
+            .expect("checkpoint interval of two rotated at least once");
+        assert!(checkpoint.high_water().sequence() >= 2);
+
+        // A fresh store instance over the same journal replays checkpoint + tail exactly.
+        let restarted_store = Arc::new(
+            A2aJournalMapperSnapshotStore::new(journal.clone()).with_checkpoint_interval(2),
+        );
+        let restored = restarted_store
+            .load_serialized_snapshot()
+            .await
+            .unwrap()
+            .expect("journal restore produces the durable head")
+            .decode()
+            .unwrap();
+        let (restart_address, _restart_server, restart_handle, restart_task) =
+            start_server_with_dependencies(
+                A2aHttpConfig::default(),
+                Arc::new(Mutex::new(restored)),
+                restarted_store,
+                Arc::new(InMemoryA2aEventStore::default()),
+                host.clone(),
+                agent_card(),
+            )
+            .await;
+
+        // The exact retry resolves through the journal's idempotency without re-running the host.
+        let retried = raw_http(
+            restart_address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &direct_payload,
+            ),
+        )
+        .await;
+        let retried_body = body(&retried);
+        assert_eq!(
+            retried_body["result"]["message"]["parts"][0]["text"], "Direct message response",
+            "unexpected retry response: {retried_body}"
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+
+        // Replayed task state carries the exact persisted artifacts and status timestamp.
+        let get = json!({
+            "jsonrpc":"2.0","id":"journal-get","method":"GetTask",
+            "params":{"tenant":"tenant-a","id":task_id}
+        })
+        .to_string();
+        let got = raw_http(
+            restart_address,
+            request("POST", "/a2a", &rpc_headers("application/json"), &get),
+        )
+        .await;
+        let got_task = body(&got)["result"].clone();
+        assert_eq!(got_task["artifacts"], artifact_result["artifacts"]);
+        assert_eq!(
+            got_task["status"]["timestamp"].as_str().unwrap(),
+            status_timestamp
+        );
+
+        restart_handle.cancel();
+        restart_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn rfc3339_formatting_and_parsing_roundtrip_and_fail_closed() {
+        assert_eq!(unix_millis_rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            unix_millis_rfc3339(1_754_000_000_000),
+            "2025-07-31T22:13:20.000Z"
+        );
+        assert_eq!(
+            unix_millis_rfc3339(1_709_164_800_123),
+            "2024-02-29T00:00:00.123Z"
+        );
+        for unix_ms in [
+            0,
+            999,
+            1_000,
+            86_400_000,
+            951_782_400_000,
+            1_754_000_000_000,
+            4_102_444_799_999,
+        ] {
+            let formatted = unix_millis_rfc3339(unix_ms);
+            assert_eq!(
+                parse_rfc3339_unix_millis(&formatted).unwrap(),
+                unix_ms,
+                "roundtrip failed for {formatted}"
+            );
+        }
+        assert_eq!(
+            parse_rfc3339_unix_millis("2023-10-27T10:00:00Z").unwrap(),
+            1_698_400_800_000
+        );
+        // Offsets are normalized to UTC; fractions beyond milliseconds truncate.
+        assert_eq!(
+            parse_rfc3339_unix_millis("2023-10-27T12:00:00+02:00").unwrap(),
+            1_698_400_800_000
+        );
+        assert_eq!(
+            parse_rfc3339_unix_millis("2023-10-27T10:00:00.123456789Z").unwrap(),
+            1_698_400_800_123
+        );
+        // Pre-epoch instants clamp to zero: every persisted timestamp satisfies that bound.
+        assert_eq!(
+            parse_rfc3339_unix_millis("1969-12-31T23:59:59Z").unwrap(),
+            0
+        );
+        for invalid in [
+            "",
+            "not-a-date",
+            "2023-10-27",
+            "2023-10-27T10:00:00",
+            "2023-13-27T10:00:00Z",
+            "2023-02-29T10:00:00Z",
+            "2023-10-27T24:00:00Z",
+            "2023-10-27T10:61:00Z",
+            "2023-10-27T10:00:60Z",
+            "2023-10-27T10:00:00.Z",
+            "2023-10-27T10:00:00+2:00",
+            "2023-10-27T10:00:00+02:60",
+            "2023-10-27T10:00:00Zextra",
+        ] {
+            assert!(
+                parse_rfc3339_unix_millis(invalid).is_err(),
+                "expected rejection for {invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_timestamps_are_persisted_and_projected_as_rfc3339() {
+        let host = Arc::new(DurableOutputHost::default());
+        let (address, server, handle, task) =
+            start_server_with_host(A2aHttpConfig::default(), host.clone()).await;
+        let before = current_unix_millis();
+        let payload = send_body("durable-artifacts-ts", true, None);
+        let response = raw_http(
+            address,
+            request("POST", "/a2a", &rpc_headers("application/json"), &payload),
+        )
+        .await;
+        let result = &body(&response)["result"]["task"];
+        let task_id = result["id"].as_str().unwrap().to_owned();
+        let after = current_unix_millis();
+
+        let wire_timestamp = result["status"]["timestamp"].as_str().unwrap().to_owned();
+        let parsed = parse_rfc3339_unix_millis(&wire_timestamp).unwrap();
+        assert!(
+            (before..=after).contains(&parsed),
+            "wire timestamp {parsed} outside [{before}, {after}]"
+        );
+
+        // The persisted record carries the exact same instant the wire projected.
+        let persisted = server
+            .mapper
+            .lock()
+            .await
+            .tasks()
+            .get(&task_id)
+            .unwrap()
+            .status_timestamp_unix_ms
+            .unwrap();
+        assert_eq!(persisted, parsed);
+
+        let get = json!({
+            "jsonrpc":"2.0","id":"ts-get","method":"GetTask",
+            "params":{"tenant":"tenant-a","id":task_id}
+        })
+        .to_string();
+        let got = raw_http(
+            address,
+            request("POST", "/a2a", &rpc_headers("application/json"), &get),
+        )
+        .await;
+        assert_eq!(
+            body(&got)["result"]["status"]["timestamp"]
+                .as_str()
+                .unwrap(),
+            wire_timestamp
+        );
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_task_history_honors_official_history_length_semantics() {
+        // Every dispatch parks the task at input-required, so each accepted message lands in the
+        // durable history and the task keeps accepting follow-ups.
+        let host = Arc::new(ExactStateTransitionHost::new(
+            A2aTaskState::InputRequired,
+            "need more input",
+        ));
+        let (address, server, handle, task) =
+            start_server_with_host(A2aHttpConfig::default(), host.clone()).await;
+        let first = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &send_body("history-first", false, None),
+            ),
+        )
+        .await;
+        let result = &body(&first)["result"]["task"];
+        let task_id = result["id"].as_str().unwrap().to_owned();
+        let context_id = result["contextId"].as_str().unwrap().to_owned();
+        wait_for_scheduler_idle(&server).await;
+
+        let mut follow_up: Value =
+            serde_json::from_str(&send_body("history-second", false, None)).unwrap();
+        follow_up["params"]["message"]["taskId"] = json!(task_id);
+        follow_up["params"]["message"]["contextId"] = json!(context_id);
+        let second = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &follow_up.to_string(),
+            ),
+        )
+        .await;
+        assert!(body(&second).get("error").is_none(), "{}", body(&second));
+        wait_for_scheduler_idle(&server).await;
+
+        let get = |history_length: Option<i64>| {
+            let mut params = json!({"tenant":"tenant-a","id":task_id});
+            if let Some(limit) = history_length {
+                params["historyLength"] = json!(limit);
+            }
+            json!({
+                "jsonrpc":"2.0","id":"history-get","method":"GetTask","params":params
+            })
+            .to_string()
+        };
+
+        // Unset: no client-imposed limit, both accepted messages in acceptance order.
+        let unlimited = raw_http(
+            address,
+            request("POST", "/a2a", &rpc_headers("application/json"), &get(None)),
+        )
+        .await;
+        let history = body(&unlimited)["result"]["history"].clone();
+        let entries = history.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["messageId"], "history-first");
+        assert_eq!(entries[1]["messageId"], "history-second");
+        assert_eq!(entries[0]["taskId"].as_str().unwrap(), task_id);
+        assert_eq!(entries[0]["contextId"].as_str().unwrap(), context_id);
+        assert_eq!(entries[0]["role"], "ROLE_USER");
+
+        // Zero: the history field is omitted entirely.
+        let zero = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &get(Some(0)),
+            ),
+        )
+        .await;
+        assert!(body(&zero)["result"]
+            .as_object()
+            .unwrap()
+            .get("history")
+            .is_none());
+
+        // Positive: at most that many of the most recent messages.
+        let bounded = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &get(Some(1)),
+            ),
+        )
+        .await;
+        let bounded_history = body(&bounded)["result"]["history"].clone();
+        let bounded_entries = bounded_history.as_array().unwrap();
+        assert_eq!(bounded_entries.len(), 1);
+        assert_eq!(bounded_entries[0]["messageId"], "history-second");
+
+        // Negative: rejected before any mapper work.
+        let negative = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &get(Some(-1)),
+            ),
+        )
+        .await;
+        assert_eq!(body(&negative)["error"]["code"], -32602);
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tasks_filters_by_status_timestamp_after_and_rejects_invalid_values() {
+        let host = Arc::new(DurableOutputHost::default());
+        let (address, _server, handle, task) =
+            start_server_with_host(A2aHttpConfig::default(), host.clone()).await;
+        let payload = send_body("durable-artifacts-filter", true, None);
+        let response = raw_http(
+            address,
+            request("POST", "/a2a", &rpc_headers("application/json"), &payload),
+        )
+        .await;
+        let created = &body(&response)["result"]["task"];
+        let context_id = created["contextId"].as_str().unwrap().to_owned();
+        let status_timestamp = created["status"]["timestamp"].as_str().unwrap().to_owned();
+
+        let list = |extra: Value| {
+            let mut params = json!({"tenant":"tenant-a","contextId":context_id});
+            for (key, value) in extra.as_object().unwrap() {
+                params[key] = value.clone();
+            }
+            json!({
+                "jsonrpc":"2.0","id":"filter-list","method":"ListTasks","params":params
+            })
+            .to_string()
+        };
+
+        // An inclusive lower bound at the exact persisted instant matches the task.
+        let matching = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &list(json!({"statusTimestampAfter": status_timestamp})),
+            ),
+        )
+        .await;
+        let matching_body = body(&matching);
+        assert_eq!(matching_body["result"]["totalSize"], 1);
+        assert_eq!(
+            matching_body["result"]["tasks"][0]["status"]["timestamp"]
+                .as_str()
+                .unwrap(),
+            status_timestamp
+        );
+
+        // A bound after the persisted instant excludes it, including from totalSize.
+        let excluded = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("application/json"),
+                &list(json!({"statusTimestampAfter": "2999-01-01T00:00:00Z"})),
+            ),
+        )
+        .await;
+        let excluded_body = body(&excluded);
+        assert_eq!(excluded_body["result"]["totalSize"], 0);
+        assert!(excluded_body["result"]["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        for invalid in [
+            json!("not-a-timestamp"),
+            json!(12345),
+            json!({"seconds": 1}),
+        ] {
+            let rejected = raw_http(
+                address,
+                request(
+                    "POST",
+                    "/a2a",
+                    &rpc_headers("application/json"),
+                    &list(json!({"statusTimestampAfter": invalid})),
+                ),
+            )
+            .await;
+            assert_eq!(
+                body(&rejected)["error"]["code"],
+                -32602,
+                "expected invalid-params for {invalid:?}"
+            );
+        }
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_send_emits_artifact_updates_before_the_terminal_frame() {
+        let host = Arc::new(DurableOutputHost::default());
+        let (address, _server, handle, task) =
+            start_server_with_host(A2aHttpConfig::default(), host.clone()).await;
+        let mut payload: Value =
+            serde_json::from_str(&send_body("durable-artifacts-stream", true, None)).unwrap();
+        payload["method"] = json!("SendStreamingMessage");
+        let response = raw_http(
+            address,
+            request(
+                "POST",
+                "/a2a",
+                &rpc_headers("text/event-stream"),
+                &payload.to_string(),
+            ),
+        )
+        .await;
+        let events = response
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let frames = events
+            .iter()
+            .filter_map(|event| event["result"].as_object())
+            .collect::<Vec<_>>();
+        assert!(!frames.is_empty());
+
+        let artifact_frames: Vec<&Value> = frames
+            .iter()
+            .filter_map(|frame| frame.get("artifactUpdate"))
+            .collect();
+        assert_eq!(artifact_frames.len(), 4);
+        let mut artifact_ids: Vec<&str> = artifact_frames
+            .iter()
+            .map(|frame| frame["artifact"]["artifactId"].as_str().unwrap())
+            .collect();
+        artifact_ids.sort_unstable();
+        assert_eq!(
+            artifact_ids,
+            [
+                "artifact-data",
+                "artifact-raw",
+                "artifact-text",
+                "artifact-url"
+            ]
+        );
+        for frame in &artifact_frames {
+            assert!(frame["taskId"].as_str().is_some());
+            assert!(frame["contextId"].as_str().is_some());
+            // Terminal-batch artifacts are complete: never appended, always the last chunk.
+            assert!(frame.get("append").is_none());
+            assert_eq!(frame["lastChunk"], true);
+        }
+
+        // Every artifact frame precedes the terminal frame, which closes the stream.
+        let last = frames.last().unwrap();
+        let terminal_state = last
+            .get("statusUpdate")
+            .map(|update| update["status"]["state"].clone())
+            .or_else(|| last.get("task").map(|task| task["status"]["state"].clone()))
+            .expect("terminal frame is a task or statusUpdate frame");
+        assert_eq!(terminal_state, "TASK_STATE_COMPLETED");
+        let terminal_index = frames.len() - 1;
+        for (index, frame) in frames.iter().enumerate() {
+            if frame.contains_key("artifactUpdate") {
+                assert!(index < terminal_index);
+            }
+        }
+        handle.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn streaming_direct_response_emits_one_terminal_message_without_terminal_task_status() {
         let host = Arc::new(DurableOutputHost::default());
         let (address, _server, handle, task) =
@@ -16272,7 +17563,7 @@ mod tests {
         wait_for_scheduler_idle(&gap_server).await;
         gap_server
             .persist_mapper_mutation(|candidate| {
-                candidate.transition_task(&task_id, A2aTaskState::Working, None)
+                candidate.transition_task(&task_id, A2aTaskState::Working, None, TEST_STATUS_TS)
             })
             .await
             .unwrap();
@@ -16286,6 +17577,7 @@ mod tests {
                     &task_id,
                     A2aTaskState::InputRequired,
                     Some("again".into()),
+                    TEST_STATUS_TS,
                 )
             })
             .await
@@ -18643,6 +19935,7 @@ mod tests {
                     &mapping.task_id,
                     A2aTaskState::InputRequired,
                     Some("advanced by a competing writer".into()),
+                    TEST_STATUS_TS,
                 )
                 .unwrap();
             snapshots
@@ -18724,6 +20017,7 @@ mod tests {
                 &send_mapping.task_id,
                 A2aTaskState::InputRequired,
                 Some("advanced send head".into()),
+                TEST_STATUS_TS,
             )
             .unwrap();
         send_snapshots
@@ -18882,6 +20176,7 @@ mod tests {
                 &mapping.task_id,
                 A2aTaskState::InputRequired,
                 Some("advanced while SSE was open".into()),
+                TEST_STATUS_TS,
             )
             .unwrap();
         snapshots
@@ -19366,7 +20661,12 @@ mod tests {
         let first_writer = tokio::spawn(async move {
             first_server
                 .persist_mapper_mutation(|candidate| {
-                    candidate.transition_task(&first_id, A2aTaskState::Completed, None)
+                    candidate.transition_task(
+                        &first_id,
+                        A2aTaskState::Completed,
+                        None,
+                        TEST_STATUS_TS,
+                    )
                 })
                 .await
         });
@@ -19375,7 +20675,12 @@ mod tests {
         let second_writer = tokio::spawn(async move {
             second_server
                 .persist_mapper_mutation(|candidate| {
-                    candidate.transition_task(&second_id, A2aTaskState::Completed, None)
+                    candidate.transition_task(
+                        &second_id,
+                        A2aTaskState::Completed,
+                        None,
+                        TEST_STATUS_TS,
+                    )
                 })
                 .await
         });

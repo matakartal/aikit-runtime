@@ -957,7 +957,11 @@ fn normalize_a2a_task_numbers(task: &mut Value, path: &str) -> Result<()> {
     let Some(task) = task.as_object_mut() else {
         return Ok(());
     };
-    for field in ["created_revision", "updated_revision"] {
+    for field in [
+        "created_revision",
+        "updated_revision",
+        "status_timestamp_unix_ms",
+    ] {
         if let Some(value) = task.get_mut(field) {
             normalize_a2a_safe_u64(value, &format!("{path}.{field}"))?;
         }
@@ -1468,16 +1472,19 @@ impl A2aMapper {
         message: Value,
         correlation: Value,
         principal: Option<Value>,
+        now_unix_ms: Option<f64>,
     ) -> Result<Value> {
         let message: A2aMessage = serde_json::from_value(message)
             .map_err(|error| invalid_a2a_input("A2A message", error))?;
         let correlation = decode_a2a_correlation(correlation)?;
         let principal = decode_a2a_principal(principal)?;
+        let now_unix_ms = decode_a2a_now_unix_ms(now_unix_ms)?;
         let mut candidate = self.inner.clone();
         let action = serde_json::to_value(candidate.prepare_send_message(
             message,
             correlation,
             principal.as_ref(),
+            now_unix_ms,
         ))
         .map_err(|_| Error::from_reason("failed to encode governed A2A action"))?;
         encode_a2a_mapper_state(&candidate)?;
@@ -1578,13 +1585,21 @@ impl A2aMapper {
         expected_attempt: f64,
         state: String,
         status_message: Option<String>,
+        now_unix_ms: Option<f64>,
     ) -> Result<Value> {
         let state: A2aTaskState = serde_json::from_value(Value::String(state))
             .map_err(|error| invalid_a2a_input("A2A task state", error))?;
         let expected_attempt = node_dispatch_attempt(expected_attempt)?;
+        let now_unix_ms = decode_a2a_now_unix_ms(now_unix_ms)?;
         let mut candidate = self.inner.clone();
         candidate
-            .transition_dispatch_task(&dispatch_id, expected_attempt, state, status_message)
+            .transition_dispatch_task(
+                &dispatch_id,
+                expected_attempt,
+                state,
+                status_message,
+                now_unix_ms,
+            )
             .map_err(a2a_protocol_error)?;
         let snapshot = encode_a2a_mapper_state(&candidate)?;
         self.inner = candidate;
@@ -1598,16 +1613,37 @@ impl A2aMapper {
         task_id: String,
         state: String,
         status_message: Option<String>,
+        now_unix_ms: Option<f64>,
     ) -> Result<Value> {
         let state: A2aTaskState = serde_json::from_value(Value::String(state))
             .map_err(|error| invalid_a2a_input("A2A task state", error))?;
+        let now_unix_ms = decode_a2a_now_unix_ms(now_unix_ms)?;
         let mut candidate = self.inner.clone();
         candidate
-            .transition_task(&task_id, state, status_message)
+            .transition_task(&task_id, state, status_message, now_unix_ms)
             .map_err(a2a_protocol_error)?;
         let snapshot = encode_a2a_mapper_state(&candidate)?;
         self.inner = candidate;
         Ok(snapshot)
+    }
+}
+
+/// Resolve the caller-supplied status-timestamp instant, defaulting to the host wall clock. The
+/// canonical mapper never reads a clock itself, so the binding owns this single injection point.
+fn decode_a2a_now_unix_ms(now_unix_ms: Option<f64>) -> Result<u64> {
+    match now_unix_ms {
+        None => Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)),
+        Some(value) if value.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&value) => {
+            Ok(value as u64)
+        }
+        Some(_) => Err(Error::from_reason(
+            "nowUnixMs must be a non-negative safe-integer millisecond timestamp",
+        )),
     }
 }
 
