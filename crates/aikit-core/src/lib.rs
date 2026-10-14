@@ -51,7 +51,10 @@ pub mod tools;
 pub mod trace_eval;
 pub mod types;
 
-pub use agent::{Agent, AgentCapabilities, AgentError, GeneratedText, ProviderCapabilityView};
+pub use agent::{
+    Agent, AgentCapabilities, AgentCompactionSummarizer, AgentError, GeneratedText,
+    ProviderCapabilityView,
+};
 pub use budget::{
     BillingDisposition, BudgetLedger, BudgetLedgerError, BudgetLedgerResult, BudgetLedgerSnapshot,
     BudgetLimits, BudgetPolicy, BudgetReservation, BudgetSnapshot, BudgetTracker, ModelPricing,
@@ -70,7 +73,10 @@ pub use client::{
     query_messages_with_executor, query_with_executor, AgentOptions, CancellableRun, Client,
     DeltaStream, RoutingOptions,
 };
-pub use compaction::{compact_messages, estimate_tokens, CompactionPolicy};
+pub use compaction::{
+    compact_messages, compact_messages_with_summarizer, estimate_tokens, extractive_digest,
+    CompactionPolicy, CompactionSummarizer, COMPACTION_SUMMARY_MAX_CHARS,
+};
 pub use contract::{
     CapabilityState, CompatibilityMode, MediaInput, MediaInputSource, OutputPart, ProviderWarning,
     StreamBlockKind, StreamEvent, StreamEventKind,

@@ -2458,7 +2458,12 @@ fn build_agent_options(
         reject_unknown_fields(
             compaction,
             "RunOptions.compaction",
-            &["max_context_tokens", "keep_recent_messages"],
+            &[
+                "max_context_tokens",
+                "keep_recent_messages",
+                "summary_model",
+                "summary_max_tokens",
+            ],
         )?;
         let max_context_tokens = optional_u64(compaction, "max_context_tokens")?
             .ok_or_else(|| "RunOptions.compaction.max_context_tokens is required".to_string())?;
@@ -2469,6 +2474,19 @@ fn build_agent_options(
                 "RunOptions.compaction.keep_recent_messages exceeds usize".to_string()
             })?,
         );
+        if let Some(summary_model) = compaction.get("summary_model").filter(|v| !v.is_null()) {
+            options.compaction_summary_model = Some(
+                summary_model
+                    .as_str()
+                    .ok_or_else(|| {
+                        "RunOptions.compaction.summary_model must be a string".to_string()
+                    })?
+                    .to_owned(),
+            );
+        }
+        if let Some(summary_max_tokens) = optional_u64(compaction, "summary_max_tokens")? {
+            options.compaction_summary_max_tokens = summary_max_tokens;
+        }
     }
     if let Some(provider_options) = object.get("provider_options") {
         options.provider_options = serde_json::from_value(provider_options.clone())

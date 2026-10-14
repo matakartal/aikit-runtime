@@ -847,6 +847,44 @@ fn provider_for_model(model: &str) -> Option<&'static str> {
     }
 }
 
+/// [`crate::compaction::CompactionSummarizer`] backed by this crate's own governed text path.
+///
+/// Summarization runs as an ordinary tool-less `generate_text` call against the configured
+/// summary model, so credential resolution, capability gating, and typed failures behave exactly
+/// like any other run. Failures fall back to the deterministic extractive note in the caller.
+pub struct AgentCompactionSummarizer {
+    agent: std::sync::Arc<Agent>,
+    model: String,
+    max_tokens: u64,
+}
+
+impl AgentCompactionSummarizer {
+    pub fn new(agent: std::sync::Arc<Agent>, model: impl Into<String>, max_tokens: u64) -> Self {
+        Self {
+            agent,
+            model: model.into(),
+            max_tokens: max_tokens.max(64),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::compaction::CompactionSummarizer for AgentCompactionSummarizer {
+    async fn summarize(&self, dropped: &[Message]) -> Result<String, AgentError> {
+        let digest = crate::compaction::extractive_digest(dropped);
+        let prompt = format!(
+            "Summarize the following conversation excerpt for an AI agent that must continue the \
+             task. Preserve task-relevant facts, decisions, tool outcomes, constraints, and open \
+             questions. Output only the summary text.\n\n{digest}"
+        );
+        let generated = self
+            .agent
+            .generate_text(prompt, &self.model, self.max_tokens)
+            .await?;
+        Ok(generated.text)
+    }
+}
+
 /// Why an [`Agent`] could not run a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentError {

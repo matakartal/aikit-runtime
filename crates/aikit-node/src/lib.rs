@@ -3627,6 +3627,10 @@ fn build_agent_options(
                 "maxContextTokens",
                 "keep_recent_messages",
                 "keepRecentMessages",
+                "summary_model",
+                "summaryModel",
+                "summary_max_tokens",
+                "summaryMaxTokens",
             ],
         )?;
         let max_context_tokens = optional_u64(
@@ -3649,6 +3653,28 @@ fn build_agent_options(
                 Error::from_reason("RunOptions.compaction.keepRecentMessages exceeds usize")
             })?,
         );
+        let summary_model = object
+            .get("summaryModel")
+            .or_else(|| object.get("summary_model"))
+            .filter(|value| !value.is_null());
+        if let Some(summary_model) = summary_model {
+            mapped.compaction_summary_model = Some(
+                summary_model
+                    .as_str()
+                    .ok_or_else(|| {
+                        Error::from_reason("RunOptions.compaction.summaryModel must be a string")
+                    })?
+                    .to_owned(),
+            );
+        }
+        if let Some(summary_max_tokens) = optional_u64(
+            object,
+            "RunOptions.compaction",
+            "summary_max_tokens",
+            "summaryMaxTokens",
+        )? {
+            mapped.compaction_summary_max_tokens = summary_max_tokens;
+        }
     }
     if options.cancel_before_start.unwrap_or(false) {
         mapped.cancellation.cancel();

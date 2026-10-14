@@ -45,6 +45,10 @@ pub struct RunConfig {
     /// Transcript compaction. Disabled by default; when enabled, the working transcript is bounded
     /// to a token budget at the start of each turn (first message + recent tail kept verbatim).
     pub compaction: crate::compaction::CompactionPolicy,
+    /// Optional model-generated compaction summaries. When present and compaction triggers, the
+    /// condensed note is produced by this summarizer; any failure falls back to the deterministic
+    /// extractive note, so the transcript stays bounded without it.
+    pub compaction_summarizer: Option<Arc<dyn crate::compaction::CompactionSummarizer>>,
     /// Completion handle retained by the caller. Records canonical messages, not reconstructed
     /// final text, so reasoning/tool history remains resumable.
     pub recorder: crate::session::RunRecorder,
@@ -77,6 +81,7 @@ impl RunConfig {
             audit: crate::observability::AuditTrail::default(),
             budget: crate::budget::BudgetPolicy::default(),
             compaction: crate::compaction::CompactionPolicy::default(),
+            compaction_summarizer: None,
             recorder: crate::session::RunRecorder::default(),
             cancellation: crate::cancellation::CancellationToken::new(),
             durable: None,
@@ -1647,7 +1652,14 @@ pub fn run_agent(
 
             // Bound the transcript to the context window before building the request. No-op unless
             // compaction is enabled; keeps the task anchor + recent tail and preserves tool pairing.
-            if let Some(compacted) = crate::compaction::compact_messages(&cfg.messages, &cfg.compaction)
+            // A configured summarizer upgrades the note to a model-generated summary; its failure
+            // falls back to the deterministic extractive note inside the call.
+            if let Some(compacted) = crate::compaction::compact_messages_with_summarizer(
+                &cfg.messages,
+                &cfg.compaction,
+                cfg.compaction_summarizer.as_deref(),
+            )
+            .await
             {
                 cfg.messages = compacted;
             }

@@ -98,6 +98,12 @@ pub struct AgentOptions {
     pub budget: BudgetPolicy,
     /// Optional transcript bounding for long-running agents. Disabled by default.
     pub compaction: CompactionPolicy,
+    /// Optional model id for model-generated compaction summaries. When set (and compaction
+    /// triggers), the condensed note is produced by a governed tool-less run against this model;
+    /// any failure falls back to the deterministic extractive note.
+    pub compaction_summary_model: Option<String>,
+    /// Token budget for one compaction summary run. Ignored without `compaction_summary_model`.
+    pub compaction_summary_max_tokens: u64,
     pub retry: RetryPolicy,
     /// Optional caller-owned catalog/request. When present, routing selects `model` immediately
     /// before provider construction; the explicit `model` field becomes only the fallback default.
@@ -132,6 +138,8 @@ impl Default for AgentOptions {
             audit: AuditTrail::default(),
             budget: BudgetPolicy::default(),
             compaction: CompactionPolicy::default(),
+            compaction_summary_model: None,
+            compaction_summary_max_tokens: 512,
             retry: RetryPolicy::default(),
             routing: None,
             cancellation: CancellationToken::new(),
@@ -326,6 +334,14 @@ impl Client {
         config.audit = options.audit;
         config.budget = options.budget;
         config.compaction = options.compaction;
+        if let Some(summary_model) = options.compaction_summary_model {
+            config.compaction_summarizer =
+                Some(Arc::new(crate::agent::AgentCompactionSummarizer::new(
+                    Arc::new(self.agent.clone()),
+                    summary_model,
+                    options.compaction_summary_max_tokens,
+                )));
+        }
         config.cancellation = options.cancellation;
         if let Some(recorder) = recorder {
             config.recorder = recorder;
