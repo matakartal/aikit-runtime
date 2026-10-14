@@ -283,6 +283,9 @@ export interface RunOptions {
   compaction?: {
     maxContextTokens: number;
     keepRecentMessages?: number;
+    /** Model id for model-generated compaction summaries; failures fall back to the extractive note. */
+    summaryModel?: string;
+    summaryMaxTokens?: number;
   };
   /** Cancels and fully closes the run when aborted, including before the first delta. */
   signal?: AbortSignal;

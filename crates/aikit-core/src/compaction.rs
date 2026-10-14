@@ -14,11 +14,30 @@
 //!    [`compact_messages`] advances the cut forward until the tail begins on a clean boundary.
 //!
 //! The default note is extractive (a truncated concatenation of the dropped text) so compaction is
-//! deterministic and keyless. A model-generated summary (as some coding agents do, compacting at
-//! ~85% of the context window with a cheap model) is the richer follow-up; the policy shape leaves
-//! room for it.
+//! deterministic and keyless. A host-pluggable [`CompactionSummarizer`] upgrades the note to a
+//! model-generated summary (as some coding agents do, compacting with a cheap model): the agent
+//! loop calls it through [`compact_messages_with_summarizer`], and any summarizer failure or
+//! empty output falls back to the deterministic extractive note, so an unavailable summary model
+//! can never unbound the transcript.
 
+use crate::agent::AgentError;
 use crate::types::{ContentBlock, Message};
+use async_trait::async_trait;
+
+/// Upper bound on a model-generated compaction summary. Longer output is truncated on a char
+/// boundary: the note must stay much smaller than the turns it replaces.
+pub const COMPACTION_SUMMARY_MAX_CHARS: usize = 4_000;
+
+/// Host-pluggable model-generated summarization for compacted turns.
+///
+/// Implementations receive the exact dropped messages and return a condensed plain-text summary.
+/// Errors and empty output are not fatal: the caller falls back to the deterministic extractive
+/// note, so compaction itself always succeeds. Implementations must not echo credentials or
+/// otherwise expand the data already present in the dropped turns.
+#[async_trait]
+pub trait CompactionSummarizer: Send + Sync {
+    async fn summarize(&self, dropped: &[Message]) -> Result<String, AgentError>;
+}
 
 /// When and how much of the transcript to compact.
 #[derive(Debug, Clone)]
@@ -92,6 +111,51 @@ fn has_tool_result(m: &Message) -> bool {
 /// Result shape: `[ first message, condensed note, ...recent tail ]`. The tail is guaranteed not to
 /// begin with an orphan `tool_result`.
 pub fn compact_messages(messages: &[Message], policy: &CompactionPolicy) -> Option<Vec<Message>> {
+    let cut = compaction_cut(messages, policy)?;
+    Some(assemble_compacted(
+        messages,
+        cut,
+        summarize_dropped(&messages[1..cut]),
+    ))
+}
+
+/// [`compact_messages`] with an optional model-generated summary.
+///
+/// When `summarizer` is `None` this is exactly the deterministic extractive path. When present,
+/// its output replaces the extractive note; a summarizer error, empty output, or oversized output
+/// (truncated at [`COMPACTION_SUMMARY_MAX_CHARS`]) never prevents compaction — the extractive
+/// note is the fail-closed fallback, so the transcript stays bounded even when the summary model
+/// is unavailable.
+pub async fn compact_messages_with_summarizer(
+    messages: &[Message],
+    policy: &CompactionPolicy,
+    summarizer: Option<&dyn CompactionSummarizer>,
+) -> Option<Vec<Message>> {
+    let cut = compaction_cut(messages, policy)?;
+    let dropped = &messages[1..cut];
+    let note = match summarizer {
+        None => summarize_dropped(dropped),
+        Some(summarizer) => match summarizer.summarize(dropped).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                let condensed: String = summary
+                    .trim()
+                    .chars()
+                    .take(COMPACTION_SUMMARY_MAX_CHARS)
+                    .collect();
+                Message::user(format!(
+                    "[aikit compacted {} earlier message(s) to fit the context window. \
+                     Model-generated summary of the omitted turns:\n{condensed}]",
+                    dropped.len()
+                ))
+            }
+            _ => summarize_dropped(dropped),
+        },
+    };
+    Some(assemble_compacted(messages, cut, note))
+}
+
+/// Shared cut selection: `Some(cut)` when compaction should replace `messages[1..cut]`.
+fn compaction_cut(messages: &[Message], policy: &CompactionPolicy) -> Option<usize> {
     if !policy.is_enabled() || estimate_tokens(messages) <= policy.max_context_tokens {
         return None;
     }
@@ -107,17 +171,20 @@ pub fn compact_messages(messages: &[Message], policy: &CompactionPolicy) -> Opti
     if cut <= 1 || cut >= len {
         return None;
     }
-
-    let dropped = &messages[1..cut];
-    let mut out = Vec::with_capacity(2 + (len - cut));
-    out.push(messages[0].clone());
-    out.push(summarize_dropped(dropped));
-    out.extend_from_slice(&messages[cut..]);
-    Some(out)
+    Some(cut)
 }
 
-/// Build the condensed note that replaces the dropped middle. Extractive and deterministic.
-fn summarize_dropped(dropped: &[Message]) -> Message {
+fn assemble_compacted(messages: &[Message], cut: usize, note: Message) -> Vec<Message> {
+    let mut out = Vec::with_capacity(2 + (messages.len() - cut));
+    out.push(messages[0].clone());
+    out.push(note);
+    out.extend_from_slice(&messages[cut..]);
+    out
+}
+
+/// Deterministic plain-text digest of dropped turns: the extractive note body, also used as the
+/// model summarizer's source text so both paths see the same redaction-free content.
+pub fn extractive_digest(dropped: &[Message]) -> String {
     let mut text = String::new();
     for m in dropped {
         for b in &m.content {
@@ -137,7 +204,12 @@ fn summarize_dropped(dropped: &[Message]) -> Message {
             }
         }
     }
-    let condensed: String = text.trim().chars().take(1000).collect();
+    text.trim().to_owned()
+}
+
+/// Build the condensed note that replaces the dropped middle. Extractive and deterministic.
+fn summarize_dropped(dropped: &[Message]) -> Message {
+    let condensed: String = extractive_digest(dropped).chars().take(1000).collect();
     // A user-role note is safe to inject mid-conversation on every provider (unlike a mid-list
     // system message, which some adapters hoist).
     Message::user(format!(
@@ -242,6 +314,160 @@ mod tests {
             "tail starts with an orphan tool_result: {:?}",
             tail_start.content
         );
+    }
+
+    struct StubSummarizer {
+        response: Result<String, &'static str>,
+    }
+
+    #[async_trait]
+    impl CompactionSummarizer for StubSummarizer {
+        async fn summarize(&self, _dropped: &[Message]) -> Result<String, AgentError> {
+            self.response
+                .clone()
+                .map_err(|reason| AgentError::Run(reason.into()))
+        }
+    }
+
+    fn oversized_transcript() -> Vec<Message> {
+        let mut msgs = vec![text_msg(Role::User, "TASK: do the thing")];
+        for i in 0..20 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("turn {i} {}", "y".repeat(200)),
+            ));
+        }
+        msgs
+    }
+
+    fn note_text(messages: &[Message]) -> String {
+        match &messages[1].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected a text note, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn model_summary_replaces_the_extractive_note() {
+        let msgs = oversized_transcript();
+        let policy = CompactionPolicy::new(200, 4);
+        let summarizer = StubSummarizer {
+            response: Ok("The agent finished turns 0-15 without blockers.".into()),
+        };
+        let out = compact_messages_with_summarizer(&msgs, &policy, Some(&summarizer))
+            .await
+            .expect("should compact");
+        let note = note_text(&out);
+        assert!(note.contains("Model-generated summary"), "note: {note}");
+        assert!(note.contains("without blockers"), "note: {note}");
+        // The extractive fallback wording must not appear on the model path.
+        assert!(!note.contains("Condensed summary"), "note: {note}");
+    }
+
+    #[tokio::test]
+    async fn failing_or_empty_summarizer_falls_back_to_extractive() {
+        let msgs = oversized_transcript();
+        let policy = CompactionPolicy::new(200, 4);
+        for response in [Err("summary model unavailable"), Ok("   ".to_owned())] {
+            let summarizer = StubSummarizer { response };
+            let out = compact_messages_with_summarizer(&msgs, &policy, Some(&summarizer))
+                .await
+                .expect("compaction must still happen");
+            let note = note_text(&out);
+            assert!(note.contains("Condensed summary"), "note: {note}");
+            assert!(out.len() < msgs.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_summarizer_matches_the_synchronous_path() {
+        let msgs = oversized_transcript();
+        let policy = CompactionPolicy::new(200, 4);
+        let sync = compact_messages(&msgs, &policy).unwrap();
+        let via_async = compact_messages_with_summarizer(&msgs, &policy, None)
+            .await
+            .unwrap();
+        assert_eq!(sync, via_async);
+    }
+
+    #[tokio::test]
+    async fn oversized_model_summary_is_truncated() {
+        let msgs = oversized_transcript();
+        let policy = CompactionPolicy::new(200, 4);
+        let summarizer = StubSummarizer {
+            response: Ok("s".repeat(COMPACTION_SUMMARY_MAX_CHARS * 3)),
+        };
+        let out = compact_messages_with_summarizer(&msgs, &policy, Some(&summarizer))
+            .await
+            .unwrap();
+        let note = note_text(&out);
+        assert!(note.len() < COMPACTION_SUMMARY_MAX_CHARS + 200);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_uses_the_configured_summarizer() {
+        use futures::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+
+        /// Captures the exact request the loop sends, then streams one final text turn.
+        struct CapturingProvider {
+            requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        }
+
+        #[async_trait]
+        impl crate::providers::Provider for CapturingProvider {
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            async fn stream(
+                &self,
+                req: crate::providers::ProviderRequest,
+            ) -> crate::error::Result<futures::stream::BoxStream<'static, crate::types::StreamDelta>>
+            {
+                self.requests.lock().unwrap().push(req.messages.clone());
+                Ok(Box::pin(futures::stream::iter([
+                    crate::types::StreamDelta::TextDelta { text: "ok".into() },
+                    crate::types::StreamDelta::MessageStop {
+                        stop_reason: "end_turn".into(),
+                    },
+                ])))
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut cfg = crate::runtime::RunConfig::new("mock-1", oversized_transcript());
+        cfg.compaction = CompactionPolicy::new(200, 4);
+        cfg.compaction_summarizer = Some(Arc::new(StubSummarizer {
+            response: Ok("Loop summary: earlier turns completed.".into()),
+        }));
+        let stream = crate::runtime::run_agent(
+            Arc::new(CapturingProvider {
+                requests: requests.clone(),
+            }),
+            Arc::new(crate::tools::NoTools),
+            cfg,
+        );
+        futures::pin_mut!(stream);
+        while stream.next().await.is_some() {}
+
+        let captured = requests.lock().unwrap();
+        let first_request = captured.first().expect("loop sent one provider request");
+        let compacted_note = first_request
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::Text { text } if text.contains("aikit compacted") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("the provider request should carry the compaction note");
+        assert!(
+            compacted_note.contains("Loop summary: earlier turns completed."),
+            "note: {compacted_note}"
+        );
+        assert!(first_request.len() < oversized_transcript().len());
     }
 
     #[test]

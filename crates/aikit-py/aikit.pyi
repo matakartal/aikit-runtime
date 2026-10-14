@@ -916,9 +916,14 @@ class RoutingOptions(TypedDict):
     request: RouteRequest
 
 
-class CompactionOptions(TypedDict):
+class _CompactionOptionsRequired(TypedDict):
     max_context_tokens: int
+
+
+class CompactionOptions(_CompactionOptionsRequired, total=False):
     keep_recent_messages: int
+    summary_model: str
+    summary_max_tokens: int
 
 
 class RunOptions(TypedDict, total=False):
