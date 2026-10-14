@@ -224,7 +224,10 @@ async fn teardown_connection(
     server.finalize_connection_termination(connection_id, Some(principal))
 }
 
-async fn read_bounded_line<R>(reader: &mut R, max_bytes: usize) -> ProtocolResult<Option<Vec<u8>>>
+pub(crate) async fn read_bounded_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> ProtocolResult<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -259,7 +262,7 @@ where
     }
 }
 
-async fn write_json_line<W>(writer: &mut W, value: &Value) -> ProtocolResult<()>
+pub(crate) async fn write_json_line<W>(writer: &mut W, value: &Value) -> ProtocolResult<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -598,6 +601,61 @@ fn valid_protocol_version(headers: &McpHttpHeaders) -> bool {
     headers.get("mcp-protocol-version") == Some(MCP_SERVER_CONTRACT_REVISION)
 }
 
+/// RFC 9728 OAuth protected-resource metadata, served without authentication at
+/// `/.well-known/oauth-protected-resource` (and the path-suffixed variant) when configured.
+///
+/// This is discovery only: it tells clients which resource identifier this server is and which
+/// authorization servers can issue tokens for it. Token issuance itself happens at those
+/// authorization servers; the MCP listener keeps validating whatever credential its configured
+/// [`McpHttpAuthenticator`] understands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpProtectedResourceMetadata {
+    /// The protected resource identifier — the MCP endpoint URL clients connect to.
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorization_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bearer_methods_supported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_documentation: Option<String>,
+}
+
+impl McpProtectedResourceMetadata {
+    fn validate(&self) -> ProtocolResult<()> {
+        for (label, value) in std::iter::once(("resource", self.resource.as_str())).chain(
+            self.authorization_servers
+                .iter()
+                .map(|server| ("authorization server", server.as_str())),
+        ) {
+            let valid_scheme =
+                value.starts_with("https://") || value.starts_with("http://127.0.0.1");
+            if !valid_scheme || value.contains(['\r', '\n', ' ', '"']) {
+                return Err(ProtocolError::invalid(format!(
+                    "OAuth protected-resource {label} must be an https URL \
+                     (or loopback http) without spaces or quotes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The metadata document URL advertised in `WWW-Authenticate: Bearer resource_metadata="..."`,
+    /// derived from the resource origin per RFC 9728.
+    fn metadata_url(&self) -> Option<String> {
+        let scheme_end = self.resource.find("://")? + 3;
+        let origin_end = self.resource[scheme_end..]
+            .find('/')
+            .map_or(self.resource.len(), |index| scheme_end + index);
+        Some(format!(
+            "{}/.well-known/oauth-protected-resource",
+            &self.resource[..origin_end]
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct McpStreamableHttpConfig {
     pub path: String,
@@ -614,6 +672,9 @@ pub struct McpStreamableHttpConfig {
     pub session_ttl: Duration,
     pub request_timeout: Duration,
     pub graceful_shutdown_timeout: Duration,
+    /// Optional RFC 9728 discovery document. `None` (the default) serves no OAuth metadata and
+    /// adds nothing to authentication challenges.
+    pub oauth_protected_resource: Option<McpProtectedResourceMetadata>,
 }
 
 impl Default for McpStreamableHttpConfig {
@@ -633,6 +694,7 @@ impl Default for McpStreamableHttpConfig {
             session_ttl: Duration::from_millis(DEFAULT_MCP_HTTP_SESSION_TTL_MS),
             request_timeout: Duration::from_secs(60),
             graceful_shutdown_timeout: Duration::from_secs(5),
+            oauth_protected_resource: None,
         }
     }
 }
@@ -663,6 +725,9 @@ impl McpStreamableHttpConfig {
             .any(|origin| origin.is_empty() || origin.contains(['\r', '\n']))
         {
             return Err(ProtocolError::invalid("invalid MCP Origin allowlist"));
+        }
+        if let Some(metadata) = &self.oauth_protected_resource {
+            metadata.validate()?;
         }
         Ok(())
     }
@@ -778,6 +843,27 @@ impl McpStreamableHttpServer {
             Ok(request) => request,
             Err(error) => return Ok(HttpResponse::text(error.status, &error.message)),
         };
+        // RFC 9728 discovery is public by design: no authentication, no session, no origin
+        // gate. Both the root document and the path-suffixed variant resolve to the same
+        // metadata because this listener serves exactly one protected resource.
+        let well_known_root = "/.well-known/oauth-protected-resource";
+        let well_known_suffixed = format!("{well_known_root}{}", self.config.path);
+        if request.path == well_known_root || request.path == well_known_suffixed {
+            return Ok(match &self.config.oauth_protected_resource {
+                None => HttpResponse::text(404, "not found"),
+                Some(metadata) if request.method == "GET" => {
+                    let document = serde_json::to_value(metadata).map_err(|error| {
+                        ProtocolError::invalid(format!(
+                            "serialize OAuth protected-resource metadata: {error}"
+                        ))
+                    })?;
+                    HttpResponse::json(200, document)
+                }
+                Some(_) => {
+                    HttpResponse::text(405, "method not allowed").with_header("Allow", "GET")
+                }
+            });
+        }
         if request.path != self.config.path {
             return Ok(HttpResponse::text(404, "not found"));
         }
@@ -791,6 +877,19 @@ impl McpStreamableHttpServer {
             Err(error) => {
                 let mut response = HttpResponse::text(error.status, &error.message);
                 if let Some(challenge) = error.www_authenticate {
+                    // Advertise the discovery document per RFC 9728 §5.1 so clients can locate
+                    // the authorization servers for this resource.
+                    let challenge = match self
+                        .config
+                        .oauth_protected_resource
+                        .as_ref()
+                        .and_then(McpProtectedResourceMetadata::metadata_url)
+                    {
+                        Some(metadata_url) => {
+                            format!("{challenge}, resource_metadata=\"{metadata_url}\"")
+                        }
+                        None => challenge,
+                    };
                     response = response.with_header("WWW-Authenticate", &challenge);
                 }
                 return Ok(response);
@@ -1367,7 +1466,7 @@ fn protocol_http_response(error: &ProtocolError) -> HttpResponse {
     HttpResponse::text(status, &error.message)
 }
 
-fn protocol_io(operation: &str, error: std::io::Error) -> ProtocolError {
+pub(crate) fn protocol_io(operation: &str, error: std::io::Error) -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::Conflict,
         format!("{operation} failed: {error}"),
@@ -1829,6 +1928,94 @@ mod tests {
             let (header, value) = line.split_once(':')?;
             header.eq_ignore_ascii_case(name).then(|| value.trim())
         })
+    }
+
+    #[tokio::test]
+    async fn oauth_protected_resource_discovery_is_public_and_advertised_in_challenges() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let handle = cancellation.handle();
+        let mut config = McpStreamableHttpConfig::default();
+        config
+            .allowed_origins
+            .insert("https://client.example".into());
+        config.oauth_protected_resource = Some(McpProtectedResourceMetadata {
+            resource: format!("http://127.0.0.1:{}/mcp", address.port()),
+            authorization_servers: vec!["https://auth.example.test".into()],
+            scopes_supported: vec!["mcp:tools:call".into()],
+            bearer_methods_supported: vec!["header".into()],
+            resource_documentation: None,
+        });
+        let transport = Arc::new(
+            McpStreamableHttpServer::new(
+                runtime_server(),
+                Arc::new(InMemoryMcpHttpSessionStore::default()),
+                Arc::new(TestAuthenticator),
+                Arc::new(EchoHost),
+                config,
+            )
+            .unwrap(),
+        );
+        let task = tokio::spawn(transport.serve(listener, cancellation));
+
+        // Discovery documents are public: no bearer token, no Origin, both well-known forms.
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ] {
+            let response = raw_http(
+                address,
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+            let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+            let document: Value = serde_json::from_str(body.trim()).unwrap();
+            assert_eq!(
+                document["resource"],
+                format!("http://127.0.0.1:{}/mcp", address.port())
+            );
+            assert_eq!(
+                document["authorization_servers"],
+                serde_json::json!(["https://auth.example.test"])
+            );
+        }
+        let post_response = raw_http(
+            address,
+            b"POST /.well-known/oauth-protected-resource HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(post_response.starts_with("HTTP/1.1 405"), "{post_response}");
+
+        // Unauthenticated requests advertise the metadata URL per RFC 9728 §5.1.
+        let initialize = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"oauth-test","version":"1"}
+            }
+        })
+        .to_string();
+        let unauthenticated = raw_http(
+            address,
+            &post(&initialize, "Origin: https://client.example\r\n"),
+        )
+        .await;
+        assert!(
+            unauthenticated.starts_with("HTTP/1.1 401"),
+            "{unauthenticated}"
+        );
+        let challenge = response_header(&unauthenticated, "WWW-Authenticate").unwrap();
+        assert!(
+            challenge.contains(&format!(
+                "resource_metadata=\"http://127.0.0.1:{}/.well-known/oauth-protected-resource\"",
+                address.port()
+            )),
+            "challenge: {challenge}"
+        );
+
+        handle.cancel();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
