@@ -144,7 +144,7 @@ jobs:
           else
             echo "has_packages=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         if: steps.pypi_plan.outputs.has_packages == 'true'
         with:
           packages-dir: dist/wheels-to-publish
@@ -163,7 +163,7 @@ jobs:
       id-token: write # npm trusted publishing (provenance is automatic with npm >= 11.5.1)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org

@@ -13,7 +13,7 @@ the Rust core, with type information in `aikit.pyi` / `py.typed`.
 ```bash
 # from the repository root
 python3 -m venv .venv
-.venv/bin/pip install "maturin==1.14.1"
+.venv/bin/pip install "maturin==1.15.0"
 .venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml --locked
 ```
 
