@@ -149,6 +149,49 @@ All notable changes to this project will be documented in this file. The format 
   tool-trajectory and denied-tool cases.
 - Dependabot, community-health files, Discussions, and repository metadata.
 
+- A2A task mutations persist caller-injected wall-clock instants projected as official RFC 3339
+  `TaskStatus.timestamp` values; `statusTimestampAfter` is an enforced inclusive `ListTasks`
+  filter; `Task.history` is projected from durable receipts under official `historyLength`
+  semantics; and completed-task artifacts publish durable `TaskArtifactUpdateEvent` frames before
+  the terminal frame, including across restart recovery. The mapper snapshot schema advances to
+  version 5 and v4-or-older snapshots migrate on read.
+- Journal-backed A2A transport persistence (`A2aJournalMapperSnapshotStore`): one hash-chained
+  typed delta per accepted mutation under the transport's deterministic commit identity, bounded
+  checkpoint rotation with prefix garbage collection, and fail-closed checkpoint+tail replay on
+  restore. `A2aMapper::journal_operations_since` / `apply_journal_delta` are the diff and replay
+  primitives. Backends ship as the linearizable in-memory reference and a durable cross-process
+  `SqliteA2aMapperJournalStore` proven byte-identical to it by a differential conformance test;
+  the default stores remain full-snapshot CAS. A persistent `a2a_journal_replay` libFuzzer target
+  joins the fuzz workflow, and every SQLite-backed store now shares one hardened open sequence.
+- ACP v1 serving transport: `serve_acp_stdio` exposes aikit as an editor-drivable ACP agent over
+  newline-delimited JSON-RPC with governed `session/new`, `session/prompt`, and `session/cancel`
+  routing over the SDK-neutral mapper, streamed `session/update` notifications, one bounded active
+  run per session, `-32601` for unsupported optional methods, and a host prompt seam so the wire
+  layer never executes tools.
+- Official MCP SDK conformance in CI: `scripts/mcp-sdk-conformance.sh` drives the pinned
+  `@modelcontextprotocol/sdk` client against the Streamable HTTP server (initialize, tools,
+  resources, prompts, bearer auth, fail-closed negatives), including RFC 9728 protected-resource
+  discovery through `McpProtectedResourceMetadata`, the `.well-known/oauth-protected-resource`
+  document, and the 401 `resource_metadata` challenge parameter. A live authorization-server token
+  flow stays outside keyless scope.
+- Model-generated transcript compaction: the `CompactionSummarizer` trait, the governed
+  `AgentCompactionSummarizer`, and `compact_messages_with_summarizer`, exposed as
+  `compaction.summary_model` / `compaction.summary_max_tokens` in Python and Node run options.
+  Any summarizer failure falls back to the deterministic extractive note.
+- Python and Node external-agent projections: execution-free discovery, detached Ed25519 manifest
+  verification, release selection, update-config validation, refresh planning, the fail-closed
+  `ExternalUpdateState` machine, and live `spawn_external_agent_session` / `ExternalAgentSession`
+  built on the shared per-kind spawn policy (`spawn_external_runtime_for_host`) with the Gemini
+  vendor-terms gate and a lag-fail-closed event stream. The `EXTERNAL_AGENTS` module byte-compares
+  the deterministic surface across all three languages, and both bindings drive a scripted ACP
+  agent through the real official-SDK client in CI.
+- Schema-driven binding declarations: `scripts/generate-declarations.sh` renders the external-agent
+  DTOs plus canonical `Usage`, `ProviderWarning`, `MediaInput`, and the `MediaInputSource`
+  discriminated union into the generated regions of `aikit.pyi` and `index.d.ts` from `schemars`
+  schemas, and `--check` fails CI on drift. `scripts/check-binding-declarations.sh` requires every
+  binding runtime export to carry a declaration and compares covered field sets against the Rust
+  inventory. Types whose `Option` fields omit `skip_serializing_if` stay hand-written.
+
 ### Changed
 
 - MCP discovery and transport now fail closed after bounded page, item, byte, cursor, or response
@@ -238,6 +281,13 @@ All notable changes to this project will be documented in this file. The format 
   executes its cassette tests in CI/release validation.
 - Python/TypeScript declarations now reflect factory-only MCP handles and optional durable resume
   approvals instead of accepting calls that runtime rejects or rejecting valid commands.
+
+- Python and Node A2A mapper tests track snapshot schema version 5. The declaration generator
+  replaced two hand-written errors (`origin`/`discovered_by` are the real enums and
+  `consecutive_failures` is required), and the inventory gate caught the optional
+  `RuntimeCandidate.aliases` drift plus the missing Python `connect_mcp_http`/`connect_mcp_stdio`
+  stubs.
+- Rustdoc intra-doc links on the A2A journal surface resolve under `-D warnings`.
 
 ### Security
 

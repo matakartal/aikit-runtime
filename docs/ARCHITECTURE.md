@@ -167,10 +167,17 @@ projection, and a separate protected cancellation ingress. That protected ingres
 a private or mutually authenticated boundary; exposing it directly to untrusted callers would
 move identity and quota enforcement outside aikit's current pre-header guarantees.
 
-Transport updates currently commit through full-snapshot compare-and-swap. A typed delta-journal
-contract exists and is tested, but it is not yet wired into the production transport hot path.
-This distinction matters: the journal API is implementation evidence, not a distributed durability
-claim.
+Transport durability accepts two interchangeable store shapes behind one compare-and-swap
+contract. The default stores persist the full snapshot per commit. The journal-backed store
+(`A2aJournalMapperSnapshotStore`) instead derives one typed, hash-chained delta per accepted
+mutation — reusing the transport's deterministic commit identity as the journal mutation id, so a
+crash-retry resolves through exact-idempotent append — rotates a checkpoint on a bounded cadence,
+garbage-collects the covered prefix, and restores by replaying checkpoint + tail through the
+canonical mapper validator. Two journal backends ship: the linearizable in-memory reference and a
+durable SQLite store whose immediate transactions give two processes sharing one database file a
+single linearized stream, proven byte-identical to the reference by a differential conformance
+test. Journal persistence is single-file/local coordination over whatever
+`A2aMapperJournalStore` the host supplies; it is not by itself a distributed durability claim.
 
 ## State and crash safety
 

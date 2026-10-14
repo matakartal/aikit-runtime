@@ -20,9 +20,10 @@ actually defends aikit's moat.*
 
 > **2026-07-24 addendum:** the Sync in-process durable driver, bounded MCP server, and experimental
 > A2A JSON-RPC/SSE listener have landed. A2A now includes artifact/direct-Message projection,
-> protected cancellation ingress, and pinned official TCK evidence. Distributed workers,
-> production A2A journal wiring, complete timestamps/history/artifact updates, and ACP wire
-> integration remain open.
+> protected cancellation ingress, complete timestamps/history/artifact updates, wired
+> delta-journal persistence (in-memory and SQLite backends), and pinned official TCK evidence;
+> the ACP stdio serving transport has landed as well. Distributed workers and production
+> deployment proof remain open.
 
 ## What the research changed (read this first)
 
@@ -116,7 +117,7 @@ capability broker as the base.*
 
 | # | Take | From | Why | Effort |
 |---|------|------|-----|--------|
-| 4.1 | **Agent Client Protocol (ACP) surface** — expose aikit over ACP so editors (Zed, etc.) can drive it. | grok-build (ACP), Zed | Editor embedding = distribution, without us building a UI. | M |
+| 4.1 | **Agent Client Protocol (ACP) surface** — expose aikit over ACP so editors (Zed, etc.) can drive it. | grok-build (ACP), Zed | Editor embedding = distribution, without us building a UI. **Landed locally:** `serve_acp_stdio` serves the governed mapper over official ACP v1 wire shapes; real-editor acceptance remains. | M |
 | 4.2 | **A2A (Agent-to-Agent) protocol** — standard multi-agent interop + agent identity/trust for delegation. | Strands, BeeAI (LF), Google A2A, MS toolkit (identity) | **Partial in tree:** governed JSON-RPC/SSE and official TCK evidence exist; production journal/deployment gaps remain. | M–L |
 | 4.3 | **Skills / plugins loader** — load skills/plugins/hooks from a directory (`AGENTS.md`-style), sandboxed + governed. | grok-build, Claude Agent SDK, opencode plugins | Extensibility without a marketplace-as-product; everything still governed. | M |
 | 4.4 | **Cedar/OPA policy import** — let the permission engine ingest standard Cedar/OPA policies. | MS toolkit (Cedar/OPA), Permit.io | Enterprise policy interop; standards credibility. | M |
@@ -160,7 +161,7 @@ Taking "everything" means every **capability** relevant to a governed, provider-
 P1  Complete the conjunction     ──►  guardrails + real OS sandbox   [largely landed]
 P2  Governance depth ≥ Claude    ──►  policy, plan mode, SmartApprove, reliability, off-prompt  [landed in core]
 P3  Depth / isolation / scale    ──►  durable core landed; distributed worker, microVM, model summaries remain
-P4  Ecosystem / interop          ──►  MCP server landed; A2A partial; ACP wire and production proof remain
+P4  Ecosystem / interop          ──►  MCP server landed; A2A partial; ACP stdio serving transport landed, production proof remains
 P5  Cross-language + conformance ──►  CONTINUOUS gate on P1–P4 (the actual moat) — project remaining Rust-only P2 helpers to Py/TS next
 ```
 
