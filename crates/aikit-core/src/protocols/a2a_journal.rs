@@ -1,14 +1,16 @@
 //! Typed, single-writer persistence contract for incremental A2A mapper mutations.
 //!
-//! This module is intentionally additive: the current A2A mapper and transport do not yet emit or
-//! replay these deltas. It defines the durable ordering, checkpoint, bounded-restore, and safe-GC
-//! boundary needed to replace full-snapshot writes without introducing per-tenant forks.
+//! The transport consumes this contract through `A2aJournalMapperSnapshotStore`, which derives one
+//! delta per accepted mutation and restores through checkpoint + bounded tail replay. This module
+//! defines the durable ordering, checkpoint, bounded-restore, and safe-GC boundary, the
+//! linearizable in-memory reference, and the durable SQLite implementation.
 
 use super::a2a::{
     A2aCancellationOutboxRecord, A2aDispatchOutboxRecord, A2aMapper, A2aMessageReceipt,
     A2aPendingEventIntent, A2aTaskRecord,
 };
 use async_trait::async_trait;
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::Mutex;
@@ -1592,6 +1594,749 @@ impl A2aMapperJournalStore for InMemoryA2aMapperJournalStore {
     }
 }
 
+const SQLITE_JOURNAL_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_manifest (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  manifest_json TEXT NOT NULL,
+  next_restore_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_deltas (
+  sequence INTEGER PRIMARY KEY,
+  delta_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_mutations (
+  mutation_id TEXT PRIMARY KEY,
+  delta_json TEXT NOT NULL,
+  token_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_compacted (
+  mutation_id TEXT PRIMARY KEY,
+  tombstone_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  checkpoint_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aikit_a2a_journal_restore_pins (
+  restore_id TEXT PRIMARY KEY,
+  pin_json TEXT NOT NULL
+);
+"#;
+
+#[derive(Serialize, Deserialize)]
+struct StoredRestorePin {
+    start: A2aJournalToken,
+    through: A2aJournalToken,
+}
+
+/// Durable, cross-process SQLite implementation of the journal contract.
+///
+/// Every method runs inside one immediate transaction, so two processes sharing the database file
+/// observe a single linearized stream: a concurrent append surfaces as `StaleHead`, an exact
+/// retry resolves through the mutation tombstones, and restore pins block GC across connections.
+/// Storage-layer failures map to [`A2aJournalError::OutcomeUnknown`], which callers already
+/// resolve through a linearizable head probe.
+#[derive(Debug)]
+pub struct SqliteA2aMapperJournalStore {
+    connection: Mutex<rusqlite::Connection>,
+}
+
+impl SqliteA2aMapperJournalStore {
+    /// Open or create the journal database at `path` with the repository's hardened SQLite open
+    /// sequence, initializing an empty-genesis manifest on first use.
+    pub fn open(path: impl AsRef<std::path::Path>) -> A2aJournalResult<Self> {
+        let connection = crate::sqlite::open_hardened(path, SQLITE_JOURNAL_SCHEMA)
+            .map_err(|reason| A2aJournalError::Invalid { reason })?;
+        let store = Self {
+            connection: Mutex::new(connection),
+        };
+        {
+            let connection = store
+                .connection
+                .try_lock()
+                .expect("journal connection is exclusively owned during open");
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT manifest_json FROM aikit_a2a_journal_manifest WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_unknown("initialize manifest"))?;
+            match existing {
+                Some(manifest_json) => {
+                    // Fail closed immediately on an unreadable manifest instead of at first use.
+                    let manifest: A2aJournalManifest = serde_json::from_str(&manifest_json)
+                        .map_err(|error| A2aJournalError::Corruption {
+                            reason: format!("stored journal manifest is unreadable: {error}"),
+                        })?;
+                    manifest.validate()?;
+                }
+                None => {
+                    let manifest = A2aJournalManifest::empty()?;
+                    connection
+                        .execute(
+                            "INSERT INTO aikit_a2a_journal_manifest \
+                             (id, manifest_json, next_restore_id) VALUES (1, ?1, 1)",
+                            rusqlite::params![encode_journal_json(&manifest)?],
+                        )
+                        .map_err(sqlite_unknown("initialize manifest"))?;
+                }
+            }
+        }
+        Ok(store)
+    }
+}
+
+fn sqlite_unknown(operation: &'static str) -> impl Fn(rusqlite::Error) -> A2aJournalError {
+    move |error| A2aJournalError::OutcomeUnknown {
+        operation: format!("{operation}: {error}"),
+    }
+}
+
+fn encode_journal_json<T: Serialize>(value: &T) -> A2aJournalResult<String> {
+    serde_json::to_string(value).map_err(serialization_error)
+}
+
+/// SQLite stores 64-bit integers as signed; journal sequences stay far below `i64::MAX`, so the
+/// conversions are total in practice and fail closed if that invariant is ever violated.
+fn sql_from_u64(value: u64) -> A2aJournalResult<i64> {
+    i64::try_from(value).map_err(|_| A2aJournalError::Invalid {
+        reason: "journal counter exceeds the SQLite integer range".into(),
+    })
+}
+
+fn sql_to_u64(value: i64) -> A2aJournalResult<u64> {
+    u64::try_from(value).map_err(|_| A2aJournalError::Corruption {
+        reason: "stored journal counter is negative".into(),
+    })
+}
+
+fn decode_journal_json<T: serde::de::DeserializeOwned>(
+    label: &'static str,
+    value: &str,
+) -> A2aJournalResult<T> {
+    serde_json::from_str(value).map_err(|error| A2aJournalError::Corruption {
+        reason: format!("stored {label} is unreadable: {error}"),
+    })
+}
+
+struct SqliteJournalView<'tx> {
+    tx: &'tx rusqlite::Transaction<'tx>,
+    manifest: A2aJournalManifest,
+    next_restore_id: u64,
+}
+
+impl<'tx> SqliteJournalView<'tx> {
+    fn load(tx: &'tx rusqlite::Transaction<'tx>) -> A2aJournalResult<Self> {
+        let (manifest_json, next_restore_id): (String, i64) = tx
+            .query_row(
+                "SELECT manifest_json, next_restore_id FROM aikit_a2a_journal_manifest WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sqlite_unknown("load manifest"))?;
+        let manifest = decode_journal_json("journal manifest", &manifest_json)?;
+        Ok(Self {
+            tx,
+            manifest,
+            next_restore_id: sql_to_u64(next_restore_id)?,
+        })
+    }
+
+    fn store_manifest(&self) -> A2aJournalResult<()> {
+        self.tx
+            .execute(
+                "UPDATE aikit_a2a_journal_manifest \
+                 SET manifest_json = ?1, next_restore_id = ?2 WHERE id = 1",
+                rusqlite::params![
+                    encode_journal_json(&self.manifest)?,
+                    sql_from_u64(self.next_restore_id)?
+                ],
+            )
+            .map_err(sqlite_unknown("store manifest"))?;
+        Ok(())
+    }
+
+    fn delta_at(&self, sequence: u64) -> A2aJournalResult<Option<A2aMapperDelta>> {
+        let row: Option<String> = self
+            .tx
+            .query_row(
+                "SELECT delta_json FROM aikit_a2a_journal_deltas WHERE sequence = ?1",
+                rusqlite::params![sql_from_u64(sequence)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_unknown("load delta"))?;
+        row.map(|json| decode_journal_json("journal delta", &json))
+            .transpose()
+    }
+
+    fn compacted_mutations(
+        &self,
+    ) -> A2aJournalResult<BTreeMap<String, A2aCompactedMutationTombstone>> {
+        let mut statement = self
+            .tx
+            .prepare("SELECT mutation_id, tombstone_json FROM aikit_a2a_journal_compacted")
+            .map_err(sqlite_unknown("load tombstones"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_unknown("load tombstones"))?;
+        let mut compacted = BTreeMap::new();
+        for row in rows {
+            let (mutation_id, tombstone_json) = row.map_err(sqlite_unknown("load tombstones"))?;
+            compacted.insert(
+                mutation_id,
+                decode_journal_json("mutation tombstone", &tombstone_json)?,
+            );
+        }
+        Ok(compacted)
+    }
+
+    fn restore_pins(&self) -> A2aJournalResult<BTreeMap<String, StoredRestorePin>> {
+        let mut statement = self
+            .tx
+            .prepare("SELECT restore_id, pin_json FROM aikit_a2a_journal_restore_pins")
+            .map_err(sqlite_unknown("load restore pins"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_unknown("load restore pins"))?;
+        let mut pins = BTreeMap::new();
+        for row in rows {
+            let (restore_id, pin_json) = row.map_err(sqlite_unknown("load restore pins"))?;
+            pins.insert(restore_id, decode_journal_json("restore pin", &pin_json)?);
+        }
+        Ok(pins)
+    }
+
+    /// Mirror of the in-memory `token_at`, resolving a historical token by sequence.
+    fn token_at(&self, sequence: u64) -> A2aJournalResult<Option<A2aJournalToken>> {
+        if sequence == self.manifest.head.sequence {
+            return Ok(Some(self.manifest.head.clone()));
+        }
+        if sequence == 0 {
+            if let Some(checkpoint) = &self.manifest.active_checkpoint {
+                if checkpoint.high_water.sequence == 0 {
+                    return Ok(Some(checkpoint.high_water.clone()));
+                }
+            }
+            return Ok(Some(A2aJournalToken::genesis()));
+        }
+        if let Some(delta) = self.delta_at(sequence)? {
+            return Ok(Some(delta.token()?));
+        }
+        Ok(self
+            .manifest
+            .active_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.high_water.sequence == sequence)
+            .map(|checkpoint| checkpoint.high_water.clone()))
+    }
+
+    /// Mirror of the in-memory `validate_head`: manifest integrity, tombstone root, head delta.
+    fn validate_head(&self) -> A2aJournalResult<()> {
+        self.manifest.validate()?;
+        let compacted = self.compacted_mutations()?;
+        if self.manifest.compacted_mutation_count != compacted.len() as u64
+            || self.manifest.compacted_mutations_hash != compacted_mutations_hash(&compacted)?
+        {
+            return Err(A2aJournalError::Corruption {
+                reason: "compacted mutation tombstones do not match the manifest root".into(),
+            });
+        }
+        if self.manifest.head.sequence == 0 {
+            if self.manifest.head != A2aJournalToken::genesis() {
+                let checkpoint = self.manifest.active_checkpoint.as_ref().ok_or_else(|| {
+                    A2aJournalError::Corruption {
+                        reason: "non-genesis sequence-zero head has no checkpoint".into(),
+                    }
+                })?;
+                if checkpoint.high_water != self.manifest.head {
+                    return Err(A2aJournalError::Corruption {
+                        reason: "bootstrap checkpoint does not match journal head".into(),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        if self.manifest.head.sequence >= self.manifest.retained_from_sequence {
+            let delta = self.delta_at(self.manifest.head.sequence)?.ok_or_else(|| {
+                A2aJournalError::Corruption {
+                    reason: "journal head delta is missing".into(),
+                }
+            })?;
+            delta.validate()?;
+            if delta.token()? != self.manifest.head {
+                return Err(A2aJournalError::Corruption {
+                    reason: "journal head token does not match head delta".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirror of the in-memory `remove_unpinned_compacted_payloads`.
+    fn remove_unpinned_compacted_payloads(&self) -> A2aJournalResult<u64> {
+        let pins = self.restore_pins()?;
+        let mut statement = self
+            .tx
+            .prepare("SELECT sequence FROM aikit_a2a_journal_deltas WHERE sequence < ?1")
+            .map_err(sqlite_unknown("scan compacted deltas"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![sql_from_u64(self.manifest.retained_from_sequence)?],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_unknown("scan compacted deltas"))?;
+        let mut removable = Vec::new();
+        for row in rows {
+            let sequence = sql_to_u64(row.map_err(sqlite_unknown("scan compacted deltas"))?)?;
+            let pinned = pins
+                .values()
+                .any(|pin| sequence > pin.start.sequence && sequence <= pin.through.sequence);
+            if !pinned {
+                removable.push(sequence);
+            }
+        }
+        for sequence in &removable {
+            self.tx
+                .execute(
+                    "DELETE FROM aikit_a2a_journal_deltas WHERE sequence = ?1",
+                    rusqlite::params![sql_from_u64(*sequence)?],
+                )
+                .map_err(sqlite_unknown("delete compacted delta"))?;
+        }
+        Ok(removable.len() as u64)
+    }
+}
+
+#[async_trait]
+impl A2aMapperJournalStore for SqliteA2aMapperJournalStore {
+    async fn manifest(&self) -> A2aJournalResult<A2aJournalManifest> {
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin manifest read"))?;
+        let view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        Ok(view.manifest)
+    }
+
+    async fn lookup_head(&self) -> A2aJournalResult<A2aJournalToken> {
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin head probe"))?;
+        let view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        Ok(view.manifest.head.clone())
+    }
+
+    async fn append_delta(
+        &self,
+        delta: A2aMapperDelta,
+    ) -> A2aJournalResult<A2aJournalAppendOutcome> {
+        delta.validate()?;
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin append"))?;
+        let mut view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+
+        let stored: Option<(String, String)> = tx
+            .query_row(
+                "SELECT delta_json, token_json FROM aikit_a2a_journal_mutations \
+                 WHERE mutation_id = ?1",
+                rusqlite::params![delta.mutation_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_unknown("load mutation identity"))?;
+        if let Some((delta_json, token_json)) = stored {
+            let existing: A2aMapperDelta = decode_journal_json("mutation delta", &delta_json)?;
+            let token: A2aJournalToken = decode_journal_json("mutation token", &token_json)?;
+            return if existing == delta && token == delta.token()? {
+                Ok(A2aJournalAppendOutcome::AlreadyApplied)
+            } else {
+                Err(A2aJournalError::MutationConflict {
+                    mutation_id: delta.mutation_id().to_owned(),
+                })
+            };
+        }
+        let compacted: Option<String> = tx
+            .query_row(
+                "SELECT tombstone_json FROM aikit_a2a_journal_compacted WHERE mutation_id = ?1",
+                rusqlite::params![delta.mutation_id()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_unknown("load mutation tombstone"))?;
+        if let Some(tombstone_json) = compacted {
+            let tombstone: A2aCompactedMutationTombstone =
+                decode_journal_json("mutation tombstone", &tombstone_json)?;
+            return if tombstone.delta_hash == delta.delta_hash()
+                && tombstone.token == delta.token()?
+            {
+                Ok(A2aJournalAppendOutcome::AlreadyApplied)
+            } else {
+                Err(A2aJournalError::MutationConflict {
+                    mutation_id: delta.mutation_id().to_owned(),
+                })
+            };
+        }
+        if delta.expected_token() != &view.manifest.head {
+            return Err(A2aJournalError::StaleHead {
+                expected: delta.expected_token().clone(),
+                actual: view.manifest.head.clone(),
+            });
+        }
+        let token = delta.token()?;
+        if view.delta_at(token.sequence)?.is_some() {
+            return Err(A2aJournalError::Corruption {
+                reason: "journal sequence already contains a different mutation".into(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO aikit_a2a_journal_deltas (sequence, delta_json) VALUES (?1, ?2)",
+            rusqlite::params![sql_from_u64(token.sequence)?, encode_journal_json(&delta)?],
+        )
+        .map_err(sqlite_unknown("insert delta"))?;
+        tx.execute(
+            "INSERT INTO aikit_a2a_journal_mutations (mutation_id, delta_json, token_json) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                delta.mutation_id(),
+                encode_journal_json(&delta)?,
+                encode_journal_json(&token)?
+            ],
+        )
+        .map_err(sqlite_unknown("insert mutation identity"))?;
+        view.manifest.head = token;
+        view.manifest.advance_generation()?;
+        view.store_manifest()?;
+        tx.commit().map_err(sqlite_unknown("commit append"))?;
+        Ok(A2aJournalAppendOutcome::Applied)
+    }
+
+    async fn install_checkpoint(
+        &self,
+        request: A2aCheckpointInstallRequest,
+    ) -> A2aJournalResult<A2aCheckpointInstallOutcome> {
+        request.checkpoint.validate()?;
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin checkpoint install"))?;
+        let mut view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        let metadata = request.checkpoint.metadata.clone();
+
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT checkpoint_json FROM aikit_a2a_journal_checkpoints \
+                 WHERE checkpoint_id = ?1",
+                rusqlite::params![metadata.checkpoint_id()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_unknown("load checkpoint"))?;
+        if view.manifest.active_checkpoint.as_ref() == Some(&metadata) {
+            let stored_json = stored.ok_or_else(|| A2aJournalError::Corruption {
+                reason: "active checkpoint bytes are missing".into(),
+            })?;
+            let stored_checkpoint: A2aMapperCheckpoint =
+                decode_journal_json("checkpoint", &stored_json)?;
+            return if stored_checkpoint == request.checkpoint {
+                Ok(A2aCheckpointInstallOutcome::AlreadyApplied)
+            } else {
+                Err(A2aJournalError::CheckpointConflict)
+            };
+        }
+        if let Some(stored_json) = stored {
+            let stored_checkpoint: A2aMapperCheckpoint =
+                decode_journal_json("checkpoint", &stored_json)?;
+            return if stored_checkpoint == request.checkpoint {
+                Err(A2aJournalError::StaleCheckpoint)
+            } else {
+                Err(A2aJournalError::CheckpointConflict)
+            };
+        }
+        if request.expected_active != view.manifest.active_checkpoint {
+            return Err(A2aJournalError::StaleCheckpoint);
+        }
+
+        let delta_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM aikit_a2a_journal_deltas", [], |row| {
+                row.get(0)
+            })
+            .map_err(sqlite_unknown("count deltas"))?;
+        let is_bootstrap = metadata.high_water.sequence == 0
+            && view.manifest.head == A2aJournalToken::genesis()
+            && view.manifest.active_checkpoint.is_none()
+            && delta_count == 0;
+        if is_bootstrap {
+            let expected = bootstrap_token(metadata.high_water.revision, &metadata.state_hash)?;
+            if metadata.high_water != expected {
+                return Err(A2aJournalError::CheckpointConflict);
+            }
+            view.manifest.head = metadata.high_water.clone();
+        } else {
+            let known = view
+                .token_at(metadata.high_water.sequence)?
+                .ok_or(A2aJournalError::HistoryCompacted)?;
+            if known != metadata.high_water {
+                return Err(A2aJournalError::CheckpointConflict);
+            }
+            if let Some(active) = &view.manifest.active_checkpoint {
+                if metadata.high_water.sequence <= active.high_water.sequence {
+                    return Err(A2aJournalError::CheckpointConflict);
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO aikit_a2a_journal_checkpoints (checkpoint_id, checkpoint_json) \
+             VALUES (?1, ?2)",
+            rusqlite::params![
+                metadata.checkpoint_id(),
+                encode_journal_json(&request.checkpoint)?
+            ],
+        )
+        .map_err(sqlite_unknown("insert checkpoint"))?;
+        view.manifest.active_checkpoint = Some(metadata);
+        view.manifest.advance_generation()?;
+        view.store_manifest()?;
+        tx.commit()
+            .map_err(sqlite_unknown("commit checkpoint install"))?;
+        Ok(A2aCheckpointInstallOutcome::Applied)
+    }
+
+    async fn begin_restore(&self) -> A2aJournalResult<A2aJournalRestorePoint> {
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin restore"))?;
+        let mut view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        let checkpoint = match &view.manifest.active_checkpoint {
+            Some(metadata) => {
+                let stored: Option<String> = tx
+                    .query_row(
+                        "SELECT checkpoint_json FROM aikit_a2a_journal_checkpoints \
+                         WHERE checkpoint_id = ?1",
+                        rusqlite::params![metadata.checkpoint_id()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_unknown("load checkpoint"))?;
+                let stored_json = stored.ok_or_else(|| A2aJournalError::Corruption {
+                    reason: "active checkpoint bytes are missing".into(),
+                })?;
+                let checkpoint: A2aMapperCheckpoint =
+                    decode_journal_json("checkpoint", &stored_json)?;
+                checkpoint.validate()?;
+                Some(checkpoint)
+            }
+            None => None,
+        };
+        let start = checkpoint
+            .as_ref()
+            .map_or_else(A2aJournalToken::genesis, |checkpoint| {
+                checkpoint.metadata.high_water.clone()
+            });
+        let restore_id = format!("a2a-restore-{}", view.next_restore_id);
+        view.next_restore_id =
+            view.next_restore_id
+                .checked_add(1)
+                .ok_or_else(|| A2aJournalError::Invalid {
+                    reason: "restore identifier capacity exhausted".into(),
+                })?;
+        let pin = StoredRestorePin {
+            start: start.clone(),
+            through: view.manifest.head.clone(),
+        };
+        tx.execute(
+            "INSERT INTO aikit_a2a_journal_restore_pins (restore_id, pin_json) VALUES (?1, ?2)",
+            rusqlite::params![restore_id, encode_journal_json(&pin)?],
+        )
+        .map_err(sqlite_unknown("insert restore pin"))?;
+        view.store_manifest()?;
+        let manifest = view.manifest.clone();
+        tx.commit().map_err(sqlite_unknown("commit restore pin"))?;
+        Ok(A2aJournalRestorePoint {
+            restore_id,
+            manifest,
+            checkpoint,
+            start,
+        })
+    }
+
+    async fn read_delta_page(
+        &self,
+        request: A2aJournalPageRequest,
+    ) -> A2aJournalResult<A2aJournalPage> {
+        request.validate()?;
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin page read"))?;
+        let view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        let pins = view.restore_pins()?;
+        let pin = pins
+            .get(request.restore_id())
+            .ok_or(A2aJournalError::RestoreNotFound)?;
+        if request.after().sequence < pin.start.sequence
+            || request.after().sequence > pin.through.sequence
+        {
+            return Err(A2aJournalError::Invalid {
+                reason: "restore cursor is outside its pinned range".into(),
+            });
+        }
+        let known_after = if *request.after() == pin.start {
+            pin.start.clone()
+        } else {
+            view.token_at(request.after().sequence)?
+                .ok_or(A2aJournalError::HistoryCompacted)?
+        };
+        if known_after != *request.after() {
+            return Err(A2aJournalError::Corruption {
+                reason: "restore cursor token does not match journal history".into(),
+            });
+        }
+
+        let through = pin.through.clone();
+        let mut deltas = Vec::new();
+        let mut encoded_bytes = 0_u32;
+        let mut cursor = request.after().clone();
+        for sequence in request.after().sequence.saturating_add(1)..=through.sequence {
+            if deltas.len() >= usize::from(request.max_deltas()) {
+                break;
+            }
+            let delta = view
+                .delta_at(sequence)?
+                .ok_or(A2aJournalError::HistoryCompacted)?;
+            delta.validate()?;
+            if delta.expected_token() != &cursor || delta.previous_hash() != cursor.delta_hash {
+                return Err(A2aJournalError::Corruption {
+                    reason: format!("broken delta hash chain at sequence {sequence}"),
+                });
+            }
+            let bytes = serde_json::to_vec(&delta)
+                .map_err(serialization_error)?
+                .len() as u32;
+            if encoded_bytes.saturating_add(bytes) > request.max_bytes() {
+                break;
+            }
+            encoded_bytes += bytes;
+            cursor = delta.token()?;
+            deltas.push(delta);
+        }
+        let done = cursor == through;
+        Ok(A2aJournalPage {
+            deltas,
+            next_after: cursor,
+            through,
+            done,
+            encoded_bytes,
+        })
+    }
+
+    async fn finish_restore(&self, restore_id: &str) -> A2aJournalResult<()> {
+        validate_id("restore id", restore_id)?;
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin restore release"))?;
+        tx.execute(
+            "DELETE FROM aikit_a2a_journal_restore_pins WHERE restore_id = ?1",
+            rusqlite::params![restore_id],
+        )
+        .map_err(sqlite_unknown("delete restore pin"))?;
+        let view = SqliteJournalView::load(&tx)?;
+        view.remove_unpinned_compacted_payloads()?;
+        tx.commit()
+            .map_err(sqlite_unknown("commit restore release"))?;
+        Ok(())
+    }
+
+    async fn garbage_collect(
+        &self,
+        request: A2aJournalGcRequest,
+    ) -> A2aJournalResult<A2aJournalGcOutcome> {
+        let mut connection = self.connection.lock().await;
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_unknown("begin garbage collection"))?;
+        let mut view = SqliteJournalView::load(&tx)?;
+        view.validate_head()?;
+        let active = view
+            .manifest
+            .active_checkpoint
+            .clone()
+            .ok_or(A2aJournalError::StaleCheckpoint)?;
+        if active != *request.checkpoint() {
+            return Err(A2aJournalError::StaleCheckpoint);
+        }
+        let next_retained = active.high_water.sequence.saturating_add(1);
+        if view.manifest.retained_from_sequence >= next_retained {
+            return Ok(A2aJournalGcOutcome::AlreadyCollected);
+        }
+        if view.manifest.token() != *request.expected_manifest() {
+            return Err(A2aJournalError::StaleManifest);
+        }
+        let mut statement = tx
+            .prepare(
+                "SELECT sequence, delta_json FROM aikit_a2a_journal_deltas \
+                 WHERE sequence <= ?1 ORDER BY sequence",
+            )
+            .map_err(sqlite_unknown("scan covered deltas"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![sql_from_u64(active.high_water.sequence)?],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(sqlite_unknown("scan covered deltas"))?;
+        let mut covered = Vec::new();
+        for row in rows {
+            let (sequence, delta_json) = row.map_err(sqlite_unknown("scan covered deltas"))?;
+            covered.push((sql_to_u64(sequence)?, delta_json));
+        }
+        drop(statement);
+        let mut compacted = view.compacted_mutations()?;
+        for (_, delta_json) in &covered {
+            let delta: A2aMapperDelta = decode_journal_json("journal delta", delta_json)?;
+            let tombstone = A2aCompactedMutationTombstone::from_delta(&delta)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO aikit_a2a_journal_compacted \
+                 (mutation_id, tombstone_json) VALUES (?1, ?2)",
+                rusqlite::params![tombstone.mutation_id(), encode_journal_json(&tombstone)?],
+            )
+            .map_err(sqlite_unknown("insert tombstone"))?;
+            tx.execute(
+                "DELETE FROM aikit_a2a_journal_mutations WHERE mutation_id = ?1",
+                rusqlite::params![delta.mutation_id()],
+            )
+            .map_err(sqlite_unknown("delete mutation identity"))?;
+            compacted.insert(tombstone.mutation_id().to_owned(), tombstone);
+        }
+        view.manifest.retained_from_sequence = next_retained;
+        view.manifest.compacted_mutation_count = compacted.len() as u64;
+        view.manifest.compacted_mutations_hash = compacted_mutations_hash(&compacted)?;
+        let removed_deltas = view.remove_unpinned_compacted_payloads()?;
+        view.manifest.advance_generation()?;
+        view.store_manifest()?;
+        tx.commit()
+            .map_err(sqlite_unknown("commit garbage collection"))?;
+        Ok(A2aJournalGcOutcome::Collected { removed_deltas })
+    }
+}
+
 fn validate_id(field: &'static str, value: &str) -> A2aJournalResult<()> {
     if value.is_empty()
         || value.len() > A2A_MAPPER_JOURNAL_ID_MAX_BYTES
@@ -1674,6 +2419,9 @@ mod tests {
     use super::*;
     use crate::protocols::{A2aMessage, A2aPart, A2aRole, CorrelationIdentity, ProtocolPrincipal};
 
+    /// Deterministic wall-clock instant injected wherever a mutation records a status timestamp.
+    const TEST_STATUS_TS: u64 = 1_754_000_000_000;
+
     fn operation(value: u64) -> A2aMapperOperation {
         A2aMapperOperation::SetNextSequence {
             next_sequence: value,
@@ -1685,10 +2433,7 @@ mod tests {
         A2aMapperDelta::new(mutation_id, expected, revision, vec![operation(value)]).unwrap()
     }
 
-    async fn append_chain(
-        store: &InMemoryA2aMapperJournalStore,
-        count: u64,
-    ) -> Vec<A2aMapperDelta> {
+    async fn append_chain(store: &dyn A2aMapperJournalStore, count: u64) -> Vec<A2aMapperDelta> {
         let mut expected = store.manifest().await.unwrap().head().clone();
         let mut deltas = Vec::new();
         for value in 1..=count {
@@ -1738,6 +2483,7 @@ mod tests {
                 },
                 CorrelationIdentity::new("journal-correlation", "journal-request").unwrap(),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -2027,5 +2773,245 @@ mod tests {
         let manifest = store.manifest().await.unwrap();
         assert_eq!(manifest.head(), checkpoint.metadata().high_water());
         assert_eq!(checkpoint.decode_mapper().unwrap(), mapper);
+    }
+
+    /// Drive the identical operation stream through the in-memory reference and the SQLite store,
+    /// asserting byte-identical manifests after every step. This pins the durable implementation
+    /// to the executable conformance reference instead of a prose contract.
+    #[tokio::test]
+    async fn sqlite_journal_matches_the_in_memory_reference_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let sqlite =
+            SqliteA2aMapperJournalStore::open(directory.path().join("journal.db")).unwrap();
+        let memory = InMemoryA2aMapperJournalStore::default();
+
+        let assert_matches = |left: &A2aJournalManifest, right: &A2aJournalManifest| {
+            assert_eq!(left, right, "manifest diverged from the reference");
+        };
+        assert_matches(
+            &sqlite.manifest().await.unwrap(),
+            &memory.manifest().await.unwrap(),
+        );
+
+        let deltas = append_chain(&memory, 3).await;
+        for next in &deltas {
+            assert_eq!(
+                sqlite.append_delta(next.clone()).await.unwrap(),
+                A2aJournalAppendOutcome::Applied
+            );
+        }
+        assert_matches(
+            &sqlite.manifest().await.unwrap(),
+            &memory.manifest().await.unwrap(),
+        );
+
+        let checkpoint = checkpoint_at(deltas[1].token().unwrap(), "reference-two");
+        for store in [&memory as &dyn A2aMapperJournalStore, &sqlite] {
+            assert_eq!(
+                store
+                    .install_checkpoint(A2aCheckpointInstallRequest::new(None, checkpoint.clone()))
+                    .await
+                    .unwrap(),
+                A2aCheckpointInstallOutcome::Applied
+            );
+        }
+        assert_matches(
+            &sqlite.manifest().await.unwrap(),
+            &memory.manifest().await.unwrap(),
+        );
+
+        for store in [&memory as &dyn A2aMapperJournalStore, &sqlite] {
+            let manifest = store.manifest().await.unwrap();
+            let request = A2aJournalGcRequest::from_manifest(&manifest).unwrap();
+            assert!(matches!(
+                store.garbage_collect(request).await.unwrap(),
+                A2aJournalGcOutcome::Collected { removed_deltas: 2 }
+            ));
+        }
+        assert_matches(
+            &sqlite.manifest().await.unwrap(),
+            &memory.manifest().await.unwrap(),
+        );
+
+        // Post-GC identity behaviour matches too: compacted retries stay idempotent, and the
+        // same stale head is reported for a replayed old token.
+        for store in [&memory as &dyn A2aMapperJournalStore, &sqlite] {
+            assert_eq!(
+                store.append_delta(deltas[0].clone()).await.unwrap(),
+                A2aJournalAppendOutcome::AlreadyApplied
+            );
+            assert!(matches!(
+                store
+                    .append_delta(delta("mutation-1", A2aJournalToken::genesis(), 9))
+                    .await
+                    .unwrap_err(),
+                A2aJournalError::MutationConflict { .. }
+            ));
+        }
+        assert_matches(
+            &sqlite.manifest().await.unwrap(),
+            &memory.manifest().await.unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_survives_reopen_with_idempotent_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.db");
+        let deltas = {
+            let store = SqliteA2aMapperJournalStore::open(&path).unwrap();
+            append_chain(&store, 2).await
+        };
+
+        let reopened = SqliteA2aMapperJournalStore::open(&path).unwrap();
+        let manifest = reopened.manifest().await.unwrap();
+        assert_eq!(manifest.head(), &deltas[1].token().unwrap());
+        // A crash-retry of the last committed mutation resolves without duplicating it.
+        assert_eq!(
+            reopened.append_delta(deltas[1].clone()).await.unwrap(),
+            A2aJournalAppendOutcome::AlreadyApplied
+        );
+        let tail = delta("mutation-after-reopen", manifest.head().clone(), 9);
+        assert_eq!(
+            reopened.append_delta(tail.clone()).await.unwrap(),
+            A2aJournalAppendOutcome::Applied
+        );
+
+        // Restore replays the full chain from genesis across the reopen boundary.
+        let restore = reopened.begin_restore().await.unwrap();
+        let page = reopened
+            .read_delta_page(
+                A2aJournalPageRequest::new(
+                    restore.restore_id(),
+                    restore.start().clone(),
+                    8,
+                    A2A_MAPPER_JOURNAL_MIN_PAGE_BYTES,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.deltas().len(), 3);
+        assert!(page.is_done());
+        reopened.finish_restore(restore.restore_id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_linearizes_two_connections_over_one_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.db");
+        let writer_a = SqliteA2aMapperJournalStore::open(&path).unwrap();
+        let writer_b = SqliteA2aMapperJournalStore::open(&path).unwrap();
+
+        let first = delta("writer-a-1", A2aJournalToken::genesis(), 1);
+        assert_eq!(
+            writer_a.append_delta(first.clone()).await.unwrap(),
+            A2aJournalAppendOutcome::Applied
+        );
+
+        // The second connection raced with a stale head and must observe the exact winner.
+        let stale = delta("writer-b-1", A2aJournalToken::genesis(), 2);
+        match writer_b.append_delta(stale).await.unwrap_err() {
+            A2aJournalError::StaleHead { actual, .. } => {
+                assert_eq!(actual, first.token().unwrap());
+            }
+            other => panic!("expected a stale head, got {other:?}"),
+        }
+        let second = delta("writer-b-1", first.token().unwrap(), 2);
+        assert_eq!(
+            writer_b.append_delta(second.clone()).await.unwrap(),
+            A2aJournalAppendOutcome::Applied
+        );
+        assert_eq!(
+            writer_a.lookup_head().await.unwrap(),
+            second.token().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_restore_pin_blocks_cross_connection_gc() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.db");
+        let reader = SqliteA2aMapperJournalStore::open(&path).unwrap();
+        let compactor = SqliteA2aMapperJournalStore::open(&path).unwrap();
+        let deltas = append_chain(&reader, 3).await;
+
+        let restore = reader.begin_restore().await.unwrap();
+        let checkpoint = checkpoint_at(deltas[2].token().unwrap(), "cross-conn");
+        compactor
+            .install_checkpoint(A2aCheckpointInstallRequest::new(None, checkpoint))
+            .await
+            .unwrap();
+        let manifest = compactor.manifest().await.unwrap();
+        let request = A2aJournalGcRequest::from_manifest(&manifest).unwrap();
+        // GC on the other connection compacts identities but must keep the pinned payloads.
+        assert!(matches!(
+            compactor.garbage_collect(request).await.unwrap(),
+            A2aJournalGcOutcome::Collected { removed_deltas: 0 }
+        ));
+
+        let page = reader
+            .read_delta_page(
+                A2aJournalPageRequest::new(
+                    restore.restore_id(),
+                    restore.start().clone(),
+                    8,
+                    A2A_MAPPER_JOURNAL_MIN_PAGE_BYTES,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.deltas().len(), 3);
+        assert!(page.is_done());
+        // Releasing the pin from its own connection finally removes the covered payloads.
+        reader.finish_restore(restore.restore_id()).await.unwrap();
+        let after = compactor.manifest().await.unwrap();
+        assert_eq!(after.retained_from_sequence(), 4);
+        let empty_restore = compactor.begin_restore().await.unwrap();
+        let empty_page = compactor
+            .read_delta_page(
+                A2aJournalPageRequest::new(
+                    empty_restore.restore_id(),
+                    empty_restore.start().clone(),
+                    8,
+                    A2A_MAPPER_JOURNAL_MIN_PAGE_BYTES,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(empty_page.deltas().is_empty());
+        assert!(empty_page.is_done());
+        compactor
+            .finish_restore(empty_restore.restore_id())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_journal_detects_tampered_rows_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.db");
+        {
+            let store = SqliteA2aMapperJournalStore::open(&path).unwrap();
+            append_chain(&store, 2).await;
+        }
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "UPDATE aikit_a2a_journal_deltas \
+                     SET delta_json = replace(delta_json, 'mutation-2', 'mutation-x') \
+                     WHERE sequence = 2",
+                    [],
+                )
+                .unwrap();
+        }
+        let reopened = SqliteA2aMapperJournalStore::open(&path).unwrap();
+        assert!(matches!(
+            reopened.lookup_head().await.unwrap_err(),
+            A2aJournalError::Corruption { .. }
+        ));
     }
 }

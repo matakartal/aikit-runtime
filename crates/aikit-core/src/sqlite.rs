@@ -54,6 +54,20 @@ CREATE TABLE IF NOT EXISTS aikit_session_execution_leases (
 "#;
 
 fn open(path: impl AsRef<Path>) -> std::result::Result<Connection, String> {
+    let connection = open_hardened(path, SCHEMA)?;
+    ensure_execution_lease_token_column(&connection)?;
+    ensure_durable_schema_version_column(&connection)?;
+    Ok(connection)
+}
+
+/// Open a SQLite database with the repository's hardened open sequence — parent creation,
+/// O_NOFOLLOW double-descriptor verification, busy timeout, owner-only permissions — and apply
+/// `schema`. Shared by every SQLite-backed store so new stores cannot silently skip a hardening
+/// step.
+pub(crate) fn open_hardened(
+    path: impl AsRef<Path>,
+    schema: &str,
+) -> std::result::Result<Connection, String> {
     let path = path.as_ref();
     if let Some(parent) = path
         .parent()
@@ -82,10 +96,8 @@ fn open(path: impl AsRef<Path>) -> std::result::Result<Connection, String> {
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
     connection
-        .execute_batch(SCHEMA)
+        .execute_batch(schema)
         .map_err(|e| e.to_string())?;
-    ensure_execution_lease_token_column(&connection)?;
-    ensure_durable_schema_version_column(&connection)?;
     tighten_owner_only_permissions(&database_file)?;
     Ok(connection)
 }

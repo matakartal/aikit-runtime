@@ -152,7 +152,7 @@ where
 }
 
 pub const A2A_PROTOCOL_VERSION: &str = "1.0";
-pub const A2A_MAPPER_SCHEMA_VERSION: u32 = 4;
+pub const A2A_MAPPER_SCHEMA_VERSION: u32 = 5;
 pub const A2A_DEFAULT_LIST_TASKS_PAGE_SIZE: u16 = 50;
 pub const A2A_MAX_LIST_TASKS_PAGE_SIZE: u16 = 100;
 /// Fail-closed permanent-state limits. Terminal tasks, receipts, dispatch tombstones, and settled
@@ -202,6 +202,7 @@ const A2A_CONTEXT_GENERATION_ATTEMPTS: usize = 8;
 const A2A_LEGACY_MAPPER_SCHEMA_VERSION: u32 = 1;
 const A2A_PREVIOUS_MAPPER_SCHEMA_VERSION: u32 = 2;
 const A2A_PRE_ARTIFACT_MAPPER_SCHEMA_VERSION: u32 = 3;
+const A2A_PRE_TIMESTAMP_MAPPER_SCHEMA_VERSION: u32 = 4;
 const A2A_RECONCILE_REASON: &str = "dispatch requires reconciliation";
 const A2A_EVENT_RECONCILE_REASON: &str = "event publication requires reconciliation";
 const A2A_EVENT_ATTEMPTS_EXHAUSTED_REASON: &str = "event publication attempt limit exhausted";
@@ -592,9 +593,10 @@ impl A2aTaskState {
 
 /// Canonical A2A 1.0 task-list filters.
 ///
-/// `historyLength`, `statusTimestampAfter`, and `includeArtifacts` remain wire concerns until the
-/// canonical task record carries those exact official fields. The mapper intentionally exposes
-/// only filters it can enforce without pretending that absent history or artifact data exists.
+/// `historyLength` and `includeArtifacts` remain wire projection concerns: they select how much
+/// data each returned task carries, never which tasks match, so they stay out of the canonical
+/// filter and its query hash. `statusTimestampAfter` is a real row filter and is enforced here
+/// against the persisted status timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct A2aListTasksRequest {
@@ -604,6 +606,10 @@ pub struct A2aListTasksRequest {
     pub context_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<A2aTaskState>,
+    /// Inclusive lower bound on the persisted status timestamp, in Unix milliseconds. Tasks
+    /// written before schema v5 carry no timestamp and never match this filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_timestamp_after_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -680,6 +686,12 @@ pub struct A2aTaskRecord {
     pub updated_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    /// Wall-clock instant of the most recent status change, injected by the caller at mutation
+    /// time and persisted verbatim. Restore never recomputes it. `None` only for records written
+    /// before schema v5; such tasks are honestly excluded from `statusTimestampAfter` filtering
+    /// and omit the wire `timestamp` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_timestamp_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -886,6 +898,10 @@ pub enum A2aPendingEventKind {
     DirectMessageResponse,
     /// Deterministic repair intent created only when an old v1 snapshot predates event intents.
     RecoveredSnapshot,
+    /// One durable completed-task artifact, published as its own official
+    /// `TaskArtifactUpdateEvent` frame before the terminal status frame. The artifact bytes stay
+    /// in the settled dispatch record; the intent carries only the artifact identity.
+    ArtifactProduced,
 }
 
 /// Durable logical stream-event intent. `event_id` is the idempotency identity an external event
@@ -910,6 +926,10 @@ pub struct A2aPendingEventIntent {
     pub task: A2aTaskRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_message: Option<A2aMessage>,
+    /// Identity of the settled-dispatch artifact an `ArtifactProduced` intent publishes. Always
+    /// `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
     pub state: A2aPendingEventState,
     /// Reserved for deterministic poison accounting in legacy snapshots. Transient event-store
     /// failures use `transient_failures` and never consume this terminal budget.
@@ -953,6 +973,7 @@ impl A2aContextOwner {
 struct A2aPendingEventScheduleKey {
     next_attempt_at_unix_ms: u64,
     source_revision: u64,
+    delivery_rank: u8,
     event_id: String,
 }
 
@@ -965,8 +986,19 @@ impl A2aPendingEventScheduleKey {
         .then(|| Self {
             next_attempt_at_unix_ms: event.next_attempt_at_unix_ms.unwrap_or(0),
             source_revision: event.source_revision,
+            delivery_rank: event_kind_delivery_rank(event.kind),
             event_id: event.event_id.clone(),
         })
+    }
+}
+
+/// Delivery order among intents that share one source revision. Artifact frames must reach the
+/// wire before the terminal status frame produced by the same completion, because A2A clients may
+/// close the stream at the terminal frame.
+fn event_kind_delivery_rank(kind: A2aPendingEventKind) -> u8 {
+    match kind {
+        A2aPendingEventKind::ArtifactProduced => 0,
+        _ => 1,
     }
 }
 
@@ -1123,6 +1155,7 @@ impl<'de> Deserialize<'de> for A2aMapper {
                 A2A_LEGACY_MAPPER_SCHEMA_VERSION
                 | A2A_PREVIOUS_MAPPER_SCHEMA_VERSION
                 | A2A_PRE_ARTIFACT_MAPPER_SCHEMA_VERSION
+                | A2A_PRE_TIMESTAMP_MAPPER_SCHEMA_VERSION
                 | A2A_MAPPER_SCHEMA_VERSION => A2A_MAPPER_SCHEMA_VERSION,
                 unsupported => unsupported,
             },
@@ -1207,6 +1240,31 @@ impl A2aMapper {
     /// task run may legitimately accept more than one message.
     pub fn dispatch_outbox(&self) -> &BTreeMap<String, A2aDispatchOutboxRecord> {
         &self.dispatch_outbox
+    }
+
+    /// Ordered accepted-message history for one task, oldest acceptance first.
+    ///
+    /// A2A 1.0 `Task.history` is projected from durable message receipts: every accepted
+    /// `SendMessage` bound to the task, ordered by its acceptance revision and normalized to the
+    /// task's canonical context/task identity exactly like the dispatched copy. The mapper stores
+    /// no synthetic agent messages, so the projection never invents interactions that were not
+    /// durably accepted.
+    pub fn history_for_task(&self, task_id: &str) -> Vec<A2aMessage> {
+        let mut receipts: Vec<&A2aMessageReceipt> = self
+            .receipts
+            .values()
+            .filter(|receipt| receipt.mapping.task_id == task_id)
+            .collect();
+        receipts.sort_by_key(|receipt| receipt.accepted_revision);
+        receipts
+            .into_iter()
+            .map(|receipt| {
+                let mut message = receipt.message.clone();
+                message.context_id = Some(receipt.mapping.context_id.clone());
+                message.task_id = Some(receipt.mapping.task_id.clone());
+                message
+            })
+            .collect()
     }
 
     /// Durable output artifacts for the task's unique finalized dispatch. The snapshot validator
@@ -1443,6 +1501,9 @@ impl A2aMapper {
         pending.sort_by(|left, right| {
             left.source_revision
                 .cmp(&right.source_revision)
+                .then_with(|| {
+                    event_kind_delivery_rank(left.kind).cmp(&event_kind_delivery_rank(right.kind))
+                })
                 .then_with(|| left.event_id.cmp(&right.event_id))
         });
         pending
@@ -3109,12 +3170,13 @@ impl A2aMapper {
                     "A2A event revision or attempt history is invalid",
                 ));
             }
-            let expected = make_pending_event_with_response(
+            let expected = make_pending_event_full(
                 &event.task,
                 event.source_revision,
                 event.kind,
                 event.message_id.as_deref(),
                 event.response_message.clone(),
+                event.artifact_id.as_deref(),
                 event.state,
                 event.created_revision,
             );
@@ -3127,6 +3189,30 @@ impl A2aMapper {
                 return Err(ProtocolError::invalid(
                     "A2A event canonical payload hash is invalid",
                 ));
+            }
+            match (event.kind, event.artifact_id.as_deref()) {
+                (A2aPendingEventKind::ArtifactProduced, Some(artifact_id)) => {
+                    let artifact_bound = self
+                        .artifacts_for_task(&event.task_id)
+                        .iter()
+                        .any(|artifact| artifact.artifact_id == artifact_id);
+                    if event.task.state != A2aTaskState::Completed || !artifact_bound {
+                        return Err(ProtocolError::invalid(
+                            "A2A artifact event is not bound to one durable completed artifact",
+                        ));
+                    }
+                }
+                (A2aPendingEventKind::ArtifactProduced, None) => {
+                    return Err(ProtocolError::invalid(
+                        "A2A artifact event is missing its artifact identity",
+                    ))
+                }
+                (_, Some(_)) => {
+                    return Err(ProtocolError::invalid(
+                        "A2A non-artifact event cannot carry an artifact identity",
+                    ))
+                }
+                (_, None) => {}
             }
             match (event.kind, event.response_message.as_ref()) {
                 (A2aPendingEventKind::DirectMessageResponse, Some(message)) => {
@@ -3259,6 +3345,12 @@ impl A2aMapper {
                 A2aPendingEventKind::RecoveredSnapshot => {
                     event.message_id.is_none()
                         && event.source_revision == event.task.updated_revision
+                }
+                A2aPendingEventKind::ArtifactProduced => {
+                    event.message_id.is_none()
+                        && event.source_revision == event.task.updated_revision
+                        && event.task.state == A2aTaskState::Completed
+                        && event.artifact_id.is_some()
                 }
             };
             if !kind_valid {
@@ -3460,11 +3552,16 @@ impl A2aMapper {
     }
 
     /// Prepare a `SendMessage` operation. Accepted message ids are durable idempotency keys.
+    ///
+    /// `now_unix_ms` is the caller-supplied wall-clock instant persisted as the task status
+    /// timestamp for any state change this acceptance performs. The mapper never reads a clock
+    /// itself so restored snapshots stay byte-identical.
     pub fn prepare_send_message(
         &mut self,
         message: A2aMessage,
         correlation: CorrelationIdentity,
         principal: Option<&ProtocolPrincipal>,
+        now_unix_ms: u64,
     ) -> GovernedAction<A2aAction> {
         // Keep the mapper mutation atomic even for direct callers. All task, receipt, dispatch,
         // and event-intent mutations are installed together only after the complete candidate has
@@ -3482,6 +3579,7 @@ impl A2aMapper {
             correlation,
             principal,
             response_policy,
+            now_unix_ms,
         );
         if governed.is_authorized() && candidate.revision != self.revision {
             *self = candidate;
@@ -3497,6 +3595,7 @@ impl A2aMapper {
         correlation: CorrelationIdentity,
         principal: Option<&ProtocolPrincipal>,
         response_policy: A2aSendResponsePolicy,
+        now_unix_ms: u64,
     ) -> GovernedAction<A2aAction> {
         let target = message
             .task_id
@@ -3616,6 +3715,7 @@ impl A2aMapper {
                 task.state = A2aTaskState::Working;
                 task.status_message = None;
                 task.updated_revision = self.revision;
+                task.status_timestamp_unix_ms = Some(now_unix_ms);
             }
             let mut mapping = existing.mapping;
             mapping.message_id = message.message_id.clone();
@@ -3696,6 +3796,7 @@ impl A2aMapper {
                     created_revision: self.revision,
                     updated_revision: self.revision,
                     status_message: None,
+                    status_timestamp_unix_ms: Some(now_unix_ms),
                 },
             );
             (mapping, None)
@@ -3853,6 +3954,12 @@ impl A2aMapper {
                     .is_none_or(|context_id| task.mapping.context_id == *context_id)
             })
             .filter(|task| request.status.is_none_or(|status| task.state == status))
+            .filter(|task| {
+                request.status_timestamp_after_unix_ms.is_none_or(|after| {
+                    task.status_timestamp_unix_ms
+                        .is_some_and(|timestamp| timestamp >= after)
+                })
+            })
             .cloned()
             .collect();
         tasks.sort_by(|left, right| {
@@ -4034,11 +4141,13 @@ impl A2aMapper {
         &mut self,
         task_id: &str,
         status_message: impl Into<String>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<()> {
         self.transition_task(
             task_id,
             A2aTaskState::InputRequired,
             Some(status_message.into()),
+            now_unix_ms,
         )
     }
 
@@ -4047,9 +4156,17 @@ impl A2aMapper {
         task_id: &str,
         next: A2aTaskState,
         status_message: Option<String>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<()> {
         let mut candidate = self.clone();
-        candidate.transition_task_candidate(task_id, next, status_message, None, None)?;
+        candidate.transition_task_candidate(
+            task_id,
+            next,
+            status_message,
+            None,
+            None,
+            now_unix_ms,
+        )?;
         *self = candidate;
         Ok(())
     }
@@ -4065,6 +4182,7 @@ impl A2aMapper {
         expected_attempt: u32,
         next: A2aTaskState,
         status_message: Option<String>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<()> {
         let dispatch = self
             .dispatch_outbox
@@ -4101,6 +4219,7 @@ impl A2aMapper {
             status_message,
             Some((dispatch_id, expected_attempt)),
             None,
+            now_unix_ms,
         )?;
         *self = candidate;
         Ok(())
@@ -4114,6 +4233,7 @@ impl A2aMapper {
         cancellation_id: &str,
         expected_attempt: u32,
         status_message: Option<String>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<()> {
         let task_id = self
             .cancellation_outbox
@@ -4129,6 +4249,7 @@ impl A2aMapper {
             status_message,
             None,
             Some((cancellation_id, expected_attempt)),
+            now_unix_ms,
         )?;
         *self = candidate;
         Ok(())
@@ -4142,11 +4263,13 @@ impl A2aMapper {
         dispatch_id: &str,
         expected_attempt: u32,
         artifacts: Vec<A2aArtifact>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<A2aTaskRecord> {
         self.complete_dispatch_output(
             dispatch_id,
             expected_attempt,
             A2aDispatchCompletionOutput::Task { artifacts },
+            now_unix_ms,
         )
     }
 
@@ -4157,11 +4280,13 @@ impl A2aMapper {
         dispatch_id: &str,
         expected_attempt: u32,
         message: A2aMessage,
+        now_unix_ms: u64,
     ) -> ProtocolResult<A2aTaskRecord> {
         self.complete_dispatch_output(
             dispatch_id,
             expected_attempt,
             A2aDispatchCompletionOutput::Message { message },
+            now_unix_ms,
         )
     }
 
@@ -4170,10 +4295,15 @@ impl A2aMapper {
         dispatch_id: &str,
         expected_attempt: u32,
         output: A2aDispatchCompletionOutput,
+        now_unix_ms: u64,
     ) -> ProtocolResult<A2aTaskRecord> {
         let mut candidate = self.clone();
-        let task =
-            candidate.complete_dispatch_output_candidate(dispatch_id, expected_attempt, output)?;
+        let task = candidate.complete_dispatch_output_candidate(
+            dispatch_id,
+            expected_attempt,
+            output,
+            now_unix_ms,
+        )?;
         *self = candidate;
         Ok(task)
     }
@@ -4183,6 +4313,7 @@ impl A2aMapper {
         dispatch_id: &str,
         expected_attempt: u32,
         output: A2aDispatchCompletionOutput,
+        now_unix_ms: u64,
     ) -> ProtocolResult<A2aTaskRecord> {
         let dispatch = self
             .dispatch_outbox
@@ -4261,6 +4392,7 @@ impl A2aMapper {
         projected.state = A2aTaskState::Completed;
         projected.status_message = None;
         projected.updated_revision = revision;
+        projected.status_timestamp_unix_ms = Some(now_unix_ms);
         let response = match output {
             A2aDispatchCompletionOutput::Task { artifacts } => {
                 validate_task_artifacts(&artifacts, projected.state)?;
@@ -4299,6 +4431,23 @@ impl A2aMapper {
             revision,
         );
         self.preflight_new_pending_event(&event)?;
+        // Each durable artifact becomes its own ArtifactProduced intent so the official
+        // artifact-update frames replay after a restart exactly like the terminal frame. The
+        // delivery rank orders them before the same-revision terminal status frame.
+        let artifact_events: Vec<A2aPendingEventIntent> = match &response {
+            A2aDispatchResponse::Task { artifacts, .. } => artifacts
+                .iter()
+                .map(|artifact| {
+                    make_artifact_pending_event(
+                        &projected,
+                        revision,
+                        &artifact.artifact_id,
+                        revision,
+                    )
+                })
+                .collect(),
+            A2aDispatchResponse::Message { .. } => Vec::new(),
+        };
 
         let mut replacement = dispatch;
         replacement.response = response;
@@ -4306,6 +4455,12 @@ impl A2aMapper {
         self.replace_dispatch_record(dispatch_id, replacement)?;
         self.settle_dispatch_at_revision(dispatch_id, revision)?;
         self.settle_task_cancellation_at_revision(&projected.mapping.task_id, revision)?;
+        for artifact_event in artifact_events {
+            self.preflight_new_pending_event(&artifact_event)?;
+            self.insert_new_pending_event(artifact_event)
+                .expect("A2A artifact event was preflighted");
+        }
+        self.preflight_new_pending_event(&event)?;
         self.insert_new_pending_event(event)
             .expect("A2A output completion event was preflighted");
         self.revision = revision;
@@ -4321,6 +4476,7 @@ impl A2aMapper {
         status_message: Option<String>,
         dispatch_ack: Option<(&str, u32)>,
         cancellation_ack: Option<(&str, u32)>,
+        now_unix_ms: u64,
     ) -> ProtocolResult<()> {
         let existing = self
             .tasks
@@ -4415,6 +4571,7 @@ impl A2aMapper {
         projected.state = next;
         projected.status_message = status_message;
         projected.updated_revision = revision;
+        projected.status_timestamp_unix_ms = Some(now_unix_ms);
         let event = make_pending_event(
             &projected,
             revision,
@@ -4907,6 +5064,50 @@ fn make_pending_event_with_response(
     state: A2aPendingEventState,
     created_revision: u64,
 ) -> A2aPendingEventIntent {
+    make_pending_event_full(
+        task,
+        source_revision,
+        kind,
+        message_id,
+        response_message,
+        None,
+        state,
+        created_revision,
+    )
+}
+
+/// One `ArtifactProduced` intent per durable completed-task artifact. The artifact identity joins
+/// both the logical-event identity and the payload hash, so two artifacts from the same
+/// completion revision are distinct durable events.
+fn make_artifact_pending_event(
+    task: &A2aTaskRecord,
+    source_revision: u64,
+    artifact_id: &str,
+    created_revision: u64,
+) -> A2aPendingEventIntent {
+    make_pending_event_full(
+        task,
+        source_revision,
+        A2aPendingEventKind::ArtifactProduced,
+        None,
+        None,
+        Some(artifact_id),
+        A2aPendingEventState::Pending,
+        created_revision,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_pending_event_full(
+    task: &A2aTaskRecord,
+    source_revision: u64,
+    kind: A2aPendingEventKind,
+    message_id: Option<&str>,
+    response_message: Option<A2aMessage>,
+    artifact_id: Option<&str>,
+    state: A2aPendingEventState,
+    created_revision: u64,
+) -> A2aPendingEventIntent {
     let mut payload = serde_json::json!({
         "kind": kind,
         "task": task,
@@ -4917,8 +5118,16 @@ fn make_pending_event_with_response(
             .expect("A2A event payload is an object")
             .insert("response_message".into(), serde_json::json!(message));
     }
+    // Absent optional identity components are omitted entirely so every pre-v5 event keeps its
+    // exact persisted hash.
+    if let Some(artifact_id) = artifact_id {
+        payload
+            .as_object_mut()
+            .expect("A2A event payload is an object")
+            .insert("artifact_id".into(), serde_json::json!(artifact_id));
+    }
     let payload_hash = crate::durability::stable_input_hash(&payload);
-    let identity = serde_json::json!({
+    let mut identity = serde_json::json!({
         "owner_subject": task.owner_subject,
         "owner_tenant_id": task.owner_tenant_id,
         "task_id": task.mapping.task_id,
@@ -4929,6 +5138,12 @@ fn make_pending_event_with_response(
         "kind": kind,
         "message_id": message_id,
     });
+    if let Some(artifact_id) = artifact_id {
+        identity
+            .as_object_mut()
+            .expect("A2A event identity is an object")
+            .insert("artifact_id".into(), serde_json::json!(artifact_id));
+    }
     let digest = crate::durability::stable_input_hash(&identity);
     A2aPendingEventIntent {
         event_id: format!("a2a-event-{digest}"),
@@ -4944,6 +5159,7 @@ fn make_pending_event_with_response(
         payload_hash,
         task: task.clone(),
         response_message,
+        artifact_id: artifact_id.map(str::to_owned),
         state,
         attempts: 0,
         transient_failures: 0,
@@ -5583,10 +5799,377 @@ fn decode_page_token(page_token: &str) -> ProtocolResult<A2aPageCursor> {
     Ok(cursor)
 }
 
+/// Journal-delta projection and replay for the typed A2A mapper journal.
+///
+/// `journal_operations_since` derives the exact ordered
+/// [`A2aMapperOperation`](super::a2a_journal::A2aMapperOperation) list that
+/// transforms `previous` into `self`; `apply_journal_delta` replays one delta onto a base mapper
+/// through the canonical serde boundary so every snapshot invariant is revalidated. Together they
+/// let a durable store persist O(changed-entries) deltas instead of full snapshots while restore
+/// remains fail-closed.
+impl A2aMapper {
+    /// Derive the ordered journal operations that transform `previous` into `self`.
+    ///
+    /// Unchanged collections are skipped in O(1) via copy-on-write pointer identity; changed
+    /// collections contribute one `Put`/`Remove` per differing key in deterministic map order.
+    pub fn journal_operations_since(
+        &self,
+        previous: &Self,
+    ) -> ProtocolResult<Vec<super::a2a_journal::A2aMapperOperation>> {
+        use super::a2a_journal::A2aMapperOperation;
+
+        let mut operations = Vec::new();
+        // Contexts and their owners are one logical entry keyed by the scoped storage key. The
+        // key is length-framed and injective, so the original context id is recoverable exactly.
+        if previous.contexts != self.contexts || previous.context_owners != self.context_owners {
+            let mut context_keys: BTreeSet<&String> = previous.contexts.keys().collect();
+            context_keys.extend(self.contexts.keys());
+            for storage_key in context_keys {
+                match (
+                    previous.contexts.get(storage_key),
+                    self.contexts.get(storage_key),
+                ) {
+                    (previous_session, Some(session_id)) => {
+                        let owner = self.context_owners.get(storage_key).ok_or_else(|| {
+                            ProtocolError::invalid(
+                                "A2A context journal projection is missing its owner",
+                            )
+                        })?;
+                        let unchanged = previous_session == Some(session_id)
+                            && previous.context_owners.get(storage_key) == Some(owner);
+                        if unchanged {
+                            continue;
+                        }
+                        let context_id = parse_scoped_context_id(storage_key, owner)?;
+                        operations.push(A2aMapperOperation::PutContext {
+                            storage_key: storage_key.clone(),
+                            context_id,
+                            session_id: session_id.clone(),
+                            owner_subject: owner.subject.clone(),
+                            owner_tenant_id: owner.tenant_id.clone(),
+                        });
+                    }
+                    (Some(_), None) => {
+                        operations.push(A2aMapperOperation::RemoveContext {
+                            storage_key: storage_key.clone(),
+                        });
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        if !Arc::ptr_eq(&previous.tasks.0, &self.tasks.0) {
+            diff_journal_map(
+                &previous.tasks,
+                &self.tasks,
+                &mut operations,
+                |key, task| A2aMapperOperation::PutTask {
+                    storage_key: key.clone(),
+                    task: task.clone(),
+                },
+                |key| A2aMapperOperation::RemoveTask {
+                    storage_key: key.clone(),
+                },
+            );
+        }
+        if !Arc::ptr_eq(&previous.receipts.0, &self.receipts.0) {
+            diff_journal_map(
+                &previous.receipts,
+                &self.receipts,
+                &mut operations,
+                |key, receipt| A2aMapperOperation::PutReceipt {
+                    storage_key: key.clone(),
+                    receipt: receipt.clone(),
+                },
+                |key| A2aMapperOperation::RemoveReceipt {
+                    storage_key: key.clone(),
+                },
+            );
+        }
+        if !Arc::ptr_eq(&previous.dispatch_outbox.0, &self.dispatch_outbox.0) {
+            diff_journal_map(
+                &previous.dispatch_outbox,
+                &self.dispatch_outbox,
+                &mut operations,
+                |key, dispatch| A2aMapperOperation::PutDispatch {
+                    storage_key: key.clone(),
+                    dispatch: Box::new(dispatch.clone()),
+                },
+                |key| A2aMapperOperation::RemoveDispatch {
+                    storage_key: key.clone(),
+                },
+            );
+        }
+        if !Arc::ptr_eq(&previous.cancellation_outbox.0, &self.cancellation_outbox.0) {
+            diff_journal_map(
+                &previous.cancellation_outbox,
+                &self.cancellation_outbox,
+                &mut operations,
+                |key, cancellation| A2aMapperOperation::PutCancellation {
+                    storage_key: key.clone(),
+                    cancellation: cancellation.clone(),
+                },
+                |key| A2aMapperOperation::RemoveCancellation {
+                    storage_key: key.clone(),
+                },
+            );
+        }
+        if !Arc::ptr_eq(&previous.pending_events.0, &self.pending_events.0) {
+            diff_journal_map(
+                &previous.pending_events,
+                &self.pending_events,
+                &mut operations,
+                |key, event| A2aMapperOperation::PutPendingEvent {
+                    storage_key: key.clone(),
+                    event: event.clone(),
+                },
+                |key| A2aMapperOperation::RemovePendingEvent {
+                    storage_key: key.clone(),
+                },
+            );
+        }
+        if previous.next_sequence != self.next_sequence {
+            operations.push(A2aMapperOperation::SetNextSequence {
+                next_sequence: self.next_sequence,
+            });
+        }
+        Ok(operations)
+    }
+
+    /// Replay one journal delta onto this mapper, revalidating every snapshot invariant.
+    ///
+    /// The mutation is applied through the canonical serialized form and re-deserialized, so a
+    /// corrupted or logically impossible delta fails closed exactly like a tampered snapshot.
+    pub fn apply_journal_delta(
+        &self,
+        delta: &super::a2a_journal::A2aMapperDelta,
+    ) -> ProtocolResult<Self> {
+        use super::a2a_journal::A2aMapperOperation;
+
+        if delta.from_revision() != self.revision {
+            return Err(ProtocolError::conflict(format!(
+                "A2A journal delta expects base revision {}, mapper is at {}",
+                delta.from_revision(),
+                self.revision
+            )));
+        }
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| ProtocolError::invalid(format!("serialize A2A mapper: {error}")))?;
+        let root = value
+            .as_object_mut()
+            .ok_or_else(|| ProtocolError::invalid("A2A mapper snapshot is not an object"))?;
+        let collection = |root: &mut serde_json::Map<String, serde_json::Value>,
+                          field: &str|
+         -> ProtocolResult<serde_json::Map<String, serde_json::Value>> {
+            match root
+                .entry(field.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+            {
+                Some(map) => Ok(std::mem::take(map)),
+                None => Err(ProtocolError::invalid(format!(
+                    "A2A mapper snapshot field {field} is not an object"
+                ))),
+            }
+        };
+        for operation in delta.operations() {
+            match operation {
+                A2aMapperOperation::PutContext {
+                    storage_key,
+                    session_id,
+                    owner_subject,
+                    owner_tenant_id,
+                    ..
+                } => {
+                    let mut contexts = collection(root, "contexts")?;
+                    contexts.insert(
+                        storage_key.clone(),
+                        serde_json::Value::String(session_id.clone()),
+                    );
+                    root.insert("contexts".into(), serde_json::Value::Object(contexts));
+                    let mut owners = collection(root, "context_owners")?;
+                    let mut owner = serde_json::Map::new();
+                    owner.insert(
+                        "subject".into(),
+                        serde_json::Value::String(owner_subject.clone()),
+                    );
+                    if let Some(tenant_id) = owner_tenant_id {
+                        owner.insert(
+                            "tenant_id".into(),
+                            serde_json::Value::String(tenant_id.clone()),
+                        );
+                    }
+                    owners.insert(storage_key.clone(), serde_json::Value::Object(owner));
+                    root.insert("context_owners".into(), serde_json::Value::Object(owners));
+                }
+                A2aMapperOperation::RemoveContext { storage_key } => {
+                    let mut contexts = collection(root, "contexts")?;
+                    contexts.remove(storage_key);
+                    root.insert("contexts".into(), serde_json::Value::Object(contexts));
+                    let mut owners = collection(root, "context_owners")?;
+                    owners.remove(storage_key);
+                    root.insert("context_owners".into(), serde_json::Value::Object(owners));
+                }
+                A2aMapperOperation::PutTask { storage_key, task } => {
+                    apply_journal_put(root, "tasks", storage_key, task)?;
+                }
+                A2aMapperOperation::RemoveTask { storage_key } => {
+                    apply_journal_remove(root, "tasks", storage_key)?;
+                }
+                A2aMapperOperation::PutReceipt {
+                    storage_key,
+                    receipt,
+                } => {
+                    apply_journal_put(root, "receipts", storage_key, receipt)?;
+                }
+                A2aMapperOperation::RemoveReceipt { storage_key } => {
+                    apply_journal_remove(root, "receipts", storage_key)?;
+                }
+                A2aMapperOperation::PutDispatch {
+                    storage_key,
+                    dispatch,
+                } => {
+                    apply_journal_put(root, "dispatch_outbox", storage_key, dispatch)?;
+                }
+                A2aMapperOperation::RemoveDispatch { storage_key } => {
+                    apply_journal_remove(root, "dispatch_outbox", storage_key)?;
+                }
+                A2aMapperOperation::PutCancellation {
+                    storage_key,
+                    cancellation,
+                } => {
+                    apply_journal_put(root, "cancellation_outbox", storage_key, cancellation)?;
+                }
+                A2aMapperOperation::RemoveCancellation { storage_key } => {
+                    apply_journal_remove(root, "cancellation_outbox", storage_key)?;
+                }
+                A2aMapperOperation::PutPendingEvent { storage_key, event } => {
+                    apply_journal_put(root, "pending_events", storage_key, event)?;
+                }
+                A2aMapperOperation::RemovePendingEvent { storage_key } => {
+                    apply_journal_remove(root, "pending_events", storage_key)?;
+                }
+                A2aMapperOperation::SetNextSequence { next_sequence } => {
+                    root.insert(
+                        "next_sequence".into(),
+                        serde_json::Value::from(*next_sequence),
+                    );
+                }
+            }
+        }
+        root.insert(
+            "revision".into(),
+            serde_json::Value::from(delta.to_revision()),
+        );
+        serde_json::from_value(value).map_err(|error| {
+            ProtocolError::invalid(format!(
+                "A2A journal delta produced an invalid mapper snapshot: {error}"
+            ))
+        })
+    }
+}
+
+fn apply_journal_put<T: Serialize>(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    storage_key: &str,
+    entry: &T,
+) -> ProtocolResult<()> {
+    let encoded = serde_json::to_value(entry)
+        .map_err(|error| ProtocolError::invalid(format!("encode A2A journal entry: {error}")))?;
+    let map = root
+        .entry(field.to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ProtocolError::invalid(format!(
+                "A2A mapper snapshot field {field} is not an object"
+            ))
+        })?;
+    map.insert(storage_key.to_owned(), encoded);
+    Ok(())
+}
+
+fn apply_journal_remove(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    storage_key: &str,
+) -> ProtocolResult<()> {
+    let map = root
+        .entry(field.to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ProtocolError::invalid(format!(
+                "A2A mapper snapshot field {field} is not an object"
+            ))
+        })?;
+    map.remove(storage_key);
+    Ok(())
+}
+
+fn diff_journal_map<V: PartialEq>(
+    previous: &BTreeMap<String, V>,
+    next: &BTreeMap<String, V>,
+    operations: &mut Vec<super::a2a_journal::A2aMapperOperation>,
+    mut put: impl FnMut(&String, &V) -> super::a2a_journal::A2aMapperOperation,
+    mut remove: impl FnMut(&String) -> super::a2a_journal::A2aMapperOperation,
+) {
+    for (key, value) in next {
+        if previous.get(key) != Some(value) {
+            operations.push(put(key, value));
+        }
+    }
+    for key in previous.keys() {
+        if !next.contains_key(key) {
+            operations.push(remove(key));
+        }
+    }
+}
+
+/// Recover the exact original context id from a length-framed scoped storage key.
+///
+/// Keys are produced by `scoped_index_key("context", subject, tenant, context_id)` with length
+/// framing, so parsing is injective. The parsed subject/tenant must match the stored owner or the
+/// projection fails closed.
+fn parse_scoped_context_id(storage_key: &str, owner: &A2aContextOwner) -> ProtocolResult<String> {
+    let malformed =
+        || ProtocolError::invalid("A2A context storage key is not a framed context key");
+    let rest = storage_key
+        .strip_prefix("a2a:v1:context:")
+        .ok_or_else(malformed)?;
+    let (subject, rest) = read_length_framed(rest).ok_or_else(malformed)?;
+    let (tenant, rest) = read_length_framed(rest).ok_or_else(malformed)?;
+    let (context_id, rest) = read_length_framed(rest).ok_or_else(malformed)?;
+    if !rest.is_empty() {
+        return Err(malformed());
+    }
+    let tenant = (!tenant.is_empty()).then_some(tenant);
+    if subject != owner.subject || tenant != owner.tenant_id.as_deref() {
+        return Err(ProtocolError::invalid(
+            "A2A context storage key does not match its stored owner",
+        ));
+    }
+    Ok(context_id.to_owned())
+}
+
+fn read_length_framed(input: &str) -> Option<(&str, &str)> {
+    let (length, rest) = input.split_once(':')?;
+    if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let length: usize = length.parse().ok()?;
+    let value = rest.get(..length)?;
+    Some((value, rest.get(length..)?))
+}
+
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
     use crate::protocols::GovernanceAuthorization;
+
+    /// Deterministic wall-clock instant injected wherever a mutation records a status timestamp.
+    const TEST_STATUS_TS: u64 = 1_754_000_000_000;
 
     #[derive(Serialize)]
     struct LegacyMapperProxy<'a> {
@@ -5662,6 +6245,7 @@ mod capacity_tests {
                 message("cow-clone"),
                 correlation("cow-clone"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -5728,7 +6312,7 @@ mod capacity_tests {
     #[test]
     fn cow_mapper_compact_json_matches_legacy_btree_wire_bytes() {
         let empty = A2aMapper::new();
-        let empty_golden = br#"{"schema_version":4,"contexts":{},"context_owners":{},"tasks":{},"receipts":{},"dispatch_outbox":{},"cancellation_outbox":{},"pending_events":{},"next_sequence":1,"revision":0}"#;
+        let empty_golden = br#"{"schema_version":5,"contexts":{},"context_owners":{},"tasks":{},"receipts":{},"dispatch_outbox":{},"cancellation_outbox":{},"pending_events":{},"next_sequence":1,"revision":0}"#;
         assert_eq!(serde_json::to_vec(&empty).unwrap(), empty_golden);
         assert_eq!(
             serde_json::to_vec(&empty).unwrap(),
@@ -5742,6 +6326,7 @@ mod capacity_tests {
                 message("cow-wire"),
                 correlation("cow-wire"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -5760,6 +6345,7 @@ mod capacity_tests {
                 message("cow-candidate"),
                 correlation("cow-candidate"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -5782,6 +6368,7 @@ mod capacity_tests {
                 attempt,
                 A2aTaskState::InputRequired,
                 Some("need input".into()),
+                TEST_STATUS_TS,
             )
             .unwrap();
 
@@ -5834,7 +6421,12 @@ mod capacity_tests {
         let mut mapper = A2aMapper::new();
         let accepted = message("message-1");
         mapper
-            .prepare_send_message(accepted.clone(), correlation("first"), Some(&principal))
+            .prepare_send_message(
+                accepted.clone(),
+                correlation("first"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
 
@@ -5862,7 +6454,12 @@ mod capacity_tests {
         let principal = principal();
         let mut mapper = A2aMapper::new();
         let (_, action) = mapper
-            .prepare_send_message(message("cancel-me"), correlation("send"), Some(&principal))
+            .prepare_send_message(
+                message("cancel-me"),
+                correlation("send"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {
@@ -5889,14 +6486,19 @@ mod capacity_tests {
             .unwrap();
         assert_eq!(
             mapper
-                .transition_task(&mapping.task_id, A2aTaskState::Cancelled, None)
+                .transition_task(
+                    &mapping.task_id,
+                    A2aTaskState::Cancelled,
+                    None,
+                    TEST_STATUS_TS
+                )
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::InvalidTransition
         );
         assert_eq!(
             mapper
-                .acknowledge_cancellation(&cancellation.cancellation_id, 0, None)
+                .acknowledge_cancellation(&cancellation.cancellation_id, 0, None, TEST_STATUS_TS)
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::InvalidTransition
@@ -5910,13 +6512,18 @@ mod capacity_tests {
             .attempts;
         assert_eq!(
             mapper
-                .acknowledge_cancellation(&cancellation.cancellation_id, attempt - 1, None)
+                .acknowledge_cancellation(
+                    &cancellation.cancellation_id,
+                    attempt - 1,
+                    None,
+                    TEST_STATUS_TS
+                )
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::InvalidTransition
         );
         mapper
-            .acknowledge_cancellation(&cancellation.cancellation_id, attempt, None)
+            .acknowledge_cancellation(&cancellation.cancellation_id, attempt, None, TEST_STATUS_TS)
             .unwrap();
         let denied = mapper.prepare_cancel_task(
             &mapping.task_id,
@@ -5946,6 +6553,7 @@ mod capacity_tests {
                     message(&format!("{label}-initial")),
                     correlation(&format!("{label}-initial")),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -5971,6 +6579,7 @@ mod capacity_tests {
                     accepted_retry.clone(),
                     correlation(&format!("{label}-accepted-before-cancel")),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -5990,6 +6599,7 @@ mod capacity_tests {
                         &mapping.task_id,
                         waiting_state,
                         Some(format!("{label} wait")),
+                        TEST_STATUS_TS,
                     )
                     .unwrap();
             }
@@ -6027,6 +6637,7 @@ mod capacity_tests {
                     accepted_retry,
                     correlation(&format!("{label}-exact-retry")),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -6050,6 +6661,7 @@ mod capacity_tests {
                 correlation(&format!("{label}-candidate")),
                 Some(&principal),
                 A2aSendResponsePolicy::Blocking,
+                TEST_STATUS_TS,
             );
             assert!(matches!(
                 &candidate_denied.envelope.authorization,
@@ -6065,6 +6677,7 @@ mod capacity_tests {
                 blocked,
                 correlation(&format!("{label}-direct")),
                 Some(&principal),
+                TEST_STATUS_TS,
             );
             assert!(matches!(
                 &denied.envelope.authorization,
@@ -6094,6 +6707,7 @@ mod capacity_tests {
                 message("cancel-atomic"),
                 correlation("cancel-atomic-send"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6154,6 +6768,7 @@ mod capacity_tests {
                 message("cancel-capacity"),
                 correlation("cancel-capacity-send"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6185,6 +6800,7 @@ mod capacity_tests {
                 message("cancel-restore"),
                 correlation("cancel-restore-send"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6253,6 +6869,7 @@ mod capacity_tests {
                 message("cancel-state"),
                 correlation("cancel-state-send"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6279,6 +6896,7 @@ mod capacity_tests {
                     &mapping.task_id,
                     A2aTaskState::Working,
                     Some("still working".into()),
+                    TEST_STATUS_TS
                 )
                 .unwrap_err()
                 .code,
@@ -6316,13 +6934,23 @@ mod capacity_tests {
 
         assert_eq!(
             mapper
-                .transition_task(&mapping.task_id, A2aTaskState::Cancelled, None)
+                .transition_task(
+                    &mapping.task_id,
+                    A2aTaskState::Cancelled,
+                    None,
+                    TEST_STATUS_TS
+                )
                 .unwrap_err()
                 .code,
             ProtocolErrorCode::InvalidTransition
         );
         mapper
-            .acknowledge_cancellation(&cancellation_id, A2A_MAX_CANCELLATION_ATTEMPTS, None)
+            .acknowledge_cancellation(
+                &cancellation_id,
+                A2A_MAX_CANCELLATION_ATTEMPTS,
+                None,
+                TEST_STATUS_TS,
+            )
             .unwrap();
         let settled = &mapper.cancellation_outbox[&cancellation_id];
         assert_eq!(settled.state, A2aCancellationOutboxState::Settled);
@@ -6342,6 +6970,7 @@ mod capacity_tests {
                 message("cancel-legacy"),
                 correlation("cancel-legacy-send"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6411,6 +7040,7 @@ mod capacity_tests {
                 message("roundtrip"),
                 correlation("roundtrip"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6433,7 +7063,12 @@ mod capacity_tests {
         let principal = principal();
         let mut mapper = A2aMapper::new();
         let (_, action) = mapper
-            .prepare_send_message(message("atomic"), correlation("atomic"), Some(&principal))
+            .prepare_send_message(
+                message("atomic"),
+                correlation("atomic"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {
@@ -6462,6 +7097,7 @@ mod capacity_tests {
             message("must-rollback"),
             correlation("must-rollback"),
             Some(&principal),
+            TEST_STATUS_TS,
         );
         assert!(!denied.is_authorized());
         assert_eq!(exhausted.revision(), 0);
@@ -6477,7 +7113,12 @@ mod capacity_tests {
         let mut mapper = A2aMapper::new();
         let request = message("retry");
         mapper
-            .prepare_send_message(request.clone(), correlation("first"), Some(&principal))
+            .prepare_send_message(
+                request.clone(),
+                correlation("first"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let revision = mapper.revision();
@@ -6486,7 +7127,12 @@ mod capacity_tests {
             .cloned()
             .unwrap();
         let (_, duplicate) = mapper
-            .prepare_send_message(request, correlation("retry"), Some(&principal))
+            .prepare_send_message(
+                request,
+                correlation("retry"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         assert!(matches!(duplicate, A2aAction::DuplicateMessage { .. }));
@@ -6507,6 +7153,7 @@ mod capacity_tests {
                 message("state-machine"),
                 correlation("state"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6544,6 +7191,7 @@ mod capacity_tests {
                 message("attempt-bound"),
                 correlation("bound"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6576,6 +7224,7 @@ mod capacity_tests {
                     message(&message_id),
                     correlation(&message_id),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -6604,20 +7253,32 @@ mod capacity_tests {
                     &mapping.task_id,
                     A2aTaskState::Working,
                     Some("late attempt still working".into()),
+                    TEST_STATUS_TS,
                 )
                 .unwrap_err();
             assert_eq!(unfenced_working.code, ProtocolErrorCode::InvalidTransition);
             assert!(unfenced_working.message.contains("exact fence"));
             assert_eq!(mapper, before_late_attempt);
             let unfenced = mapper
-                .transition_task(&mapping.task_id, next, status_message.clone())
+                .transition_task(
+                    &mapping.task_id,
+                    next,
+                    status_message.clone(),
+                    TEST_STATUS_TS,
+                )
                 .unwrap_err();
             assert_eq!(unfenced.code, ProtocolErrorCode::InvalidTransition);
             assert!(unfenced.message.contains("exact fence"));
             assert_eq!(mapper, before_late_attempt);
 
             let stale = mapper
-                .transition_dispatch_task(&dispatch_id, attempt_one, next, status_message.clone())
+                .transition_dispatch_task(
+                    &dispatch_id,
+                    attempt_one,
+                    next,
+                    status_message.clone(),
+                    TEST_STATUS_TS,
+                )
                 .unwrap_err();
             assert_eq!(stale.code, ProtocolErrorCode::InvalidTransition);
             assert!(stale.message.contains("generation is stale"));
@@ -6634,6 +7295,7 @@ mod capacity_tests {
                     attempt_one,
                     A2aTaskState::Working,
                     Some("stale progress".into()),
+                    TEST_STATUS_TS,
                 )
                 .unwrap_err();
             assert_eq!(stale_progress.code, ProtocolErrorCode::InvalidTransition);
@@ -6645,6 +7307,7 @@ mod capacity_tests {
                     attempt_two,
                     A2aTaskState::Working,
                     Some("current attempt is working".into()),
+                    TEST_STATUS_TS,
                 )
                 .unwrap();
             assert_eq!(
@@ -6657,7 +7320,13 @@ mod capacity_tests {
             );
 
             mapper
-                .transition_dispatch_task(&dispatch_id, attempt_two, next, status_message.clone())
+                .transition_dispatch_task(
+                    &dispatch_id,
+                    attempt_two,
+                    next,
+                    status_message.clone(),
+                    TEST_STATUS_TS,
+                )
                 .unwrap();
             assert_eq!(
                 mapper.dispatch_outbox()[&dispatch_id].state,
@@ -6666,7 +7335,13 @@ mod capacity_tests {
             assert_eq!(mapper.tasks()[&mapping.task_id].state, next);
             let settled_revision = mapper.revision();
             mapper
-                .transition_dispatch_task(&dispatch_id, attempt_two, next, status_message)
+                .transition_dispatch_task(
+                    &dispatch_id,
+                    attempt_two,
+                    next,
+                    status_message,
+                    TEST_STATUS_TS,
+                )
                 .unwrap();
             assert_eq!(mapper.revision(), settled_revision);
 
@@ -6681,7 +7356,12 @@ mod capacity_tests {
         let principal = principal();
         let mut mapper = A2aMapper::new();
         let (_, original_action) = mapper
-            .prepare_send_message(message("restore"), correlation("restore"), Some(&principal))
+            .prepare_send_message(
+                message("restore"),
+                correlation("restore"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let original = mapper
@@ -6726,6 +7406,7 @@ mod capacity_tests {
                     message(&format!("suppressed-{state:?}")),
                     correlation(&format!("suppressed-{state:?}")),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -6740,7 +7421,7 @@ mod capacity_tests {
             mapper.mark_dispatch_running(&dispatch_id).unwrap();
             let attempt = mapper.dispatch_outbox()[&dispatch_id].attempts;
             mapper
-                .transition_dispatch_task(&dispatch_id, attempt, state, None)
+                .transition_dispatch_task(&dispatch_id, attempt, state, None, TEST_STATUS_TS)
                 .unwrap();
             assert_eq!(
                 mapper.dispatch_outbox()[&dispatch_id].state,
@@ -6767,6 +7448,7 @@ mod capacity_tests {
                     message(message_id),
                     correlation(message_id),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -6835,6 +7517,7 @@ mod capacity_tests {
                     first.clone(),
                     correlation("ordered-first"),
                     Some(&principal),
+                    TEST_STATUS_TS,
                 )
                 .into_authorized()
                 .unwrap();
@@ -6875,8 +7558,12 @@ mod capacity_tests {
                 .unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::InvalidTransition);
             assert_eq!(error.message, A2A_UNSETTLED_MESSAGE_EVENT_SEND_REASON);
-            let denied =
-                mapper.prepare_send_message(next, correlation("ordered-second"), Some(&principal));
+            let denied = mapper.prepare_send_message(
+                next,
+                correlation("ordered-second"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            );
             assert!(matches!(
                 &denied.envelope.authorization,
                 GovernanceAuthorization::Denied {
@@ -6888,7 +7575,12 @@ mod capacity_tests {
 
             // The content-bound retry remains readable and cannot create a second dispatch.
             let (_, retry) = mapper
-                .prepare_send_message(first, correlation("ordered-retry"), Some(&principal))
+                .prepare_send_message(
+                    first,
+                    correlation("ordered-retry"),
+                    Some(&principal),
+                    TEST_STATUS_TS,
+                )
                 .into_authorized()
                 .unwrap();
             assert!(matches!(retry, A2aAction::DuplicateMessage { .. }));
@@ -6902,7 +7594,12 @@ mod capacity_tests {
         let mut mapper = A2aMapper::new();
         let first = message("ordered-active-first");
         let (_, action) = mapper
-            .prepare_send_message(first.clone(), correlation("active-first"), Some(&principal))
+            .prepare_send_message(
+                first.clone(),
+                correlation("active-first"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {
@@ -6938,7 +7635,12 @@ mod capacity_tests {
             assert_eq!(error.message, A2A_UNSETTLED_MESSAGE_DISPATCH_SEND_REASON);
             assert_eq!(mapper, before);
             let (_, duplicate) = mapper
-                .prepare_send_message(first.clone(), correlation("active-retry"), Some(&principal))
+                .prepare_send_message(
+                    first.clone(),
+                    correlation("active-retry"),
+                    Some(&principal),
+                    TEST_STATUS_TS,
+                )
                 .into_authorized()
                 .unwrap();
             assert!(matches!(duplicate, A2aAction::DuplicateMessage { .. }));
@@ -6959,6 +7661,7 @@ mod capacity_tests {
                 first.clone(),
                 correlation("generation-fence-first"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6981,6 +7684,7 @@ mod capacity_tests {
                 second.clone(),
                 correlation("generation-fence-second"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -6999,7 +7703,12 @@ mod capacity_tests {
         // rejection instead of silently consuming that queued work.
         let before_late_transition = mapper.clone();
         let error = mapper
-            .transition_task(&mapping.task_id, A2aTaskState::Completed, None)
+            .transition_task(
+                &mapping.task_id,
+                A2aTaskState::Completed,
+                None,
+                TEST_STATUS_TS,
+            )
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::InvalidTransition);
         assert!(error.message.contains("exact fence"));
@@ -7016,6 +7725,7 @@ mod capacity_tests {
                 second,
                 correlation("generation-fence-second-retry"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7051,7 +7761,7 @@ mod capacity_tests {
             .mark_cancellation_running(&cancellation_id)
             .unwrap();
         restored
-            .acknowledge_cancellation(&cancellation_id, 1, None)
+            .acknowledge_cancellation(&cancellation_id, 1, None, TEST_STATUS_TS)
             .unwrap();
         assert_eq!(
             restored.dispatch_outbox()[&second_dispatch_id].state,
@@ -7072,7 +7782,12 @@ mod capacity_tests {
         let mut mapper = A2aMapper::new();
         let first = message("output-fence");
         let (_, action) = mapper
-            .prepare_send_message(first.clone(), correlation("output-fence"), Some(&principal))
+            .prepare_send_message(
+                first.clone(),
+                correlation("output-fence"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {
@@ -7101,7 +7816,12 @@ mod capacity_tests {
 
         let before_stale = mapper.clone();
         let stale = mapper
-            .complete_dispatch_with_artifacts(&dispatch_id, attempt - 1, vec![artifact.clone()])
+            .complete_dispatch_with_artifacts(
+                &dispatch_id,
+                attempt - 1,
+                vec![artifact.clone()],
+                TEST_STATUS_TS,
+            )
             .unwrap_err();
         assert_eq!(stale.code, ProtocolErrorCode::InvalidTransition);
         assert_eq!(mapper, before_stale);
@@ -7116,7 +7836,7 @@ mod capacity_tests {
             .unwrap();
         let before_cancelled_completion = mapper.clone();
         let cancelled = mapper
-            .complete_dispatch_with_artifacts(&dispatch_id, attempt, vec![artifact])
+            .complete_dispatch_with_artifacts(&dispatch_id, attempt, vec![artifact], TEST_STATUS_TS)
             .unwrap_err();
         assert_eq!(cancelled.code, ProtocolErrorCode::InvalidTransition);
         assert!(cancelled.message.contains("cancellation fence"));
@@ -7132,6 +7852,7 @@ mod capacity_tests {
                 message("rollback-retry"),
                 correlation("rollback-retry"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7172,6 +7893,7 @@ mod capacity_tests {
                 message("due-template"),
                 correlation("due-template"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7215,6 +7937,7 @@ mod capacity_tests {
                 message("deterministic-poison"),
                 correlation("deterministic-poison"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7266,6 +7989,7 @@ mod capacity_tests {
                 message("legacy-exhausted-event"),
                 correlation("legacy-exhausted-event"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7310,6 +8034,7 @@ mod capacity_tests {
                 message("v2-quarantined-event"),
                 correlation("v2-quarantined-event"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7351,7 +8076,12 @@ mod capacity_tests {
         let mut mapper = A2aMapper::new();
         let first = message("legacy-ordered-first");
         let (_, action) = mapper
-            .prepare_send_message(first.clone(), correlation("legacy-first"), Some(&principal))
+            .prepare_send_message(
+                first.clone(),
+                correlation("legacy-first"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {
@@ -7375,6 +8105,7 @@ mod capacity_tests {
                 targeted_message("legacy-ordered-second", &mapping),
                 correlation("legacy-second"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7408,6 +8139,7 @@ mod capacity_tests {
                 message("terminal-event"),
                 correlation("terminal"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7425,7 +8157,13 @@ mod capacity_tests {
         mapper.mark_dispatch_running(&dispatch_id).unwrap();
         let attempt = mapper.dispatch_outbox()[&dispatch_id].attempts;
         mapper
-            .transition_dispatch_task(&dispatch_id, attempt, A2aTaskState::Completed, None)
+            .transition_dispatch_task(
+                &dispatch_id,
+                attempt,
+                A2aTaskState::Completed,
+                None,
+                TEST_STATUS_TS,
+            )
             .unwrap();
         let restored: A2aMapper =
             serde_json::from_value(serde_json::to_value(&mapper).unwrap()).unwrap();
@@ -7458,6 +8196,7 @@ mod capacity_tests {
                 message("cross-owner"),
                 correlation("cross"),
                 Some(&principal),
+                TEST_STATUS_TS,
             )
             .into_authorized()
             .unwrap();
@@ -7486,7 +8225,12 @@ mod capacity_tests {
         let principal = principal();
         let mut mapper = A2aMapper::new();
         let (_, action) = mapper
-            .prepare_send_message(message("legacy"), correlation("legacy"), Some(&principal))
+            .prepare_send_message(
+                message("legacy"),
+                correlation("legacy"),
+                Some(&principal),
+                TEST_STATUS_TS,
+            )
             .into_authorized()
             .unwrap();
         let A2aAction::DispatchMessage { mapping, .. } = action else {

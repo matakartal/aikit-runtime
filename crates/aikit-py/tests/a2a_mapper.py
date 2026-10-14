@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from aikit import A2aMapper
 
-EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 4
+EXPECTED_A2A_MAPPER_SCHEMA_VERSION = 5
 
 if TYPE_CHECKING:
     from aikit import (

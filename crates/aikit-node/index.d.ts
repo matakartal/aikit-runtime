@@ -1035,6 +1035,7 @@ export class A2aMapper {
     message: A2aMessage,
     correlation: A2aCorrelationIdentity,
     principal?: A2aProtocolPrincipal,
+    nowUnixMs?: number,
   ): A2aGovernedAction;
   listTasks(
     request: A2aListTasksRequest,
@@ -1061,12 +1062,14 @@ export class A2aMapper {
     expectedAttempt: number,
     state: A2aTaskState,
     statusMessage?: string,
+    nowUnixMs?: number,
   ): A2aMapperState;
   /** Admin-only transition for tasks without an open dispatch. */
   transitionTask(
     taskId: string,
     state: A2aTaskState,
     statusMessage?: string,
+    nowUnixMs?: number,
   ): A2aMapperState;
 }
 

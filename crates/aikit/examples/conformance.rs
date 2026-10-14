@@ -1102,6 +1102,9 @@ fn a2a_principal(tenant: &str) -> ProtocolPrincipal {
         .expect("valid deterministic A2A principal")
 }
 
+/// Deterministic wall-clock instant so conformance snapshots are byte-stable across languages.
+const A2A_CONFORMANCE_STATUS_TS: u64 = 1_754_000_000_000;
+
 fn a2a_send(
     mapper: &mut A2aMapper,
     message_id: &str,
@@ -1121,6 +1124,7 @@ fn a2a_send(
         },
         a2a_correlation(sequence),
         Some(principal),
+        A2A_CONFORMANCE_STATUS_TS,
     );
     match action.action().expect("authorized deterministic A2A send") {
         A2aAction::DispatchMessage { mapping, .. } => mapping.clone(),
