@@ -8,14 +8,6 @@ T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
 
 
-class Usage(TypedDict):
-    input_tokens: int
-    output_tokens: int
-    cache_creation_input_tokens: int
-    cache_read_input_tokens: int
-    reasoning_tokens: int
-
-
 ErrorCode = Literal[
     "provider_auth",
     "provider_rate_limit",
@@ -106,41 +98,6 @@ class Base64MediaSource(TypedDict):
 
 
 MediaSource = Union[UrlMediaSource, Base64MediaSource]
-
-
-class UrlMediaInputSource(TypedDict):
-    kind: Literal["url"]
-    url: str
-
-
-class Base64MediaInputSource(TypedDict):
-    kind: Literal["base64"]
-    data: str
-
-
-class BytesMediaInputSource(TypedDict):
-    kind: Literal["bytes"]
-    data: List[int]
-
-
-class ArtifactMediaInputSource(TypedDict):
-    kind: Literal["artifact"]
-    artifact_id: str
-
-
-MediaInputSource = Union[
-    UrlMediaInputSource,
-    Base64MediaInputSource,
-    BytesMediaInputSource,
-    ArtifactMediaInputSource,
-]
-
-
-class MediaInput(TypedDict):
-    media_type: str
-    source: MediaInputSource
-    sha256: str
-    size_bytes: int
 
 
 def validate_media_input(media: MediaInput) -> MediaInput: ...
@@ -1286,15 +1243,6 @@ StreamDelta = Union[
 ]
 
 
-class _ProviderWarningRequired(TypedDict):
-    code: str
-    message: str
-
-
-class ProviderWarning(_ProviderWarningRequired, total=False):
-    parameter: str
-    provider: str
-    model: str
 
 
 StreamBlockKind = Literal[
@@ -1742,6 +1690,24 @@ class McpToolFilter(TypedDict, total=False):
     """Exact, case-sensitive MCP tool visibility policy; deny always wins."""
     allow: Sequence[str]
     deny: Sequence[str]
+
+async def connect_mcp_http(
+    endpoint: str,
+    name: str,
+    bearer_token: Optional[str] = ...,
+    tool_filter: Optional[McpToolFilter] = ...,
+) -> "McpConnection": ...
+
+
+async def connect_mcp_stdio(
+    program: str,
+    args: Sequence[str],
+    name: str,
+    env: Optional[Mapping[str, str]] = ...,
+    inherit_env: bool = ...,
+    tool_filter: Optional[McpToolFilter] = ...,
+) -> "McpConnection": ...
+
 
 class McpConnection:
     def __init__(self, _factory_only: NoReturn) -> None: ...
@@ -2344,6 +2310,277 @@ def evaluate_outcome(outcome: RunOutcome, gates: Sequence[EvalGate]) -> EvalVerd
 
 
 def evaluate_trace(suite: EvalSuite, trace: TraceInput) -> TraceEvalResult: ...
+
+
+# --- BEGIN GENERATED external-agent declarations (scripts/generate-declarations.sh) ---
+ExternalAgentKind = Literal["codex", "gemini", "claude", "grok"]
+ExternalRuntimeProfile = Literal["external", "managed"]
+ExternalUpdatePolicy = Literal["check_only", "vendor_managed", "aikit_managed"]
+ExternalUpdateChannel = Literal["stable", "preview"]
+ExternalUpdatePhase = Literal["idle", "checking", "available", "downloading", "staged", "activating", "current", "rolled_back", "failed"]
+ExternalRefreshAction = Literal["rediscover", "refresh_model_catalog", "check_compatibility_manifest", "report_external_update", "stage_managed_update"]
+ExternalRuntimeInstallOrigin = Literal["aikit_managed", "vendor_native", "homebrew", "npm", "application_bundle", "explicit_path", "unknown"]
+ExternalRuntimeDiscoverySource = Literal["explicit", "path", "known_location"]
+
+
+class UrlMediaInputSource(TypedDict):
+    url: str
+    kind: Literal["url"]
+
+
+class Base64MediaInputSource(TypedDict):
+    data: str
+    kind: Literal["base64"]
+
+
+class BytesMediaInputSource(TypedDict):
+    data: List[int]
+    kind: Literal["bytes"]
+
+
+class ArtifactMediaInputSource(TypedDict):
+    artifact_id: str
+    kind: Literal["artifact"]
+
+
+MediaInputSource = Union[
+    UrlMediaInputSource,
+    Base64MediaInputSource,
+    BytesMediaInputSource,
+    ArtifactMediaInputSource,
+]
+
+
+class _ExternalRuntimeCandidateRequired(TypedDict):
+    kind: ExternalAgentKind
+    executable: str
+    real_executable: str
+    origin: ExternalRuntimeInstallOrigin
+    discovered_by: List[ExternalRuntimeDiscoverySource]
+
+
+class ExternalRuntimeCandidate(_ExternalRuntimeCandidateRequired, total=False):
+    aliases: List[str]
+
+
+class ExternalRuntimeArtifact(TypedDict):
+    target_os: str
+    target_arch: str
+    url: str
+    sha256: str
+    size_bytes: int
+    executable_name: str
+
+
+class _ExternalRuntimeReleaseRequired(TypedDict):
+    kind: ExternalAgentKind
+    channel: ExternalUpdateChannel
+    version: str
+    protocol: str
+    contract_version: int
+    artifacts: List[ExternalRuntimeArtifact]
+
+
+class ExternalRuntimeRelease(_ExternalRuntimeReleaseRequired, total=False):
+    minimum_aikit_version: str
+    maximum_aikit_version: str
+
+
+class _ExternalUpdateManifestRequired(TypedDict):
+    schema_version: int
+    generated_unix_ms: int
+    expires_unix_ms: int
+    releases: List[ExternalRuntimeRelease]
+
+
+class ExternalUpdateManifest(_ExternalUpdateManifestRequired, total=False):
+    minimum_aikit_version: str
+
+
+class ExternalUpdateSelection(TypedDict):
+    kind: ExternalAgentKind
+    version: str
+    channel: ExternalUpdateChannel
+    protocol: str
+    artifact: ExternalRuntimeArtifact
+
+
+class ExternalUpdateSource(TypedDict):
+    manifest_url: str
+    signature_url: str
+    key_id: str
+    public_key_base64: str
+
+
+class ExternalUpdateConfig(TypedDict):
+    schema_version: int
+    instance_id: str
+    kind: ExternalAgentKind
+    profile: ExternalRuntimeProfile
+    policy: ExternalUpdatePolicy
+    channel: ExternalUpdateChannel
+    source: ExternalUpdateSource
+
+
+class _ExternalUpdateStateSnapshotRequired(TypedDict):
+    schema_version: int
+    instance_id: str
+    profile: ExternalRuntimeProfile
+    policy: ExternalUpdatePolicy
+    channel: ExternalUpdateChannel
+    phase: ExternalUpdatePhase
+    consecutive_failures: int
+
+
+class ExternalUpdateStateSnapshot(_ExternalUpdateStateSnapshotRequired, total=False):
+    current_version: str
+    available_version: str
+    quarantined_version: str
+    last_manifest_check_unix_ms: int
+    last_model_refresh_unix_ms: int
+    last_discovery_unix_ms: int
+    retry_after_unix_ms: int
+    last_error: str
+
+
+class Usage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int
+    cache_read_input_tokens: int
+    reasoning_tokens: int
+
+
+class _ProviderWarningRequired(TypedDict):
+    code: str
+    message: str
+
+
+class ProviderWarning(_ProviderWarningRequired, total=False):
+    parameter: str
+    provider: str
+    model: str
+
+
+class MediaInput(TypedDict):
+    media_type: str
+    source: MediaInputSource
+    sha256: str
+    size_bytes: int
+# --- END GENERATED external-agent declarations ---
+
+
+def discover_external_runtime_candidates(
+    kind: str, explicit_path: Optional[str] = ...
+) -> List[ExternalRuntimeCandidate]: ...
+
+
+def verify_external_update_manifest(
+    manifest_bytes: bytes,
+    signature_base64: str,
+    key_id: str,
+    trusted_keys: Dict[str, str],
+    now_unix_ms: int,
+) -> ExternalUpdateManifest: ...
+
+
+def select_external_runtime_update(
+    manifest: ExternalUpdateManifest,
+    kind: str,
+    channel: ExternalUpdateChannel,
+    aikit_version: str,
+    target_os: str,
+    target_arch: str,
+    current_version: Optional[str] = ...,
+) -> Optional[ExternalUpdateSelection]: ...
+
+
+def validate_external_update_config(config: ExternalUpdateConfig) -> None: ...
+
+
+def external_update_refresh_actions(
+    state: ExternalUpdateStateSnapshot, now_unix_ms: int
+) -> List[ExternalRefreshAction]: ...
+
+
+def spawn_external_agent_session(
+    kind: str,
+    workspace: str,
+    explicit_executable: Optional[str] = ...,
+    instance_id: Optional[str] = ...,
+    claude_bridge: Optional[str] = ...,
+    claude_bridge_args: Optional[Sequence[str]] = ...,
+    acknowledge_vendor_terms: bool = ...,
+) -> Awaitable["ExternalAgentSession"]: ...
+
+
+@final
+class ExternalAgentSession:
+    def __init__(self, _factory_only: NoReturn) -> None: ...
+    def descriptor(self) -> Dict[str, Any]: ...
+    def initialize(self) -> Awaitable[Dict[str, Any]]: ...
+    def auth_status(self, refresh: bool = ...) -> Awaitable[Dict[str, Any]]: ...
+    def list_models(self) -> Awaitable[Dict[str, Any]]: ...
+    def new_session(self, request: Mapping[str, Any]) -> Awaitable[Dict[str, Any]]: ...
+    def prompt(self, prompt: Mapping[str, Any]) -> Awaitable[None]: ...
+    def cancel(self, session_id: str, turn_id: Optional[str] = ...) -> Awaitable[None]: ...
+    def respond_approval(
+        self, session_id: str, request_id: str, decision: Mapping[str, Any]
+    ) -> Awaitable[None]: ...
+    def respond_user_input(
+        self, session_id: str, request_id: str, answers: Mapping[str, str]
+    ) -> Awaitable[None]: ...
+    def events(self) -> "ExternalAgentEventStream": ...
+    def shutdown(self) -> Awaitable[None]: ...
+
+
+@final
+class ExternalAgentEventStream:
+    def __init__(self, _factory_only: NoReturn) -> None: ...
+    def __aiter__(self) -> "ExternalAgentEventStream": ...
+    def __anext__(self) -> Awaitable[Dict[str, Any]]: ...
+
+
+@final
+class ExternalUpdateState:
+    def __init__(self, instance_id: str, profile: ExternalRuntimeProfile) -> None: ...
+    @staticmethod
+    def from_state(state: ExternalUpdateStateSnapshot) -> ExternalUpdateState: ...
+    def snapshot(self) -> ExternalUpdateStateSnapshot: ...
+    @property
+    def phase(self) -> ExternalUpdatePhase: ...
+    @property
+    def current_version(self) -> Optional[str]: ...
+    @property
+    def available_version(self) -> Optional[str]: ...
+    @property
+    def quarantined_version(self) -> Optional[str]: ...
+    @property
+    def consecutive_failures(self) -> int: ...
+    @property
+    def retry_after_unix_ms(self) -> Optional[int]: ...
+    @property
+    def last_error(self) -> Optional[str]: ...
+    def manifest_check_due(self, now_unix_ms: int) -> bool: ...
+    def model_refresh_due(self, now_unix_ms: int) -> bool: ...
+    def discovery_due(self, now_unix_ms: int) -> bool: ...
+    def may_apply_binary_update(self) -> bool: ...
+    def refresh_actions(self, now_unix_ms: int) -> List[ExternalRefreshAction]: ...
+    def record_check_success(
+        self, now_unix_ms: int, selection: Optional[ExternalUpdateSelection] = ...
+    ) -> None: ...
+    def record_failure(self, now_unix_ms: int, error: str) -> None: ...
+    def record_discovery(self, now_unix_ms: int) -> None: ...
+    def record_model_refresh(self, now_unix_ms: int) -> None: ...
+    def begin_download(self) -> None: ...
+    def record_staged(self) -> None: ...
+    def begin_activation(self) -> None: ...
+    def record_activated(self) -> None: ...
+    def recover_activated(self, active_version: str) -> bool: ...
+    def quarantine_available(self) -> None: ...
+    def record_rollback(
+        self, restored_version: str, rejected_version: Optional[str] = ...
+    ) -> None: ...
 
 
 __version__: str

@@ -1239,6 +1239,111 @@ fn a2a_facts() -> Value {
     })
 }
 
+const EXTERNAL_MANIFEST_JSON: &str = concat!(
+    "{\"schema_version\":1,\"generated_unix_ms\":1000,\"expires_unix_ms\":10000,\"releases\":",
+    "[{\"kind\":\"gemini\",\"channel\":\"stable\",\"version\":\"1.2.3\",\"protocol\":\"acp\",",
+    "\"contract_version\":1,\"artifacts\":[{\"target_os\":\"macos\",\"target_arch\":\"aarch64\",",
+    "\"url\":\"https://updates.example.test/gemini\",",
+    "\"sha256\":\"d92c6a81b2ff50096bcda80885427d1f59a25b5f483f7055523504925d16ab23\",",
+    "\"size_bytes\":7,\"executable_name\":\"gemini\"}]}]}"
+);
+const EXTERNAL_SIGNATURE_B64: &str =
+    "PLnOFo824GQR9bmoOdChdF+xvlgh3C34yQnNY7ZMTcndBEPqPrrLpVoGUSbr4c0G87/KkkopnitV8QpkbW6LAA==";
+const EXTERNAL_PUBLIC_KEY_B64: &str = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+
+fn external_agent_facts() -> Result<Value, Box<dyn std::error::Error>> {
+    use aikit::{
+        due_refresh_actions, select_runtime_update, verify_update_manifest, ExternalAgentKind,
+        RuntimeInstanceId, RuntimeProfile, RuntimeUpdateChannel, RuntimeUpdateState,
+        TrustedManifestKeys,
+    };
+
+    let now_ms = 2_000_u64;
+    let mut keys = TrustedManifestKeys::default();
+    keys.insert_base64("stable-2026", EXTERNAL_PUBLIC_KEY_B64)?;
+    let manifest = verify_update_manifest(
+        EXTERNAL_MANIFEST_JSON.as_bytes(),
+        EXTERNAL_SIGNATURE_B64,
+        "stable-2026",
+        &keys,
+        now_ms,
+    )?;
+    let tampered_rejected = verify_update_manifest(
+        format!("{EXTERNAL_MANIFEST_JSON} ").as_bytes(),
+        EXTERNAL_SIGNATURE_B64,
+        "stable-2026",
+        &keys,
+        now_ms,
+    )
+    .is_err();
+    let selection = select_runtime_update(
+        &manifest,
+        ExternalAgentKind::Gemini,
+        RuntimeUpdateChannel::Stable,
+        None,
+        &semver::Version::new(0, 3, 0),
+        "macos",
+        "aarch64",
+    )?
+    .expect("fixture manifest offers a gemini release");
+
+    let mut state = RuntimeUpdateState::new(
+        "gemini-default".parse::<RuntimeInstanceId>()?,
+        RuntimeProfile::Managed,
+    );
+    let managed_may_apply_before_check = state.may_apply_binary_update();
+    let mut phases = vec![serde_json::to_value(&state.phase)?];
+    state.record_check_success(now_ms, Some(&selection));
+    phases.push(serde_json::to_value(&state.phase)?);
+    state.begin_download()?;
+    phases.push(serde_json::to_value(&state.phase)?);
+    state.record_staged()?;
+    phases.push(serde_json::to_value(&state.phase)?);
+    state.begin_activation()?;
+    phases.push(serde_json::to_value(&state.phase)?);
+    state.record_activated()?;
+    phases.push(serde_json::to_value(&state.phase)?);
+    let activated_version = state.current_version.as_ref().map(ToString::to_string);
+    state.record_rollback(
+        semver::Version::new(1, 0, 0),
+        Some(selection.version.clone()),
+    );
+    phases.push(serde_json::to_value(&state.phase)?);
+    state.record_failure(now_ms, "manifest fetch failed");
+    let first_retry = state.retry_after_unix_ms;
+    state.record_failure(now_ms, "manifest fetch failed");
+    let second_retry = state.retry_after_unix_ms;
+
+    let mut external = RuntimeUpdateState::new(
+        "gemini-path".parse::<RuntimeInstanceId>()?,
+        RuntimeProfile::External,
+    );
+    external.record_check_success(now_ms, Some(&selection));
+
+    Ok(json!({
+        "verified": {
+            "schema_version": manifest.schema_version,
+            "release_kind": serde_json::to_value(manifest.releases[0].kind)?,
+            "release_version": manifest.releases[0].version.to_string(),
+        },
+        "tampered_rejected": tampered_rejected,
+        "selection": {
+            "version": selection.version.to_string(),
+            "protocol": selection.protocol,
+            "artifact_sha256": selection.artifact.sha256,
+        },
+        "phases": phases,
+        "activated_version": activated_version,
+        "rollback": {
+            "current": state.current_version.as_ref().map(ToString::to_string),
+            "quarantined": state.quarantined_version.as_ref().map(ToString::to_string),
+        },
+        "failure_retry_after_unix_ms": [first_retry, second_retry],
+        "managed_may_apply_before_check": managed_may_apply_before_check,
+        "external_actions": serde_json::to_value(due_refresh_actions(&external, now_ms + 1))?,
+    }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit("governance", governance_facts().await)?;
@@ -1249,5 +1354,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit("builtins", builtins_facts().await?)?;
     emit("input", input_facts().await)?;
     emit("a2a", a2a_facts())?;
+    emit("external_agents", external_agent_facts()?)?;
     Ok(())
 }

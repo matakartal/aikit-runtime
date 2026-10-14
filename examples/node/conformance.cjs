@@ -756,6 +756,101 @@ function a2aFacts() {
   };
 }
 
+const EXTERNAL_MANIFEST_JSON =
+  '{"schema_version":1,"generated_unix_ms":1000,"expires_unix_ms":10000,"releases":' +
+  '[{"kind":"gemini","channel":"stable","version":"1.2.3","protocol":"acp",' +
+  '"contract_version":1,"artifacts":[{"target_os":"macos","target_arch":"aarch64",' +
+  '"url":"https://updates.example.test/gemini",' +
+  '"sha256":"d92c6a81b2ff50096bcda80885427d1f59a25b5f483f7055523504925d16ab23",' +
+  '"size_bytes":7,"executable_name":"gemini"}]}]}';
+const EXTERNAL_SIGNATURE_B64 =
+  "PLnOFo824GQR9bmoOdChdF+xvlgh3C34yQnNY7ZMTcndBEPqPrrLpVoGUSbr4c0G87/KkkopnitV8QpkbW6LAA==";
+const EXTERNAL_PUBLIC_KEY_B64 = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=";
+
+function externalAgentFacts() {
+  const {
+    ExternalUpdateState,
+    externalUpdateRefreshActions,
+    selectExternalRuntimeUpdate,
+    verifyExternalUpdateManifest,
+  } = require("../../crates/aikit-node");
+  const nowMs = 2_000;
+  const trustedKeys = { "stable-2026": EXTERNAL_PUBLIC_KEY_B64 };
+  const manifest = verifyExternalUpdateManifest(
+    Buffer.from(EXTERNAL_MANIFEST_JSON),
+    EXTERNAL_SIGNATURE_B64,
+    "stable-2026",
+    trustedKeys,
+    nowMs,
+  );
+  let tamperedRejected = false;
+  try {
+    verifyExternalUpdateManifest(
+      Buffer.from(EXTERNAL_MANIFEST_JSON + " "),
+      EXTERNAL_SIGNATURE_B64,
+      "stable-2026",
+      trustedKeys,
+      nowMs,
+    );
+  } catch {
+    tamperedRejected = true;
+  }
+  const selection = selectExternalRuntimeUpdate(
+    manifest,
+    "gemini",
+    "stable",
+    "0.3.0",
+    "macos",
+    "aarch64",
+  );
+  const state = new ExternalUpdateState("gemini-default", "managed");
+  const phases = [state.snapshot().phase];
+  state.recordCheckSuccess(nowMs, selection);
+  phases.push(state.snapshot().phase);
+  state.beginDownload();
+  phases.push(state.snapshot().phase);
+  state.recordStaged();
+  phases.push(state.snapshot().phase);
+  state.beginActivation();
+  phases.push(state.snapshot().phase);
+  state.recordActivated();
+  phases.push(state.snapshot().phase);
+  const activatedVersion = state.currentVersion;
+  state.recordRollback("1.0.0", "1.2.3");
+  phases.push(state.snapshot().phase);
+  state.recordFailure(nowMs, "manifest fetch failed");
+  const firstRetry = state.retryAfterUnixMs;
+  state.recordFailure(nowMs, "manifest fetch failed");
+  const secondRetry = state.retryAfterUnixMs;
+  const external = new ExternalUpdateState("gemini-path", "external");
+  external.recordCheckSuccess(nowMs, selection);
+  return {
+    verified: {
+      schema_version: manifest.schema_version,
+      release_kind: manifest.releases[0].kind,
+      release_version: manifest.releases[0].version,
+    },
+    tampered_rejected: tamperedRejected,
+    selection: {
+      version: selection.version,
+      protocol: selection.protocol,
+      artifact_sha256: selection.artifact.sha256,
+    },
+    phases,
+    activated_version: activatedVersion,
+    rollback: {
+      current: state.currentVersion,
+      quarantined: state.quarantinedVersion,
+    },
+    failure_retry_after_unix_ms: [firstRetry, secondRetry],
+    managed_may_apply_before_check: new ExternalUpdateState(
+      "gemini-default",
+      "managed",
+    ).mayApplyBinaryUpdate(),
+    external_actions: externalUpdateRefreshActions(external.snapshot(), nowMs + 1),
+  };
+}
+
 async function main() {
   emit("governance", await governanceFacts());
   emit("structured", await structuredFacts());
@@ -765,6 +860,7 @@ async function main() {
   emit("orchestration", await orchestrationFacts());
   emit("builtins", await builtinsFacts());
   emit("a2a", a2aFacts());
+  emit("external_agents", externalAgentFacts());
 }
 
 main().catch((error) => {

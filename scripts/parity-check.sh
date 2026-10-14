@@ -80,7 +80,7 @@ fi
 
 # This array is the conformance registry. It deliberately stays independent of language-specific
 # build logic, so BUILTINS (or any later surface) can be added as one isolated module.
-conformance_modules=(GOVERNANCE STRUCTURED RUN_OPTIONS STATE ORCHESTRATION BUILTINS INPUT A2A)
+conformance_modules=(GOVERNANCE STRUCTURED RUN_OPTIONS STATE ORCHESTRATION BUILTINS INPUT A2A EXTERNAL_AGENTS)
 if [ -n "${AIKIT_CONFORMANCE_EXTRA_MODULES:-}" ]; then
   read -r -a extra_modules <<<"$AIKIT_CONFORMANCE_EXTRA_MODULES"
   conformance_modules+=("${extra_modules[@]}")

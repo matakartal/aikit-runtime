@@ -833,6 +833,100 @@ def a2a_facts():
     }
 
 
+EXTERNAL_MANIFEST_JSON = (
+    '{"schema_version":1,"generated_unix_ms":1000,"expires_unix_ms":10000,"releases":'
+    '[{"kind":"gemini","channel":"stable","version":"1.2.3","protocol":"acp",'
+    '"contract_version":1,"artifacts":[{"target_os":"macos","target_arch":"aarch64",'
+    '"url":"https://updates.example.test/gemini",'
+    '"sha256":"d92c6a81b2ff50096bcda80885427d1f59a25b5f483f7055523504925d16ab23",'
+    '"size_bytes":7,"executable_name":"gemini"}]}]}'
+)
+EXTERNAL_SIGNATURE_B64 = (
+    "PLnOFo824GQR9bmoOdChdF+xvlgh3C34yQnNY7ZMTcndBEPqPrrLpVoGUSbr4c0G87/KkkopnitV8QpkbW6LAA=="
+)
+EXTERNAL_PUBLIC_KEY_B64 = "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+
+
+def external_agent_facts():
+    from aikit import (
+        ExternalUpdateState,
+        external_update_refresh_actions,
+        select_external_runtime_update,
+        verify_external_update_manifest,
+    )
+
+    now_ms = 2_000
+    manifest = verify_external_update_manifest(
+        EXTERNAL_MANIFEST_JSON.encode(),
+        EXTERNAL_SIGNATURE_B64,
+        "stable-2026",
+        {"stable-2026": EXTERNAL_PUBLIC_KEY_B64},
+        now_ms,
+    )
+    tampered_rejected = False
+    try:
+        verify_external_update_manifest(
+            (EXTERNAL_MANIFEST_JSON + " ").encode(),
+            EXTERNAL_SIGNATURE_B64,
+            "stable-2026",
+            {"stable-2026": EXTERNAL_PUBLIC_KEY_B64},
+            now_ms,
+        )
+    except Exception:  # noqa: BLE001
+        tampered_rejected = True
+    selection = select_external_runtime_update(
+        manifest, "gemini", "stable", "0.3.0", "macos", "aarch64"
+    )
+    assert selection is not None
+    state = ExternalUpdateState("gemini-default", "managed")
+    phases = [state.snapshot()["phase"]]
+    state.record_check_success(now_ms, selection)
+    phases.append(state.snapshot()["phase"])
+    state.begin_download()
+    phases.append(state.snapshot()["phase"])
+    state.record_staged()
+    phases.append(state.snapshot()["phase"])
+    state.begin_activation()
+    phases.append(state.snapshot()["phase"])
+    state.record_activated()
+    phases.append(state.snapshot()["phase"])
+    activated_version = state.current_version
+    state.record_rollback("1.0.0", "1.2.3")
+    phases.append(state.snapshot()["phase"])
+    state.record_failure(now_ms, "manifest fetch failed")
+    first_retry = state.retry_after_unix_ms
+    state.record_failure(now_ms, "manifest fetch failed")
+    second_retry = state.retry_after_unix_ms
+    external = ExternalUpdateState("gemini-path", "external")
+    external.record_check_success(now_ms, selection)
+    return {
+        "verified": {
+            "schema_version": manifest["schema_version"],
+            "release_kind": manifest["releases"][0]["kind"],
+            "release_version": manifest["releases"][0]["version"],
+        },
+        "tampered_rejected": tampered_rejected,
+        "selection": {
+            "version": selection["version"],
+            "protocol": selection["protocol"],
+            "artifact_sha256": selection["artifact"]["sha256"],
+        },
+        "phases": phases,
+        "activated_version": activated_version,
+        "rollback": {
+            "current": state.current_version,
+            "quarantined": state.quarantined_version,
+        },
+        "failure_retry_after_unix_ms": [first_retry, second_retry],
+        "managed_may_apply_before_check": ExternalUpdateState(
+            "gemini-default", "managed"
+        ).may_apply_binary_update(),
+        "external_actions": external_update_refresh_actions(
+            external.snapshot(), now_ms + 1
+        ),
+    }
+
+
 async def main():
     emit("governance", await governance_facts())
     emit("structured", await structured_facts())
@@ -842,6 +936,7 @@ async def main():
     emit("builtins", await builtins_facts())
     emit("input", await input_facts())
     emit("a2a", a2a_facts())
+    emit("external_agents", external_agent_facts())
 
 
 if __name__ == "__main__":

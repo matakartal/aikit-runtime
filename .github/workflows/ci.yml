@@ -128,7 +128,9 @@ jobs:
           .venv/bin/python crates/aikit-py/tests/production_state.py
           .venv/bin/python crates/aikit-py/tests/multimodal_messages.py
           .venv/bin/python crates/aikit-py/tests/a2a_mapper.py
-          .venv/bin/mypy --strict crates/aikit-py/tests/typing_contract.py crates/aikit-py/tests/a2a_mapper.py
+          .venv/bin/python crates/aikit-py/tests/external_agents.py
+          .venv/bin/python crates/aikit-py/tests/external_agent_session.py
+          .venv/bin/mypy --strict crates/aikit-py/tests/typing_contract.py crates/aikit-py/tests/a2a_mapper.py crates/aikit-py/tests/external_agents.py crates/aikit-py/tests/external_agent_session.py
       - name: Build Node binding
         run: ./scripts/build-node.sh
       - name: Install pinned Node runtime-test dependency
@@ -149,10 +151,18 @@ jobs:
           node crates/aikit-node/tests/production-state.cjs
           node crates/aikit-node/tests/multimodal-messages.cjs
           node crates/aikit-node/tests/a2a-mapper.cjs
+          node crates/aikit-node/tests/external-agents.cjs
+          node crates/aikit-node/tests/external-agent-session.cjs
           ./.github/node-test-deps/node_modules/.bin/tsc --noEmit --strict --target ES2020 \
             --module commonjs --moduleResolution node crates/aikit-node/tests/typing.ts
       - name: Official MCP SDK conformance
         run: ./scripts/mcp-sdk-conformance.sh
+      - name: Generated declarations are current
+        run: ./scripts/generate-declarations.sh --check
+      - name: Binding runtime/declaration inventory gate
+        env:
+          PYTHON: .venv/bin/python
+        run: ./scripts/check-binding-declarations.sh
       - name: Canonical three-language parity
         env:
           PYTHON: .venv/bin/python

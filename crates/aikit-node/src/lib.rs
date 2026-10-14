@@ -2175,6 +2175,553 @@ pub fn seal_policy_snapshot(policy: Value) -> Result<Value> {
         .map_err(|_| Error::from_reason("failed to encode policy snapshot"))
 }
 
+// ---------------------------------------------------------------------------------------------
+// External-agent projections: the deterministic discovery, signed-manifest, selection, and
+// managed-update state machine surface. Live child-process runtimes (ACP/Codex sessions) stay
+// Rust/CLI-only; these bindings project exactly the keyless state machines the core tests prove.
+// ---------------------------------------------------------------------------------------------
+
+fn external_agent_error(error: aikit_core::external_agent::ExternalAgentError) -> Error {
+    let code = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    Error::new(
+        Status::GenericFailure,
+        format!("external agent error ({code}): {}", error.message),
+    )
+}
+
+fn parse_external_agent_kind(kind: &str) -> Result<aikit_core::external_agent::ExternalAgentKind> {
+    kind.parse().map_err(external_agent_error)
+}
+
+fn parse_external_version(label: &str, version: &str) -> Result<semver::Version> {
+    semver::Version::parse(version)
+        .map_err(|error| Error::new(Status::InvalidArg, format!("invalid {label}: {error}")))
+}
+
+fn external_unix_ms(now_unix_ms: f64) -> Result<u64> {
+    decode_a2a_now_unix_ms(Some(now_unix_ms))
+}
+
+/// Recursively convert whole-valued JS floats back to integers. External-agent DTOs contain only
+/// integral numeric fields, so this is lossless and lets `deny_unknown_fields` decoding accept
+/// values that crossed the JS number bridge.
+fn normalize_external_agent_numbers(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            if let Some(float) = number.as_f64() {
+                if number.is_f64()
+                    && float.fract() == 0.0
+                    && (0.0..=NODE_MAX_SAFE_INTEGER as f64).contains(&float)
+                {
+                    *number = serde_json::Number::from(float as u64);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(normalize_external_agent_numbers),
+        Value::Object(map) => map.values_mut().for_each(normalize_external_agent_numbers),
+        _ => {}
+    }
+}
+
+fn decode_external_value<T: serde::de::DeserializeOwned>(
+    label: &str,
+    mut value: Value,
+) -> Result<T> {
+    normalize_external_agent_numbers(&mut value);
+    serde_json::from_value(value)
+        .map_err(|error| Error::new(Status::InvalidArg, format!("invalid {label}: {error}")))
+}
+
+/// Deterministic, execution-free discovery of vendor CLI runtime candidates.
+#[napi]
+pub fn discover_external_runtime_candidates(
+    kind: String,
+    explicit_path: Option<String>,
+) -> Result<Value> {
+    let kind = parse_external_agent_kind(&kind)?;
+    let explicit = explicit_path.map(PathBuf::from);
+    let candidates =
+        aikit_core::external_agent::discover_runtime_candidates(kind, explicit.as_deref())
+            .map_err(external_agent_error)?;
+    serde_json::to_value(candidates)
+        .map_err(|_| Error::from_reason("failed to encode runtime candidates"))
+}
+
+/// Verify a detached Ed25519 manifest signature before parsing, exactly like the Rust core.
+#[napi]
+pub fn verify_external_update_manifest(
+    manifest_bytes: Buffer,
+    signature_base64: String,
+    key_id: String,
+    trusted_keys: HashMap<String, String>,
+    now_unix_ms: f64,
+) -> Result<Value> {
+    let mut keys = aikit_core::external_agent::TrustedManifestKeys::default();
+    // Deterministic insertion order so duplicate-id errors are stable across languages.
+    let ordered: std::collections::BTreeMap<String, String> = trusted_keys.into_iter().collect();
+    for (id, public_key_base64) in ordered {
+        keys.insert_base64(id, &public_key_base64)
+            .map_err(external_agent_error)?;
+    }
+    let manifest = aikit_core::external_agent::verify_update_manifest(
+        manifest_bytes.as_ref(),
+        &signature_base64,
+        &key_id,
+        &keys,
+        external_unix_ms(now_unix_ms)?,
+    )
+    .map_err(external_agent_error)?;
+    serde_json::to_value(manifest)
+        .map_err(|_| Error::from_reason("failed to encode update manifest"))
+}
+
+/// Pick the newest compatible release+artifact for one runtime kind, channel, and target.
+#[napi]
+#[allow(clippy::too_many_arguments)]
+pub fn select_external_runtime_update(
+    manifest: Value,
+    kind: String,
+    channel: Value,
+    aikit_version: String,
+    target_os: String,
+    target_arch: String,
+    current_version: Option<String>,
+) -> Result<Value> {
+    let manifest: aikit_core::external_agent::RuntimeUpdateManifest =
+        decode_external_value("external update manifest", manifest)?;
+    let kind = parse_external_agent_kind(&kind)?;
+    let channel: aikit_core::external_agent::RuntimeUpdateChannel =
+        decode_external_value("external update channel", channel)?;
+    let aikit_version = parse_external_version("aikit version", &aikit_version)?;
+    let current_version = current_version
+        .map(|version| parse_external_version("current runtime version", &version))
+        .transpose()?;
+    let selection = aikit_core::external_agent::select_runtime_update(
+        &manifest,
+        kind,
+        channel,
+        current_version.as_ref(),
+        &aikit_version,
+        &target_os,
+        &target_arch,
+    )
+    .map_err(external_agent_error)?;
+    serde_json::to_value(selection)
+        .map_err(|_| Error::from_reason("failed to encode update selection"))
+}
+
+/// Fail-closed validation of a persisted signed-update configuration document.
+#[napi]
+pub fn validate_external_update_config(config: Value) -> Result<()> {
+    let config: aikit_core::external_agent::RuntimeUpdateConfig =
+        decode_external_value("external update config", config)?;
+    config.validate().map_err(external_agent_error)
+}
+
+/// Due maintenance actions for one update state at an injected instant.
+#[napi]
+pub fn external_update_refresh_actions(state: Value, now_unix_ms: f64) -> Result<Value> {
+    let state: aikit_core::external_agent::RuntimeUpdateState =
+        decode_external_value("external update state", state)?;
+    let actions =
+        aikit_core::external_agent::due_refresh_actions(&state, external_unix_ms(now_unix_ms)?);
+    serde_json::to_value(actions)
+        .map_err(|_| Error::from_reason("failed to encode refresh actions"))
+}
+
+/// Typed projection of the managed-update state machine.
+///
+/// Mirrors the Rust `RuntimeUpdateState` exactly: every transition is fail-closed, every instant
+/// is injected by the caller, and a rejected transition leaves the state untouched.
+#[napi(js_name = "ExternalUpdateState")]
+pub struct ExternalUpdateState {
+    inner: aikit_core::external_agent::RuntimeUpdateState,
+}
+
+#[napi]
+impl ExternalUpdateState {
+    #[napi(constructor)]
+    pub fn new(instance_id: String, profile: Value) -> Result<Self> {
+        let instance_id: aikit_core::external_agent::RuntimeInstanceId =
+            instance_id.parse().map_err(external_agent_error)?;
+        let profile: aikit_core::external_agent::RuntimeProfile =
+            decode_external_value("external runtime profile", profile)?;
+        Ok(Self {
+            inner: aikit_core::external_agent::RuntimeUpdateState::new(instance_id, profile),
+        })
+    }
+
+    #[napi(factory)]
+    pub fn from_state(state: Value) -> Result<Self> {
+        let inner: aikit_core::external_agent::RuntimeUpdateState =
+            decode_external_value("external update state", state)?;
+        Ok(Self { inner })
+    }
+
+    #[napi]
+    pub fn snapshot(&self) -> Result<Value> {
+        serde_json::to_value(&self.inner)
+            .map_err(|_| Error::from_reason("failed to encode external update state"))
+    }
+
+    #[napi(getter)]
+    pub fn phase(&self) -> Result<Value> {
+        serde_json::to_value(&self.inner.phase)
+            .map_err(|_| Error::from_reason("failed to encode update phase"))
+    }
+
+    #[napi(getter)]
+    pub fn current_version(&self) -> Option<String> {
+        self.inner.current_version.as_ref().map(ToString::to_string)
+    }
+
+    #[napi(getter)]
+    pub fn available_version(&self) -> Option<String> {
+        self.inner
+            .available_version
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    #[napi(getter)]
+    pub fn quarantined_version(&self) -> Option<String> {
+        self.inner
+            .quarantined_version
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    #[napi(getter)]
+    pub fn consecutive_failures(&self) -> u32 {
+        self.inner.consecutive_failures
+    }
+
+    #[napi(getter)]
+    pub fn retry_after_unix_ms(&self) -> Option<f64> {
+        self.inner.retry_after_unix_ms.map(|value| value as f64)
+    }
+
+    #[napi(getter)]
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error.clone()
+    }
+
+    #[napi]
+    pub fn manifest_check_due(&self, now_unix_ms: f64) -> Result<bool> {
+        Ok(self
+            .inner
+            .manifest_check_due(external_unix_ms(now_unix_ms)?))
+    }
+
+    #[napi]
+    pub fn model_refresh_due(&self, now_unix_ms: f64) -> Result<bool> {
+        Ok(self.inner.model_refresh_due(external_unix_ms(now_unix_ms)?))
+    }
+
+    #[napi]
+    pub fn discovery_due(&self, now_unix_ms: f64) -> Result<bool> {
+        Ok(self.inner.discovery_due(external_unix_ms(now_unix_ms)?))
+    }
+
+    #[napi]
+    pub fn may_apply_binary_update(&self) -> bool {
+        self.inner.may_apply_binary_update()
+    }
+
+    #[napi]
+    pub fn refresh_actions(&self, now_unix_ms: f64) -> Result<Value> {
+        let actions = aikit_core::external_agent::due_refresh_actions(
+            &self.inner,
+            external_unix_ms(now_unix_ms)?,
+        );
+        serde_json::to_value(actions)
+            .map_err(|_| Error::from_reason("failed to encode refresh actions"))
+    }
+
+    #[napi]
+    pub fn record_check_success(
+        &mut self,
+        now_unix_ms: f64,
+        selection: Option<Value>,
+    ) -> Result<()> {
+        let selection: Option<aikit_core::external_agent::RuntimeUpdateSelection> = selection
+            .map(|selection| decode_external_value("external update selection", selection))
+            .transpose()?;
+        self.inner
+            .record_check_success(external_unix_ms(now_unix_ms)?, selection.as_ref());
+        Ok(())
+    }
+
+    #[napi]
+    pub fn record_failure(&mut self, now_unix_ms: f64, error: String) -> Result<()> {
+        self.inner
+            .record_failure(external_unix_ms(now_unix_ms)?, error);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn record_discovery(&mut self, now_unix_ms: f64) -> Result<()> {
+        self.inner.record_discovery(external_unix_ms(now_unix_ms)?);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn record_model_refresh(&mut self, now_unix_ms: f64) -> Result<()> {
+        self.inner
+            .record_model_refresh(external_unix_ms(now_unix_ms)?);
+        Ok(())
+    }
+
+    #[napi]
+    pub fn begin_download(&mut self) -> Result<()> {
+        self.inner.begin_download().map_err(external_agent_error)
+    }
+
+    #[napi]
+    pub fn record_staged(&mut self) -> Result<()> {
+        self.inner.record_staged().map_err(external_agent_error)
+    }
+
+    #[napi]
+    pub fn begin_activation(&mut self) -> Result<()> {
+        self.inner.begin_activation().map_err(external_agent_error)
+    }
+
+    #[napi]
+    pub fn record_activated(&mut self) -> Result<()> {
+        self.inner.record_activated().map_err(external_agent_error)
+    }
+
+    #[napi]
+    pub fn recover_activated(&mut self, active_version: String) -> Result<bool> {
+        let active_version = parse_external_version("active version", &active_version)?;
+        self.inner
+            .recover_activated(&active_version)
+            .map_err(external_agent_error)
+    }
+
+    #[napi]
+    pub fn quarantine_available(&mut self) {
+        self.inner.quarantine_available();
+    }
+
+    #[napi]
+    pub fn record_rollback(
+        &mut self,
+        restored_version: String,
+        rejected_version: Option<String>,
+    ) -> Result<()> {
+        let restored_version = parse_external_version("restored version", &restored_version)?;
+        let rejected_version = rejected_version
+            .map(|version| parse_external_version("rejected version", &version))
+            .transpose()?;
+        self.inner
+            .record_rollback(restored_version, rejected_version);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Live external-agent sessions: spawn a vendor CLI runtime (Codex app-server, Gemini/Grok/Claude
+// over ACP) and drive it with the same governed core the CLI uses. The per-kind spawn policy and
+// the Gemini vendor-terms gate live in the shared Rust helper, not in this binding.
+// ---------------------------------------------------------------------------------------------
+
+fn external_runtime_error(error: aikit_core::external_agent::ExternalAgentError) -> Error {
+    external_agent_error(error)
+}
+
+fn encode_external_json<T: serde::Serialize>(label: &str, value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|_| Error::from_reason(format!("failed to encode {label}")))
+}
+
+/// Options accepted by [`spawn_external_agent_session`].
+#[napi(object)]
+#[derive(Default)]
+pub struct ExternalAgentSpawnOptions {
+    pub explicit_executable: Option<String>,
+    pub instance_id: Option<String>,
+    pub claude_bridge: Option<String>,
+    pub claude_bridge_args: Option<Vec<String>>,
+    /// Gemini CLI OAuth reuse requires this explicit acknowledgement, like the CLI flag.
+    pub acknowledge_vendor_terms: Option<bool>,
+}
+
+/// Spawn one live vendor-CLI session with the shared per-kind policy.
+#[napi]
+pub async fn spawn_external_agent_session(
+    kind: String,
+    workspace: String,
+    options: Option<ExternalAgentSpawnOptions>,
+) -> Result<ExternalAgentSession> {
+    let kind = parse_external_agent_kind(&kind)?;
+    let options = options.unwrap_or_default();
+    let mut spawn = aikit_core::external_agent::ExternalRuntimeSpawnOptions::new(workspace);
+    spawn.explicit_executable = options.explicit_executable.map(PathBuf::from);
+    spawn.instance_id = options
+        .instance_id
+        .as_deref()
+        .map(|value| {
+            value
+                .parse::<aikit_core::external_agent::RuntimeInstanceId>()
+                .map_err(external_runtime_error)
+        })
+        .transpose()?;
+    spawn.claude_bridge = options.claude_bridge.map(PathBuf::from);
+    spawn.claude_bridge_args = options.claude_bridge_args.unwrap_or_default();
+    spawn.acknowledge_vendor_terms = options.acknowledge_vendor_terms.unwrap_or(false);
+    let inner = aikit_core::external_agent::spawn_external_runtime_for_host(kind, spawn)
+        .await
+        .map_err(external_runtime_error)?;
+    Ok(ExternalAgentSession { inner })
+}
+
+/// One live vendor-CLI session; every method is a Promise and `events()` returns an async pull
+/// stream that fails closed when the subscriber lags.
+#[napi]
+pub struct ExternalAgentSession {
+    inner: Arc<dyn aikit_core::external_agent::ExternalAgentRuntime>,
+}
+
+#[napi]
+impl ExternalAgentSession {
+    #[napi]
+    pub fn descriptor(&self) -> Result<Value> {
+        encode_external_json("runtime descriptor", &self.inner.descriptor())
+    }
+
+    #[napi]
+    pub async fn initialize(&self) -> Result<Value> {
+        let descriptor = self
+            .inner
+            .initialize()
+            .await
+            .map_err(external_runtime_error)?;
+        encode_external_json("runtime descriptor", &descriptor)
+    }
+
+    #[napi]
+    pub async fn auth_status(&self, refresh: Option<bool>) -> Result<Value> {
+        let status = self
+            .inner
+            .auth_status(refresh.unwrap_or(false))
+            .await
+            .map_err(external_runtime_error)?;
+        encode_external_json("auth status", &status)
+    }
+
+    #[napi]
+    pub async fn list_models(&self) -> Result<Value> {
+        let catalog = self
+            .inner
+            .list_models()
+            .await
+            .map_err(external_runtime_error)?;
+        encode_external_json("model catalog", &catalog)
+    }
+
+    #[napi]
+    pub async fn new_session(&self, request: Value) -> Result<Value> {
+        let request: aikit_core::external_agent::NewRuntimeSession =
+            decode_external_value("external agent session request", request)?;
+        let session = self
+            .inner
+            .new_session(request)
+            .await
+            .map_err(external_runtime_error)?;
+        encode_external_json("runtime session", &session)
+    }
+
+    #[napi]
+    pub async fn prompt(&self, prompt: Value) -> Result<()> {
+        let prompt: aikit_core::external_agent::ExternalPrompt =
+            decode_external_value("external agent prompt", prompt)?;
+        self.inner
+            .prompt(prompt)
+            .await
+            .map_err(external_runtime_error)
+    }
+
+    #[napi]
+    pub async fn cancel(&self, session_id: String, turn_id: Option<String>) -> Result<()> {
+        self.inner
+            .cancel(&session_id, turn_id.as_deref())
+            .await
+            .map_err(external_runtime_error)
+    }
+
+    #[napi]
+    pub async fn respond_approval(
+        &self,
+        session_id: String,
+        request_id: String,
+        decision: Value,
+    ) -> Result<()> {
+        let decision: aikit_core::external_agent::ExternalApprovalDecision =
+            decode_external_value("external agent approval decision", decision)?;
+        self.inner
+            .respond_approval(&session_id, &request_id, decision)
+            .await
+            .map_err(external_runtime_error)
+    }
+
+    #[napi]
+    pub async fn respond_user_input(
+        &self,
+        session_id: String,
+        request_id: String,
+        answers: HashMap<String, String>,
+    ) -> Result<()> {
+        self.inner
+            .respond_user_input(&session_id, &request_id, answers.into_iter().collect())
+            .await
+            .map_err(external_runtime_error)
+    }
+
+    #[napi]
+    pub fn events(&self) -> ExternalAgentEventStream {
+        ExternalAgentEventStream {
+            receiver: Arc::new(TokioMutex::new(self.inner.subscribe())),
+        }
+    }
+
+    #[napi]
+    pub async fn shutdown(&self) -> Result<()> {
+        self.inner.shutdown().await.map_err(external_runtime_error)
+    }
+}
+
+/// Async pull stream over normalized runtime events; `next()` resolves `null` when the runtime
+/// closes and rejects when the subscriber lagged, mirroring the CLI's fail-closed event loop.
+#[napi]
+pub struct ExternalAgentEventStream {
+    receiver:
+        Arc<TokioMutex<tokio::sync::broadcast::Receiver<aikit_core::external_agent::RuntimeEvent>>>,
+}
+
+#[napi]
+impl ExternalAgentEventStream {
+    #[napi]
+    pub async fn next(&self) -> Result<Option<Value>> {
+        let event = {
+            let mut receiver = self.receiver.lock().await;
+            receiver.recv().await
+        };
+        match event {
+            Ok(event) => encode_external_json("runtime event", &event).map(Some),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => Ok(None),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                Err(Error::from_reason(format!(
+                    "external agent event stream lagged and dropped {missed} event(s)"
+                )))
+            }
+        }
+    }
+}
+
 /// Seal a policy snapshot together with its complete durable scope identity.
 #[napi]
 pub fn seal_governance_binding(

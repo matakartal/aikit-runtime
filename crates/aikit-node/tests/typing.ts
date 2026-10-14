@@ -3,6 +3,12 @@ import {
   Agent,
   Client,
   DurableRun,
+  ExternalUpdateState,
+  discoverExternalRuntimeCandidates,
+  externalUpdateRefreshActions,
+  selectExternalRuntimeUpdate,
+  validateExternalUpdateConfig,
+  verifyExternalUpdateManifest,
   McpConnection,
   legacy,
   evaluateOutcome,
@@ -18,6 +24,11 @@ import {
   validateMediaInput,
   validateModelProfile,
   type AuditablePolicyDecision,
+  type ExternalRefreshAction,
+  type ExternalRuntimeCandidate,
+  type ExternalUpdateManifest,
+  type ExternalUpdateSelection,
+  type ExternalUpdateStateSnapshot,
   type A2aDispatchOutboxRecord,
   type A2aGovernedAction,
   type A2aMapperState,
@@ -556,6 +567,50 @@ async function typedCanonicalInputs(): Promise<void> {
   void object.warnings[0]?.parameter;
   void invoice;
 }
+
+const externalManifest: ExternalUpdateManifest = verifyExternalUpdateManifest(
+  new Uint8Array([123, 125]),
+  "signature",
+  "key",
+  { key: "public" },
+  1,
+);
+const externalSelection: ExternalUpdateSelection | null = selectExternalRuntimeUpdate(
+  externalManifest,
+  "gemini",
+  "stable",
+  "0.3.0",
+  "macos",
+  "aarch64",
+);
+const externalState = new ExternalUpdateState("gemini-default", "managed");
+externalState.recordCheckSuccess(1, externalSelection ?? undefined);
+const externalSnapshot: ExternalUpdateStateSnapshot = externalState.snapshot();
+const externalActions: ExternalRefreshAction[] = externalUpdateRefreshActions(
+  externalSnapshot,
+  1,
+);
+const externalRestored: ExternalUpdateState = ExternalUpdateState.fromState(externalSnapshot);
+const externalCandidates: ExternalRuntimeCandidate[] = discoverExternalRuntimeCandidates(
+  "gemini",
+);
+validateExternalUpdateConfig({
+  schema_version: 1,
+  instance_id: "gemini-default",
+  kind: "gemini",
+  profile: "managed",
+  policy: "aikit_managed",
+  channel: "stable",
+  source: {
+    manifest_url: "https://example.test/m.json",
+    signature_url: "https://example.test/m.sig",
+    key_id: "key",
+    public_key_base64: "public",
+  },
+});
+void externalActions;
+void externalRestored;
+void externalCandidates;
 
 void consume;
 void inspectContainment;

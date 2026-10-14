@@ -9,7 +9,19 @@ use tokio::sync::broadcast;
 
 pub const EXTERNAL_AGENT_CONTRACT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalAgentKind {
     Codex,
@@ -87,7 +99,9 @@ pub fn vendor_session_environment(kind: ExternalAgentKind) -> BTreeMap<String, S
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct RuntimeInstanceId(String);
 
@@ -130,14 +144,14 @@ impl FromStr for RuntimeInstanceId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeProfile {
     External,
     Managed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeInstallOrigin {
     AikitManaged,
@@ -149,7 +163,7 @@ pub enum RuntimeInstallOrigin {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeDiscoverySource {
     Explicit,
@@ -157,7 +171,7 @@ pub enum RuntimeDiscoverySource {
     KnownLocation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCandidate {
     pub kind: ExternalAgentKind,

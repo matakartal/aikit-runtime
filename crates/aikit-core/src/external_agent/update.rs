@@ -31,7 +31,7 @@ pub const DISCOVERY_REFRESH_TTL_MS: u64 = 60 * 60 * 1_000;
 
 const RETRY_DELAYS_MS: [u64; 3] = [60 * 60 * 1_000, 6 * 60 * 60 * 1_000, 24 * 60 * 60 * 1_000];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeUpdateChannel {
     Stable,
@@ -47,7 +47,7 @@ impl RuntimeUpdateChannel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeUpdatePolicy {
     /// Discover and report versions without mutating the vendor installation.
@@ -67,7 +67,7 @@ impl RuntimeUpdatePolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateSource {
     pub manifest_url: String,
@@ -111,7 +111,7 @@ impl RuntimeUpdateSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateConfig {
     pub schema_version: u32,
@@ -233,33 +233,37 @@ impl RuntimeUpdateClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateManifest {
     pub schema_version: u32,
     pub generated_unix_ms: u64,
     pub expires_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub minimum_aikit_version: Option<Version>,
     pub releases: Vec<RuntimeRelease>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRelease {
     pub kind: ExternalAgentKind,
     pub channel: RuntimeUpdateChannel,
+    #[schemars(with = "String")]
     pub version: Version,
     pub protocol: String,
     pub contract_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub minimum_aikit_version: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub maximum_aikit_version: Option<Version>,
     pub artifacts: Vec<RuntimeArtifact>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeArtifact {
     pub target_os: String,
@@ -291,6 +295,22 @@ impl TrustedManifestKeys {
             Entry::Occupied(_) => return Err(update_error("duplicate manifest key id")),
         }
         Ok(())
+    }
+
+    /// Insert a standard-base64 Ed25519 public key, validating shape before storage. This is the
+    /// binding-facing form of [`Self::insert`]; both enforce the same key-id and length rules.
+    pub fn insert_base64(
+        &mut self,
+        key_id: impl Into<String>,
+        public_key_base64: &str,
+    ) -> ExternalAgentResult<()> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(public_key_base64.trim())
+            .map_err(|_| update_error("manifest public key is not valid base64"))?;
+        let public_key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| update_error("Ed25519 manifest public keys are exactly 32 bytes"))?;
+        self.insert(key_id, public_key)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -425,10 +445,11 @@ fn validate_update_url(label: &str, value: &str) -> ExternalAgentResult<url::Url
     Ok(url)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateSelection {
     pub kind: ExternalAgentKind,
+    #[schemars(with = "String")]
     pub version: Version,
     pub channel: RuntimeUpdateChannel,
     pub protocol: String,
@@ -487,7 +508,7 @@ pub fn select_runtime_update(
     }))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeUpdatePhase {
     Idle,
@@ -501,7 +522,7 @@ pub enum RuntimeUpdatePhase {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeUpdateState {
     pub schema_version: u32,
@@ -511,11 +532,14 @@ pub struct RuntimeUpdateState {
     pub channel: RuntimeUpdateChannel,
     pub phase: RuntimeUpdatePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub current_version: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub available_version: Option<Version>,
     /// A version whose staged health check failed or which was explicitly rolled back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub quarantined_version: Option<Version>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_manifest_check_unix_ms: Option<u64>,
@@ -686,7 +710,7 @@ impl RuntimeUpdateState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeRefreshAction {
     Rediscover,

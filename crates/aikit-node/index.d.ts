@@ -2,14 +2,6 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type ProviderMetadata = Record<string, JsonValue[]>;
 
-export interface Usage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-  reasoning_tokens: number;
-}
-
 export type ErrorCode =
   | "provider_auth"
   | "provider_rate_limit"
@@ -78,14 +70,6 @@ export type StreamDelta =
 
 export type CapabilityState = "supported" | "unsupported" | "unknown";
 export type CompatibilityMode = "strict" | "warn" | "best_effort";
-
-export interface ProviderWarning {
-  code: string;
-  message: string;
-  parameter?: string;
-  provider?: string;
-  model?: string;
-}
 
 export type StreamBlockKind =
   | "text"
@@ -173,19 +157,6 @@ export type ContentBlock =
 
 /** Canonical v0.3 name; ContentBlock remains the v0.x compatibility spelling. */
 export type ContentPart = ContentBlock;
-
-export type MediaInputSource =
-  | { kind: "url"; url: string }
-  | { kind: "base64"; data: string }
-  | { kind: "bytes"; data: number[] }
-  | { kind: "artifact"; artifact_id: string };
-
-export interface MediaInput {
-  media_type: string;
-  source: MediaInputSource;
-  sha256: string;
-  size_bytes: number;
-}
 
 /** Canonical validation gate; rejects malformed MIME, size, hash, and unknown fields. */
 export function validateMediaInput(media: MediaInput): MediaInput;
@@ -1074,6 +1045,233 @@ export class A2aMapper {
     statusMessage?: string,
     nowUnixMs?: number,
   ): A2aMapperState;
+}
+
+// --- BEGIN GENERATED external-agent declarations (scripts/generate-declarations.sh) ---
+export type ExternalAgentKind = "codex" | "gemini" | "claude" | "grok";
+export type ExternalRuntimeProfile = "external" | "managed";
+export type ExternalUpdatePolicy = "check_only" | "vendor_managed" | "aikit_managed";
+export type ExternalUpdateChannel = "stable" | "preview";
+export type ExternalUpdatePhase = "idle" | "checking" | "available" | "downloading" | "staged" | "activating" | "current" | "rolled_back" | "failed";
+export type ExternalRefreshAction = "rediscover" | "refresh_model_catalog" | "check_compatibility_manifest" | "report_external_update" | "stage_managed_update";
+export type ExternalRuntimeInstallOrigin = "aikit_managed" | "vendor_native" | "homebrew" | "npm" | "application_bundle" | "explicit_path" | "unknown";
+export type ExternalRuntimeDiscoverySource = "explicit" | "path" | "known_location";
+
+export type MediaInputSource =
+  | { url: string; kind: "url" }
+  | { data: string; kind: "base64" }
+  | { data: number[]; kind: "bytes" }
+  | { artifact_id: string; kind: "artifact" };
+
+export interface ExternalRuntimeCandidate {
+  kind: ExternalAgentKind;
+  executable: string;
+  real_executable: string;
+  origin: ExternalRuntimeInstallOrigin;
+  discovered_by: ExternalRuntimeDiscoverySource[];
+  aliases?: string[];
+}
+
+export interface ExternalRuntimeArtifact {
+  target_os: string;
+  target_arch: string;
+  url: string;
+  sha256: string;
+  size_bytes: number;
+  executable_name: string;
+}
+
+export interface ExternalRuntimeRelease {
+  kind: ExternalAgentKind;
+  channel: ExternalUpdateChannel;
+  version: string;
+  protocol: string;
+  contract_version: number;
+  minimum_aikit_version?: string;
+  maximum_aikit_version?: string;
+  artifacts: ExternalRuntimeArtifact[];
+}
+
+export interface ExternalUpdateManifest {
+  schema_version: number;
+  generated_unix_ms: number;
+  expires_unix_ms: number;
+  minimum_aikit_version?: string;
+  releases: ExternalRuntimeRelease[];
+}
+
+export interface ExternalUpdateSelection {
+  kind: ExternalAgentKind;
+  version: string;
+  channel: ExternalUpdateChannel;
+  protocol: string;
+  artifact: ExternalRuntimeArtifact;
+}
+
+export interface ExternalUpdateSource {
+  manifest_url: string;
+  signature_url: string;
+  key_id: string;
+  public_key_base64: string;
+}
+
+export interface ExternalUpdateConfig {
+  schema_version: number;
+  instance_id: string;
+  kind: ExternalAgentKind;
+  profile: ExternalRuntimeProfile;
+  policy: ExternalUpdatePolicy;
+  channel: ExternalUpdateChannel;
+  source: ExternalUpdateSource;
+}
+
+export interface ExternalUpdateStateSnapshot {
+  schema_version: number;
+  instance_id: string;
+  profile: ExternalRuntimeProfile;
+  policy: ExternalUpdatePolicy;
+  channel: ExternalUpdateChannel;
+  phase: ExternalUpdatePhase;
+  current_version?: string;
+  available_version?: string;
+  quarantined_version?: string;
+  last_manifest_check_unix_ms?: number;
+  last_model_refresh_unix_ms?: number;
+  last_discovery_unix_ms?: number;
+  consecutive_failures: number;
+  retry_after_unix_ms?: number;
+  last_error?: string;
+}
+
+export interface Usage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  reasoning_tokens: number;
+}
+
+export interface ProviderWarning {
+  code: string;
+  message: string;
+  parameter?: string;
+  provider?: string;
+  model?: string;
+}
+
+export interface MediaInput {
+  media_type: string;
+  source: MediaInputSource;
+  sha256: string;
+  size_bytes: number;
+}
+// --- END GENERATED external-agent declarations ---
+
+/** Deterministic, execution-free discovery of vendor CLI runtime candidates. */
+export function discoverExternalRuntimeCandidates(
+  kind: string,
+  explicitPath?: string,
+): ExternalRuntimeCandidate[];
+
+/** Verify a detached Ed25519 manifest signature before parsing, exactly like the Rust core. */
+export function verifyExternalUpdateManifest(
+  manifestBytes: Uint8Array,
+  signatureBase64: string,
+  keyId: string,
+  trustedKeys: Record<string, string>,
+  nowUnixMs: number,
+): ExternalUpdateManifest;
+
+/** Pick the newest compatible release+artifact for one runtime kind, channel, and target. */
+export function selectExternalRuntimeUpdate(
+  manifest: ExternalUpdateManifest,
+  kind: string,
+  channel: ExternalUpdateChannel,
+  aikitVersion: string,
+  targetOs: string,
+  targetArch: string,
+  currentVersion?: string,
+): ExternalUpdateSelection | null;
+
+/** Fail-closed validation of a persisted signed-update configuration document. */
+export function validateExternalUpdateConfig(config: ExternalUpdateConfig): void;
+
+/** Due maintenance actions for one update state at an injected instant. */
+export function externalUpdateRefreshActions(
+  state: ExternalUpdateStateSnapshot,
+  nowUnixMs: number,
+): ExternalRefreshAction[];
+
+export interface ExternalAgentSpawnOptions {
+  explicitExecutable?: string;
+  instanceId?: string;
+  claudeBridge?: string;
+  claudeBridgeArgs?: string[];
+  /** Gemini CLI OAuth reuse requires this explicit acknowledgement, like the CLI flag. */
+  acknowledgeVendorTerms?: boolean;
+}
+
+/** Spawn one live vendor-CLI session with the shared per-kind policy. */
+export function spawnExternalAgentSession(
+  kind: string,
+  workspace: string,
+  options?: ExternalAgentSpawnOptions,
+): Promise<ExternalAgentSession>;
+
+/** One live vendor-CLI session; `events()` fails closed when the subscriber lags. */
+export class ExternalAgentSession {
+  private constructor();
+  descriptor(): JsonValue;
+  initialize(): Promise<JsonValue>;
+  authStatus(refresh?: boolean): Promise<JsonValue>;
+  listModels(): Promise<JsonValue>;
+  newSession(request: JsonValue): Promise<JsonValue>;
+  prompt(prompt: JsonValue): Promise<void>;
+  cancel(sessionId: string, turnId?: string): Promise<void>;
+  respondApproval(sessionId: string, requestId: string, decision: JsonValue): Promise<void>;
+  respondUserInput(
+    sessionId: string,
+    requestId: string,
+    answers: Record<string, string>,
+  ): Promise<void>;
+  events(): ExternalAgentEventStream;
+  shutdown(): Promise<void>;
+}
+
+/** Async pull stream over normalized runtime events; `next()` is `null` after close. */
+export class ExternalAgentEventStream {
+  private constructor();
+  next(): Promise<JsonValue | null>;
+}
+
+/** Typed projection of the fail-closed managed-update state machine. */
+export class ExternalUpdateState {
+  constructor(instanceId: string, profile: ExternalRuntimeProfile);
+  static fromState(state: ExternalUpdateStateSnapshot): ExternalUpdateState;
+  snapshot(): ExternalUpdateStateSnapshot;
+  get phase(): ExternalUpdatePhase;
+  get currentVersion(): string | null;
+  get availableVersion(): string | null;
+  get quarantinedVersion(): string | null;
+  get consecutiveFailures(): number;
+  get retryAfterUnixMs(): number | null;
+  get lastError(): string | null;
+  manifestCheckDue(nowUnixMs: number): boolean;
+  modelRefreshDue(nowUnixMs: number): boolean;
+  discoveryDue(nowUnixMs: number): boolean;
+  mayApplyBinaryUpdate(): boolean;
+  refreshActions(nowUnixMs: number): ExternalRefreshAction[];
+  recordCheckSuccess(nowUnixMs: number, selection?: ExternalUpdateSelection): void;
+  recordFailure(nowUnixMs: number, error: string): void;
+  recordDiscovery(nowUnixMs: number): void;
+  recordModelRefresh(nowUnixMs: number): void;
+  beginDownload(): void;
+  recordStaged(): void;
+  beginActivation(): void;
+  recordActivated(): void;
+  recoverActivated(activeVersion: string): boolean;
+  quarantineAvailable(): void;
+  recordRollback(restoredVersion: string, rejectedVersion?: string): void;
 }
 
 /** Stateful wrapper over the canonical append-only Rust durability engine. */
