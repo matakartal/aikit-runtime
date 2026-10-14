@@ -72,9 +72,14 @@ it, so stores and host logs must protect it like prompts and model output.
 - Realtime event fingerprints survive serialization so reconnect duplicates remain idempotent;
   reusing an event id with different content fails closed.
 
-Python and Node expose the v2 async event stream and the same durable run/eval state machine. Full
-schema-generated declarations for every older convenience surface remain a tracked v1 gate rather
-than an implied completion claim.
+Python and Node expose the v2 async event stream and the same durable run/eval state machine.
+Declaration generation is real but partial: `scripts/generate-declarations.sh` renders the
+external-agent DTOs plus canonical `Usage`/`ProviderWarning`/`MediaInput` and the
+`MediaInputSource` discriminated union for both languages directly from `schemars` schemas — 
+structs, string enums, and internally tagged unions — and CI fails when the checked-in region is
+stale. Types whose `Option` fields omit `skip_serializing_if` stay hand-written because a schema
+cannot separate present-as-null from absent. Full schema-generated declarations for every type
+remain a tracked v1 gate rather than an implied completion claim.
 
 The provider media layer includes catalog-gated OpenAI HTTP contracts for image generation,
 transcription, speech, and realtime WebRTC call setup. It uses typed cancellation/errors, bounded
@@ -115,17 +120,33 @@ schema-drift reapproval. The A2A canonical mapper also owner-scopes context/sess
 implements authenticated ListTasks filtering before counts, cursor validation and bounded
 pagination in Rust/Python/Node. A bounded experimental JSON-RPC/SSE listener projects Tasks,
 artifacts, direct `Message` responses and durable SSE events, with a separately capacity-bounded
-protected cancellation ingress. It still omits complete timestamp/history and artifact-update
-coverage. The typed delta-journal/checkpoint contract is exposed but not yet wired into the
-transport hot path, which still uses bounded full-snapshot CAS. The pinned official TCK therefore
+protected cancellation ingress. Every task mutation persists a caller-injected wall-clock instant
+projected as the official RFC 3339 `TaskStatus.timestamp`; `statusTimestampAfter` is an enforced
+inclusive ListTasks filter; `Task.history` is projected from durable message receipts under the
+official `historyLength` semantics; and completed-task artifacts publish durable
+`TaskArtifactUpdateEvent` frames ordered before the terminal frame, including across restart
+recovery. The typed delta journal is wired into the transport persistence boundary through
+`A2aJournalMapperSnapshotStore`: one hash-chained typed delta per accepted mutation under the
+transport's deterministic commit identity, bounded checkpoint rotation with prefix GC, and
+fail-closed checkpoint+tail replay on restore. Journal backends ship as the linearizable
+in-memory reference and a durable cross-process `SqliteA2aMapperJournalStore` proven
+byte-identical to it by a differential conformance test; the default stores remain bounded
+full-snapshot CAS. The pinned official TCK therefore
 keeps its raw six false negatives visible and uses a separate exact-set verification gate rather
 than claiming an unqualified pass. The SDK-neutral ACP mapper remains separate from the real
 external-agent stdio runtime. The envelope
 operation `tasks/list` is an internal policy/audit key; transports must call the governed mapper and
 explicitly project official DTOs rather than serializing internal records or reading `tasks()`
-directly. ACP is no longer mapping-only for vendor CLI sessions: the external-agent module has a
-real official-SDK stdio client for Gemini/Grok and pinned bridges, while the older protocol mapper
-remains the SDK-neutral DTO layer.
+directly. ACP is served as well as consumed: the external-agent module has a real official-SDK
+stdio client for Gemini/Grok and pinned bridges, and `serve_acp_stdio` now exposes aikit **as**
+an ACP v1 agent over newline-delimited JSON-RPC — governed `session/new`/`session/prompt`/
+`session/cancel` routing over the SDK-neutral mapper, official camelCase wire shapes, streamed
+`session/update` notifications, one bounded active run per session, honest `-32601` for
+unsupported optional methods, and a host prompt seam so the wire layer can never execute tools. The deterministic external-agent surface — execution-free
+discovery, detached-Ed25519 manifest verification, release selection, refresh planning, and the
+fail-closed managed-update state machine — is projected into typed Python and Node bindings and
+byte-compared across all three languages by the `EXTERNAL_AGENTS` conformance module; live
+child-process session runtimes remain Rust/CLI-only.
 
 The optional Firecracker lifecycle validates immutable kernel/rootfs/VMM/jailer inputs, constructs
 shell-free jailer arguments, checks trusted paths and Linux prerequisites, waits for the API socket,
@@ -451,8 +472,11 @@ already enforces the exact host allowlist and public-only IP policy. Rust passes
 `external_egress_enforced=True`; Node passes `{ externalEgressEnforced: true }`. These values are
 assertions, not switches that install or verify enforcement. Current-URL checks remain
 defense-in-depth postconditions. Browser URL/query/selector/type/session inputs and WebDriver JSON
-responses are bounded; failure payloads are redacted. Opt-in deterministic compaction preserves
-the task anchor, recent tail, and tool pairs.
+responses are bounded; failure payloads are redacted. Opt-in compaction preserves the task
+anchor, recent tail, and tool pairs; the condensed note is deterministic-extractive by default,
+and a host-pluggable `CompactionSummarizer` (with the governed `AgentCompactionSummarizer`
+implementation) upgrades it to a model-generated summary whose failure always falls back to the
+extractive note, so the transcript stays bounded without the summary model.
 
 ## Containment
 
@@ -489,10 +513,11 @@ are asserted instead.
 
 - Live PostgreSQL failover proof and a deployed Temporal SDK worker beyond the implemented
   transactional PostgreSQL store and deterministic Temporal mapping.
-- Model-generated/two-pass summaries beyond deterministic extractive compaction.
-- A2A timestamps/history/artifact-update completion, production delta-journal wiring, authenticated
-  deployment proof, and removal of the six pinned TCK waivers; ACP wire transport and official MCP
-  external SDK/OAuth conformance also remain open.
+- A2A authenticated deployment proof and removal of the six pinned TCK waivers. The pinned
+  official MCP SDK client suite, including RFC 9728 protected-resource discovery, runs against
+  the Streamable HTTP server in CI; only a live authorization-server token flow stays outside
+  keyless scope. The ACP serving transport ships as `serve_acp_stdio`; editor-grade acceptance
+  against a real ACP client product remains external evidence.
 - Stronger Windows filesystem/network isolation beyond Job Objects.
 - Built-in LLM risk judge (the trait + heuristic scorer ship now; hosts can plug their own).
 - Transparent egress enforcement for arbitrary child processes beyond explicit brokered HTTP and
