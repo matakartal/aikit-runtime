@@ -151,6 +151,8 @@ jobs:
           node crates/aikit-node/tests/a2a-mapper.cjs
           ./.github/node-test-deps/node_modules/.bin/tsc --noEmit --strict --target ES2020 \
             --module commonjs --moduleResolution node crates/aikit-node/tests/typing.ts
+      - name: Official MCP SDK conformance
+        run: ./scripts/mcp-sdk-conformance.sh
       - name: Canonical three-language parity
         env:
           PYTHON: .venv/bin/python
