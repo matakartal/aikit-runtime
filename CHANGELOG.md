@@ -239,6 +239,13 @@ All notable changes to this project will be documented in this file. The format 
 - Python/TypeScript declarations now reflect factory-only MCP handles and optional durable resume
   approvals instead of accepting calls that runtime rejects or rejecting valid commands.
 
+### Security
+
+- Lockfiles advance `rustls` 0.23.42 → 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349), `h2`
+  0.4.15 → 0.4.20 (RUSTSEC-2026-0258), `quinn-proto` 0.11.16 → 0.11.19 (RUSTSEC-2026-0338 through
+  -0342), `event-listener` 5.4.1 → 5.4.2 (RUSTSEC-2026-0221), and the yanked `chacha20` 0.10.1 →
+  0.10.2, so `cargo deny` and `cargo audit` pass with no accepted advisories.
+
 ### Documentation
 
 - Reworked the documentation set for the 0.3 alpha parity candidate: architecture and migration
