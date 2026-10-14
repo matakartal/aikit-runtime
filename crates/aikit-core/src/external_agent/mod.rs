@@ -8,6 +8,7 @@
 mod acp;
 mod codex;
 mod discovery;
+mod host;
 mod jsonrpc;
 mod types;
 mod update;
@@ -16,6 +17,9 @@ pub use acp::{AcpExternalRuntime, AcpRuntimeConfig};
 pub use codex::{CodexAppServerConfig, CodexAppServerRuntime};
 pub use discovery::{
     discover_runtime_candidates, discover_support_executable, runtime_install_origin,
+};
+pub use host::{
+    ensure_vendor_terms_acknowledged, spawn_external_runtime_for_host, ExternalRuntimeSpawnOptions,
 };
 pub use jsonrpc::{
     AgentProcessLaunch, JsonRpcConnection, JsonRpcDialect, JsonRpcProcess, RpcError, RpcInbound,

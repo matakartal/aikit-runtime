@@ -140,6 +140,26 @@ Default roots are `AIKIT_HOME/runtimes` when configured, the platform user-data 
 otherwise, or an explicit `--root`. `--instance` separates multiple accounts for the same vendor.
 Normal agent commands use the corresponding `--runtime-root` and `--instance` values.
 
+## Python and TypeScript projections
+
+The deterministic external-agent surface is projected into both bindings with typed
+declarations and strict type-checked tests: `discover_external_runtime_candidates` /
+`discoverExternalRuntimeCandidates` (execution-free discovery), `verify_external_update_manifest`
+(detached Ed25519 verification before parse), `select_external_runtime_update`,
+`validate_external_update_config`, `external_update_refresh_actions`, and the fail-closed
+`ExternalUpdateState` state machine with caller-injected instants. The
+`EXTERNAL_AGENTS` conformance module in `scripts/parity-check.sh` proves the same
+verify/select/transition/backoff transcript byte-identical across Rust, Python, and Node.
+
+Live sessions are projected as well: `spawn_external_agent_session` (Python) /
+`spawnExternalAgentSession` (Node) construct a runtime through the shared per-kind spawn policy
+in the Rust core — including the Gemini vendor-terms acknowledgement gate and the exact Claude
+bridge rules — and return an `ExternalAgentSession` with awaitable
+initialize/auth_status/list_models/new_session/prompt/cancel/respond_approval/respond_user_input/
+shutdown plus an async event stream over the normalized `RuntimeEvent` feed that fails closed if
+the subscriber lags. Keyless CI proof drives a scripted ACP agent through the real official-SDK
+client from both languages.
+
 ## Current proof boundary
 
 Deterministic tests cover discovery without execution, app-server/ACP message handling, event and

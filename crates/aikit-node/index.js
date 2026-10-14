@@ -774,6 +774,73 @@ module.exports = {
       throw normalizeNativeError(error);
     }
   },
+  ExternalUpdateState: native.ExternalUpdateState,
+  ExternalAgentSession: native.ExternalAgentSession,
+  ExternalAgentEventStream: native.ExternalAgentEventStream,
+  spawnExternalAgentSession: async (kind, workspace, options) => {
+    try {
+      return await native.spawnExternalAgentSession(kind, workspace, options);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  discoverExternalRuntimeCandidates: (kind, explicitPath) => {
+    try {
+      return native.discoverExternalRuntimeCandidates(kind, explicitPath);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  verifyExternalUpdateManifest: (manifestBytes, signatureBase64, keyId, trustedKeys, nowUnixMs) => {
+    try {
+      return native.verifyExternalUpdateManifest(
+        manifestBytes,
+        signatureBase64,
+        keyId,
+        trustedKeys,
+        nowUnixMs,
+      );
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  selectExternalRuntimeUpdate: (
+    manifest,
+    kind,
+    channel,
+    aikitVersion,
+    targetOs,
+    targetArch,
+    currentVersion,
+  ) => {
+    try {
+      return native.selectExternalRuntimeUpdate(
+        manifest,
+        kind,
+        channel,
+        aikitVersion,
+        targetOs,
+        targetArch,
+        currentVersion,
+      );
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  validateExternalUpdateConfig: (config) => {
+    try {
+      return native.validateExternalUpdateConfig(config);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
+  externalUpdateRefreshActions: (state, nowUnixMs) => {
+    try {
+      return native.externalUpdateRefreshActions(state, nowUnixMs);
+    } catch (error) {
+      throw normalizeNativeError(error);
+    }
+  },
   tool,
   // query(prompt, tools?, options?) — `tools` maps a name to a JS `async (input) => string`.
   query: (prompt, tools, options) => {

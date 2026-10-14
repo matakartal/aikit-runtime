@@ -4159,6 +4159,543 @@ impl PyClient {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// External-agent projections: the deterministic discovery, signed-manifest, selection, and
+// managed-update state machine surface. Live child-process runtimes (ACP/Codex sessions) stay
+// Rust/CLI-only; these bindings project exactly the keyless state machines the core tests prove.
+// ---------------------------------------------------------------------------------------------
+
+fn py_external_agent_error(error: aikit_core::external_agent::ExternalAgentError) -> PyErr {
+    let code = serde_json::to_value(error.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    AikitError::new_err(format!("{code}: {}", error.message))
+}
+
+fn parse_external_agent_kind(
+    kind: &str,
+) -> PyResult<aikit_core::external_agent::ExternalAgentKind> {
+    kind.parse().map_err(py_external_agent_error)
+}
+
+fn parse_external_version(label: &str, version: &str) -> PyResult<semver::Version> {
+    semver::Version::parse(version)
+        .map_err(|error| PyValueError::new_err(format!("invalid {label}: {error}")))
+}
+
+/// Deterministic, execution-free discovery of vendor CLI runtime candidates.
+#[pyfunction]
+#[pyo3(signature = (kind, explicit_path=None))]
+fn discover_external_runtime_candidates<'py>(
+    py: Python<'py>,
+    kind: &str,
+    explicit_path: Option<PathBuf>,
+) -> PyResult<Py<PyAny>> {
+    let kind = parse_external_agent_kind(kind)?;
+    let candidates =
+        aikit_core::external_agent::discover_runtime_candidates(kind, explicit_path.as_deref())
+            .map_err(py_external_agent_error)?;
+    python_json(py, &candidates)
+}
+
+/// Verify a detached Ed25519 manifest signature before parsing, exactly like the Rust core.
+#[pyfunction]
+fn verify_external_update_manifest<'py>(
+    py: Python<'py>,
+    manifest_bytes: &[u8],
+    signature_base64: &str,
+    key_id: &str,
+    trusted_keys: HashMap<String, String>,
+    now_unix_ms: u64,
+) -> PyResult<Py<PyAny>> {
+    let keys = decode_external_trusted_keys(trusted_keys)?;
+    let manifest = aikit_core::external_agent::verify_update_manifest(
+        manifest_bytes,
+        signature_base64,
+        key_id,
+        &keys,
+        now_unix_ms,
+    )
+    .map_err(py_external_agent_error)?;
+    python_json(py, &manifest)
+}
+
+fn decode_external_trusted_keys(
+    trusted_keys: HashMap<String, String>,
+) -> PyResult<aikit_core::external_agent::TrustedManifestKeys> {
+    let mut keys = aikit_core::external_agent::TrustedManifestKeys::default();
+    // Deterministic insertion order so duplicate-id errors are stable across languages.
+    let ordered: std::collections::BTreeMap<String, String> = trusted_keys.into_iter().collect();
+    for (key_id, public_key_base64) in ordered {
+        keys.insert_base64(key_id, &public_key_base64)
+            .map_err(py_external_agent_error)?;
+    }
+    Ok(keys)
+}
+
+/// Pick the newest compatible release+artifact for one runtime kind, channel, and target.
+#[pyfunction]
+#[pyo3(signature = (manifest, kind, channel, aikit_version, target_os, target_arch, current_version=None))]
+#[allow(clippy::too_many_arguments)]
+fn select_external_runtime_update<'py>(
+    py: Python<'py>,
+    manifest: Bound<'py, PyAny>,
+    kind: &str,
+    channel: Bound<'py, PyAny>,
+    aikit_version: &str,
+    target_os: &str,
+    target_arch: &str,
+    current_version: Option<&str>,
+) -> PyResult<Py<PyAny>> {
+    let manifest: aikit_core::external_agent::RuntimeUpdateManifest =
+        python_protocol_value(&manifest, "external update manifest")?;
+    let kind = parse_external_agent_kind(kind)?;
+    let channel: aikit_core::external_agent::RuntimeUpdateChannel =
+        python_protocol_value(&channel, "external update channel")?;
+    let aikit_version = parse_external_version("aikit version", aikit_version)?;
+    let current_version = current_version
+        .map(|version| parse_external_version("current runtime version", version))
+        .transpose()?;
+    let selection = aikit_core::external_agent::select_runtime_update(
+        &manifest,
+        kind,
+        channel,
+        current_version.as_ref(),
+        &aikit_version,
+        target_os,
+        target_arch,
+    )
+    .map_err(py_external_agent_error)?;
+    python_json(py, &selection)
+}
+
+/// Fail-closed validation of a persisted signed-update configuration document.
+#[pyfunction]
+fn validate_external_update_config(config: Bound<'_, PyAny>) -> PyResult<()> {
+    let config: aikit_core::external_agent::RuntimeUpdateConfig =
+        python_protocol_value(&config, "external update config")?;
+    config.validate().map_err(py_external_agent_error)
+}
+
+/// Due maintenance actions for one update state at an injected instant.
+#[pyfunction]
+fn external_update_refresh_actions<'py>(
+    py: Python<'py>,
+    state: Bound<'py, PyAny>,
+    now_unix_ms: u64,
+) -> PyResult<Py<PyAny>> {
+    let state: aikit_core::external_agent::RuntimeUpdateState =
+        python_protocol_value(&state, "external update state")?;
+    python_json(
+        py,
+        &aikit_core::external_agent::due_refresh_actions(&state, now_unix_ms),
+    )
+}
+
+/// Typed projection of the managed-update state machine.
+///
+/// Mirrors the Rust `RuntimeUpdateState` exactly: every transition is fail-closed, every instant
+/// is injected by the caller, and a rejected transition leaves the state untouched.
+#[pyclass(name = "ExternalUpdateState", module = "aikit")]
+struct PyExternalUpdateState {
+    inner: aikit_core::external_agent::RuntimeUpdateState,
+}
+
+#[pymethods]
+impl PyExternalUpdateState {
+    #[new]
+    fn new(instance_id: &str, profile: Bound<'_, PyAny>) -> PyResult<Self> {
+        let instance_id: aikit_core::external_agent::RuntimeInstanceId =
+            instance_id.parse().map_err(py_external_agent_error)?;
+        let profile: aikit_core::external_agent::RuntimeProfile =
+            python_protocol_value(&profile, "external runtime profile")?;
+        Ok(Self {
+            inner: aikit_core::external_agent::RuntimeUpdateState::new(instance_id, profile),
+        })
+    }
+
+    #[staticmethod]
+    fn from_state(state: Bound<'_, PyAny>) -> PyResult<Self> {
+        let inner: aikit_core::external_agent::RuntimeUpdateState =
+            python_protocol_value(&state, "external update state")?;
+        Ok(Self { inner })
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        python_json(py, &self.inner)
+    }
+
+    #[getter]
+    fn phase<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        python_json(py, &self.inner.phase)
+    }
+
+    #[getter]
+    fn current_version(&self) -> Option<String> {
+        self.inner.current_version.as_ref().map(ToString::to_string)
+    }
+
+    #[getter]
+    fn available_version(&self) -> Option<String> {
+        self.inner
+            .available_version
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    #[getter]
+    fn quarantined_version(&self) -> Option<String> {
+        self.inner
+            .quarantined_version
+            .as_ref()
+            .map(ToString::to_string)
+    }
+
+    #[getter]
+    fn consecutive_failures(&self) -> u32 {
+        self.inner.consecutive_failures
+    }
+
+    #[getter]
+    fn retry_after_unix_ms(&self) -> Option<u64> {
+        self.inner.retry_after_unix_ms
+    }
+
+    #[getter]
+    fn last_error(&self) -> Option<String> {
+        self.inner.last_error.clone()
+    }
+
+    fn manifest_check_due(&self, now_unix_ms: u64) -> bool {
+        self.inner.manifest_check_due(now_unix_ms)
+    }
+
+    fn model_refresh_due(&self, now_unix_ms: u64) -> bool {
+        self.inner.model_refresh_due(now_unix_ms)
+    }
+
+    fn discovery_due(&self, now_unix_ms: u64) -> bool {
+        self.inner.discovery_due(now_unix_ms)
+    }
+
+    fn may_apply_binary_update(&self) -> bool {
+        self.inner.may_apply_binary_update()
+    }
+
+    fn refresh_actions<'py>(&self, py: Python<'py>, now_unix_ms: u64) -> PyResult<Py<PyAny>> {
+        python_json(
+            py,
+            &aikit_core::external_agent::due_refresh_actions(&self.inner, now_unix_ms),
+        )
+    }
+
+    #[pyo3(signature = (now_unix_ms, selection=None))]
+    fn record_check_success(
+        &mut self,
+        now_unix_ms: u64,
+        selection: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let selection: Option<aikit_core::external_agent::RuntimeUpdateSelection> = selection
+            .map(|selection| python_protocol_value(&selection, "external update selection"))
+            .transpose()?;
+        self.inner
+            .record_check_success(now_unix_ms, selection.as_ref());
+        Ok(())
+    }
+
+    fn record_failure(&mut self, now_unix_ms: u64, error: &str) {
+        self.inner.record_failure(now_unix_ms, error);
+    }
+
+    fn record_discovery(&mut self, now_unix_ms: u64) {
+        self.inner.record_discovery(now_unix_ms);
+    }
+
+    fn record_model_refresh(&mut self, now_unix_ms: u64) {
+        self.inner.record_model_refresh(now_unix_ms);
+    }
+
+    fn begin_download(&mut self) -> PyResult<()> {
+        self.inner.begin_download().map_err(py_external_agent_error)
+    }
+
+    fn record_staged(&mut self) -> PyResult<()> {
+        self.inner.record_staged().map_err(py_external_agent_error)
+    }
+
+    fn begin_activation(&mut self) -> PyResult<()> {
+        self.inner
+            .begin_activation()
+            .map_err(py_external_agent_error)
+    }
+
+    fn record_activated(&mut self) -> PyResult<()> {
+        self.inner
+            .record_activated()
+            .map_err(py_external_agent_error)
+    }
+
+    fn recover_activated(&mut self, active_version: &str) -> PyResult<bool> {
+        let active_version = parse_external_version("active version", active_version)?;
+        self.inner
+            .recover_activated(&active_version)
+            .map_err(py_external_agent_error)
+    }
+
+    fn quarantine_available(&mut self) {
+        self.inner.quarantine_available();
+    }
+
+    #[pyo3(signature = (restored_version, rejected_version=None))]
+    fn record_rollback(
+        &mut self,
+        restored_version: &str,
+        rejected_version: Option<&str>,
+    ) -> PyResult<()> {
+        let restored_version = parse_external_version("restored version", restored_version)?;
+        let rejected_version = rejected_version
+            .map(|version| parse_external_version("rejected version", version))
+            .transpose()?;
+        self.inner
+            .record_rollback(restored_version, rejected_version);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Live external-agent sessions: spawn a vendor CLI runtime (Codex app-server, Gemini/Grok/Claude
+// over ACP) and drive it with the same governed core the CLI uses. The per-kind spawn policy and
+// the Gemini vendor-terms gate live in the shared Rust helper, not in this binding.
+// ---------------------------------------------------------------------------------------------
+
+fn py_external_agent_runtime_error(error: aikit_core::external_agent::ExternalAgentError) -> PyErr {
+    py_external_agent_error(error)
+}
+
+/// One live vendor-CLI session. All methods are awaitables; `events()` yields the normalized
+/// runtime event stream and fails closed if the subscriber lags behind.
+#[pyclass(name = "ExternalAgentSession", module = "aikit")]
+struct PyExternalAgentSession {
+    inner: Arc<dyn aikit_core::external_agent::ExternalAgentRuntime>,
+}
+
+#[pyfunction]
+#[pyo3(signature = (kind, workspace, explicit_executable=None, instance_id=None, claude_bridge=None, claude_bridge_args=None, acknowledge_vendor_terms=false))]
+#[allow(clippy::too_many_arguments)]
+fn spawn_external_agent_session<'py>(
+    py: Python<'py>,
+    kind: &str,
+    workspace: PathBuf,
+    explicit_executable: Option<PathBuf>,
+    instance_id: Option<&str>,
+    claude_bridge: Option<PathBuf>,
+    claude_bridge_args: Option<Vec<String>>,
+    acknowledge_vendor_terms: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kind = parse_external_agent_kind(kind)?;
+    let instance_id = instance_id
+        .map(|value| {
+            value
+                .parse::<aikit_core::external_agent::RuntimeInstanceId>()
+                .map_err(py_external_agent_runtime_error)
+        })
+        .transpose()?;
+    let mut options = aikit_core::external_agent::ExternalRuntimeSpawnOptions::new(workspace);
+    options.instance_id = instance_id;
+    options.explicit_executable = explicit_executable;
+    options.claude_bridge = claude_bridge;
+    options.claude_bridge_args = claude_bridge_args.unwrap_or_default();
+    options.acknowledge_vendor_terms = acknowledge_vendor_terms;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let inner = aikit_core::external_agent::spawn_external_runtime_for_host(kind, options)
+            .await
+            .map_err(py_external_agent_runtime_error)?;
+        Python::attach(|py| Py::new(py, PyExternalAgentSession { inner }))
+    })
+}
+
+#[pymethods]
+impl PyExternalAgentSession {
+    fn descriptor<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
+        python_json(py, &self.inner.descriptor())
+    }
+
+    fn initialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let descriptor = inner
+                .initialize()
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| python_json(py, &descriptor))
+        })
+    }
+
+    #[pyo3(signature = (refresh=false))]
+    fn auth_status<'py>(&self, py: Python<'py>, refresh: bool) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let status = inner
+                .auth_status(refresh)
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| python_json(py, &status))
+        })
+    }
+
+    fn list_models<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let catalog = inner
+                .list_models()
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| python_json(py, &catalog))
+        })
+    }
+
+    fn new_session<'py>(
+        &self,
+        py: Python<'py>,
+        request: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: aikit_core::external_agent::NewRuntimeSession =
+            python_protocol_value(&request, "external agent session request")?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = inner
+                .new_session(request)
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| python_json(py, &session))
+        })
+    }
+
+    fn prompt<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let prompt: aikit_core::external_agent::ExternalPrompt =
+            python_protocol_value(&prompt, "external agent prompt")?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .prompt(prompt)
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    #[pyo3(signature = (session_id, turn_id=None))]
+    fn cancel<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        turn_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .cancel(&session_id, turn_id.as_deref())
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    fn respond_approval<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        request_id: String,
+        decision: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let decision: aikit_core::external_agent::ExternalApprovalDecision =
+            python_protocol_value(&decision, "external agent approval decision")?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .respond_approval(&session_id, &request_id, decision)
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    fn respond_user_input<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        request_id: String,
+        answers: HashMap<String, String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .respond_user_input(&session_id, &request_id, answers.into_iter().collect())
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    fn events(&self) -> PyExternalAgentEventStream {
+        PyExternalAgentEventStream {
+            receiver: Arc::new(TokioMutex::new(self.inner.subscribe())),
+        }
+    }
+
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .shutdown()
+                .await
+                .map_err(py_external_agent_runtime_error)?;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+}
+
+/// Async iterator over normalized runtime events. A lagged subscriber fails closed instead of
+/// silently skipping events, mirroring the CLI's event loop.
+#[pyclass(name = "ExternalAgentEventStream", module = "aikit")]
+struct PyExternalAgentEventStream {
+    receiver:
+        Arc<TokioMutex<tokio::sync::broadcast::Receiver<aikit_core::external_agent::RuntimeEvent>>>,
+}
+
+#[pymethods]
+impl PyExternalAgentEventStream {
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let receiver = self.receiver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let event = {
+                let mut receiver = receiver.lock().await;
+                receiver.recv().await
+            };
+            match event {
+                Ok(event) => Python::attach(|py| python_json(py, &event)),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(PyStopAsyncIteration::new_err(()))
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    Err(AikitError::new_err(format!(
+                        "external agent event stream lagged and dropped {missed} event(s)"
+                    )))
+                }
+            }
+        })
+    }
+}
+
 #[pymodule]
 fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AikitError", m.py().get_type::<AikitError>())?;
@@ -4178,6 +4715,15 @@ fn aikit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(seal_governance_binding, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_http, m)?)?;
     m.add_function(wrap_pyfunction!(connect_mcp_stdio, m)?)?;
+    m.add_function(wrap_pyfunction!(discover_external_runtime_candidates, m)?)?;
+    m.add_function(wrap_pyfunction!(spawn_external_agent_session, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_external_update_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(select_external_runtime_update, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_external_update_config, m)?)?;
+    m.add_function(wrap_pyfunction!(external_update_refresh_actions, m)?)?;
+    m.add_class::<PyExternalUpdateState>()?;
+    m.add_class::<PyExternalAgentSession>()?;
+    m.add_class::<PyExternalAgentEventStream>()?;
     m.add_class::<PyToolDecorator>()?;
     m.add_class::<QueryStream>()?;
     m.add_class::<QueryEventStream>()?;

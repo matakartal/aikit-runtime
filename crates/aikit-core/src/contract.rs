@@ -42,7 +42,7 @@ pub enum CompatibilityMode {
 }
 
 /// A machine-readable, non-fatal compatibility decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderWarning {
     pub code: String,
@@ -56,7 +56,7 @@ pub struct ProviderWarning {
 }
 
 /// Lossless media input with caller-supplied integrity and size metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MediaInputSource {
     Url { url: String },
@@ -75,7 +75,7 @@ impl From<MediaSource> for MediaInputSource {
 }
 
 /// Lossless media input with caller-supplied integrity and size metadata.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MediaInput {
     pub media_type: String,

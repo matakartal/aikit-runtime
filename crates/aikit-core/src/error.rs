@@ -7,7 +7,7 @@ use crate::contract::ProviderWarning;
 
 /// Stable, host-facing error classification. These serialized names are part of the public wire
 /// contract: bindings should branch on `code`, never parse a display message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     ProviderAuth,
@@ -68,7 +68,7 @@ impl ErrorCode {
 /// `message` is always derived from [`ErrorCode`], never copied from an untrusted provider body or
 /// arbitrary internal error string. Provider routing metadata and retry semantics remain intact
 /// without exposing request bodies, prompts, tool inputs, headers, or credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ErrorInfo {
     pub code: ErrorCode,
     pub message: String,

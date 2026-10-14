@@ -168,7 +168,9 @@ pub type ProviderOptions = BTreeMap<String, serde_json::Map<String, Value>>;
 pub type ProviderMetadata = BTreeMap<String, Vec<Value>>;
 
 /// Token accounting. Cache + reasoning fields are `0` when a provider does not report them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
