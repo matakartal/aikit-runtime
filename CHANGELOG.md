@@ -251,6 +251,12 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- `CancellableRun` (and the Python/Node `run()` streams built on it) now starts its driver lazily
+  on the first poll, `cancel()`, `finish()`, or drop. A cancellation requested before the first
+  pull previously raced the eagerly-spawned driver and could finalize as `completed` against a
+  fast provider (about 1 in 10 local mock runs, flaking the `cancel` conformance fact); it now
+  deterministically finalizes as `cancelled` without a provider call. A handle dropped unpolled
+  still runs its Stop hook, `RunStopped` audit, and recorder finalizer.
 - Allow the bounded Windows Job capability probe up to two minutes for the cold PowerShell 5.1
   `Add-Type` compilation seen on fresh hosted runners; the probed child and launcher cleanup remain
   independently limited to five seconds.
