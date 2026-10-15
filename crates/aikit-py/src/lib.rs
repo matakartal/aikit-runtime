@@ -1171,6 +1171,8 @@ fn seal_governance_binding<'py>(
     python_json(py, &binding)
 }
 
+/// A live, initialized MCP client connection with its filtered tool list. Create it with
+/// `connect_mcp_http` / `connect_mcp_stdio`, then pass it to `Agent.register_mcp`.
 #[pyclass(name = "McpConnection")]
 struct PyMcpConnection {
     specs: Vec<ToolSpec>,
@@ -1180,6 +1182,7 @@ struct PyMcpConnection {
 
 #[pymethods]
 impl PyMcpConnection {
+    /// List server resources (following bounded pagination from `cursor` when given).
     fn list_resources<'py>(
         &self,
         py: Python<'py>,
@@ -1199,6 +1202,7 @@ impl PyMcpConnection {
         })
     }
 
+    /// Read one resource by URI and return the server's JSON result.
     fn read_resource<'py>(&self, py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1214,6 +1218,7 @@ impl PyMcpConnection {
         })
     }
 
+    /// List server prompts (following bounded pagination from `cursor` when given).
     fn list_prompts<'py>(
         &self,
         py: Python<'py>,
@@ -1233,6 +1238,7 @@ impl PyMcpConnection {
         })
     }
 
+    /// Render one server prompt with JSON `arguments` and return the server's result.
     fn get_prompt<'py>(
         &self,
         py: Python<'py>,
@@ -1256,6 +1262,9 @@ impl PyMcpConnection {
     }
 }
 
+/// Connect to a Streamable HTTP MCP server, initialize it, and discover its tools. Remote
+/// endpoints must use HTTPS (plain HTTP is accepted only for loopback). `tool_filter` is an
+/// exact `{"allow": [...], "deny": [...]}` policy where deny always wins.
 #[pyfunction]
 #[pyo3(signature = (endpoint, name, bearer_token=None, tool_filter=None))]
 fn connect_mcp_http<'py>(
@@ -1294,6 +1303,8 @@ fn connect_mcp_http<'py>(
     })
 }
 
+/// Spawn a local MCP server over stdio (no shell), initialize it, and discover its tools. The
+/// child does not inherit this process's environment unless `inherit_env=True`.
 #[pyfunction]
 #[pyo3(signature = (program, args, name, env=None, inherit_env=false, tool_filter=None))]
 fn connect_mcp_stdio<'py>(
@@ -1424,7 +1435,9 @@ fn decorate_tool(
     input_schema: &Value,
 ) -> PyResult<()> {
     if !callback.is_callable() {
-        return Err(PyValueError::new_err("tool callback must be callable"));
+        return Err(PyValueError::new_err(
+            "tool callback must be callable (an async def taking the input dict and returning str)",
+        ));
     }
     callback.setattr("name", name)?;
     callback.setattr("description", description)?;
@@ -2006,7 +2019,9 @@ impl PyHookTemplateRegistry {
 
 fn callback_template(callback: Bound<'_, PyAny>) -> PyResult<Arc<PyCallbackTemplate>> {
     if !callback.is_callable() {
-        return Err(PyValueError::new_err("callback must be callable"));
+        return Err(PyValueError::new_err(
+            "callback must be callable (pass an async def function)",
+        ));
     }
     Ok(Arc::new(PyCallbackTemplate {
         callable: Arc::new(callback.unbind()),
@@ -3162,6 +3177,8 @@ async fn generate_configured(
 
 #[pymethods]
 impl PyAgent {
+    /// Build an agent whose providers come from this process's environment variables. Use
+    /// `Agent.from_env({})` for a keyless agent that only uses the deterministic mock models.
     #[new]
     fn new() -> Self {
         PyAgent::from_core(Agent::from_process_env())
@@ -3212,6 +3229,7 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Back `remember`/`recall` with a SQLite database under an explicit namespace.
     #[pyo3(signature = (path, namespace="default"))]
     fn use_sqlite_memory(&mut self, path: &str, namespace: &str) -> PyResult<()> {
         if namespace.trim().is_empty() {
@@ -3223,6 +3241,7 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Persist subagent sessions to a SQLite database.
     fn use_sqlite_sessions(&mut self, path: &str) -> PyResult<()> {
         self.session_store = Arc::new(
             SqliteSessionStore::open(path)
@@ -3256,6 +3275,8 @@ impl PyAgent {
             .map_err(|error| py_core_error(error.into()))
     }
 
+    /// Register `WebFetch` (plus `WebSearch` when `search_endpoint` contains one `{query}`
+    /// marker). Only the exact allowlisted HTTPS hosts are reachable.
     #[pyo3(signature = (allowed_hosts, search_endpoint=None, max_response_bytes=None))]
     fn register_web_tools(
         &mut self,
@@ -3277,6 +3298,8 @@ impl PyAgent {
         self.install_external_tools(specs, Arc::new(tools))
     }
 
+    /// Register WebDriver browser tools. `external_egress_enforced=True` asserts that network
+    /// egress is enforced outside this process; aikit does not enforce it itself.
     #[pyo3(signature = (webdriver_endpoint, session_id, allowed_hosts, *, external_egress_enforced))]
     fn register_browser_tools(
         &mut self,
@@ -3296,10 +3319,13 @@ impl PyAgent {
         self.install_external_tools(specs, Arc::new(tools))
     }
 
+    /// Expose a connected MCP server's filtered tools to this agent's runs.
     fn register_mcp(&mut self, server: PyRef<'_, PyMcpConnection>) -> PyResult<()> {
         self.install_external_tools(server.specs.clone(), server.executor.clone())
     }
 
+    /// Gate registered tools behind the human-approved `request_capability` tool. Requires
+    /// `can_use_tool` first; grants last for one run.
     fn enable_capability_requests(&mut self, gated_tools: Vec<String>) -> PyResult<()> {
         if self.approver.is_none() {
             return Err(PyValueError::new_err(
@@ -3329,6 +3355,8 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Block input matching any regex in `blocked_input_patterns` and redact secrets and PII
+    /// from output.
     #[pyo3(signature = (blocked_input_patterns=Vec::new()))]
     fn enable_default_guardrails(&mut self, blocked_input_patterns: Vec<String>) -> PyResult<()> {
         let pairs: Vec<_> = blocked_input_patterns
@@ -3353,6 +3381,7 @@ impl PyAgent {
         self.inner
             .add_key(key, provider, None)
             .map(|p| p.to_string())
+            // The core ResolveError text already names the accepted providers and env vars.
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -3433,11 +3462,15 @@ impl PyAgent {
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tools = self.builtin_tools.clone().ok_or_else(|| {
-            PyValueError::new_err("enable_bash_with_required_containment has not been called")
+            PyValueError::new_err(
+                "enable_bash_with_required_containment has not been called; call \
+                 register_builtin_tools(roots) and then enable_bash_with_required_containment() first",
+            )
         })?;
         if !tools.tool_names().contains(&"Bash") {
             return Err(PyValueError::new_err(
-                "enable_bash_with_required_containment has not been called",
+                "enable_bash_with_required_containment has not been called; call it after \
+                 register_builtin_tools(roots) before probing containment",
             ));
         }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -3469,6 +3502,7 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Register an async UserPromptSubmit hook; it may continue, rewrite, or block.
     fn on_user_prompt(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
         self.hooks
             .user_prompt
@@ -3477,6 +3511,7 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Register an async PreToolUse hook, optionally for one exact tool name.
     #[pyo3(signature = (callback_value, tool=None))]
     fn on_pre_tool_use(
         &mut self,
@@ -3491,6 +3526,7 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Register an async PostToolUse hook, optionally for one exact tool name.
     #[pyo3(signature = (callback_value, tool=None))]
     fn on_post_tool_use(
         &mut self,
@@ -3521,12 +3557,14 @@ impl PyAgent {
         Ok(())
     }
 
+    /// Register an async hook for run failures; it may continue or rewrite the error text.
     fn on_failure(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
         self.hooks.failure.push(callback_template(callback_value)?);
         self.requires_callback_locals = true;
         Ok(())
     }
 
+    /// Register an async hook that observes every run's terminal stop.
     fn on_stop(&mut self, callback_value: Bound<'_, PyAny>) -> PyResult<()> {
         self.hooks.stop.push(callback_template(callback_value)?);
         self.requires_callback_locals = true;
@@ -3542,6 +3580,7 @@ impl PyAgent {
             .collect()
     }
 
+    /// Whether `provider` currently has an active credential.
     fn has_provider(&self, provider: &str) -> bool {
         self.inner.has_provider(provider)
     }
@@ -3633,6 +3672,8 @@ impl PyAgent {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Write one memory entry only if its stored revision equals `expected_revision`; returns
+    /// the new revision. A stale writer gets an error instead of silently winning.
     #[pyo3(signature = (key, value, expected_revision, plane="working", provenance=None))]
     fn remember_cas(
         &self,

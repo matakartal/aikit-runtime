@@ -639,3 +639,60 @@ fn eval_rejects_symlinks_before_opening_the_target() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
 }
+
+#[test]
+fn missing_provider_key_explains_which_variable_to_set() {
+    let output = aikit()
+        .args(["run", "--model", "claude-test", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hint:"), "{stderr}");
+    assert!(stderr.contains("ANTHROPIC_API_KEY"), "{stderr}");
+}
+
+#[test]
+fn unknown_model_points_at_routing_prefixes() {
+    let output = aikit()
+        .args(["run", "--model", "not-a-model", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hint:"), "{stderr}");
+    assert!(stderr.contains("mock-1"), "{stderr}");
+}
+
+#[test]
+fn help_documents_examples_and_exit_codes() {
+    let root = aikit().arg("--help").output().unwrap();
+    assert!(root.status.success());
+    let root = String::from_utf8_lossy(&root.stdout);
+    assert!(root.contains("Exit codes:"), "{root}");
+    assert!(root.contains("Quick start:"), "{root}");
+
+    for command in [
+        &["run"][..],
+        &["chat"],
+        &["eval"],
+        &["doctor"],
+        &["agents", "run"],
+        &["agents", "update", "configure"],
+    ] {
+        let output = aikit().args(command).arg("--help").output().unwrap();
+        assert!(output.status.success(), "{command:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Example"), "{command:?}: {stdout}");
+    }
+}
+
+#[test]
+fn missing_eval_dataset_names_the_path() {
+    let output = aikit()
+        .args(["eval", "definitely-missing-dataset.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("definitely-missing-dataset.json"));
+}

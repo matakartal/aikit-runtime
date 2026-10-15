@@ -3119,7 +3119,9 @@ impl Agent {
     ) -> Result<u64> {
         if !side_effects_reconciled {
             return Err(Error::from_reason(
-                "expired session recovery requires sideEffectsReconciled=true",
+                "expired session recovery requires sideEffectsReconciled=true; pass true only after \
+                 confirming the prior worker stopped and reconciling every possibly completed \
+                 external side effect",
             ));
         }
         let base = match self.session_store.load_session(&session_id) {
@@ -3182,7 +3184,8 @@ impl Agent {
     pub fn enable_capability_requests(&mut self, gated_tools: Vec<String>) -> Result<()> {
         if self.approver.is_none() {
             return Err(Error::from_reason(
-                "configure canUseTool before enabling capability requests",
+                "enableCapabilityRequests requires an approver; call agent.canUseTool(callback) \
+                 first",
             ));
         }
         if let Some(name) = gated_tools.iter().find(|name| {
@@ -3193,7 +3196,8 @@ impl Agent {
                 .any(|tool| tool.name == **name)
         }) {
             return Err(Error::from_reason(format!(
-                "cannot gate unregistered tool '{name}'"
+                "cannot gate unregistered tool '{name}'; register it (addTool, registerMcp, \
+                 registerBuiltinTools, ...) before calling enableCapabilityRequests"
             )));
         }
         if !self
@@ -3291,7 +3295,10 @@ impl Agent {
         docker: Option<DockerContainmentOptions>,
     ) -> Result<()> {
         let sandbox = self.builtin_sandbox.clone().ok_or_else(|| {
-            Error::from_reason("registerBuiltinTools must be called before enabling contained Bash")
+            Error::from_reason(
+                "registerBuiltinTools must be called before enabling contained Bash; call \
+                 agent.registerBuiltinTools(roots) first",
+            )
         })?;
         let tools = Arc::new(
             BuiltinTools::new(sandbox.clone())
@@ -3305,11 +3312,15 @@ impl Agent {
     #[napi(ts_return_type = "Promise<any>")]
     pub async fn builtin_containment_capabilities(&self) -> Result<Value> {
         let tools = self.builtin_tools.clone().ok_or_else(|| {
-            Error::from_reason("enableBashWithRequiredContainment has not been called")
+            Error::from_reason(
+                "enableBashWithRequiredContainment has not been called; enable contained Bash \
+                 before probing builtinContainmentCapabilities()",
+            )
         })?;
         if !tools.tool_names().contains(&"Bash") {
             return Err(Error::from_reason(
-                "enableBashWithRequiredContainment has not been called",
+                "enableBashWithRequiredContainment has not been called; enable contained Bash \
+                 before probing builtinContainmentCapabilities()",
             ));
         }
         let report = tools.containment_capabilities().await;
@@ -4079,6 +4090,14 @@ fn parse_budget_policy(value: Option<Value>) -> Result<BudgetPolicy> {
         max_cost_usd: optional_f64(object, "RunOptions.budget", "max_cost_usd", "maxCostUsd")?,
         pricing,
     };
+    // The core reports a cost cap without pricing as a generic "budget exceeded" error. Name the
+    // missing field instead so the caller knows how to fix the options; the run is still rejected.
+    if policy.max_cost_usd.is_some_and(|limit| limit >= 0.0) && policy.pricing.is_none() {
+        return Err(Error::from_reason(
+            "RunOptions.budget.maxCostUsd requires RunOptions.budget.pricing \
+             ({ inputPerMillionUsd, outputPerMillionUsd }) to estimate spend",
+        ));
+    }
     policy
         .validate()
         .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -4474,7 +4493,8 @@ impl QueryStream {
         let inner = self.inner.clone();
         let mut guard = inner.try_lock().map_err(|_| {
             Error::from_reason(
-                "QueryStream is single-consumer; concurrent or re-entrant next() is not supported",
+                "QueryStream is single-consumer; concurrent or re-entrant next() is not \
+                 supported (await each next() before calling it again)",
             )
         })?;
         let next = match guard.as_mut() {
@@ -4544,7 +4564,8 @@ impl QueryEventStream {
     pub async fn next(&self) -> Result<Option<Value>> {
         let mut state = self.state.try_lock().map_err(|_| {
             Error::from_reason(
-                "QueryEventStream is single-consumer; concurrent next() is unsupported",
+                "QueryEventStream is single-consumer; concurrent next() is unsupported (await \
+                 each next() before calling it again)",
             )
         })?;
         if let Some(event) = state.pending.pop_front() {
@@ -4555,7 +4576,10 @@ impl QueryEventStream {
 
         let delta = {
             let mut run = self.inner.try_lock().map_err(|_| {
-                Error::from_reason("legacy and event stream views cannot be consumed concurrently")
+                Error::from_reason(
+                    "legacy and event stream views cannot be consumed concurrently; consume \
+                     either the QueryStream deltas or stream.events(), not both at once",
+                )
             })?;
             match run.as_mut() {
                 Some(run) => run.next().await,
@@ -4619,7 +4643,8 @@ impl ObjectStream {
         let inner = self.inner.clone();
         let mut guard = inner.try_lock().map_err(|_| {
             Error::from_reason(
-                "ObjectStream is single-consumer; concurrent or re-entrant next() is not supported",
+                "ObjectStream is single-consumer; concurrent or re-entrant next() is not \
+                 supported (await each next() before calling it again)",
             )
         })?;
         match guard.next().await {

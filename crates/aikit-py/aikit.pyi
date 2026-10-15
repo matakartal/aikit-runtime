@@ -1,3 +1,18 @@
+"""Typed Python binding for the aikit Rust runtime (distribution name ``aikit-runtime``).
+
+Start with ``Agent``. ``Agent.from_env({})`` builds a keyless agent whose default
+``mock-1`` / ``mock-structured`` models are deterministic and need no network, so every
+example below runs offline. Activate live providers with ``Agent.add_key`` or by passing
+provider environment variables to ``Agent.from_env``.
+
+Runtime failures raise ``AikitError`` (branch on ``exc.code``); malformed host input raises
+``ValueError`` before any provider call starts. All governance (permissions, hooks,
+approvals, budgets, containment) is evaluated in the Rust core; Python supplies callbacks
+and structured configuration only.
+
+This is an alpha (0.3.x) source-first binding; see the package README for the build steps.
+"""
+
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Literal, Mapping, NoReturn, Optional, Protocol, Sequence, TypedDict, TypeVar, Union, final, overload
 
 JsonPrimitive = Union[str, int, float, bool, None]
@@ -8,6 +23,10 @@ T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
 
 
+# Stable ``AikitError.code`` / ``ErrorInfo["code"]`` values. Branch on these rather than on
+# message text. Common first-run codes: ``provider_auth`` (missing or rejected credential:
+# call ``Agent.add_key``), ``configuration`` (invalid setup), ``permission_denied`` (policy
+# denied a tool), ``budget_exceeded`` / ``max_turns`` (run limits reached).
 ErrorCode = Literal[
     "provider_auth",
     "provider_rate_limit",
@@ -44,11 +63,39 @@ class _ErrorInfoRequired(TypedDict):
 
 
 class ErrorInfo(_ErrorInfoRequired, total=False):
+    """Stable, redacted error envelope carried by ``AikitError.info`` and error deltas."""
     warnings: List["ProviderWarning"]
 
 
 class AikitError(RuntimeError):
-    """Typed terminal runtime failure; branch on ``code`` instead of parsing text."""
+    """Typed terminal runtime failure; branch on ``code`` instead of parsing text.
+
+    Raised by awaited generation calls, when starting a run that cannot be configured
+    (for example ``provider_auth`` for a model whose provider has no key), by iterating a
+    failed ``ObjectStream``, and by durable-run transitions (``code == "conflict"``).
+    ``QueryStream`` failures after start do not raise: they arrive as an ``"error"`` delta
+    and as ``outcome()["terminal_status"]``. ``info`` carries the same stable, redacted
+    envelope (provider, model, HTTP status, ``retryable``, ``retry_after_ms``) the Rust
+    core records; the message text is for humans and may change between releases.
+
+    Invalid host input (unknown option fields, malformed schemas or messages) raises
+    ``ValueError`` instead, before any provider work starts. ``McpConnection`` transport
+    failures raise a plain ``RuntimeError``. The external-agent helpers raise
+    ``AikitError`` with the code only as a ``"<code>: "`` message prefix, so read
+    ``getattr(exc, "code", None)`` defensively there.
+
+    For example, retry only when the core says it is safe::
+
+        try:
+            result = await agent.generate_text("hi", model="claude-sonnet-4-5")
+        except aikit.AikitError as exc:
+            if exc.code == "provider_auth":
+                ...  # call agent.add_key(...) first
+            elif exc.info["retryable"]:
+                ...  # back off for exc.info["retry_after_ms"] and retry
+            else:
+                raise
+    """
 
     code: ErrorCode
     info: ErrorInfo
@@ -100,7 +147,9 @@ class Base64MediaSource(TypedDict):
 MediaSource = Union[UrlMediaSource, Base64MediaSource]
 
 
-def validate_media_input(media: MediaInput) -> MediaInput: ...
+def validate_media_input(media: MediaInput) -> MediaInput:
+    """Validate and return a canonical provider-neutral media input; raises ``ValueError``."""
+    ...
 
 
 class OutputTextPart(TypedDict):
@@ -234,6 +283,7 @@ PromptInput = Union[str, Sequence[Message]]
 
 
 class GeneratedText(TypedDict):
+    """Result of ``Agent.generate_text``."""
     text: str
     usage: Usage
     stop_reason: Optional[str]
@@ -342,12 +392,14 @@ class _PermissionRuleRequired(TypedDict):
 
 
 class PermissionRule(_PermissionRuleRequired, total=False):
+    """One declarative rule; ``pattern`` is a regex over the input's string values (or ``field``)."""
     id: str
     pattern: str
     field: str
 
 
 class ApprovalRequest(TypedDict):
+    """What the ``can_use_tool`` approver receives for an ``"ask"`` decision."""
     run_id: str
     turn: int
     tool_use_id: str
@@ -551,12 +603,14 @@ class RunPricing(_RunPricingRequired, total=False):
 
 
 class BudgetPolicy(TypedDict, total=False):
+    """Per-run token and/or USD cost ceiling; exceeding it ends the run as ``budget_exceeded``."""
     max_total_tokens: int
     max_cost_usd: float
     pricing: RunPricing
 
 
 class RetryPolicy(TypedDict, total=False):
+    """Bounded per-model retry and backoff for retryable provider failures."""
     max_attempts_per_model: int
     base_delay_ms: int
     max_delay_ms: int
@@ -605,10 +659,20 @@ class ModelProfile(_ModelProfileRequired, total=False):
     capability_states: Dict[str, CapabilityState]
 
 
-def validate_model_profile(profile: ModelProfile) -> ModelProfile: ...
+def validate_model_profile(profile: ModelProfile) -> ModelProfile:
+    """Validate one profile with the routing catalog's invariants; raises ``ValueError``."""
+    ...
 def model_capability_state(
     profile: ModelProfile, capability: ModelCapability
-) -> CapabilityState: ...
+) -> CapabilityState:
+    """Return ``"supported"``, ``"unsupported"``, or ``"unknown"`` for one capability.
+
+    ``"unknown"`` is never collapsed to ``False``; strict routing treats it as unmet.
+
+    Raises:
+        ValueError: Malformed profile or capability.
+    """
+    ...
 
 
 class CatalogSource(TypedDict):
@@ -631,8 +695,16 @@ class ResolvedModelCatalog(ModelCatalogSnapshot):
     override_count: int
 
 
-def shipped_model_catalog() -> ModelCatalogSnapshot: ...
-def resolve_model_catalog(overrides: Sequence[ModelProfile] = ...) -> ResolvedModelCatalog: ...
+def shipped_model_catalog() -> ModelCatalogSnapshot:
+    """Return the reviewed, versioned model catalog compiled into this package (no network)."""
+    ...
+def resolve_model_catalog(overrides: Sequence[ModelProfile] = ...) -> ResolvedModelCatalog:
+    """Overlay caller-owned profiles on the shipped catalog without mutating it.
+
+    Raises:
+        ValueError: An override profile is invalid.
+    """
+    ...
 
 
 class _ExternalDecisionMetadataRequired(TypedDict):
@@ -699,7 +771,13 @@ class PolicySnapshot(TypedDict):
     hash: str
 
 
-def seal_policy_snapshot(policy: PolicyDocument) -> PolicySnapshot: ...
+def seal_policy_snapshot(policy: PolicyDocument) -> PolicySnapshot:
+    """Seal a policy document into the integrity-checked snapshot ``DurableRun`` accepts.
+
+    Raises:
+        ValueError: Malformed policy document.
+    """
+    ...
 
 
 class _GovernanceBindingRequired(TypedDict):
@@ -719,7 +797,15 @@ def seal_governance_binding(
     run_id: str,
     tenant_id: Optional[str] = ...,
     agent_id: Optional[str] = ...,
-) -> GovernanceBinding: ...
+) -> GovernanceBinding:
+    """Seal a policy snapshot together with its tenant/agent/run scope identity.
+
+    Pass the result to ``DurableRun.with_governance_binding``.
+
+    Raises:
+        ValueError: Malformed snapshot or scope identifiers.
+    """
+    ...
 
 
 class AuditablePolicyDecision(TypedDict):
@@ -774,10 +860,28 @@ class CedarDecisionResponse(_CedarDecisionResponseRequired, total=False):
 
 def normalize_opa_decision(
     response: OpaDecisionResponse, metadata: ExternalDecisionMetadata
-) -> AuditablePolicyDecision: ...
+) -> AuditablePolicyDecision:
+    """Normalize a completed OPA Data API response into auditable, fail-closed evidence.
+
+    aikit does not call OPA; pass the response you already received. A missing/null
+    (undefined) or partial result is an error, so it can never be read as an allow.
+
+    Raises:
+        ValueError: Malformed, undefined, or partial response, or malformed metadata.
+    """
+    ...
 def normalize_cedar_decision(
     response: CedarDecisionResponse, metadata: ExternalDecisionMetadata
-) -> AuditablePolicyDecision: ...
+) -> AuditablePolicyDecision:
+    """Normalize a completed Cedar authorization response into auditable, deny-wins evidence.
+
+    aikit does not call Cedar. A matched forbid or an evaluator diagnostic error is a deny
+    even if an upstream wrapper labels it ``Allow``.
+
+    Raises:
+        ValueError: Malformed response or metadata.
+    """
+    ...
 
 
 ModalityRequirement = Literal[
@@ -807,7 +911,9 @@ class MediaArtifact(_MediaArtifactRequired, total=False):
     model: str
 
 
-def validate_media_artifact(artifact: MediaArtifact) -> MediaArtifact: ...
+def validate_media_artifact(artifact: MediaArtifact) -> MediaArtifact:
+    """Validate and return immutable media-artifact metadata; raises ``ValueError``."""
+    ...
 
 
 class _GeneratedImageRequired(TypedDict):
@@ -884,6 +990,7 @@ class CompactionOptions(_CompactionOptionsRequired, total=False):
 
 
 class RunOptions(TypedDict, total=False):
+    """Options for ``Agent.run`` / ``Client.query`` / ``aikit.query``; unknown keys raise ``ValueError``."""
     model: str
     fallback_models: List[str]
     max_tokens: int
@@ -1006,6 +1113,7 @@ class _RunOutcomeRequired(TypedDict):
 
 
 class RunOutcome(_RunOutcomeRequired, total=False):
+    """Canonical record of one run; pass a terminal one to ``evaluate_outcome``."""
     final_text: str
     provider_metadata: Dict[str, List[JsonValue]]
     warnings: List["ProviderWarning"]
@@ -1343,34 +1451,109 @@ StreamEvent = Union[
 
 
 class QueryEventStream(AsyncIterator[StreamEvent]):
+    """Versioned start/delta/end event view over the same run as its ``QueryStream``.
+
+    Obtain it with ``QueryStream.events(response_id)``. It shares the underlying run, so
+    consume either the delta view or this event view, never both concurrently. Use
+    ``async with`` for deterministic cleanup on early exit, exactly like ``QueryStream``.
+    """
+
     def __aiter__(self) -> "QueryEventStream": ...
     async def __anext__(self) -> StreamEvent: ...
     async def __aenter__(self) -> "QueryEventStream": ...
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
-    def cancel(self) -> None: ...
-    def is_cancelled(self) -> bool: ...
-    async def aclose(self) -> RunOutcome: ...
-    def outcome(self) -> RunOutcome: ...
+    def cancel(self) -> None:
+        """Request cooperative cancellation without waiting; see ``QueryStream.cancel``."""
+        ...
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation was requested for the shared run."""
+        ...
+    async def aclose(self) -> RunOutcome:
+        """Cancel, drain the run, and return its terminal ``RunOutcome``."""
+        ...
+    def outcome(self) -> RunOutcome:
+        """Return the current recorder snapshot; terminal after exhaustion or ``aclose()``."""
+        ...
 
 
 class QueryStream(AsyncIterator[StreamDelta]):
+    """Single-consumer async iterator of canonical ``StreamDelta`` dicts for one run.
+
+    Returned by ``Agent.run``, ``Agent.stream_text``, ``Client.query`` and ``aikit.query``.
+    Branch on each delta's ``"type"`` (``"text_delta"``, ``"tool_call_start"``,
+    ``"usage"``, ``"error"``, ...). Failures after the run starts are delivered as an
+    ``"error"`` delta and recorded in ``outcome()["terminal_status"]``; they are not
+    raised from ``__anext__``. Driving ``__anext__`` concurrently raises ``RuntimeError``.
+
+    Prefer ``async with`` so leaving the loop early still runs Stop hooks, audit emission,
+    and recorder finalization (a plain ``break`` does not call ``aclose()``)::
+
+        async with agent.run("Summarize the report", {"max_turns": 4}) as stream:
+            async for delta in stream:
+                if delta["type"] == "text_delta":
+                    print(delta["text"], end="")
+        print(stream.outcome()["terminal_status"])
+    """
+
     def __aiter__(self) -> "QueryStream": ...
     async def __anext__(self) -> StreamDelta: ...
-    def events(self, response_id: str) -> QueryEventStream: ...
+    def events(self, response_id: str) -> QueryEventStream:
+        """Switch to the versioned start/delta/end event view of this same run.
+
+        Args:
+            response_id: Caller-chosen, non-empty id stamped on every emitted event.
+
+        Raises:
+            ValueError: ``response_id`` is empty or whitespace.
+        """
+        ...
     async def __aenter__(self) -> "QueryStream": ...
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
-    def cancel(self) -> None: ...
-    def is_cancelled(self) -> bool: ...
-    async def aclose(self) -> RunOutcome: ...
-    def outcome(self) -> RunOutcome: ...
+    def cancel(self) -> None:
+        """Request cooperative cancellation immediately and return without waiting.
+
+        Use ``await stream.aclose()`` instead when you must wait for Stop hooks, audit
+        emission, and recorder finalization before continuing.
+        """
+        ...
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation was requested for this run."""
+        ...
+    async def aclose(self) -> RunOutcome:
+        """Cancel, drain the core driver, and return the terminal canonical ``RunOutcome``."""
+        ...
+    def outcome(self) -> RunOutcome:
+        """Return the current recorder snapshot.
+
+        The snapshot is terminal once the stream is exhausted or ``aclose()`` returned;
+        before that ``terminal_status`` may still be ``"running"``. Pass a terminal
+        outcome to ``aikit.evaluate_outcome`` for deterministic gates.
+        """
+        ...
 
 
 class ObjectStream(AsyncIterator[ObjectStreamEvent[T]], Generic[T]):
+    """Single-consumer async iterator of structured-output events from ``Agent.stream_object``.
+
+    Yields ``attempt_started``, ``delta``, and ``validation_failed`` events, then exactly
+    one ``completed`` event whose ``object["value"]`` is schema-valid (materialized as the
+    Pydantic model when a Pydantic v2 class was passed as the schema). A terminal failure
+    raises ``AikitError`` from ``__anext__``.
+    """
+
     def __aiter__(self) -> "ObjectStream[T]": ...
     async def __anext__(self) -> ObjectStreamEvent[T]: ...
 
 
 class Tool(Protocol):
+    """A host tool definition: metadata plus an ``async`` callable returning ``str``.
+
+    ``aikit.tool(...)`` produces one from any ``async def``; any object with these three
+    attributes that is itself awaitable-callable also satisfies the protocol. The
+    callable receives the model's input dict and must resolve to ``str`` (anything else
+    is recorded as a tool error and fed back to the model).
+    """
+
     name: str
     description: str
     input_schema: Mapping[str, JsonValue]
@@ -1632,43 +1815,76 @@ class A2aMapperState(TypedDict):
 
 @final
 class A2aMapper:
-    """Rust-core A2A mapping state; not a network listener or wire Task serializer."""
+    """Rust-core A2A mapping state; not a network listener or wire Task serializer.
+
+    Maps authenticated A2A operations onto owner-scoped contexts and tasks and returns a
+    governed action (allowed or denied with a typed reason) for the host to execute.
+    Mutating calls commit only when the whole operation succeeds. Persist ``snapshot()``
+    and rebuild with ``A2aMapper.from_state``; snapshots are internal state, not A2A
+    response objects. Malformed input and rejected state transitions raise
+    ``ValueError`` (the message starts with a stable ``"<code>: "`` prefix).
+    """
 
     def __init__(self) -> None: ...
 
     @staticmethod
-    def from_state(state: A2aMapperState) -> "A2aMapper": ...
+    def from_state(state: A2aMapperState) -> "A2aMapper":
+        """Rebuild a mapper from a ``snapshot()``; raises ``ValueError`` if it is invalid."""
+        ...
 
-    def snapshot(self) -> A2aMapperState: ...
+    def snapshot(self) -> A2aMapperState:
+        """Return the canonical persistable mapping state."""
+        ...
     def send_message(
         self,
         message: A2aMessage,
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
         now_unix_ms: Optional[int] = ...,
-    ) -> A2aGovernedAction: ...
+    ) -> A2aGovernedAction:
+        """Map an idempotent ``SendMessage`` into a dispatch, duplicate, or denial action.
+
+        ``now_unix_ms`` defaults to the host wall clock.
+        """
+        ...
     def list_tasks(
         self,
         request: A2aListTasksRequest,
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
-    ) -> A2aGovernedAction: ...
+    ) -> A2aGovernedAction:
+        """Return the caller-owned tasks page as a governed action (read-only)."""
+        ...
     def get_task(
         self,
         task_id: str,
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
-    ) -> A2aGovernedAction: ...
+    ) -> A2aGovernedAction:
+        """Return one caller-owned task as a governed action (read-only)."""
+        ...
     def cancel_task(
         self,
         task_id: str,
         correlation: A2aCorrelationIdentity,
         principal: Optional[A2aProtocolPrincipal] = ...,
-    ) -> A2aGovernedAction: ...
-    def mark_dispatch_running(self, dispatch_id: str) -> A2aMapperState: ...
+    ) -> A2aGovernedAction:
+        """Decide a cancellation for one caller-owned task and record it when allowed."""
+        ...
+    def mark_dispatch_running(self, dispatch_id: str) -> A2aMapperState:
+        """Claim a queued/reconcile-pending dispatch and return the snapshot with its new attempt.
+
+        Pass that exact attempt number to ``transition_dispatch_task``.
+        """
+        ...
     def mark_dispatch_reconcile_pending(
         self, dispatch_id: str, error: str
-    ) -> A2aMapperState: ...
+    ) -> A2aMapperState:
+        """Move a queued/running dispatch into startup-safe reconciliation.
+
+        Only a sanitized reason is persisted, not the raw ``error`` text.
+        """
+        ...
     def transition_dispatch_task(
         self,
         dispatch_id: str,
@@ -1676,14 +1892,22 @@ class A2aMapper:
         state: A2aTaskState,
         status_message: Optional[str] = ...,
         now_unix_ms: Optional[int] = ...,
-    ) -> A2aMapperState: ...
+    ) -> A2aMapperState:
+        """Settle a dispatch's task state, fenced by ``expected_attempt``.
+
+        A stale callback from an older attempt is rejected instead of overwriting a newer
+        attempt.
+        """
+        ...
     def transition_task(
         self,
         task_id: str,
         state: A2aTaskState,
         status_message: Optional[str] = ...,
         now_unix_ms: Optional[int] = ...,
-    ) -> A2aMapperState: ...
+    ) -> A2aMapperState:
+        """Admin-only task state change; open dispatches must use ``transition_dispatch_task``."""
+        ...
 
 
 class McpToolFilter(TypedDict, total=False):
@@ -1696,7 +1920,32 @@ async def connect_mcp_http(
     name: str,
     bearer_token: Optional[str] = ...,
     tool_filter: Optional[McpToolFilter] = ...,
-) -> "McpConnection": ...
+) -> "McpConnection":
+    """Connect to a Streamable HTTP MCP server, initialize it, and discover its tools.
+
+    Args:
+        endpoint: Absolute ``https`` URL of the MCP endpoint (plain ``http`` is accepted
+            only for ``localhost`` / loopback addresses).
+        name: Local connection name used to identify this server's tools.
+        bearer_token: Optional token sent as ``Authorization: Bearer ...``.
+        tool_filter: Optional exact allow/deny visibility policy; ``deny`` always wins.
+            Omit for allow-all; ``{"allow": []}`` exposes no tools.
+
+    Returns:
+        A connection to pass to ``Agent.register_mcp``.
+
+    Raises:
+        ValueError: Invalid or non-HTTPS remote endpoint, or invalid ``tool_filter``.
+        RuntimeError: Initialization, discovery, or a bounded transport limit failed.
+
+    Example::
+
+        server = await aikit.connect_mcp_http(
+            "https://mcp.example.com", "work", tool_filter={"allow": ["search"]}
+        )
+        agent.register_mcp(server)
+    """
+    ...
 
 
 async def connect_mcp_stdio(
@@ -1706,24 +1955,55 @@ async def connect_mcp_stdio(
     env: Optional[Mapping[str, str]] = ...,
     inherit_env: bool = ...,
     tool_filter: Optional[McpToolFilter] = ...,
-) -> "McpConnection": ...
+) -> "McpConnection":
+    """Spawn a local MCP server over stdio, initialize it, and discover its tools.
+
+    Args:
+        program: Executable to spawn (no shell is involved).
+        args: Arguments passed to ``program``.
+        name: Local connection name used to identify this server's tools.
+        env: Extra environment variables for the child process.
+        inherit_env: Defaults to ``False``: the child does not inherit this process's
+            environment (and therefore none of its API keys) unless you opt in.
+        tool_filter: Optional exact allow/deny visibility policy; ``deny`` always wins.
+
+    Returns:
+        A connection to pass to ``Agent.register_mcp``.
+
+    Raises:
+        ValueError: Invalid ``tool_filter``.
+        RuntimeError: Spawn, initialization, or tool discovery failed.
+    """
+    ...
 
 
 class McpConnection:
+    """A live, initialized MCP client connection with its filtered tool list.
+
+    Create it with ``connect_mcp_http`` or ``connect_mcp_stdio`` (there is no public
+    constructor), then call ``Agent.register_mcp``. Resource and prompt helpers raise
+    ``RuntimeError`` on protocol or transport failure.
+    """
+
     def __init__(self, _factory_only: NoReturn) -> None: ...
-    async def list_resources(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
-    async def read_resource(self, uri: str) -> JsonValue: ...
-    async def list_prompts(self, cursor: Optional[str] = ...) -> List[JsonValue]: ...
-    async def get_prompt(self, name: str, arguments: JsonValue) -> JsonValue: ...
+    async def list_resources(self, cursor: Optional[str] = ...) -> List[JsonValue]:
+        """List server resources, following pagination (from ``cursor`` when given) within bounds."""
+        ...
+    async def read_resource(self, uri: str) -> JsonValue:
+        """Read one resource by URI and return the server's JSON result."""
+        ...
+    async def list_prompts(self, cursor: Optional[str] = ...) -> List[JsonValue]:
+        """List server prompts, following pagination (from ``cursor`` when given) within bounds."""
+        ...
+    async def get_prompt(self, name: str, arguments: JsonValue) -> JsonValue:
+        """Render one server prompt with JSON ``arguments`` and return the server's result."""
+        ...
 
 class _LegacyNamespace:
-    """Deprecated v0.x compatibility namespace."""
+    """Deprecated v0.x compatibility namespace; ``legacy.McpServer`` is ``McpConnection``."""
     McpServer: type[McpConnection]
 
 legacy: _LegacyNamespace
-
-async def connect_mcp_http(endpoint: str, name: str, bearer_token: Optional[str] = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpConnection: ...
-async def connect_mcp_stdio(program: str, args: Sequence[str], name: str, env: Optional[Mapping[str, str]] = ..., inherit_env: bool = ..., tool_filter: Optional[McpToolFilter] = ...) -> McpConnection: ...
 
 
 @overload
@@ -1732,7 +2012,29 @@ def tool(
     description: str,
     input_schema: Mapping[str, JsonValue],
     callback: ToolCallback,
-) -> Tool: ...
+) -> Tool:
+    """Attach tool metadata to an ``async def`` and return it as a ``Tool``.
+
+    Without ``callback`` this is a decorator factory; with one it annotates and returns the
+    same callable, which stays directly awaitable. Register the result with
+    ``Agent.add_tool_definition`` or pass it in ``aikit.query(tools=[...])``.
+
+    Raises:
+        ValueError: ``input_schema`` is not JSON-compatible or ``callback`` is not callable.
+
+    Example::
+
+        @aikit.tool("lookup", "Look up one market symbol", {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+        })
+        async def lookup(tool_input: dict) -> str:
+            return f"price:{tool_input['symbol']}"
+
+        agent.add_tool_definition(lookup)
+    """
+    ...
 
 
 @overload
@@ -1745,30 +2047,129 @@ def tool(
 
 
 class Agent:
-    def __init__(self) -> None: ...
+    """The governed, multi-provider agent: credentials, tools, policy, hooks, and runs.
+
+    ``Agent()`` activates providers from this process's environment variables;
+    ``Agent.from_env(mapping)`` reads only the mapping you pass, so ``from_env({})`` gives a
+    keyless agent that can still use the deterministic ``mock-1`` / ``mock-structured``
+    models. Configuration methods mutate the agent in place and raise ``ValueError`` on
+    invalid input; configure everything before starting runs.
+
+    A model id selects its provider by prefix (``claude*`` -> anthropic, ``gpt*`` /
+    ``o1``/``o3``/``o4`` -> openai, ``gemini*`` -> google, ``deepseek*``,
+    ``openrouter:``, ``groq:``, ``mistral:``, ``xai:`` / ``grok-``). Starting a run for a
+    provider without a key raises ``AikitError`` with ``code == "provider_auth"``.
+
+    For example, a keyless first run::
+
+        import asyncio, aikit
+
+        async def main() -> None:
+            agent = aikit.Agent.from_env({})
+            result = await agent.generate_text("Say hello")
+            print(result["text"])
+
+        asyncio.run(main())
+    """
+
+    def __init__(self) -> None:
+        """Build an agent whose providers come from this process's environment variables."""
+        ...
 
     @staticmethod
-    def from_env(env: Mapping[str, str]) -> "Agent": ...
+    def from_env(env: Mapping[str, str]) -> "Agent":
+        """Build an agent from an explicit ``{VAR: value}`` mapping instead of ``os.environ``.
+
+        Recognized variables: ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``,
+        ``DEEPSEEK_API_KEY``, ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``,
+        ``OPENROUTER_API_KEY``, ``GROQ_API_KEY``, ``MISTRAL_API_KEY``, ``XAI_API_KEY``.
+        Pass ``dict(os.environ)`` to opt in to the process environment explicitly, or
+        ``{}`` for a keyless agent.
+        """
+        ...
 
     def configure_jsonl_audit(
         self,
         path: str,
         payload_policy: Literal["metadata_only", "full"] = ...,
         failure_mode: Literal["fail_closed", "best_effort"] = ...,
-    ) -> None: ...
-    def use_memory_file(self, path: str, namespace: str = ...) -> None: ...
-    def use_session_file(self, path: str) -> None: ...
-    def use_sqlite_memory(self, path: str, namespace: str = ...) -> None: ...
-    def use_sqlite_sessions(self, path: str) -> None: ...
+    ) -> None:
+        """Persist structured audit records to an owner-only JSONL file.
+
+        Args:
+            path: Target file. Unsafe targets are rejected immediately.
+            payload_policy: ``"metadata_only"`` (default) omits prompt/tool payloads;
+                ``"full"`` records them.
+            failure_mode: ``"fail_closed"`` (default) fails the run when an audit record
+                cannot be written; ``"best_effort"`` continues.
+
+        Raises:
+            ValueError: Unknown policy or mode.
+            RuntimeError: The audit file cannot be opened.
+        """
+        ...
+    def use_memory_file(self, path: str, namespace: str = ...) -> None:
+        """Back ``remember``/``recall`` with a crash-safe local JSON file.
+
+        ``namespace`` (default ``"default"``) isolates tenants sharing one file. Concurrent
+        coordination is process-local; use ``use_sqlite_memory`` across processes.
+
+        Raises:
+            ValueError: ``namespace`` is empty.
+            RuntimeError: The file cannot be opened.
+        """
+        ...
+    def use_session_file(self, path: str) -> None:
+        """Persist subagent sessions to a JSON file (process-local compare-and-swap).
+
+        Raises:
+            ValueError: ``path`` is empty.
+        """
+        ...
+    def use_sqlite_memory(self, path: str, namespace: str = ...) -> None:
+        """Back ``remember``/``recall`` with a SQLite database under ``namespace``.
+
+        Raises:
+            ValueError: ``namespace`` is empty.
+            RuntimeError: The database cannot be opened.
+        """
+        ...
+    def use_sqlite_sessions(self, path: str) -> None:
+        """Persist subagent sessions to a SQLite database."""
+        ...
     def recover_expired_session(
         self,
         session_id: str,
         *,
         side_effects_reconciled: Literal[True],
     ) -> int:
-        """Clear an expired lease after reconciliation; does not execute or resume work."""
+        """Clear an expired lease after reconciliation; does not execute or resume work.
+
+        Call this only after verifying the old worker stopped and reconciling any external
+        side effects it may have completed. A later ``run_subagent`` / ``resume_subagent``
+        call is a separate execution decision.
+
+        Returns:
+            The session's new revision.
+
+        Raises:
+            ValueError: ``side_effects_reconciled`` is not ``True``.
+            AikitError: The store rejected the recovery (for example, the lease is live).
+        """
         ...
-    def register_web_tools(self, allowed_hosts: Sequence[str], search_endpoint: Optional[str] = ..., max_response_bytes: Optional[int] = ...) -> None: ...
+    def register_web_tools(self, allowed_hosts: Sequence[str], search_endpoint: Optional[str] = ..., max_response_bytes: Optional[int] = ...) -> None:
+        """Register ``WebFetch`` (and ``WebSearch`` when ``search_endpoint`` is set).
+
+        Args:
+            allowed_hosts: Exact HTTPS hosts the tools may reach; everything else is denied.
+            search_endpoint: Optional allowlisted URL containing exactly one ``{query}``
+                marker.
+            max_response_bytes: Optional response cap (the default is 1,000,000 bytes).
+
+        Raises:
+            ValueError: Invalid endpoint, or a tool name is already registered.
+        """
+        ...
     def register_browser_tools(
         self,
         webdriver_endpoint: str,
@@ -1777,87 +2178,275 @@ class Agent:
         *,
         external_egress_enforced: Literal[True],
     ) -> None:
-        """Register browser tools after asserting an exact external host/public-IP boundary."""
+        """Register browser tools after asserting an exact external host/public-IP boundary.
+
+        ``external_egress_enforced=True`` is your assertion that network egress for the
+        WebDriver session is enforced outside this process; aikit does not enforce it.
+
+        Raises:
+            ValueError: Invalid endpoint/hosts, or a tool name is already registered.
+        """
         ...
-    def register_mcp(self, server: McpConnection) -> None: ...
-    def enable_capability_requests(self, gated_tools: Sequence[str]) -> None: ...
-    def enable_default_guardrails(self, blocked_input_patterns: Sequence[str] = ...) -> None: ...
-    def add_key(self, key: str, provider: Optional[str] = ...) -> str: ...
-    def active_providers(self) -> List[str]: ...
-    def has_provider(self, provider: str) -> bool: ...
-    def capabilities(self) -> AgentCapabilities: ...
+    def register_mcp(self, server: McpConnection) -> None:
+        """Expose a connected MCP server's (filtered) tools to this agent's runs.
+
+        Raises:
+            ValueError: One of the server's tool names is already registered.
+        """
+        ...
+    def enable_capability_requests(self, gated_tools: Sequence[str]) -> None:
+        """Gate already-registered tools behind a human-approved ``request_capability`` tool.
+
+        The model must call ``request_capability``; the ``can_use_tool`` callback decides,
+        and a gated tool is refused until granted. Grants last for one run only.
+
+        Raises:
+            ValueError: ``can_use_tool`` was not configured first, or a gated name is not a
+                registered tool.
+        """
+        ...
+    def enable_default_guardrails(self, blocked_input_patterns: Sequence[str] = ...) -> None:
+        """Enable the default guardrail chain.
+
+        Input is checked against ``blocked_input_patterns`` (regular expressions); output
+        passes through the built-in secret and PII redactors.
+
+        Raises:
+            ValueError: A pattern is not a valid regular expression.
+        """
+        ...
+    def add_key(self, key: str, provider: Optional[str] = ...) -> str:
+        """Activate a provider credential and return the provider name it activated.
+
+        Args:
+            key: The API key. Its format usually identifies the provider.
+            provider: Explicit provider name (``"anthropic"``, ``"openai"``,
+                ``"google"``, ``"deepseek"``, ``"openrouter"``, ``"groq"``,
+                ``"mistral"``, ``"xai"``). Required for ``sk-`` keys, which could be
+                OpenAI or DeepSeek.
+
+        Raises:
+            ValueError: Empty, ambiguous, or unrecognized key, or unknown provider.
+
+        Example::
+
+            agent.add_key(os.environ["OPENAI_API_KEY"], provider="openai")
+        """
+        ...
+    def active_providers(self) -> List[str]:
+        """Return the names of providers that currently have a credential."""
+        ...
+    def has_provider(self, provider: str) -> bool:
+        """Return whether ``provider`` currently has a credential."""
+        ...
+    def capabilities(self) -> AgentCapabilities:
+        """Describe what this agent can do right now: providers (with fidelity) and tools."""
+        ...
     def add_tool(
         self,
         name: str,
         description: str,
         input_schema: Mapping[str, JsonValue],
         callback: Callable[[Dict[str, JsonValue]], Awaitable[str]],
-    ) -> None: ...
-    def add_tool_definition(self, definition: Tool) -> None: ...
+    ) -> None:
+        """Register one host tool backed by a Python ``async def``.
+
+        Args:
+            name: Unique tool name advertised to the model.
+            description: What the tool does, written for the model.
+            input_schema: JSON Schema for the tool's input object.
+            callback: ``async`` callable receiving the input dict and returning ``str``.
+
+        Raises:
+            ValueError: ``name`` is already registered or ``callback`` is not callable.
+        """
+        ...
+    def add_tool_definition(self, definition: Tool) -> None:
+        """Register a definition produced by ``aikit.tool(...)`` (or any ``Tool``)."""
+        ...
     def register_builtin_tools(self, roots: Sequence[str]) -> None:
-        """Register jailed Read/Write/Edit/Glob/Grep tools; Bash stays disabled."""
+        """Register jailed Read/Write/Edit/Glob/Grep tools; Bash stays disabled.
+
+        File tools are confined to ``roots`` and reject root escapes and symlinks.
+        Registration fails closed on platforms without the descriptor-relative jail
+        (currently Windows).
+
+        Raises:
+            ValueError: Invalid roots, or a built-in name collides with a host tool.
+        """
         ...
     def enable_bash_with_required_containment(
         self, docker: Optional[DockerContainmentOptions] = ...
     ) -> None:
-        """Add Bash under Required(Auto), optionally with a digest-pinned Docker fallback."""
+        """Add Bash under Required(Auto), optionally with a digest-pinned Docker fallback.
+
+        Call ``register_builtin_tools`` first. There is no uncontained Bash mode in this
+        binding; if no containment backend is available, Bash calls fail closed. Probe the
+        result with ``builtin_containment_capabilities``.
+
+        Raises:
+            ValueError: Invalid Docker options.
+        """
         ...
     async def builtin_containment_capabilities(self) -> ContainmentCapabilityReport:
-        """Probe the required Bash backends without weakening containment."""
+        """Probe the required Bash backends without weakening containment.
+
+        Raises:
+            ValueError: ``enable_bash_with_required_containment`` has not been called.
+        """
         ...
     def set_permissions(
         self,
         rules: Optional[Sequence[PermissionRule]] = ...,
         default_mode: Literal["allow", "deny", "ask"] = ...,
-    ) -> None: ...
+    ) -> None:
+        """Replace the declarative tool permission policy.
+
+        Args:
+            rules: Rules such as ``{"id": "...", "effect": "ask", "tool":
+                "lookup"}``; ``pattern`` is a regex matched against the input's string
+                values (or one ``field``).
+            default_mode: Effect for tools no rule matches (default ``"allow"``).
+
+        ``"ask"`` decisions go to the ``can_use_tool`` callback; without one they fail
+        closed (deny).
+
+        Raises:
+            ValueError: Invalid rule, effect, or regex.
+        """
+        ...
     def can_use_tool(
         self,
         callback: Callable[[ApprovalRequest], Awaitable[ApprovalResponse]],
-    ) -> None: ...
+    ) -> None:
+        """Register the async approver for ``"ask"`` permission decisions.
+
+        The callback receives an ``ApprovalRequest`` and returns ``True``/``False``,
+        ``"allow"``/``"deny"``, or an exact ``{"action": "allow"|"deny", ...}`` object.
+        Exceptions and malformed responses deny the tool call.
+
+        Example::
+
+            async def approve(request: "aikit.ApprovalRequest") -> "aikit.ApprovalResponse":
+                # Quote stub-only types (or use `from __future__ import annotations`):
+                # TypedDicts and aliases exist for type checkers, not at runtime.
+                return "allow" if request["tool"] == "lookup" else "deny"
+
+            agent.can_use_tool(approve)
+        """
+        ...
     def on_user_prompt(
         self,
         callback: Callable[[PromptContext], Awaitable[PromptHookResponse]],
-    ) -> None: ...
+    ) -> None:
+        """Register an async UserPromptSubmit hook (continue, rewrite, or block).
+
+        An exception or malformed response blocks the prompt.
+        """
+        ...
     def on_pre_tool_use(
         self,
         callback: Callable[[PreToolUseContext], Awaitable[PreToolHookResponse]],
         tool: Optional[str] = ...,
-    ) -> None: ...
+    ) -> None:
+        """Register an async PreToolUse hook (continue, rewrite input, or block).
+
+        ``tool`` restricts the hook to one tool name; omit it to match every tool.
+        """
+        ...
     def on_post_tool_use(
         self,
         callback: Callable[[PostToolUseContext], Awaitable[PostToolHookResponse]],
         tool: Optional[str] = ...,
-    ) -> None: ...
+    ) -> None:
+        """Register an async PostToolUse hook (continue, rewrite output, or turn it into an error).
+
+        ``tool`` restricts the hook to one tool name; omit it to match every tool.
+        """
+        ...
     def on_post_tool_failure(
         self,
         callback: Callable[[FailureContext], Awaitable[FailureHookResponse]],
         tool: Optional[str] = ...,
-    ) -> None: ...
+    ) -> None:
+        """Register an async hook for tool-scoped failures.
+
+        Runs in the dedicated PostToolFailure phase, before general ``on_failure`` hooks,
+        and honors the same ``tool`` matcher as ``on_pre_tool_use``.
+        """
+        ...
     def on_failure(
         self,
         callback: Callable[[FailureContext], Awaitable[FailureHookResponse]],
-    ) -> None: ...
+    ) -> None:
+        """Register an async hook for run failures (continue or rewrite the error text)."""
+        ...
     def on_stop(
         self,
         callback: Callable[[StopContext], Awaitable[None]],
-    ) -> None: ...
+    ) -> None:
+        """Register an async hook that observes every run's terminal stop."""
+        ...
 
     async def generate_text(
         self,
         prompt: PromptInput,
         model: Optional[str] = ...,
         max_tokens: int = ...,
-    ) -> GeneratedText: ...
+    ) -> GeneratedText:
+        """Run the governed loop to completion and return the final text.
+
+        Args:
+            prompt: A string or a canonical ``Message`` history (text and media blocks).
+            model: Model id; defaults to the keyless deterministic ``"mock-1"``.
+            max_tokens: Output token cap per model call (default 1024).
+
+        Returns:
+            ``GeneratedText`` with ``text``, ``usage``, ``stop_reason``, ``messages``,
+            ``provider_metadata``, and ``warnings``.
+
+        Raises:
+            AikitError: Provider, policy, budget, or tool failure (branch on ``code``).
+            ValueError: Malformed ``prompt``.
+        """
+        ...
 
     def stream_text(
         self,
         prompt: PromptInput,
         model: Optional[str] = ...,
         max_tokens: int = ...,
-    ) -> QueryStream: ...
+    ) -> QueryStream:
+        """Start a governed run and stream canonical deltas (defaults as ``generate_text``).
 
-    def run(self, prompt: PromptInput, options: Optional[RunOptions] = ...) -> QueryStream: ...
-    def client(self) -> "Client": ...
+        Use ``run`` instead when you need budgets, retries, fallbacks, routing, or
+        compaction.
+        """
+        ...
+
+    def run(self, prompt: PromptInput, options: Optional[RunOptions] = ...) -> QueryStream:
+        """Start a cancellable governed run with the full ``RunOptions`` surface.
+
+        ``options`` is strict: unknown top-level or nested fields raise ``ValueError``, so a
+        misspelled budget or retry limit is never silently ignored.
+
+        Raises:
+            AikitError: The run cannot start (for example ``provider_auth``).
+            ValueError: Malformed ``prompt`` or ``options``.
+
+        Example::
+
+            async with agent.run(
+                "Plan the migration",
+                {"model": "mock-1", "max_turns": 4, "budget": {"max_total_tokens": 20_000}},
+            ) as stream:
+                async for delta in stream:
+                    ...
+        """
+        ...
+    def client(self) -> "Client":
+        """Snapshot this configured agent into a reusable ``Client``."""
+        ...
 
     @overload
     async def generate_object(
@@ -1871,7 +2460,42 @@ class Agent:
         provider_options: Optional[ProviderOptions] = ...,
         compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
-    ) -> GeneratedObject[T]: ...
+    ) -> GeneratedObject[T]:
+        """Generate one schema-validated object, repairing invalid attempts.
+
+        Args:
+            prompt: A string or a canonical ``Message`` history.
+            schema: A JSON Schema mapping, or a Pydantic v2 model class (then
+                ``result["value"]`` is a model instance).
+            model: Model id; defaults to the keyless deterministic ``"mock-structured"``.
+            max_retries: Repair attempts after the first (default 2; the core rejects
+                more than 32).
+            max_tokens: Output token cap per attempt (default 1024).
+            name: Optional schema name forwarded to providers that use one.
+            provider_options: Per-provider options, checked against the adapter catalog.
+            compatibility_mode: ``"strict"`` (default) rejects unsupported options;
+                ``"warn"`` / ``"best_effort"`` are explicit opt-ins that keep warnings.
+            validator: Optional ``async`` business-rule check returning ``"accept"``,
+                ``{"action": "retry", "reason": ...}``, or
+                ``{"action": "reject", "reason": ...}``. Exceptions fail closed.
+
+        Returns:
+            ``GeneratedObject`` with ``value``, ``fidelity``, ``attempts``,
+            ``provider_metadata``, and ``warnings``.
+
+        Raises:
+            AikitError: ``code == "structured_output"`` once retries are exhausted or the
+                validator rejects; provider failures use their own codes.
+            ValueError: Invalid schema, options, or prompt.
+
+        Example::
+
+            schema = {"type": "object", "properties": {"city": {"type": "string"}},
+                      "required": ["city"], "additionalProperties": False}
+            result = await agent.generate_object("Where is the Eiffel Tower?", schema)
+            print(result["value"])
+        """
+        ...
 
     @overload
     async def generate_object(
@@ -1899,7 +2523,14 @@ class Agent:
         provider_options: Optional[ProviderOptions] = ...,
         compatibility_mode: CompatibilityMode = ...,
         validator: Optional[SemanticValidator] = ...,
-    ) -> ObjectStream[T]: ...
+    ) -> ObjectStream[T]:
+        """Stream structured-output attempts, deltas, repairs, and one final ``completed``.
+
+        Takes the same arguments as ``generate_object``. Only the final
+        ``completed["object"]["value"]`` is materialized as a Pydantic model; earlier
+        events are left untouched.
+        """
+        ...
 
     @overload
     def stream_object(
@@ -1915,7 +2546,13 @@ class Agent:
         validator: Optional[SemanticValidator] = ...,
     ) -> ObjectStream[JsonValue]: ...
 
-    def remember(self, key: str, value: JsonValue) -> None: ...
+    def remember(self, key: str, value: JsonValue) -> None:
+        """Explicitly persist one JSON value; model output is never remembered automatically.
+
+        Raises:
+            RuntimeError: The memory store rejected the write.
+        """
+        ...
     def remember_cas(
         self,
         key: str,
@@ -1923,11 +2560,35 @@ class Agent:
         expected_revision: int,
         plane: Literal["working", "episodic", "semantic"] = ...,
         provenance: Optional[MemoryProvenance] = ...,
-    ) -> int: ...
-    def recall(self, query: str, limit: int = ...) -> List[MemoryEntry]: ...
+    ) -> int:
+        """Write one memory entry only if its stored revision equals ``expected_revision``.
+
+        This is the safe path for concurrent writers: a stale writer gets an error instead
+        of silently winning.
+
+        Returns:
+            The entry's new revision.
+
+        Raises:
+            ValueError: Unknown ``plane`` or malformed ``provenance``.
+            RuntimeError: Revision conflict or store failure.
+        """
+        ...
+    def recall(self, query: str, limit: int = ...) -> List[MemoryEntry]:
+        """Search explicit memories in this agent's namespace (default ``limit`` 10)."""
+        ...
     def route(
         self, profiles: Sequence[ModelProfile], request: RouteRequest
-    ) -> RouteDecision: ...
+    ) -> RouteDecision:
+        """Deterministically pick a model profile for ``request`` from ``profiles``.
+
+        Only providers with an active credential are eligible; credential values never
+        enter the catalog or the result.
+
+        Raises:
+            ValueError: Malformed profiles or request.
+        """
+        ...
 
     async def run_subagent(
         self,
@@ -1935,7 +2596,13 @@ class Agent:
         profiles: Sequence[ModelProfile],
         budget: Optional[BudgetLimits] = ...,
         max_parallelism: int = ...,
-    ) -> SubagentResult: ...
+    ) -> SubagentResult:
+        """Run one governed, budget-aware child agent (build ``spec`` with ``subtask``).
+
+        The child inherits this agent's host tools, hooks, approvals, and permission
+        policy, narrowed by its ``allowed_tools``. ``max_parallelism`` defaults to 4.
+        """
+        ...
 
     def subtask(
         self,
@@ -1947,7 +2614,15 @@ class Agent:
         max_turns: int = ...,
         max_tokens: int = ...,
         estimated_input_tokens: int = ...,
-    ) -> SubagentSpec: ...
+    ) -> SubagentSpec:
+        """Build the canonical ``SubagentSpec`` used by the subagent and council methods.
+
+        Defaults: ``max_turns=16``, ``max_tokens=4096``, ``estimated_input_tokens=1024``.
+
+        Raises:
+            ValueError: Malformed ``route``.
+        """
+        ...
 
     async def resume_subagent(
         self,
@@ -1956,7 +2631,9 @@ class Agent:
         profiles: Sequence[ModelProfile],
         budget: Optional[BudgetLimits] = ...,
         max_parallelism: int = ...,
-    ) -> SubagentResult: ...
+    ) -> SubagentResult:
+        """Resume a persisted child session through this agent's session store and CAS."""
+        ...
 
     async def fan_out(
         self,
@@ -1964,7 +2641,9 @@ class Agent:
         profiles: Sequence[ModelProfile],
         budget: Optional[BudgetLimits] = ...,
         max_parallelism: int = ...,
-    ) -> List[SubagentResult]: ...
+    ) -> List[SubagentResult]:
+        """Run independent children with bounded concurrency; results keep input order."""
+        ...
 
     async def parallel(
         self,
@@ -1972,7 +2651,9 @@ class Agent:
         profiles: Sequence[ModelProfile],
         budget: Optional[BudgetLimits] = ...,
         max_parallelism: int = ...,
-    ) -> List[SubagentResult]: ...
+    ) -> List[SubagentResult]:
+        """Alias for ``fan_out`` with identical concurrency, ordering, and governance."""
+        ...
 
     async def council(
         self,
@@ -1982,7 +2663,9 @@ class Agent:
         min_successes: int = ...,
         budget: Optional[BudgetLimits] = ...,
         max_parallelism: int = ...,
-    ) -> CouncilResult: ...
+    ) -> CouncilResult:
+        """Run ``members`` in parallel, then ``synthesizer`` once ``min_successes`` succeed."""
+        ...
 
     def __repr__(self) -> str: ...
 
@@ -2136,25 +2819,51 @@ class DurableCommandResult(TypedDict, total=False):
 
 
 class DurableRun:
+    """Append-only, replay-validated durable run state with human-in-the-loop approvals.
+
+    This is a local state machine: it persists nothing by itself. Store ``snapshot()``
+    wherever you like and rebuild with ``DurableRun.from_state``; every imported snapshot
+    is replay-validated against its event log. Each mutating call takes a caller-chosen id
+    (``pause_id``, ``command_id``, ...) so retries are idempotent. Invalid transitions
+    raise ``AikitError`` with ``code == "conflict"``; malformed input raises
+    ``ValueError``.
+
+    For example, pause for a confirmation and resume after a human answers::
+
+        run = aikit.DurableRun("session-1", "run-1")
+        approval_id = run.request_confirmation("deploy", "Deploy to production?")
+        saved = run.snapshot()              # persist this
+        run = aikit.DurableRun.from_state(saved)
+        run.resolve_approval("cmd-1", approval_id, approved=True)
+    """
+
     def __init__(
         self, session_id: str, run_id: str, durability: DurabilityMode = ...
-    ) -> None: ...
+    ) -> None:
+        """Start a new run; ``durability`` defaults to ``"sync"``."""
+        ...
     @staticmethod
-    def from_state(state: DurableRunState) -> "DurableRun": ...
+    def from_state(state: DurableRunState) -> "DurableRun":
+        """Rebuild a run from a ``snapshot()``; raises ``ValueError`` if replay disagrees."""
+        ...
     @staticmethod
     def with_policy_snapshot(
         session_id: str,
         run_id: str,
         policy_snapshot: PolicySnapshot,
         durability: DurabilityMode = ...,
-    ) -> "DurableRun": ...
+    ) -> "DurableRun":
+        """Start a run with a ``seal_policy_snapshot`` result pinned before any other work."""
+        ...
     @staticmethod
     def with_governance_binding(
         session_id: str,
         run_id: str,
         governance_binding: GovernanceBinding,
         durability: DurabilityMode = ...,
-    ) -> "DurableRun": ...
+    ) -> "DurableRun":
+        """Start a run with a ``seal_governance_binding`` result (tenant/agent/run) pinned."""
+        ...
     @property
     def schema_version(self) -> int: ...
     @property
@@ -2169,44 +2878,75 @@ class DurableRun:
     def governance_binding(self) -> Optional[GovernanceBinding]: ...
     @property
     def status(self) -> DurableRunStatus: ...
-    def snapshot(self) -> DurableRunState: ...
+    def snapshot(self) -> DurableRunState:
+        """Return the complete persistable state (event log plus projection)."""
+        ...
     def replace_state(
         self, mutation_id: str, state: JsonValue
-    ) -> DurableRunState: ...
+    ) -> DurableRunState:
+        """Replace the application-defined state projection through an appended event."""
+        ...
     def checkpoint(
         self, checkpoint_key: str, label: Optional[str] = ...
-    ) -> Checkpoint: ...
-    def pause(self, pause_id: str, reason: str) -> None: ...
+    ) -> Checkpoint:
+        """Commit a full projection snapshot at the current event boundary."""
+        ...
+    def pause(self, pause_id: str, reason: str) -> None:
+        """Pause the run with a recorded reason."""
+        ...
     def request_approval(
         self,
         logical_key: str,
         prompt: str,
         payload: JsonValue,
         activity_id: Optional[str] = ...,
-    ) -> str: ...
-    def request_typed_approval(self, request: DurableApprovalRequest) -> str: ...
-    def expire_approvals(self, expiration_id: str, now_unix_ms: int) -> List[str]: ...
+    ) -> str:
+        """Persist an untyped approval request, pause the run, and return its approval id.
+
+        The id is derived from the run, branch, and ``logical_key``. Legacy-compatible:
+        the approval never expires; use ``request_typed_approval`` for deadlines.
+        """
+        ...
+    def request_typed_approval(self, request: DurableApprovalRequest) -> str:
+        """Persist a typed approval (kind, policy binding, deadline) and return its id.
+
+        Resolve it with ``resolve_approval_at`` / ``apply_command_at`` and a trusted
+        timestamp so an expired response cannot become valid after a restart.
+        """
+        ...
+    def expire_approvals(self, expiration_id: str, now_unix_ms: int) -> List[str]:
+        """Append timeout denials for typed approvals past their deadline at ``now_unix_ms``.
+
+        Idempotent; returns the ids of the approvals it expired.
+        """
+        ...
     def request_confirmation(
         self,
         logical_key: str,
         prompt: str,
         details: JsonValue = ...,
         activity_id: Optional[str] = ...,
-    ) -> str: ...
+    ) -> str:
+        """Persist a non-expiring yes/no confirmation, pause the run, and return its id."""
+        ...
     def request_input(
         self,
         logical_key: str,
         prompt: str,
         input_schema: JsonValue = ...,
         activity_id: Optional[str] = ...,
-    ) -> str: ...
+    ) -> str:
+        """Persist a non-expiring missing-input request (optional JSON Schema hint); returns its id."""
+        ...
     def request_output_review(
         self,
         logical_key: str,
         prompt: str,
         output: JsonValue,
         activity_id: Optional[str] = ...,
-    ) -> str: ...
+    ) -> str:
+        """Persist a non-expiring review of ``output`` (stored unmodified); returns its id."""
+        ...
     def request_edit_retry(
         self,
         logical_key: str,
@@ -2214,14 +2954,21 @@ class DurableRun:
         output: JsonValue,
         error: Optional[str] = ...,
         activity_id: Optional[str] = ...,
-    ) -> str: ...
+    ) -> str:
+        """Persist a non-expiring edit/retry decision for a rejected ``output``; returns its id."""
+        ...
     def resolve_approval(
         self,
         command_id: str,
         approval_id: str,
         approved: bool,
         response: JsonValue = ...,
-    ) -> DurableCommandResult: ...
+    ) -> DurableCommandResult:
+        """Resolve exactly one pending approval through the canonical resume command.
+
+        Typed approvals require ``resolve_approval_at`` instead.
+        """
+        ...
     def resolve_approval_at(
         self,
         command_id: str,
@@ -2229,13 +2976,23 @@ class DurableRun:
         approved: bool,
         now_unix_ms: int,
         response: JsonValue = ...,
-    ) -> DurableCommandResult: ...
-    def complete(self, completion_id: str) -> None: ...
-    def fail(self, failure_id: str, error: str) -> None: ...
-    def apply_command(self, command: DurableCommand) -> DurableCommandResult: ...
+    ) -> DurableCommandResult:
+        """Resolve one approval using an explicit trusted wall-clock value (Unix ms)."""
+        ...
+    def complete(self, completion_id: str) -> None:
+        """Mark the run completed."""
+        ...
+    def fail(self, failure_id: str, error: str) -> None:
+        """Mark the run failed with ``error``."""
+        ...
+    def apply_command(self, command: DurableCommand) -> DurableCommandResult:
+        """Apply one resume, fork, rewind, or cancel command atomically."""
+        ...
     def apply_command_at(
         self, command: DurableCommand, now_unix_ms: int
-    ) -> DurableCommandResult: ...
+    ) -> DurableCommandResult:
+        """Apply a command with the trusted clock that typed approval resolutions require."""
+        ...
 
 
 class SimpleTraceAssertion(TypedDict):
@@ -2293,8 +3050,16 @@ class TraceEvalResult(TypedDict):
 
 
 class Client:
+    """Reusable snapshot of a configured ``Agent`` (tools, policy, callbacks, credentials).
+
+    The configuration is captured when the client is created, so finish configuring the
+    agent first. Prefer ``agent.client()`` to construct one.
+    """
+
     def __init__(self, agent: Agent) -> None: ...
-    def query(self, prompt: PromptInput, options: Optional[RunOptions] = ...) -> QueryStream: ...
+    def query(self, prompt: PromptInput, options: Optional[RunOptions] = ...) -> QueryStream:
+        """Start a governed run, exactly like ``Agent.run`` on the snapshotted agent."""
+        ...
 
 
 def query(
@@ -2303,13 +3068,52 @@ def query(
     model: Optional[str] = ...,
     permissions: Optional[Sequence[PermissionRule]] = ...,
     options: Optional[RunOptions] = ...,
-) -> QueryStream: ...
+) -> QueryStream:
+    """One-shot governed run without building an ``Agent`` first.
+
+    Credentials come from this process's environment variables (as with ``Agent()``).
+    ``model`` overrides ``options["model"]``; the default is the keyless ``"mock-1"``.
+    Tools denied by ``permissions`` never execute; the model receives an error tool
+    result instead. The default permission mode is ``"allow"``.
+
+    Raises:
+        AikitError: The run cannot start (for example ``provider_auth``).
+        ValueError: Malformed prompt, permissions, or options.
+
+    Example::
+
+        async for delta in aikit.query("hello", tools=[lookup]):
+            print(delta["type"])
+    """
+    ...
 
 
-def evaluate_outcome(outcome: RunOutcome, gates: Sequence[EvalGate]) -> EvalVerdict: ...
+def evaluate_outcome(outcome: RunOutcome, gates: Sequence[EvalGate]) -> EvalVerdict:
+    """Evaluate a recorded ``RunOutcome`` against deterministic gates, offline.
+
+    Performs no provider, tool, filesystem, or network work. Unknown outcome or gate
+    fields raise ``ValueError``. Text, tool, and turn gates need the runtime-recorded
+    ``invocation_start_message_index``; legacy outcomes without it can still use the
+    terminal-status and usage gates.
+
+    Example::
+
+        verdict = aikit.evaluate_outcome(stream.outcome(), [
+            {"type": "terminal_status", "status": "completed"},
+            {"type": "max_total_tokens", "value": 2_000},
+        ])
+        assert verdict["passed"], verdict["checks"]
+    """
+    ...
 
 
-def evaluate_trace(suite: EvalSuite, trace: TraceInput) -> TraceEvalResult: ...
+def evaluate_trace(suite: EvalSuite, trace: TraceInput) -> TraceEvalResult:
+    """Check stream/durability trace assertions deterministically, offline.
+
+    Raises:
+        ValueError: Malformed ``suite`` or ``trace``.
+    """
+    ...
 
 
 # --- BEGIN GENERATED external-agent declarations (scripts/generate-declarations.sh) ---
@@ -2472,7 +3276,17 @@ class MediaInput(TypedDict):
 
 def discover_external_runtime_candidates(
     kind: str, explicit_path: Optional[str] = ...
-) -> List[ExternalRuntimeCandidate]: ...
+) -> List[ExternalRuntimeCandidate]:
+    """List local vendor CLI candidates for ``kind`` without executing anything.
+
+    Args:
+        kind: ``"codex"``, ``"gemini"``, ``"claude"``, or ``"grok"``.
+        explicit_path: Optional exact executable to consider instead of searching.
+
+    Raises:
+        AikitError: Unknown ``kind`` or invalid path (code in the message prefix).
+    """
+    ...
 
 
 def verify_external_update_manifest(
@@ -2481,7 +3295,16 @@ def verify_external_update_manifest(
     key_id: str,
     trusted_keys: Dict[str, str],
     now_unix_ms: int,
-) -> ExternalUpdateManifest: ...
+) -> ExternalUpdateManifest:
+    """Verify a detached Ed25519 signature over ``manifest_bytes``, then parse the manifest.
+
+    ``trusted_keys`` maps key id to base64 public key; ``key_id`` selects the signer.
+    Nothing is parsed before the signature verifies.
+
+    Raises:
+        AikitError: Bad signature, unknown or malformed key, or invalid/expired manifest.
+    """
+    ...
 
 
 def select_external_runtime_update(
@@ -2492,15 +3315,27 @@ def select_external_runtime_update(
     target_os: str,
     target_arch: str,
     current_version: Optional[str] = ...,
-) -> Optional[ExternalUpdateSelection]: ...
+) -> Optional[ExternalUpdateSelection]:
+    """Pick the newest compatible release and artifact for one kind, channel, and target.
+
+    Returns ``None`` when nothing newer than ``current_version`` is compatible.
+    """
+    ...
 
 
-def validate_external_update_config(config: ExternalUpdateConfig) -> None: ...
+def validate_external_update_config(config: ExternalUpdateConfig) -> None:
+    """Fail-closed check of a persisted signed-update configuration.
+
+    Raises ``ValueError`` for a malformed document and ``AikitError`` for an invalid one.
+    """
+    ...
 
 
 def external_update_refresh_actions(
     state: ExternalUpdateStateSnapshot, now_unix_ms: int
-) -> List[ExternalRefreshAction]: ...
+) -> List[ExternalRefreshAction]:
+    """Return the maintenance actions due for ``state`` at the injected instant."""
+    ...
 
 
 def spawn_external_agent_session(
@@ -2511,11 +3346,35 @@ def spawn_external_agent_session(
     claude_bridge: Optional[str] = ...,
     claude_bridge_args: Optional[Sequence[str]] = ...,
     acknowledge_vendor_terms: bool = ...,
-) -> Awaitable["ExternalAgentSession"]: ...
+) -> Awaitable["ExternalAgentSession"]:
+    """Discover and spawn one live vendor CLI runtime and return its session handle.
+
+    Args:
+        kind: ``"codex"``, ``"gemini"``, ``"claude"``, or ``"grok"``.
+        workspace: Directory the session operates in.
+        explicit_executable: Exact executable; otherwise the first discovered candidate.
+        instance_id: Optional instance identity (defaults per kind).
+        claude_bridge: Explicit Claude ACP bridge executable (``claude`` kind only).
+        claude_bridge_args: Arguments for ``claude_bridge`` (``claude`` kind only).
+        acknowledge_vendor_terms: Required ``True`` for ``gemini``, whose CLI OAuth reuse
+            is governed by Google's account terms.
+
+    Raises:
+        AikitError: No executable found, terms not acknowledged, invalid options, or spawn
+            failure (code in the message prefix).
+    """
+    ...
 
 
 @final
 class ExternalAgentSession:
+    """One live vendor CLI session created by ``spawn_external_agent_session``.
+
+    Every method except ``descriptor`` and ``events`` is awaitable. Call ``shutdown`` when
+    finished; ``events()`` yields normalized runtime events and fails closed if the
+    subscriber lags behind.
+    """
+
     def __init__(self, _factory_only: NoReturn) -> None: ...
     def descriptor(self) -> Dict[str, Any]: ...
     def initialize(self) -> Awaitable[Dict[str, Any]]: ...
@@ -2536,6 +3395,8 @@ class ExternalAgentSession:
 
 @final
 class ExternalAgentEventStream:
+    """Async iterator of normalized runtime events; a lagged subscriber fails closed."""
+
     def __init__(self, _factory_only: NoReturn) -> None: ...
     def __aiter__(self) -> "ExternalAgentEventStream": ...
     def __anext__(self) -> Awaitable[Dict[str, Any]]: ...
@@ -2543,6 +3404,12 @@ class ExternalAgentEventStream:
 
 @final
 class ExternalUpdateState:
+    """Typed managed-update state machine mirroring the Rust ``RuntimeUpdateState``.
+
+    Every transition is fail-closed, every instant is injected by the caller, and a
+    rejected transition leaves the state untouched. It performs no I/O itself.
+    """
+
     def __init__(self, instance_id: str, profile: ExternalRuntimeProfile) -> None: ...
     @staticmethod
     def from_state(state: ExternalUpdateStateSnapshot) -> ExternalUpdateState: ...

@@ -2,11 +2,16 @@
 
 // Thin wrapper over the napi-built native addon. `cargo build -p aikit-node` produces the cdylib
 // and `scripts/build-node.sh` copies it here as `aikit_node.node`; requiring it runs napi's module
-// init, which registers `Agent`, `query`, and `QueryStream`.
+// init, which registers the native classes (`Agent`, `Client`, `QueryStream`, `DurableRun`, ...)
+// and functions (`query`, `evaluateOutcome`, ...).
 //
-// The only ergonomics we add on top of the raw addon: make the streaming `QueryStream` (which
-// exposes an async `next()` returning the next delta or `null`) idiomatic to consume with
-// `for await`. Generation, memory, routing, orchestration, and governance stay in Rust.
+// The ergonomics added on top of the raw addon: `for await` support (with deterministic close on
+// early exit and AbortSignal) for every pull stream, strict validation of JavaScript option bags,
+// Zod v4 schema adaptation, and reconstruction of branchable `AikitError` values (`code`/`info`)
+// from async native failures. Generation, memory, routing, orchestration, and governance stay in
+// Rust.
+//
+// The public API contract, with TSDoc for every export, lives in `index.d.ts`.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -60,7 +65,8 @@ function loadNative() {
   } catch (cause) {
     const error = new Error(
       `aikit-runtime could not load ${packageName}; optional dependencies may have been omitted ` +
-        "during installation",
+        "during installation (from a source checkout, run ./scripts/build-node.sh to build " +
+        "crates/aikit-node/aikit_node.node)",
     );
     error.cause = cause;
     throw error;
@@ -70,6 +76,12 @@ function loadNative() {
 const native = loadNative();
 const TYPED_ERROR_MARKER = "__AIKIT_TYPED_ERROR__";
 
+/**
+ * Rebuild an `AikitError`-shaped value (`name`, `code`, `info`, `cause`) from a native rejection
+ * that carries the private typed-error marker. Other errors are returned unchanged.
+ * @param {unknown} error
+ * @returns {unknown}
+ */
 function normalizeNativeError(error) {
   const message = typeof error?.message === "string" ? error.message : "";
   const marker = message.indexOf(TYPED_ERROR_MARKER);
@@ -280,7 +292,15 @@ function nativeOptions(options, allowedKeys = RUN_OPTION_KEYS) {
   return [{ ...rest, cancelBeforeStart: signal?.aborted === true }, signal];
 }
 
-/** Pair one canonical tool definition with its host callback for convenient registration. */
+/**
+ * Pair one canonical tool definition with its host callback for convenient registration.
+ * @param {string} name Non-empty tool name advertised to the model.
+ * @param {string} description Tool description advertised to the model.
+ * @param {object} inputSchema JSON Schema for the tool input.
+ * @param {(input: unknown) => Promise<string>} callback Host implementation.
+ * @returns {Readonly<{name: string, description: string, inputSchema: object, callback: Function}>}
+ * @throws {TypeError} When an argument has the wrong type.
+ */
 function tool(name, description, inputSchema, callback) {
   if (typeof name !== "string" || name.length === 0) {
     throw new TypeError("tool name must be a non-empty string");

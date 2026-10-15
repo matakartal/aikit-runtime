@@ -3,6 +3,8 @@
 The CLI is the source-first terminal interface to the same governed Rust core used by the Rust,
 Python, and TypeScript SDKs. It does not reimplement provider routing or agent behavior.
 It is an outbound operator surface; it does not start the experimental inbound A2A or MCP servers.
+For a guided first run (keyless `run`, `providers`, `doctor`, and governance evals), see
+[Getting started](../../docs/GETTING-STARTED.md).
 
 ## Run from the repository
 
@@ -20,8 +22,16 @@ Global syntax:
 aikit [--format text|json|jsonl] [--quiet] <command>
 ```
 
-`--quiet` suppresses non-result informational output. `--version` reports the workspace package
-version; this source preview is `0.3.0-alpha.1`.
+`--quiet` suppresses non-result informational output; errors still print. `--version` reports the
+workspace package version; this source preview is `0.3.0-alpha.1`.
+
+Every command has its own help page with copy-paste examples, and the top-level help lists the exit
+codes:
+
+```bash
+cargo run -p aikit-cli -- --help
+cargo run -p aikit-cli -- agents run --help
+```
 
 ## Commands
 
@@ -40,7 +50,15 @@ export XAI_API_KEY='...'
 cargo run -p aikit-cli -- run --model grok-4.5 "Hello from Grok"
 ```
 
-No command prints credential values.
+No command prints credential values. The model id prefix selects the provider (`claude-*`,
+`gpt-*`/`o1-*`/`o3-*`/`o4-*`, `gemini-*`, `deepseek-*`, `grok-*`/`xai:*`, `openrouter:*`, `groq:*`,
+`mistral:*`). If the matching key is missing or the id matches no provider, the error is followed by
+a `hint:` line naming the environment variable to set or the accepted prefixes:
+
+```text
+aikit: runtime error: no credential active for provider 'anthropic' — add a key first
+hint: set ANTHROPIC_API_KEY in the environment (its value is never printed), then retry; ...
+```
 
 ### Interactive chat
 
@@ -189,7 +207,16 @@ raising any cap requires an explicit CLI option. See the
 | Requested output tokens | 32,768 | `--max-live-output-tokens` |
 | Total wall time | 600 seconds | `--max-live-wall-seconds` |
 
-The dataset must be a regular file no larger than 4 MiB. Symlinks and special files are rejected.
+Governance-trajectory datasets such as `evals/governance-denied.json` need a tool to call; pass
+`--demo-tools allowed` or `--demo-tools denied` to register a keyless, side-effect-free probe tool
+(`denied` also installs a deny rule so the call is refused before execution):
+
+```bash
+cargo run -p aikit-cli -- eval evals/governance-denied.json --demo-tools denied
+```
+
+When a live dataset exceeds a cap, the error states the requested amount so the override value is
+explicit. The dataset must be a regular file no larger than 4 MiB. Symlinks and special files are rejected.
 JSON reports include the runtime/schema version, exact dataset SHA-256, cases, usage, attempts, and
 redacted errors; they do not copy model output or provider metadata.
 
@@ -210,7 +237,8 @@ Global output modes:
 - `--format jsonl` — one compact JSON event per line, required for automated chat streams.
 
 For scripts, select the format explicitly and branch on the process code rather than parsing human
-text. JSONL is mandatory for automated chat because one session produces multiple events; JSON is
+text. Errors go to stderr as `aikit: <message>`, optionally followed by a `hint:` line; neither is a
+stable contract. JSONL is mandatory for automated chat because one session produces multiple events; JSON is
 appropriate for one-shot commands and eval reports.
 
 Stable process codes:
@@ -219,7 +247,7 @@ Stable process codes:
 |---:|---|
 | `0` | Success |
 | `1` | Local I/O or serialization failure |
-| `2` | Invalid input or incompatible CLI mode |
+| `2` | Invalid input, command-line usage error, or incompatible CLI mode |
 | `3` | Agent/provider/runtime failure, including evaluation infrastructure |
 | `4` | Evaluation dataset ran but at least one case failed |
 

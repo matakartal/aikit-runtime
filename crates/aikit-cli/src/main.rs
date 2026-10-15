@@ -45,19 +45,48 @@ const PROVIDERS: [(&str, &str, &str); 8] = [
     ("mistral", "MISTRAL_API_KEY", "mistral:*"),
 ];
 
+const ROOT_LONG_ABOUT: &str = "\
+Governed, provider-aware AI agents from one Rust core.
+
+This is the source-first terminal surface of aikit-runtime (pre-release). It calls the same core
+used by the Rust, Python, and TypeScript SDKs. The default model is `mock-1`, which is keyless,
+offline, deterministic, and free; no live provider, vendor CLI, or updater is selected implicitly.";
+
+const ROOT_AFTER_HELP: &str = "\
+Quick start:
+  aikit run \"Say hello\"                        Keyless, offline mock-1 run
+  aikit doctor                                 Check credentials, workspace, containment
+  aikit providers                              Show which provider keys are active
+  export ANTHROPIC_API_KEY=...                 Activate a live provider (never printed)
+  aikit run --model claude-<id> \"Say hello\"    Use it explicitly
+
+Exit codes:
+  0  success
+  1  local I/O or serialization failure
+  2  invalid input, usage error, or incompatible CLI mode
+  3  agent, provider, or runtime failure (including eval infrastructure)
+  4  eval dataset ran but at least one case failed
+
+Errors are printed to stderr as `aikit: <message>`, sometimes followed by a `hint:` line. Scripts
+should pass --format json or --format jsonl and branch on the exit code, not on human text.
+
+Run `aikit <COMMAND> --help` for command-specific examples.";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "aikit",
     version,
-    about = "Governed, provider-aware AI agents from one Rust core"
+    about = "Governed, provider-aware AI agents from one Rust core",
+    long_about = ROOT_LONG_ABOUT,
+    after_help = ROOT_AFTER_HELP
 )]
 #[command(propagate_version = true, arg_required_else_help = true)]
 struct Cli {
-    /// Output contract for humans or automation.
+    /// Output contract: `text` for humans, `json` for one document, `jsonl` for event streams.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
-    /// Suppress non-result informational output.
+    /// Suppress non-result informational output (banners, notices, hints); errors still print.
     #[arg(long, global = true)]
     quiet: bool,
 
@@ -67,30 +96,122 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum OutputFormat {
+    /// Human-readable output (default).
     Text,
+    /// One pretty-printed JSON document; rejected by multi-event commands.
     Json,
+    /// One compact JSON value per line; required for automated chat and agent runs.
     Jsonl,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run one prompt and print the completed result.
+    #[command(after_help = RUN_AFTER_HELP)]
     Run(RunArgs),
     /// Start a multi-turn terminal conversation.
+    #[command(after_help = CHAT_AFTER_HELP)]
     Chat(ChatArgs),
-    /// List supported providers without exposing credentials.
+    /// List supported providers and whether their key is set, without printing credentials.
+    #[command(after_help = PROVIDERS_AFTER_HELP)]
     Providers,
     /// Discover and use vendor CLI sessions without copying their credentials.
+    #[command(after_help = AGENTS_AFTER_HELP)]
     Agents(AgentsArgs),
-    /// Show currently active provider and runtime capabilities.
+    /// Show currently active provider and runtime capabilities as JSON.
+    #[command(after_help = "Examples:\n  aikit capabilities\n  aikit --format jsonl capabilities")]
     Capabilities,
-    /// Diagnose credentials, workspace access, and containment.
+    /// Diagnose credentials, workspace access, and Bash containment.
+    #[command(after_help = DOCTOR_AFTER_HELP)]
     Doctor(DoctorArgs),
     /// Run a deterministic JSON evaluation dataset; live models require --allow-live.
+    #[command(after_help = EVAL_AFTER_HELP)]
     Eval(EvalArgs),
     /// Generate a shell completion script on stdout.
+    #[command(after_help = COMPLETIONS_AFTER_HELP)]
     Completions(CompletionArgs),
 }
+
+const RUN_AFTER_HELP: &str = "\
+Model routing (by id prefix):
+  mock-1 (default, keyless)   claude-* -> ANTHROPIC_API_KEY   gpt-*/o1-*/o3-*/o4-* -> OPENAI_API_KEY
+  gemini-* -> GEMINI_API_KEY or GOOGLE_API_KEY                deepseek-* -> DEEPSEEK_API_KEY
+  grok-*/xai:* -> XAI_API_KEY   openrouter:* -> OPENROUTER_API_KEY
+  groq:* -> GROQ_API_KEY        mistral:* -> MISTRAL_API_KEY
+
+Examples:
+  aikit run \"Say hello\"
+  aikit run --system \"Be concise\" \"Explain Rust ownership\"
+  printf 'Summarize this' | aikit run
+  aikit --format json run --model grok-4.5 --max-tokens 256 \"Hello\"
+
+A non-mock model makes a billable network call to its provider.";
+
+const CHAT_AFTER_HELP: &str = "\
+Commands inside chat:
+  /help        show chat commands
+  /providers   show provider activation (no secrets)
+  /clear       clear history, keeping the --system instruction
+  /exit        end the session (also /quit or Ctrl-D)
+
+Examples:
+  aikit chat
+  aikit chat --model claude-<id> --system \"Answer in one paragraph\"
+
+Text mode requires an interactive terminal; use `aikit run` for piped input. --format json is
+rejected because chat emits one event per turn; use --format jsonl for automation.";
+
+const PROVIDERS_AFTER_HELP: &str = "\
+A provider is `active` when its conventional environment variable is set to a non-empty value.
+Values are never printed. `mock-1` needs no key and is always available.
+
+Examples:
+  aikit providers
+  aikit --format json providers";
+
+const AGENTS_AFTER_HELP: &str = "\
+External coding-agent runtimes are separate from API-key providers: the vendor CLI owns its account
+session, tool loop, and approvals. aikit never reads, copies, or prints the CLI's tokens.
+
+Examples:
+  aikit agents discover
+  aikit agents status codex
+  aikit agents login codex
+  aikit agents status gemini --acknowledge-vendor-terms
+  aikit agents run codex --mode workspace_write \"Fix the focused test\"
+  aikit --format jsonl agents run grok --approval deny \"Review the current diff\"
+
+Guide: docs/EXTERNAL-AGENTS.md in the repository.";
+
+const DOCTOR_AFTER_HELP: &str = "\
+Statuses: PASS (ready), WARN (usable with a limitation), FAIL (blocking). A credentials warning
+still leaves mock-1 available; a bash_containment warning means Bash tools fail closed while file
+tools keep working.
+
+Examples:
+  aikit doctor
+  aikit doctor --workspace ./my-project
+  aikit --format json doctor";
+
+const EVAL_AFTER_HELP: &str = "\
+Datasets default to mock-1 and run keyless and offline. Any non-mock model is rejected before a
+provider is built unless --allow-live is passed; live runs are then capped by the --max-live-*
+limits. The dataset must be a regular JSON file of at most 4 MiB.
+
+Examples:
+  aikit eval evals/smoke.json
+  aikit --format json eval evals/smoke.json
+  aikit eval evals/governance-denied.json --demo-tools denied
+  aikit eval my-live.json --allow-live --max-live-cases 2
+
+Exit code 4 means the dataset ran and at least one case failed; 3 means provider or runtime
+infrastructure failed. Guide: docs/EVALUATIONS.md in the repository.";
+
+const COMPLETIONS_AFTER_HELP: &str = "\
+Examples:
+  aikit completions bash > ~/.local/share/bash-completion/completions/aikit
+  aikit completions zsh  > ~/.zfunc/_aikit
+  aikit completions fish > ~/.config/fish/completions/aikit.fish";
 
 #[derive(Debug, Args)]
 struct RunArgs {
@@ -98,31 +219,31 @@ struct RunArgs {
     #[arg(value_name = "PROMPT", trailing_var_arg = true)]
     prompt: Vec<String>,
 
-    /// Model id. Examples: mock-1, claude-*, gpt-*, gemini-*, deepseek-*, grok-4.5.
-    #[arg(short, long, default_value = "mock-1")]
+    /// Model id; its prefix selects the provider (see below). Examples: mock-1, grok-4.5.
+    #[arg(short, long, value_name = "MODEL", default_value = "mock-1")]
     model: String,
 
-    /// Maximum output-token budget.
-    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Maximum output-token budget (at least 1).
+    #[arg(long, value_name = "N", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
 
     /// Optional system instruction prepended to the canonical message list.
-    #[arg(long)]
+    #[arg(long, value_name = "TEXT")]
     system: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct ChatArgs {
-    /// Model id used for every turn.
-    #[arg(short, long, default_value = "mock-1")]
+    /// Model id used for every turn; its prefix selects the provider (see `aikit run --help`).
+    #[arg(short, long, value_name = "MODEL", default_value = "mock-1")]
     model: String,
 
-    /// Maximum output-token budget per turn.
-    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Maximum output-token budget per turn (at least 1).
+    #[arg(long, value_name = "N", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
     max_tokens: u64,
 
-    /// Optional system instruction retained across the conversation.
-    #[arg(long)]
+    /// Optional system instruction retained across the conversation (and after /clear).
+    #[arg(long, value_name = "TEXT")]
     system: Option<String>,
 }
 
@@ -134,21 +255,57 @@ struct AgentsArgs {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
-    /// Find installed Codex, Gemini, Claude, and Grok executables.
+    /// Find installed Codex, Gemini, Claude, and Grok executables (inspected, never executed).
+    #[command(
+        after_help = "Examples:\n  aikit agents discover\n  aikit agents discover codex\n  aikit agents discover claude --path /usr/local/bin/claude"
+    )]
     Discover(AgentDiscoverArgs),
-    /// Initialize a runtime and report normalized health/auth status.
+    /// Initialize a runtime and report normalized health/auth status (no model prompt).
+    #[command(
+        after_help = "Examples:\n  aikit agents status codex\n  aikit agents status gemini --acknowledge-vendor-terms\n  aikit agents status claude --bridge /abs/path/to/pinned-claude-acp\n\nIf auth is not ready, run `aikit agents login KIND`."
+    )]
     Status(AgentRuntimeArgs),
     /// Start the vendor-owned login flow without reading or copying tokens.
+    #[command(
+        after_help = "Examples:\n  aikit agents login codex\n  aikit agents login gemini --acknowledge-vendor-terms"
+    )]
     Login(AgentRuntimeArgs),
     /// Ask the vendor runtime to invalidate its current login.
+    #[command(after_help = "Example:\n  aikit agents logout codex")]
     Logout(AgentRuntimeArgs),
     /// Report models advertised by the runtime without issuing a billable prompt.
+    #[command(
+        after_help = "Examples:\n  aikit agents models codex\n  aikit --format json agents models grok\n\nACP runtimes may publish models only after a session starts, so an empty list is not an auth failure."
+    )]
     Models(AgentRuntimeArgs),
-    /// Run one coding-agent session through the vendor CLI.
+    /// Run one coding-agent session through the vendor CLI (may be billed to the vendor account).
+    #[command(after_help = AGENTS_RUN_AFTER_HELP)]
     Run(AgentRunArgs),
     /// Configure, check, apply, or roll back signed runtime updates.
+    #[command(after_help = AGENTS_UPDATE_AFTER_HELP)]
     Update(AgentUpdateArgs),
 }
+
+const AGENTS_RUN_AFTER_HELP: &str = "\
+Examples:
+  aikit agents run codex \"Explain this workspace\"
+  aikit agents run codex --mode workspace_write \"Fix the focused test\"
+  aikit agents run gemini --acknowledge-vendor-terms \"Summarize the README\"
+  printf 'Review the diff' | aikit --format jsonl agents run grok --approval deny
+
+--approval prompt (default) needs an interactive terminal. Automation must choose `deny`, or opt
+into `allow-once` explicitly, and use --format jsonl. Ctrl-C sends protocol cancellation first.";
+
+const AGENTS_UPDATE_AFTER_HELP: &str = "\
+Typical flow:
+  1. aikit agents update configure KIND --manifest-url URL --signature-url URL \\
+       --key-id ID --public-key-base64 KEY [--policy check-only|vendor-managed|aikit-managed]
+  2. aikit agents update status KIND
+  3. aikit agents update sync KIND [--force]
+  4. aikit agents update rollback KIND        (aikit-managed only)
+
+Nothing runs in the background; schedule `aikit agents update sync KIND` with the host scheduler
+for unattended checks.";
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum AgentKindArg {
@@ -172,42 +329,42 @@ impl From<AgentKindArg> for ExternalAgentKind {
 #[derive(Debug, Args)]
 struct AgentDiscoverArgs {
     /// Restrict discovery to one vendor runtime.
-    #[arg(value_enum)]
+    #[arg(value_enum, value_name = "KIND")]
     kind: Option<AgentKindArg>,
 
     /// Exact executable path. Requires KIND and never falls back to PATH if invalid.
-    #[arg(long, requires = "kind")]
+    #[arg(long, value_name = "EXECUTABLE", requires = "kind")]
     path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct AgentRuntimeArgs {
     /// Vendor coding-agent runtime.
-    #[arg(value_enum)]
+    #[arg(value_enum, value_name = "KIND")]
     kind: AgentKindArg,
 
-    /// Runtime instance id. Defaults to the vendor name.
-    #[arg(long)]
+    /// Runtime instance id, for separate accounts. Defaults to the vendor name.
+    #[arg(long, value_name = "ID")]
     instance: Option<String>,
 
     /// Exact vendor CLI executable. Invalid paths fail instead of falling back to PATH.
-    #[arg(long)]
+    #[arg(long, value_name = "EXECUTABLE")]
     path: Option<PathBuf>,
 
     /// Exact, pinned ACP bridge executable for Claude; otherwise AIKit uses its pinned npx bridge.
-    #[arg(long)]
+    #[arg(long, value_name = "EXECUTABLE")]
     bridge: Option<PathBuf>,
 
-    /// Argument passed to a custom pinned Claude ACP bridge. Requires --bridge; @latest is rejected.
-    #[arg(long = "bridge-arg", allow_hyphen_values = true)]
+    /// Argument passed to a custom pinned Claude ACP bridge (repeatable). Requires --bridge; @latest is rejected.
+    #[arg(long = "bridge-arg", value_name = "ARG", allow_hyphen_values = true)]
     bridge_args: Vec<String>,
 
-    /// Default workspace used when ACP session/load requires a cwd.
-    #[arg(long, default_value = ".")]
+    /// Workspace directory used as the session cwd. Must exist.
+    #[arg(long, value_name = "DIR", default_value = ".")]
     workspace: PathBuf,
 
     /// Managed-runtime state root. Defaults to AIKIT_HOME/runtimes or the platform user-data path.
-    #[arg(long)]
+    #[arg(long, value_name = "DIR")]
     runtime_root: Option<PathBuf>,
 
     /// Acknowledge that vendor account terms govern third-party Gemini CLI OAuth integrations.
@@ -224,34 +381,47 @@ struct AgentUpdateArgs {
 #[derive(Debug, Subcommand)]
 enum AgentUpdateCommand {
     /// Persist a signed manifest source and update policy for one runtime.
+    #[command(
+        after_help = "Example (placeholder values, not a production feed):\n  aikit agents update configure gemini \\\n    --manifest-url https://updates.example.com/aikit/gemini/manifest.json \\\n    --signature-url https://updates.example.com/aikit/gemini/manifest.sig \\\n    --key-id stable-2026 \\\n    --public-key-base64 BASE64_RAW_ED25519_PUBLIC_KEY \\\n    --policy aikit-managed"
+    )]
     Configure(AgentUpdateConfigureArgs),
-    /// Show persisted update configuration, state, and active artifact.
+    /// Show persisted update configuration, state, and active artifact (offline).
+    #[command(
+        after_help = "Examples:\n  aikit agents update status gemini\n  aikit --format json agents update status codex --root ./runtimes"
+    )]
     Status(AgentUpdateTargetArgs),
     /// Run a due check and automatically apply AIKit-managed updates.
+    #[command(
+        after_help = "Examples:\n  aikit agents update sync codex\n  aikit agents update sync gemini --force --acknowledge-vendor-terms\n\nChecks honor a 24-hour manifest TTL and failure backoff; --force overrides both once."
+    )]
     Sync(AgentUpdateSyncArgs),
     /// Atomically restore the previous AIKit-managed artifact.
+    #[command(after_help = "Example:\n  aikit agents update rollback codex")]
     Rollback(AgentUpdateRollbackArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 struct AgentUpdateTargetArgs {
     /// Vendor coding-agent runtime.
-    #[arg(value_enum)]
+    #[arg(value_enum, value_name = "KIND")]
     kind: AgentKindArg,
 
-    /// Runtime instance id. Defaults to the vendor name.
-    #[arg(long)]
+    /// Runtime instance id, for separate accounts. Defaults to the vendor name.
+    #[arg(long, value_name = "ID")]
     instance: Option<String>,
 
     /// Managed-runtime state root. Defaults to AIKIT_HOME/runtimes or the platform user-data path.
-    #[arg(long)]
+    #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum AgentUpdatePolicyArg {
+    /// Verify and report a compatible version; never change the install.
     CheckOnly,
+    /// Report that a vendor or package-manager action is required; never invoke it.
     VendorManaged,
+    /// Download, verify, stage, health-check, then atomically activate the signed artifact.
     AikitManaged,
 }
 
@@ -267,7 +437,9 @@ impl From<AgentUpdatePolicyArg> for RuntimeUpdatePolicy {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum AgentUpdateChannelArg {
+    /// Stable releases only (default).
     Stable,
+    /// Preview releases; only when selected explicitly.
     Preview,
 }
 
@@ -285,20 +457,20 @@ struct AgentUpdateConfigureArgs {
     #[command(flatten)]
     target: AgentUpdateTargetArgs,
 
-    /// Credential-free HTTPS URL for the strict JSON compatibility manifest.
-    #[arg(long)]
+    /// Credential-free HTTPS URL (no query string) for the strict JSON compatibility manifest.
+    #[arg(long, value_name = "URL")]
     manifest_url: String,
 
-    /// Credential-free HTTPS URL containing its detached base64 Ed25519 signature.
-    #[arg(long)]
+    /// Credential-free HTTPS URL (no query string) of its detached base64 Ed25519 signature.
+    #[arg(long, value_name = "URL")]
     signature_url: String,
 
     /// Stable identifier for the trusted signing key.
-    #[arg(long)]
+    #[arg(long, value_name = "ID")]
     key_id: String,
 
     /// Base64-encoded raw 32-byte Ed25519 public key.
-    #[arg(long)]
+    #[arg(long, value_name = "BASE64")]
     public_key_base64: String,
 
     /// Update behavior. Only aikit-managed installs binary artifacts automatically.
@@ -319,16 +491,16 @@ struct AgentUpdateSyncArgs {
     #[arg(long)]
     force: bool,
 
-    /// Workspace used for the staged runtime health check.
-    #[arg(long, default_value = ".")]
+    /// Workspace directory used for the staged runtime health check. Must exist.
+    #[arg(long, value_name = "DIR", default_value = ".")]
     workspace: PathBuf,
 
     /// Exact pinned Claude ACP bridge executable for staged health checks.
-    #[arg(long)]
+    #[arg(long, value_name = "EXECUTABLE")]
     bridge: Option<PathBuf>,
 
-    /// Argument passed to a custom pinned Claude ACP bridge.
-    #[arg(long = "bridge-arg", allow_hyphen_values = true)]
+    /// Argument passed to a custom pinned Claude ACP bridge (repeatable).
+    #[arg(long = "bridge-arg", value_name = "ARG", allow_hyphen_values = true)]
     bridge_args: Vec<String>,
 
     /// Acknowledge vendor terms before health-checking an AIKit-managed Gemini runtime.
@@ -341,16 +513,16 @@ struct AgentUpdateRollbackArgs {
     #[command(flatten)]
     target: AgentUpdateTargetArgs,
 
-    /// Workspace used to verify the restored runtime after switching the activation pointer.
-    #[arg(long, default_value = ".")]
+    /// Workspace directory used to verify the restored runtime after switching the activation pointer.
+    #[arg(long, value_name = "DIR", default_value = ".")]
     workspace: PathBuf,
 
     /// Exact pinned Claude ACP bridge executable for the restored runtime health check.
-    #[arg(long)]
+    #[arg(long, value_name = "EXECUTABLE")]
     bridge: Option<PathBuf>,
 
-    /// Argument passed to a custom pinned Claude ACP bridge.
-    #[arg(long = "bridge-arg", allow_hyphen_values = true)]
+    /// Argument passed to a custom pinned Claude ACP bridge (repeatable).
+    #[arg(long = "bridge-arg", value_name = "ARG", allow_hyphen_values = true)]
     bridge_args: Vec<String>,
 
     /// Acknowledge vendor terms before health-checking a restored Gemini runtime.
@@ -378,11 +550,11 @@ struct AgentRunArgs {
     prompt: Vec<String>,
 
     /// Runtime model id. ACP runtimes validate it against advertised session options.
-    #[arg(long)]
+    #[arg(long, value_name = "MODEL")]
     model: Option<String>,
 
     /// Runtime session mode. Codex supports analysis_only, workspace_write, or full_access.
-    #[arg(long)]
+    #[arg(long, value_name = "MODE")]
     mode: Option<String>,
 
     /// Permission behavior for vendor tool calls.
@@ -392,8 +564,8 @@ struct AgentRunArgs {
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
-    /// Workspace used for filesystem jail and containment probing.
-    #[arg(long, default_value = ".")]
+    /// Workspace directory used for filesystem jail and containment probing. Must exist.
+    #[arg(long, value_name = "DIR", default_value = ".")]
     workspace: PathBuf,
 }
 
@@ -407,26 +579,26 @@ struct EvalArgs {
     #[arg(long)]
     allow_live: bool,
 
-    /// Maximum number of paid/network cases permitted in one invocation.
-    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_CASES, value_parser = clap::value_parser!(u64).range(1..=256))]
+    /// Maximum number of paid/network cases permitted in one invocation (1-256).
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_LIVE_CASES, value_parser = clap::value_parser!(u64).range(1..=256))]
     max_live_cases: u64,
 
     /// Aggregate prompt and system-instruction byte ceiling across all live cases.
-    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_INPUT_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_LIVE_INPUT_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
     max_live_input_bytes: u64,
 
     /// Aggregate requested output-token ceiling across all live cases.
-    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_OUTPUT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_name = "TOKENS", default_value_t = DEFAULT_MAX_LIVE_OUTPUT_TOKENS, value_parser = clap::value_parser!(u64).range(1..))]
     max_live_output_tokens: u64,
 
-    /// Hard wall-time ceiling shared by all live cases in this invocation.
-    #[arg(long, default_value_t = DEFAULT_MAX_LIVE_WALL_SECONDS, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    /// Hard wall-time ceiling in seconds shared by all live cases in this invocation (1-86400).
+    #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_MAX_LIVE_WALL_SECONDS, value_parser = clap::value_parser!(u64).range(1..=86_400))]
     max_live_wall_seconds: u64,
 
     /// Register a deterministic in-process demo probe tool so governance-trajectory datasets can
     /// exercise a real tool call. `denied` additionally installs a deny rule so the call is refused
     /// before execution. The probe has no side effects (it echoes its input).
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, value_name = "MODE")]
     demo_tools: Option<DemoTools>,
 }
 
@@ -465,7 +637,7 @@ impl ToolExecutor for DemoProbe {
 #[derive(Debug, Args)]
 struct CompletionArgs {
     /// Target shell.
-    #[arg(value_enum)]
+    #[arg(value_enum, value_name = "SHELL")]
     shell: Shell,
 }
 
@@ -533,7 +705,17 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Run(args) => run_once(&process_agent(), args, cli.format).await,
         Command::Chat(args) => chat(&process_agent(), args, cli.format, cli.quiet).await,
-        Command::Providers => print_providers(&process_agent(), cli.format),
+        Command::Providers => {
+            let agent = process_agent();
+            print_providers(&agent, cli.format)?;
+            if cli.format == OutputFormat::Text && !cli.quiet && agent.active_providers().is_empty()
+            {
+                eprintln!(
+                    "hint: no provider is active; export one CREDENTIAL variable above to enable it (mock-1 always works)"
+                );
+            }
+            Ok(())
+        }
         Command::Agents(args) => run_agent_command(args, cli.format, cli.quiet).await,
         Command::Capabilities => print_value(&process_agent().capabilities(), cli.format),
         Command::Doctor(args) => doctor(&process_agent(), args, cli.format).await,
@@ -757,9 +939,10 @@ async fn sync_agent_update(
             ))
         })?;
     if config.kind != kind {
-        return Err(CliError::Input(
-            "configured runtime kind does not match the requested agent".into(),
-        ));
+        return Err(CliError::Input(format!(
+            "instance {instance_id} is configured for {}, not {kind}; pass the matching KIND or a different --instance",
+            config.kind
+        )));
     }
     let now = unix_millis();
     let activation = store
@@ -939,11 +1122,15 @@ async fn rollback_agent_update(
     let config = store
         .read_update_config(&instance_id)
         .map_err(external_runtime_error)?
-        .ok_or_else(|| CliError::Input("runtime update is not configured".into()))?;
+        .ok_or_else(|| {
+            CliError::Input(format!(
+                "no update source configured for {instance_id}; run `aikit agents update configure {kind} ... --policy aikit-managed` first"
+            ))
+        })?;
     if config.kind != kind || config.policy != RuntimeUpdatePolicy::AikitManaged {
-        return Err(CliError::Input(
-            "rollback is available only for the matching AIKit-managed runtime".into(),
-        ));
+        return Err(CliError::Input(format!(
+            "rollback is available only for the matching AIKit-managed runtime; `aikit agents update status {kind}` shows the configured kind and policy"
+        )));
     }
     let activation = store
         .rollback(&instance_id, unix_millis())
@@ -1149,9 +1336,7 @@ async fn open_external_runtime(
 ) -> Result<Box<dyn ExternalAgentRuntime>, CliError> {
     let kind = ExternalAgentKind::from(args.kind);
     ensure_vendor_terms_acknowledged(kind, args.acknowledge_vendor_terms)?;
-    let workspace = args.workspace.canonicalize().map_err(|error| {
-        CliError::Input(format!("workspace {}: {error}", args.workspace.display()))
-    })?;
+    let workspace = canonical_workspace(&args.workspace)?;
     let instance_id = args
         .instance
         .as_ref()
@@ -1201,7 +1386,7 @@ async fn open_external_runtime(
         .next()
         .ok_or_else(|| {
             CliError::Input(format!(
-                "no {} CLI executable found; install it or pass --path",
+                "no {} CLI executable found; install it, pass --path <EXECUTABLE>, or run `aikit agents discover` to see candidates",
                 kind.command_name()
             ))
         })?;
@@ -1302,9 +1487,7 @@ async fn verify_managed_launch(
     acknowledge_vendor_terms: bool,
 ) -> Result<(), CliError> {
     ensure_vendor_terms_acknowledged(launch.kind, acknowledge_vendor_terms)?;
-    let workspace = workspace
-        .canonicalize()
-        .map_err(|error| CliError::Input(format!("workspace {}: {error}", workspace.display())))?;
+    let workspace = canonical_workspace(workspace)?;
     let runtime = spawn_external_runtime(
         launch.instance_id,
         launch.candidate,
@@ -1407,12 +1590,7 @@ async fn run_external_agent(args: AgentRunArgs, format: OutputFormat) -> Result<
         ));
     }
     let prompt_text = read_prompt(args.prompt)?;
-    let workspace = args.runtime.workspace.canonicalize().map_err(|error| {
-        CliError::Input(format!(
-            "workspace {}: {error}",
-            args.runtime.workspace.display()
-        ))
-    })?;
+    let workspace = canonical_workspace(&args.runtime.workspace)?;
     let runtime = open_external_runtime(&args.runtime).await?;
     let mut events = runtime.subscribe();
     let operation = async {
@@ -1534,7 +1712,9 @@ async fn approval_decision(
                 "a" | "always" => Ok(ExternalApprovalDecision::AcceptForSession),
                 "n" | "no" | "" => Ok(ExternalApprovalDecision::Decline),
                 "c" | "cancel" => Ok(ExternalApprovalDecision::Cancel),
-                _ => Err(CliError::Input("unknown approval response".into())),
+                other => Err(CliError::Input(format!(
+                    "unknown approval response '{other}'; expected y, a, n, or c"
+                ))),
             }
         })
         .await
@@ -1577,6 +1757,74 @@ async fn user_input_answers(detail: Value) -> Result<BTreeMap<String, String>, C
     .map_err(|error| CliError::Runtime(format!("user-input prompt task failed: {error}")))?
 }
 
+/// Convert a provider-path failure into a runtime error that also tells the operator what to do
+/// next. The message keeps the core's original wording; the hint is appended on its own line.
+fn agent_error(error: &aikit::AgentError, model: &str) -> CliError {
+    let hint = agent_error_hint(error, model);
+    CliError::Runtime(match hint {
+        Some(hint) => format!("{error}\nhint: {hint}"),
+        None => error.to_string(),
+    })
+}
+
+fn agent_error_hint(error: &aikit::AgentError, model: &str) -> Option<String> {
+    match error {
+        aikit::AgentError::NoCredential(provider) => Some(match provider_credential(provider) {
+            Some(variable) => format!(
+                "set {variable} in the environment (its value is never printed), then retry; `aikit providers` shows which keys are active, and --model mock-1 runs keyless"
+            ),
+            None => "run `aikit providers` to see which keys are active; --model mock-1 runs keyless".into(),
+        }),
+        aikit::AgentError::UnknownModel(_) => Some(format!(
+            "the model id prefix selects the provider (claude-*, gpt-*, o1-*/o3-*/o4-*, gemini-*, deepseek-*, grok-*, xai:*, openrouter:*, groq:*, mistral:*); '{model}' matches none. See `aikit run --help`, or use --model mock-1"
+        )),
+        aikit::AgentError::NoAdapter(_) => {
+            Some("choose a model from another provider; `aikit providers` lists them".into())
+        }
+        _ => {
+            let info = error.info();
+            let variable = info.provider.as_deref().and_then(provider_credential);
+            match info.code {
+                ErrorCode::ProviderAuth => Some(match variable {
+                    Some(variable) => format!(
+                        "the provider rejected the credential; check that {variable} holds a valid, unexpired key"
+                    ),
+                    None => "the provider rejected the credential; check the configured API key".into(),
+                }),
+                ErrorCode::ProviderRateLimit => Some(match info.retry_after_ms {
+                    Some(ms) => format!("retry after about {} second(s), or lower --max-tokens", ms.div_ceil(1000)),
+                    None => "wait and retry, or lower --max-tokens".into(),
+                }),
+                ErrorCode::ProviderTimeout | ErrorCode::ProviderTransport => {
+                    Some("check network connectivity and any proxy settings, then retry".into())
+                }
+                ErrorCode::ProviderInvalidRequest => Some(format!(
+                    "check that '{model}' is a model id your account can use and that --max-tokens is within its limit"
+                )),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Conventional credential variable(s) for a provider name, from the same table `providers` prints.
+fn provider_credential(provider: &str) -> Option<&'static str> {
+    PROVIDERS
+        .iter()
+        .find(|(name, _, _)| *name == provider)
+        .map(|(_, credential, _)| *credential)
+}
+
+/// Canonicalize a workspace directory with an actionable error.
+fn canonical_workspace(workspace: &Path) -> Result<PathBuf, CliError> {
+    workspace.canonicalize().map_err(|error| {
+        CliError::Input(format!(
+            "workspace {}: {error}; pass --workspace with an existing directory",
+            workspace.display()
+        ))
+    })
+}
+
 fn external_runtime_error(error: impl std::fmt::Display) -> CliError {
     CliError::Runtime(error.to_string())
 }
@@ -1613,9 +1861,10 @@ async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result
     }
     if u64::try_from(live_cases.len()).unwrap_or(u64::MAX) > args.max_live_cases {
         return Err(CliError::Input(format!(
-            "dataset requests {} live case(s); --max-live-cases is {}",
+            "dataset requests {} live case(s); --max-live-cases is {} (raise it to at least {} to proceed)",
             live_cases.len(),
-            args.max_live_cases
+            args.max_live_cases,
+            live_cases.len()
         )));
     }
     let requested_live_input_bytes = live_cases.iter().try_fold(0_u64, |total, case| {
@@ -1632,7 +1881,7 @@ async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result
     };
     if requested_live_input_bytes > args.max_live_input_bytes {
         return Err(CliError::Input(format!(
-            "dataset requests {requested_live_input_bytes} live input byte(s); --max-live-input-bytes is {}",
+            "dataset requests {requested_live_input_bytes} live input byte(s); --max-live-input-bytes is {} (raise it to at least {requested_live_input_bytes} to proceed)",
             args.max_live_input_bytes
         )));
     }
@@ -1646,7 +1895,7 @@ async fn run_eval(agent: &Agent, args: EvalArgs, format: OutputFormat) -> Result
     };
     if requested_live_output_tokens > args.max_live_output_tokens {
         return Err(CliError::Input(format!(
-            "dataset requests {requested_live_output_tokens} live output token(s); --max-live-output-tokens is {}",
+            "dataset requests {requested_live_output_tokens} live output token(s); --max-live-output-tokens is {} (raise it to at least {requested_live_output_tokens} to proceed)",
             args.max_live_output_tokens
         )));
     }
@@ -1808,7 +2057,14 @@ fn is_eval_infrastructure_error(code: ErrorCode) -> bool {
 }
 
 fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
-    let path_metadata = std::fs::symlink_metadata(path)?;
+    // Keep I/O failures in the I/O class (exit code 1) but name the dataset path in the message.
+    let with_path = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("eval dataset {}: {error}", path.display()),
+        )
+    };
+    let path_metadata = std::fs::symlink_metadata(path).map_err(with_path)?;
     if !path_metadata.file_type().is_file() {
         return Err(CliError::Input(
             "eval dataset must be a regular file, not a symlink or special file".into(),
@@ -1819,8 +2075,8 @@ fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options.open(path)?;
-    let metadata = file.metadata()?;
+    let file = options.open(path).map_err(with_path)?;
+    let metadata = file.metadata().map_err(with_path)?;
     if !metadata.file_type().is_file() {
         return Err(CliError::Input(
             "eval dataset must remain a regular file while it is read".into(),
@@ -1828,7 +2084,8 @@ fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
     }
     if metadata.len() > MAX_EVAL_DATASET_BYTES as u64 {
         return Err(CliError::Input(format!(
-            "eval dataset exceeds the {} byte limit",
+            "eval dataset {} exceeds the {} byte limit",
+            path.display(),
             MAX_EVAL_DATASET_BYTES
         )));
     }
@@ -1839,15 +2096,20 @@ fn load_eval_dataset(path: &Path) -> Result<LoadedEvalDataset, CliError> {
             .min(MAX_EVAL_DATASET_BYTES),
     );
     file.take((MAX_EVAL_DATASET_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(with_path)?;
     if bytes.len() > MAX_EVAL_DATASET_BYTES {
         return Err(CliError::Input(format!(
             "eval dataset exceeds the {} byte limit",
             MAX_EVAL_DATASET_BYTES
         )));
     }
-    let dataset = serde_json::from_slice(&bytes)
-        .map_err(|error| CliError::Input(format!("invalid eval dataset JSON: {error}")))?;
+    let dataset = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::Input(format!(
+            "invalid eval dataset JSON in {}: {error}; see docs/EVALUATIONS.md for the schema",
+            path.display()
+        ))
+    })?;
     let digest = Sha256::digest(&bytes);
     let mut sha256 = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -1899,7 +2161,7 @@ async fn run_once(agent: &Agent, args: RunArgs, format: OutputFormat) -> Result<
     let result = agent
         .generate_text_messages(messages, &args.model, args.max_tokens)
         .await
-        .map_err(|error| CliError::Runtime(error.to_string()))?;
+        .map_err(|error| agent_error(&error, &args.model))?;
     let view = RunView {
         model: &args.model,
         text: &result.text,
@@ -1965,7 +2227,10 @@ async fn chat(
         .into_iter()
         .collect::<Vec<_>>();
     if !quiet && format == OutputFormat::Text {
-        eprintln!("aikit chat · model={} · /help for commands", args.model);
+        eprintln!(
+            "aikit chat · model={} · /help for commands · /exit or Ctrl-D to quit",
+            args.model
+        );
     }
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -1983,7 +2248,10 @@ async fn chat(
             "" => continue,
             "/exit" | "/quit" => break,
             "/help" => {
-                eprintln!("/help  /providers  /clear  /exit");
+                eprintln!("/help       show this list");
+                eprintln!("/providers  show provider activation (no secrets)");
+                eprintln!("/clear      clear history, keeping the --system instruction");
+                eprintln!("/exit       end the session (also /quit or Ctrl-D)");
                 continue;
             }
             "/clear" => {
@@ -2001,7 +2269,7 @@ async fn chat(
                 continue;
             }
             value if value.starts_with('/') => {
-                eprintln!("unknown command: {value}");
+                eprintln!("unknown command: {value} (type /help for the list)");
                 continue;
             }
             _ => {}
@@ -2010,7 +2278,7 @@ async fn chat(
         let result = agent
             .generate_text_messages(history.clone(), &args.model, args.max_tokens)
             .await
-            .map_err(|error| CliError::Runtime(error.to_string()))?;
+            .map_err(|error| agent_error(&error, &args.model))?;
         match format {
             OutputFormat::Text => println!("assistant> {}", result.text),
             OutputFormat::Json | OutputFormat::Jsonl => print_value(
@@ -2053,9 +2321,7 @@ fn print_providers(agent: &Agent, format: OutputFormat) -> Result<(), CliError> 
 
 async fn doctor(agent: &Agent, args: DoctorArgs, format: OutputFormat) -> Result<(), CliError> {
     let mut checks = Vec::new();
-    let workspace = args.workspace.canonicalize().map_err(|error| {
-        CliError::Input(format!("workspace {}: {error}", args.workspace.display()))
-    })?;
+    let workspace = canonical_workspace(&args.workspace)?;
     checks.push(DoctorCheck {
         name: "workspace".into(),
         status: "pass",
@@ -2066,7 +2332,7 @@ async fn doctor(agent: &Agent, args: DoctorArgs, format: OutputFormat) -> Result
         name: "credentials".into(),
         status: if active.is_empty() { "warn" } else { "pass" },
         detail: if active.is_empty() {
-            "no provider keys found; mock-1 remains available".into()
+            "no provider keys found; mock-1 remains available (set e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY; see `aikit providers`)".into()
         } else {
             format!("active providers: {}", active.join(", "))
         },
@@ -2086,7 +2352,9 @@ async fn doctor(agent: &Agent, args: DoctorArgs, format: OutputFormat) -> Result
         detail: containment
             .selected_backend
             .map(|backend| format!("selected: {backend:?}"))
-            .unwrap_or_else(|| "no backend selected; Bash will fail closed".into()),
+            .unwrap_or_else(|| {
+                "no backend selected; Bash will fail closed (file tools still work; see --format json doctor for probe details)".into()
+            }),
     });
     let report = DoctorReport {
         ok: checks.iter().all(|check| check.status != "fail"),
@@ -2190,6 +2458,38 @@ mod tests {
             }),
             4
         );
+    }
+
+    #[test]
+    fn clap_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn missing_credential_hint_names_the_environment_variable() {
+        let hint = agent_error_hint(&aikit::AgentError::NoCredential("anthropic"), "claude-x")
+            .expect("missing credentials always carry a hint");
+        assert!(hint.contains("ANTHROPIC_API_KEY"));
+        assert!(hint.contains("mock-1"));
+        let google = agent_error_hint(&aikit::AgentError::NoCredential("google"), "gemini-x")
+            .expect("missing credentials always carry a hint");
+        assert!(google.contains("GEMINI_API_KEY or GOOGLE_API_KEY"));
+    }
+
+    #[test]
+    fn unknown_model_hint_lists_routing_prefixes() {
+        let hint = agent_error_hint(&aikit::AgentError::UnknownModel("foo".into()), "foo")
+            .expect("unknown models always carry a hint");
+        assert!(hint.contains("claude-*"));
+        assert!(hint.contains("'foo'"));
+    }
+
+    #[test]
+    fn every_listed_provider_has_a_credential_variable() {
+        for (provider, credential, _) in PROVIDERS {
+            assert_eq!(provider_credential(provider), Some(credential));
+        }
+        assert_eq!(provider_credential("mock"), None);
     }
 
     #[test]

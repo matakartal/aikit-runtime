@@ -1,6 +1,16 @@
 "use strict";
 
 // Keyless binding conformance for RunOptions, Client, AbortSignal, and early-loop finalization.
+//
+// Build first:  ./scripts/build-node.sh   (then)  node examples/node/run_options.cjs
+//
+// What it shows, in order: a reusable Client with fallback models and retry; maxTurns and budget
+// limits ending a run with typed `max_turns` / `budget_exceeded` errors; misspelled or duplicate
+// snake_case/camelCase option fields being rejected instead of silently ignored; typed startup
+// errors (`error.code` / `error.info`); cancellation through AbortSignal (before the first pull
+// and while a hook is blocked), `close()`, and `for await ... break`; and per-run routing over a
+// caller-owned model catalog. The final RUN_OPTIONS_JSON line is compared byte-for-byte with
+// examples/python/run_options.py by scripts/parity-check.sh, so keep it in lockstep.
 const { Agent, Client } = require("../../crates/aikit-node");
 
 async function drain(stream, expectedErrorCode) {

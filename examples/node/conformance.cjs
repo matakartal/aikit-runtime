@@ -2,6 +2,13 @@
 
 // Keyless, canonical public-surface conformance for the Node binding. Dynamic IDs, timestamps,
 // durations, and raw error text are intentionally normalized away before byte comparison.
+//
+// Build first:  ./scripts/build-node.sh   (then)  node examples/node/conformance.cjs
+//
+// This is a test fixture rather than a tutorial (see quickstart.cjs for that). Each
+// CONFORMANCE_<MODULE>_JSON line is compared byte-for-byte with examples/python/conformance.py and
+// the Rust `conformance` example by scripts/parity-check.sh: comment edits are safe, but any
+// change to behaviour or printed output must land on all three surfaces at once.
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");

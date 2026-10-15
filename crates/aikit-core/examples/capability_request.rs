@@ -1,8 +1,17 @@
-//! Agent-native self-extension, **human-governed** — the loop the "key gir → güçlen" pitch
-//! actually promises. The agent doesn't silently gain power: it *requests* a capability it lacks,
-//! a human decides, the grant is recorded, and only then can it use the tool. No API key needed.
+//! Agent self-extension, **human-governed**. The agent doesn't silently gain power: it *requests*
+//! a capability it lacks, a human decides, the grant is recorded, and only then can it use the
+//! tool. Keyless and offline — the agent's tool calls are made by hand to show each step.
+//!
+//! What it demonstrates:
+//! - `CapabilityGate` wraps your real tools and refuses the gated ones (`Bash` here) until granted.
+//! - The model asks via the `request_capability` tool (`REQUEST_CAPABILITY_TOOL`; expose
+//!   `request_capability_tool()` in the run's tool list so the model can call it).
+//! - `CapabilityBroker` forwards each request to a `ToolApprover` (your human/policy) and records
+//!   grants for the run; `broker.granted()` lists them.
 //!
 //! Run: `cargo run -p aikit-runtime-core --example capability_request`
+//!
+//! Expected: step 1 is refused, step 2 is denied ("trust me"), step 3 is granted, step 4 runs.
 
 use aikit_core::governance::capability::{
     CapabilityBroker, CapabilityGate, REQUEST_CAPABILITY_TOOL,
@@ -52,7 +61,7 @@ async fn main() {
 
     println!("1. Agent tries Bash before asking:");
     match gate.execute("Bash", json!({})).await {
-        Ok(o) => println!("   -> {o}  (!! should have been gated)"),
+        Ok(o) => panic!("Bash should have been gated before a grant, got: {o}"),
         Err(e) => println!("   -> refused: {e}"),
     }
 
@@ -87,7 +96,7 @@ async fn main() {
 
     println!("\ngranted so far: {:?}", broker.granted());
     println!(
-        "\n✅ Self-extension is real but human-governed: the agent requested power, a human decided,\n\
+        "\nOK: self-extension stayed human-governed — the agent requested power, a human decided,\n\
          the grant was recorded, and nothing escalated silently."
     );
 }

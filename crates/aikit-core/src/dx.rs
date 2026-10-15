@@ -42,8 +42,13 @@ const MAX_STRUCTURED_OUTPUT_RETRIES: u32 = 32;
 /// [`Reject`](Self::Reject) terminates immediately with a typed structured-output error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticValidation {
+    /// The object is acceptable; it is returned to the caller as-is.
     Accept,
+    /// Ask the model for a corrected object. The reason is sent to the model and recorded in the
+    /// audit trail (bounded to 1 KiB; control and bidi characters are replaced), so it must be a
+    /// safe summary.
     Retry(String),
+    /// Stop immediately with [`AikitError::StructuredOutput`] carrying the (bounded) reason.
     Reject(String),
 }
 
@@ -106,11 +111,15 @@ impl GeneratedObject {
 /// Rust callers never need to manually duplicate a serde type as an untyped JSON schema.
 #[derive(Debug, Clone)]
 pub struct TypedGeneratedObject<T> {
+    /// The schema-validated object, deserialized into `T`.
     pub value: T,
+    /// Which mechanism actually produced it. See [`GeneratedObject::fidelity`].
     pub fidelity: FidelityGrade,
+    /// How many model round-trips it took (1 = first try).
     pub attempts: u32,
     /// Raw, potentially sensitive provider-native response metadata.
     pub provider_metadata: crate::types::ProviderMetadata,
+    /// Ordered adapter compatibility warnings observed across all attempts.
     pub warnings: Vec<crate::contract::ProviderWarning>,
 }
 
@@ -122,9 +131,13 @@ pub struct TypedGeneratedObject<T> {
 pub enum ObjectStreamEvent {
     /// A model round-trip is about to begin. Attempts after the first are validation repairs.
     AttemptStarted {
+        /// 1-based attempt number.
         attempt: u32,
+        /// `max_retries + 1`: the most attempts this call will make.
         total_attempts: u32,
+        /// The mechanism requested for every attempt of this call.
         fidelity: FidelityGrade,
+        /// `true` for every attempt after the first.
         repair: bool,
     },
     /// An unmodified canonical provider delta, delivered before the full object is available.
@@ -132,8 +145,11 @@ pub enum ObjectStreamEvent {
     /// The completed candidate could not be parsed, did not satisfy the schema, or requested a
     /// semantic repair.
     ValidationFailed {
+        /// The attempt whose candidate failed.
         attempt: u32,
+        /// Why it failed. This is the same text fed back to the model on the repair attempt.
         error: String,
+        /// Whether another repair attempt follows; when `false` the stream ends with an error.
         will_retry: bool,
     },
     /// The first fully parsed, schema-valid, and semantically accepted result.
@@ -158,6 +174,8 @@ pub struct ObjectOptions {
     /// are applied after these options, so a caller cannot accidentally override the schema or
     /// weaken the reported fidelity grade.
     pub provider_options: crate::types::ProviderOptions,
+    /// How unsupported request parameters are handled. The default,
+    /// [`Strict`](crate::contract::CompatibilityMode::Strict), rejects them before network I/O.
     pub compatibility_mode: crate::contract::CompatibilityMode,
     /// Optional application-level validator, run only after JSON Schema succeeds. The callback
     /// must be pure/idempotent and may accept, request a bounded repair, or reject immediately.
@@ -257,7 +275,9 @@ async fn validate_semantics(
             bounded_semantic_reason(reason, "callback returned an error")
         ))),
         Err(_) => Err(AikitError::StructuredOutput(
-            "semantic validator panicked; object rejected".into(),
+            "semantic validator panicked; object rejected (fix the validator callback so it \
+             returns Accept, Retry, or Reject instead of panicking)"
+                .into(),
         )),
     }
 }
@@ -434,7 +454,9 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
 {
     let schema = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
-        AikitError::StructuredOutput(format!("schema encoding failed: {error}"))
+        AikitError::StructuredOutput(format!(
+            "schema encoding failed for the Rust output type: {error}; check its JsonSchema derive"
+        ))
     })?;
     let generated = generate_object(
         provider,
@@ -448,7 +470,9 @@ where
     .await?;
     let value = serde_json::from_value(generated.value).map_err(|error| {
         AikitError::StructuredOutput(format!(
-            "validated result could not be decoded into the Rust type: {error}"
+            "validated result could not be decoded into the Rust type: {error}; the type's \
+             JsonSchema and Deserialize impls likely disagree (check #[serde] attributes such \
+             as rename, flatten, default, or deny_unknown_fields)"
         ))
     })?;
     Ok(TypedGeneratedObject {
@@ -474,7 +498,9 @@ where
     T: DeserializeOwned + schemars::JsonSchema,
 {
     let schema = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
-        AikitError::StructuredOutput(format!("schema encoding failed: {error}"))
+        AikitError::StructuredOutput(format!(
+            "schema encoding failed for the Rust output type: {error}; check its JsonSchema derive"
+        ))
     })?;
     let generated = generate_object_messages(
         provider,
@@ -488,7 +514,9 @@ where
     .await?;
     let value = serde_json::from_value(generated.value).map_err(|error| {
         AikitError::StructuredOutput(format!(
-            "validated result could not be decoded into the Rust type: {error}"
+            "validated result could not be decoded into the Rust type: {error}; the type's \
+             JsonSchema and Deserialize impls likely disagree (check #[serde] attributes such \
+             as rename, flatten, default, or deny_unknown_fields)"
         ))
     })?;
     Ok(TypedGeneratedObject {
@@ -633,7 +661,9 @@ pub fn stream_object_observed(
 fn validate_object_messages(messages: Vec<Message>) -> Result<Vec<Message>> {
     if messages.is_empty() {
         return Err(AikitError::Configuration(
-            "structured input messages must not be empty".into(),
+            "structured input messages must not be empty; pass a prompt string or at least one \
+             user message"
+                .into(),
         ));
     }
     if !messages
@@ -641,7 +671,9 @@ fn validate_object_messages(messages: Vec<Message>) -> Result<Vec<Message>> {
         .any(|message| message.role == crate::types::Role::User)
     {
         return Err(AikitError::Configuration(
-            "structured input messages require at least one user message".into(),
+            "structured input messages require at least one user message; system, assistant, \
+             and tool messages alone give the model nothing to answer"
+                .into(),
         ));
     }
     Ok(messages)
@@ -795,7 +827,9 @@ pub fn stream_object_messages_observed(
     Box::pin(async_stream::try_stream! {
         let total_attempts = total_attempts.ok_or_else(|| {
             AikitError::Configuration(format!(
-                "structured output max_retries cannot exceed {MAX_STRUCTURED_OUTPUT_RETRIES}"
+                "structured output max_retries cannot exceed {MAX_STRUCTURED_OUTPUT_RETRIES} \
+                 (got {}); lower max_retries",
+                options.max_retries
             ))
         })?;
         let base_messages = base_messages?;
@@ -1063,9 +1097,7 @@ pub fn stream_object_messages_observed(
                                     will_retry,
                                 };
                                 if !will_retry {
-                                    Err(AikitError::StructuredOutput(format!(
-                                        "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
-                                    )))?;
+                                    Err(exhausted_repairs_error(total_attempts, &last_error))?;
                                 }
                                 continue;
                             }
@@ -1123,15 +1155,22 @@ pub fn stream_object_messages_observed(
                 will_retry,
             };
             if !will_retry {
-                Err(AikitError::StructuredOutput(format!(
-                    "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
-                )))?;
+                Err(exhausted_repairs_error(total_attempts, &last_error))?;
             }
         }
-        Err(AikitError::StructuredOutput(format!(
-            "failed to produce a valid object after {total_attempts} attempt(s): {last_error}"
-        )))?;
+        Err(exhausted_repairs_error(total_attempts, &last_error))?;
     })
+}
+
+/// The terminal error once every validation-repair attempt failed. The last validation error is
+/// kept verbatim (it is what the model was asked to fix); the trailing hint names the knobs a
+/// caller can actually turn. This text is host-facing only and is never sent to the model.
+fn exhausted_repairs_error(total_attempts: u32, last_error: &str) -> AikitError {
+    AikitError::StructuredOutput(format!(
+        "failed to produce a valid object after {total_attempts} attempt(s): {last_error}; \
+         hint: simplify or loosen the schema, make the prompt state the required fields, or \
+         raise max_retries (at most {MAX_STRUCTURED_OUTPUT_RETRIES})"
+    ))
 }
 
 fn stream_delta_error(

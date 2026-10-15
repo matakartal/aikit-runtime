@@ -2,25 +2,38 @@
 
 This directory contains the napi binding for the local aikit Rust workspace. It exposes the same
 canonical agent, streaming, structured-output, routing, memory, governance, and hook behavior as
-the Rust core, with TypeScript declarations in `index.d.ts`.
+the Rust core, with TypeScript declarations (including TSDoc for every export) in `index.d.ts`.
 
 > The npm distribution name is **`aikit-runtime`**; the existing bare `aikit` package is unrelated.
 > Local artifact assembly reserves `aikit-runtime-{platform}` for native packages and the wrapper
-> selects that shape automatically. No npm registry publication is currently claimed or planned.
+> selects that shape automatically. No npm registry publication is currently claimed or planned,
+> so today you build the binding from this checkout.
+
+## Prerequisites
+
+- Node.js 18.17 or newer (the package `engines` range)
+- A Rust toolchain, to compile the native addon
+- Optional: `zod` v4, only if you want to pass Zod schemas to `generateObject` / `streamObject`
 
 ## Build from this checkout
 
 ```bash
-# from the repository root
-./scripts/build-node.sh
-node examples/node/agent_governance.cjs
-node examples/node/run_options.cjs
+# from the repository root; rerun after changing Rust code
+./scripts/build-node.sh            # debug build; pass `release` for an optimized one
+node examples/node/quickstart.cjs  # keyless guided tour: start here
 ```
 
+`build-node.sh` compiles the cdylib with cargo and copies it to `crates/aikit-node/aikit_node.node`,
+which `index.js` loads. More runnable examples, all keyless except `live_provider.cjs`, are listed
+in the [Node examples guide](../../examples/node/README.md).
+
+## Quick start
+
 ```js
-const { Agent, tool } = require("./crates/aikit-node");
+const { Agent, tool } = require("./crates/aikit-node"); // path relative to the repository root
 
 async function main() {
+  // fromEnv({}) ignores your shell, so only the deterministic keyless mock models are active.
   const agent = Agent.fromEnv({});
   agent.addToolDefinition(tool(
     "lookup",
@@ -34,12 +47,78 @@ async function main() {
     properties: { status: { type: "string", enum: ["ok"] } },
   };
   for await (const event of agent.streamObject("Return status", schema)) {
-    if (event.type === "completed") console.log(event.object.value);
+    if (event.type === "completed") console.log(event.object.value); // { status: 'ok' }
   }
 }
 
 main();
 ```
+
+Everything above runs offline against the built-in mock provider (`mock-1` for text,
+`mock-structured` for objects). Its canned text replies are a fixed Turkish sentence; that is
+expected.
+
+### Going live
+
+`new Agent()` activates every supported provider key it finds in `process.env`
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, ...). You can also add
+keys explicitly; the provider is inferred from the key format unless you name it:
+
+```js
+const agent = new Agent();
+agent.addKey(process.env.ANTHROPIC_API_KEY);        // returns "anthropic"
+agent.addKey(process.env.OPENAI_API_KEY, "openai"); // bare `sk-` keys are ambiguous: name them
+console.log(agent.activeProviders());
+const { text } = await agent.generateText("Say hello", { model: "<a model id from that provider>" });
+```
+
+`shippedModelCatalog()` lists reviewed model ids offline. Live calls are real, billed API requests;
+see [`examples/node/live_provider.cjs`](../../examples/node/live_provider.cjs) for a capped,
+opt-in example.
+
+## Errors and troubleshooting
+
+Failures that come from the core carry a stable `code` (an `ErrorCode`) and a redacted `info`
+envelope (`ErrorInfo`: provider, model, HTTP status, `retryable`, `retry_after_ms`). Branch on
+`error.code`, never on message text. `AikitError` is a TypeScript interface, not a runtime class,
+so `instanceof` does not work:
+
+```js
+try {
+  await agent.generateText("hello", { model: "gpt-5" });
+} catch (error) {
+  if (error.code === "provider_auth") console.error("add a key for this provider first");
+  else if (error.info?.retryable) console.error("transient failure; retry later");
+  else throw error;
+}
+```
+
+| Symptom | Cause and fix |
+|---|---|
+| `aikit-runtime could not load aikit-runtime-<platform>` | The local addon is missing. Run `./scripts/build-node.sh` from the repository root (the wrapper only falls back to platform packages when `aikit_node.node` is absent). |
+| `code: "provider_auth"`, message `no credential active for provider '...'` | The requested model's provider has no key. Use `new Agent()` with the env var set, or `agent.addKey(...)`. |
+| `TypeError: RunOptions contains unknown field '...'` | Option bags are validated strictly so a typo cannot silently weaken a run. Check the field name against `index.d.ts`. |
+| `... is single-consumer; concurrent or re-entrant next() ...` | A stream was read from two places at once. Use one `for await` loop, or await each `next()` before the next call. |
+| `aikit received a Zod schema, but optional peer dependency 'zod' is not installed` | Install `zod` v4, or pass a plain JSON Schema object. |
+| `registerBuiltinTools must be called before enabling contained Bash` | Call `agent.registerBuiltinTools([root])` before `enableBashWithRequiredContainment()`. |
+
+## API at a glance
+
+| Area | Entry points |
+|---|---|
+| Agent setup | `new Agent()`, `Agent.fromEnv(env)`, `addKey`, `activeProviders`, `capabilities` |
+| Text | `generateText`, `streamText`, `run` (full `RunOptions`), `agent.client()` / `Client.query` |
+| Structured output | `generateObject`, `streamObject` (JSON Schema or Zod v4, optional semantic `validator`) |
+| Tools | `tool(...)` + `addToolDefinition`, `addTool`, `registerBuiltinTools`, `registerMcp`, `registerWebTools`, `registerBrowserTools` |
+| Governance | `setPermissions`, `canUseTool`, `onUserPrompt`, `onPreToolUse`, `onPostToolUse`, `onPostToolFailure`, `onFailure`, `onStop`, `enableCapabilityRequests`, `enableDefaultGuardrails` |
+| State | `configureJsonlAudit`, `useMemoryFile` / `useSqliteMemory`, `useSessionFile` / `useSqliteSessions`, `remember`, `rememberCas`, `recall`, `recoverExpiredSession` |
+| Orchestration | `subtask`, `runSubagent`, `parallel` / `fanOut`, `council`, `resumeSubagent`, `route` |
+| Evaluation | `evaluateOutcome`, `evaluateTrace` |
+| Durability and policy | `DurableRun`, `sealPolicySnapshot`, `sealGovernanceBinding`, `normalizeOpaDecision`, `normalizeCedarDecision` |
+| Models and media | `shippedModelCatalog`, `resolveModelCatalog`, `modelCapabilityState`, `validateModelProfile`, `validateMediaInput`, `validateMediaArtifact` |
+| Protocols | `McpConnection`, `A2aMapper`, external vendor-CLI agents (`spawnExternalAgentSession`, ...; see [External agents](../../docs/EXTERNAL-AGENTS.md)) |
+
+Hover any of these in an editor for TSDoc with defaults, thrown errors, and examples.
 
 ## Canonical input and structured output
 
@@ -250,6 +329,7 @@ containment. Apply separate process isolation when callback code is untrusted.
 | Guide | Purpose |
 |---|---|
 | [Root README](../../README.md) | Project overview and multi-language quick start |
+| [Node examples](../../examples/node/README.md) | Runnable keyless learning path and the live-provider example |
 | [Architecture](../../docs/ARCHITECTURE.md) | Core ownership, run lifecycle, state, and trust boundaries |
 | [Feature reference](../../docs/FEATURES.md) | Full capability and governance reference |
 | [Threat model](../../docs/THREAT-MODEL.md) | Containment guarantees and exclusions |

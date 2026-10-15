@@ -1,8 +1,22 @@
-//! A keyless, runnable demonstration of aikit's flagship: the governed tool suite — a filesystem
-//! sandbox + built-in tools + the permission engine — the combination no other multi-provider SDK
-//! ships in one package. No API key required.
+//! The governed tool suite: a filesystem sandbox + built-in tools + the permission engine +
+//! process hardening, composed without any model in the loop. Keyless and offline.
+//!
+//! What it demonstrates, step by step:
+//! 1. `Sandbox::jail` confines the built-in file tools (`Read`, `Write`, ...) to one workspace.
+//! 2. `Write`/`Read` work inside the jail.
+//! 3. A read outside the jail (`/etc/hosts`) is refused by the sandbox.
+//! 4. A `PermissionEngine` rule denies `rm -rf`, including a whitespace-obfuscated variant.
+//! 5. An allowed `Bash` command runs. Bash is opt-in (`.with_bash()`) and is NOT jailed by the
+//!    sandbox — the permission engine (and, if configured, OS containment) is its guard.
+//! 6. The default `BashPolicy` scrubs the environment, so the shell cannot read API keys.
+//!
+//! In a real run you pass `tools` as the agent's executor and `gov` as `AgentOptions::governance`;
+//! the runtime then calls `authorize` before every tool call, exactly as step 4 does by hand.
 //!
 //! Run: `cargo run -p aikit-runtime-core --example governed_tools`
+//!
+//! Expected: every escape attempt prints `DENIED`, `ls -la` prints `ALLOWED`, and the API-key
+//! probe prints `key=CLEARED`. The workspace is a temp directory removed at the end.
 
 use aikit_core::{
     Authorization, BuiltinTools, Governance, PermissionEngine, PermissionMode, Rule, Sandbox,
@@ -40,8 +54,8 @@ async fn main() {
         Err(e) => println!("Read  /etc/hosts       -> DENIED: {e}"),
     }
 
-    // 4. The permission engine: deny the dangerous Bash, allow the rest. Note the third command
-    //    hides the space as a TAB — a bypass the audit caught; it is denied correctly now.
+    // 4. The permission engine: deny the dangerous Bash, allow the rest. The third command hides
+    //    the space as a TAB; the `\s+` in the rule matches it, so it is denied too.
     let gov = Governance::new(
         PermissionEngine::with_rules(
             PermissionMode::Allow,
@@ -64,7 +78,7 @@ async fn main() {
     }
 
     // 5. An allowed Bash command actually runs through the suite (Bash is opt-in and NOT jailed —
-    //    the permission engine is its guard, which is exactly why steps 4 matters).
+    //    the permission engine is its guard, which is exactly why step 4 matters).
     let out = tools
         .execute("Bash", json!({ "command": "echo governed" }))
         .await
@@ -91,7 +105,8 @@ async fn main() {
 
     let _ = std::fs::remove_dir_all(&workspace);
     println!(
-        "\n✅ governed tool suite: sandbox + permissions + built-in tools + process hardening \
-         (scrubbed env), all provider-agnostic."
+        "\nOK: governed tool suite demonstrated — sandbox + permissions + built-in tools + process \
+         hardening (scrubbed env), all provider-agnostic.\n\
+         Next: run `--example defense_in_depth` to see these layers stacked with guardrails."
     );
 }

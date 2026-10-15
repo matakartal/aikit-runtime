@@ -1,13 +1,17 @@
-"""Phase 0 FFI spike — proves the two hard cross-language seams end to end.
+"""Phase 0 FFI spike: the two hard cross-language seams, end to end (historical, still in CI).
 
-Run (after `maturin develop` in the aikit-py crate's venv):
+Run from the repository root after building the binding (see examples/python/README.md):
 
-    python examples/python/spike.py
+    .venv/bin/python examples/python/spike.py
 
-It uses the in-memory MockProvider (no API key, deterministic), so all it exercises is the
-FFI architecture:
-  1. streaming OUT   — Rust tokio loop -> Python `async for`
-  2. tool callback IN — Rust loop awaits a Python `async def` across the boundary
+Keyless and offline: it uses the deterministic in-memory mock model (`mock-1`), so all it
+exercises is the FFI architecture:
+  1. streaming OUT    -- Rust tokio loop -> Python `async for`
+  2. tool callback IN -- Rust loop awaits a Python `async def` across the boundary
+
+New to aikit? Start with examples/python/quickstart.py instead; this file keeps the original
+milestone shape (a hand-written tool class and the low-level `aikit.query` function). See
+docs/PHASE-0-SPIKE.md for the background.
 """
 
 import asyncio
@@ -18,8 +22,9 @@ import aikit
 class Tool:
     """Minimal tool object: metadata attributes + an async __call__(input_dict) -> str.
 
-    The real SDK will provide an `@tool` decorator; the spike only needs the shape the
-    Rust binding reads (name / description / input_schema / async callable).
+    The binding now also ships an `aikit.tool(...)` decorator (see quickstart.py); the spike
+    keeps the bare shape the Rust binding reads (name / description / input_schema / async
+    callable) to show that any object with those attributes works.
     """
 
     def __init__(self, name, description, input_schema, fn):
@@ -36,13 +41,13 @@ async def search_db(tool_input):
     # A real async tool: awaits (simulated I/O) and returns a string result.
     await asyncio.sleep(0.01)
     q = tool_input.get("q")
-    return f"[db] '{q}' için 3 sonuç bulundu"
+    return f"[db] 3 results for '{q}'"
 
 
 async def main():
     tool = Tool(
         name="search_db",
-        description="veritabanında ara",
+        description="search the database",
         input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
         fn=search_db,
     )
@@ -51,7 +56,7 @@ async def main():
     saw_tool_result = False
     final_text = ""
 
-    async for ev in aikit.query("veritabanında merhaba ara", tools=[tool], model="mock-1"):
+    async for ev in aikit.query("search the database for merhaba", tools=[tool], model="mock-1"):
         kind = ev.get("type")
         if kind == "message_start":
             print(f"[message_start] model={ev['model']}")
@@ -73,13 +78,14 @@ async def main():
         elif kind == "error":
             raise RuntimeError(f"stream error: {ev['message']}")
 
-    assert saw_tool_call, "seam 1 FAIL: hiç tool_call gelmedi"
-    assert saw_tool_result, "seam 2 FAIL: Python tool çalışmadı / sonucu dönmedi"
-    assert "tamamladım" in final_text, "loop ikinci turdan sonra final metni üretmedi"
+    assert saw_tool_call, "seam 1 FAIL: no tool_call was streamed"
+    assert saw_tool_result, "seam 2 FAIL: the Python tool did not run or return its result"
+    # The mock model's canned final answer is Turkish ("... görevi tamamladım" = "task done").
+    assert "tamamladım" in final_text, "the loop produced no final text after the second turn"
 
-    print("\n\nSPIKE OK ✅  — iki FFI geçişi de çalıştı:")
+    print("\n\nSPIKE OK ✅  — both FFI seams work:")
     print("  1) stream-out:      Rust tokio loop -> Python async for")
-    print("  2) tool-callback-in: Rust loop -> Python async def -> sonuç geri Rust'a")
+    print("  2) tool-callback-in: Rust loop -> Python async def -> result back into Rust")
 
 
 if __name__ == "__main__":
