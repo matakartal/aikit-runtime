@@ -3,9 +3,15 @@
 // The agent-native + governance surface from Node (keyless) — a byte-for-byte behavioural mirror
 // of examples/python/agent_governance.py, driven by the SAME Rust core. This is the cross-language
 // parity proof: a permission policy and the "key gir → güçlen" primitive behave identically in
-// Python and in Node because both are thin shells over aikit-runtime-core.
+// Python and in Node because both are thin shells over aikit-runtime-core. ("key gir → güçlen" is
+// Turkish for "add a key → get stronger": capabilities grow as provider keys are added.)
 //
 // Build first:  ./scripts/build-node.sh   (then)  node examples/node/agent_governance.cjs
+//
+// New to the binding? Start with quickstart.cjs; this file is denser because it doubles as a
+// parity test. scripts/parity-check.sh compares its PARITY_JSON line byte-for-byte with the
+// Python demo and the Rust `parity` example, and its GOVERNANCE_JSON / BINDING_STREAM_JSON
+// lines with examples/python/agent_governance.py, so keep its printed facts in lockstep.
 
 const path = require("node:path");
 const { Agent, query } = require(

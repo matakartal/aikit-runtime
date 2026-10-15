@@ -1,13 +1,77 @@
 //! # aikit-runtime-core
 //!
-//! The agent-native, governed, provider-agnostic runtime **core** — "the brain". Pure Rust,
-//! no FFI: the PyO3 (`aikit-py`) and napi (`aikit-node`) bindings sit on top of this crate,
-//! and the native Rust API re-exports it. Correctness-critical logic (canonical schema,
-//! reasoning-state replay, the agent loop, governance) lives here exactly once, so behaviour
-//! is identical across providers *and* across languages.
+//! The governed, provider-agnostic agent runtime **core**. Pure Rust, no FFI: the PyO3
+//! (`aikit-py`) and napi (`aikit-node`) bindings sit on top of this crate, and the
+//! `aikit-runtime` crate re-exports it as the Rust package applications depend on.
+//! Correctness-critical logic (canonical schema, reasoning-state replay, the agent loop,
+//! governance) lives here exactly once, so behaviour is identical across providers *and*
+//! across languages.
 //!
-//! Phase 0 (this milestone) proves the two hard FFI seams end-to-end with a [`MockProvider`]:
-//! streaming out to the host, and calling a host tool back in via [`ToolExecutor`].
+//! Status: `0.3.0-alpha.1`, source-first. Public APIs may still change between alpha releases.
+//!
+//! ## Where to start
+//!
+//! | You want to… | Start with |
+//! |---|---|
+//! | Run a prompt with whatever provider keys are in the environment | [`Agent::from_process_env`], [`Agent::generate_text`], [`Agent::stream_text`] |
+//! | One options object for streaming runs (tools, governance, budget, retry, routing) | [`Client`], [`AgentOptions`], [`query`] |
+//! | Typed / structured output | [`generate_object`], [`generate_object_typed`], [`stream_object`] |
+//! | Expose your own tools to the model | [`ToolSpec`], [`ToolExecutor`], [`tool`], [`ToolRouter`] |
+//! | Sandboxed file tools and opt-in Bash | [`BuiltinTools`], [`Sandbox`], [`BashPolicy`] |
+//! | Authorize every tool call before it runs | [`Governance`], [`PermissionEngine`], [`PolicySpec`], [`ToolApprover`] |
+//! | Redact secrets/PII or block inputs at the tool boundary | [`GuardedExecutor`], [`GuardrailChain`] |
+//! | Drive the loop directly (custom provider, recorder, message history) | [`run_agent`], [`RunConfig`], [`Provider`] |
+//! | Test without API keys or network | [`MockProvider`] (any model id starting with `mock`, e.g. `mock-1`) |
+//!
+//! ## Quick start (keyless)
+//!
+//! Model ids starting with `mock` resolve to the deterministic [`MockProvider`], so this runs
+//! without credentials or network. Swap in a real model id once the matching key (for example
+//! `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) is set in the environment.
+//!
+//! ```
+//! use aikit_core::Agent;
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), aikit_core::AgentError> {
+//! let agent = Agent::from_process_env();
+//! let reply = agent.generate_text("hello", "mock-1", 64).await?;
+//! println!("{}", reply.text);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Module map
+//!
+//! - **Entry points:** [`agent`] (credential-driven [`Agent`]), [`client`] ([`Client`],
+//!   [`AgentOptions`], [`query`]), [`dx`] (structured output), [`runtime`] (the loop itself).
+//! - **Canonical schema & contracts:** [`types`] ([`Message`], [`ContentBlock`], [`StreamDelta`]),
+//!   [`contract`] (versioned [`StreamEvent`]s), [`streaming`], [`error`].
+//! - **Providers & models:** [`providers`], [`credentials`], [`capabilities`], [`catalog`],
+//!   [`routing`], [`resilience`] (retry/fallback), [`reasoning`] (reasoning-state replay).
+//! - **Tools:** [`tools`] (executor boundary, built-in and web tools), [`mcp`] (MCP client).
+//! - **Governance:** [`governance`] — permissions, policy, hooks, sandbox, containment,
+//!   guardrails, plan review, capability requests, risk scoring, off-prompt outputs, egress.
+//! - **Limits & context:** [`budget`], [`compaction`], [`cancellation`].
+//! - **State & durability:** [`session`], [`memory`], [`sqlite`], [`durability`],
+//!   [`durable_store`], [`durable_runtime`], [`durable_worker`], [`temporal_adapter`]
+//!   (and `postgres_store` behind the `postgres-store` feature).
+//! - **Multi-agent & protocols:** [`orchestration`], [`external_agent`], [`protocols`].
+//! - **Media:** [`multimodal`], [`media_runtime`], [`provider_media`].
+//! - **Observability & evaluation:** [`observability`] (audit/trace; an OpenTelemetry sink
+//!   behind the `opentelemetry` feature), [`eval`], [`trace_eval`], [`provider_validation`].
+//!
+//! ## Runnable examples
+//!
+//! Each example below is keyless and deterministic:
+//! `cargo run -p aikit-runtime-core --example <name>`.
+//!
+//! - `governed_tools` — sandboxed file tools, permission rules, scrubbed Bash environment.
+//! - `guardrails` — redacting secrets/PII from tool output, blocking a destructive input.
+//! - `plan_mode` — a human reviews (and revises) the agent's plan before any tool runs.
+//! - `capability_request` — the agent asks a human to unlock a gated tool.
+//! - `defense_in_depth` — the decision and execution layers composed.
+//! - `policy`, `smart_approval`, `reliability`, `structured_output` — smaller focused demos.
 
 pub mod agent;
 pub mod budget;

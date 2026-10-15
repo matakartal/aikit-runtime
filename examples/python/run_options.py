@@ -1,4 +1,22 @@
-"""Keyless binding conformance for RunOptions, Client, and deterministic cancellation."""
+"""Keyless binding conformance for RunOptions, Client, and deterministic cancellation.
+
+Run from the repository root after building the binding (see examples/python/README.md):
+
+    .venv/bin/python examples/python/run_options.py
+
+Shows, against the deterministic in-memory mock model (no API key, no network):
+  - `Client(agent).query(...)` and `agent.run(...)` with RunOptions: model, fallback_models,
+    max_tokens, max_turns, provider_options, retry, and budget;
+  - `max_turns` and `budget` limits ending a run with a typed terminal status and error code;
+  - misspelled option fields (budget, retry, compaction) and unsafe permission rules raising
+    `ValueError` (fail closed) instead of being silently ignored;
+  - the typed error envelope (`error.code` / `error.info["code"]`) for an unknown model;
+  - cancellation before the first pull and while a host hook is blocked, plus `async with`
+    closing a stream early.
+
+The last line (`RUN_OPTIONS_JSON=...`) is a parity contract: scripts/parity-check.sh compares it
+byte-for-byte with examples/node/run_options.cjs, so keep its facts and formatting unchanged.
+"""
 
 import asyncio
 import json

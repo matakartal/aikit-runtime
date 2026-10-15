@@ -59,7 +59,7 @@ impl Agent {
     }
 
     /// Self-configure from environment pairs (name, value). Every non-empty var that maps to a
-    /// known provider activates it — the "key gir → güçlen" flow. Unknown vars and blank
+    /// known provider activates it — the drop-in-a-key flow. Unknown vars and blank
     /// credentials are ignored. If both Google aliases are present, `GOOGLE_API_KEY` follows the
     /// official client-library precedence regardless of iterator order. The core stays pure by
     /// taking the pairs as input.

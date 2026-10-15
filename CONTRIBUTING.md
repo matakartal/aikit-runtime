@@ -81,13 +81,19 @@ see [`docs/LIVE-SMOKE.md`](docs/LIVE-SMOKE.md).
 
 ### Useful examples
 
+New to the project? [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) walks through these in order,
+and the [Python](examples/python/README.md) and [Node](examples/node/README.md) example guides
+explain each binding example (start with `quickstart.py` / `quickstart.cjs`).
+
 ```bash
 cargo run -p aikit-runtime --example quickstart
 cargo run -p aikit-runtime-core --example policy
 cargo run -p aikit-runtime-core --example plan_mode
 cargo run -p aikit-runtime-core --example smart_approval
 cargo run -p aikit-runtime-core --example reliability
-python examples/python/agent_governance.py
+.venv/bin/python examples/python/quickstart.py
+.venv/bin/python examples/python/agent_governance.py
+node examples/node/quickstart.cjs
 node examples/node/agent_governance.cjs
 ```
 

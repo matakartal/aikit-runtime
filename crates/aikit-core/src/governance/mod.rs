@@ -1,12 +1,11 @@
-//! The governance harness — the flagship differentiator. A declarative permission engine,
+//! The governance harness. A declarative permission engine,
 //! *enforcing* lifecycle hooks, built-in tools, and fail-closed OS containment let a human hand an
 //! agent powerful tools with explicit boundaries. It wraps the loop's tool-execution seam: every
 //! tool call is authorized BEFORE it runs. A normal denial is surfaced to the model as an error
 //! result; an interrupting human denial terminates the run. Neither path executes the tool.
 //!
-//! This is what no other multi-provider SDK ships in one package (LiteLLM = proxy guardrail,
-//! Pydantic AI = approval-only, the Claude Agent SDK = Claude-only). Here it is provider-agnostic
-//! and runs identically on every provider.
+//! The harness is provider-agnostic: the same policy, hooks, and containment run unchanged on
+//! every provider adapter.
 
 pub mod capability;
 pub mod containment;

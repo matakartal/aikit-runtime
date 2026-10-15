@@ -1,12 +1,26 @@
 """Demonstrates the agent-native + governance surface from Python (keyless).
 
-Run (after `maturin develop` in the aikit-py crate's venv):
+Run from the repository root after building the binding (see examples/python/README.md):
 
-    python examples/python/agent_governance.py
+    .venv/bin/python examples/python/agent_governance.py
 
-Shows: (1) the `Agent` primitive — drop in a key, capabilities grow, keys never leak;
-(2) governance from Python — a denied tool never runs, the model gets an error result instead.
-Uses the in-memory MockProvider, so no API key is needed.
+Uses the deterministic in-memory mock model, so no API key or network access is needed; the
+`sk-ant-DEMOKEY`-style keys below are fake and only activate provider capability metadata.
+
+Walks through, in order:
+  1. the `Agent` primitive: drop in a key and capabilities grow; keys never leak via repr; a
+     live model without its key raises instead of falling back to the mock;
+  2. governance with `aikit.query`: a denied tool never runs and the model gets an error result;
+  3. a governed `Agent` with a registered tool, an "ask" approval callback, and every async
+     lifecycle hook (prompt, pre/post tool use, failure, stop);
+  4. text generation and streaming;  5. explicit memory (`remember` / `recall`);
+  6. capability-aware routing;  7. bounded orchestration (`run_subagent`, `fan_out`, `council`);
+  8-9. structured output (`generate_object`, `stream_object`, optional Pydantic models) and
+     approval interruption.
+
+The `GOVERNANCE_JSON=`, `BINDING_STREAM_JSON=`, and `PARITY_JSON=` lines are parity contracts:
+scripts/parity-check.sh compares them byte-for-byte with the Node demo (and `PARITY_JSON` with
+Rust), so keep the emitted facts and formatting unchanged when editing this file.
 """
 
 import asyncio

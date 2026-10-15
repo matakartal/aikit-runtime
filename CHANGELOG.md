@@ -192,6 +192,18 @@ All notable changes to this project will be documented in this file. The format 
   binding runtime export to carry a declaration and compares covered field sets against the Rust
   inventory. Types whose `Option` fields omit `skip_serializing_if` stay hand-written.
 
+- `ErrorCode::hint()`, `ErrorInfo::hint()`, `AikitError::code()`, and `AikitError::hint()` return
+  a fixed, secret-free remediation hint per error code. Hints are not serialized, so the
+  `ErrorInfo` wire contract is unchanged, and they may be reworded between releases.
+- `credentials::env_vars_for_provider()` returns the conventional environment variables for a
+  provider (the inverse of `provider_from_env_var`).
+- Keyless learning examples for the bindings: `examples/python/quickstart.py` and
+  `examples/node/quickstart.cjs` (both run in CI), an opt-in billable
+  `examples/node/live_provider.cjs`, and example guides in `examples/python/README.md` and
+  `examples/node/README.md`.
+- The `aikit-runtime` facade prelude additionally re-exports `AgentError`, `Governance`,
+  `HookDispatcher`, `PermissionEngine`, `PermissionMode`, and `Rule` (additive).
+
 ### Changed
 
 - MCP discovery and transport now fail closed after bounded page, item, byte, cursor, or response
@@ -223,6 +235,19 @@ All notable changes to this project will be documented in this file. The format 
 - Updated Tokio, Regex, SQLite, and the Python FFI stack. PyO3, `pyo3-async-runtimes`, and
   `pythonize` now use the patched 0.29 line; SQLite revisions are converted explicitly at the
   signed storage boundary.
+
+- CLI help and diagnostics: every command and subcommand `--help` ends with copy-paste examples;
+  the root help documents the exit codes and the `aikit: ...` / `hint:` stderr format; `run` and
+  `chat` failures add a `hint:` line (for example the exact `*_API_KEY` to export, or the accepted
+  model-id prefixes). Flags, defaults, exit codes, JSON output, and stdout are unchanged; stderr
+  wording is not a stable contract.
+- More actionable error text across the core and bindings: `ResolveError` messages name the
+  provider option or environment variable to set; `ProviderError` display adds the HTTP status,
+  model, retry delay, and a hint while keeping its `<provider> provider error (<Kind>` prefix;
+  structured-output, budget, and max-turns errors state the next step; Node errors name the call
+  to make first, and `RunOptions.budget.maxCostUsd` without `pricing` now says so instead of
+  reporting a generic budget failure. `ErrorCode::message()` texts (the wire contract) are
+  unchanged.
 
 ### Fixed
 
@@ -289,6 +314,11 @@ All notable changes to this project will be documented in this file. The format 
   stubs.
 - Rustdoc intra-doc links on the A2A journal surface resolve under `-D warnings`.
 
+- `ResolveError::UnknownProvider` no longer echoes a credential when `add_key` is called with the
+  key and provider arguments swapped; a key-shaped provider value is shown as `<redacted>`.
+- The Python stub no longer redeclares `connect_mcp_http` / `connect_mcp_stdio` (the two
+  `mypy --strict` no-redef errors on `aikit.pyi`).
+
 ### Security
 
 - Lockfiles advance `rustls` 0.23.42 → 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349), `h2`
@@ -304,6 +334,13 @@ All notable changes to this project will be documented in this file. The format 
 - Refreshed the complete documentation map for A2A transport/TCK evidence, eight-module parity,
   durable worker/store boundaries, current remote-workflow status, and the distinction between
   source proof, live-provider acceptance, signing, registry ownership, and publication.
+- First-run UX pass: a task-oriented documentation index, a new step-by-step
+  `docs/GETTING-STARTED.md` (every command shown was run), a rebuilt root README quick start with
+  per-language paths, a "going live" section, and first-run troubleshooting; expanded Python and
+  Node binding READMEs, docstrings in `aikit.pyi` and TSDoc in `index.d.ts` (declarations and
+  generated regions unchanged); crate-level rustdoc for `aikit-runtime` and `aikit-runtime-core`
+  with keyless doctests; and example headers with run commands and expected output. Removed
+  outdated "no other SDK ships this" claims from examples and the governance module docs.
 
 ## [0.1.0] - Source preview
 

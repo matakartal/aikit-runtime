@@ -117,6 +117,7 @@ jobs:
       - name: Python FFI and governed-agent scenarios
         run: |
           .venv/bin/python examples/python/spike.py
+          .venv/bin/python examples/python/quickstart.py
           .venv/bin/python examples/python/agent_governance.py
           .venv/bin/python examples/python/run_options.py
           .venv/bin/python examples/python/conformance.py
@@ -140,6 +141,7 @@ jobs:
           NODE_PATH: ${{ github.workspace }}/.github/node-test-deps/node_modules
         run: |
           node -e "const { z } = require('zod'); if (typeof z.toJSONSchema !== 'function') throw new Error('pinned Zod v4 did not load')"
+          node examples/node/quickstart.cjs
           node examples/node/agent_governance.cjs
           node examples/node/run_options.cjs
           node examples/node/conformance.cjs

@@ -21,7 +21,7 @@ streaming, tools, policy, routing, budgets, audit, memory, or sessions in every 
 
 **One core. Three SDKs. Four native providers. Four compatible endpoints. One policy boundary.**
 
-[Quick start](#quick-start) · [CLI](#command-line-interface) · [Architecture](#architecture) · [Governance](#governed-tool-execution) · [SDKs](#one-runtime-three-sdks) · [Documentation](#documentation)
+[Quick start](#quick-start) · [CLI](#command-line-interface) · [Next steps](#where-to-go-next) · [Architecture](#architecture) · [Governance](#governed-tool-execution) · [SDKs](#one-runtime-three-sdks) · [Documentation](#documentation)
 
 </div>
 
@@ -82,20 +82,147 @@ provider translation, or orchestration logic.
 
 ## Quick start
 
-The repository includes a deterministic provider, so you can exercise the complete runtime with
-**no API key and no network call**.
+`aikit-runtime` is **source-first**: nothing is published to crates.io, PyPI, or npm for this
+`v0.3.0-alpha.1` candidate, so every path below starts from a clone. Each quick start uses the
+built-in deterministic `mock-1` model, so it needs **no API key and makes no network call**.
+
+| Requirement | Version | Needed for |
+|---|---|---|
+| Rust | 1.88+ (CI's primary toolchain is 1.97.1) | Everything |
+| C/C++ toolchain | Platform default | Python and Node native bindings |
+| Python | 3.9+ | Python binding |
+| Node.js | 18.17+ | Node binding |
 
 ```bash
 git clone https://github.com/matakartal/aikit-runtime.git
 cd aikit-runtime
+```
+
+All commands below run from the repository root. The first build compiles the workspace and takes
+a few minutes; later runs are incremental. For a longer, step-by-step walkthrough with the real
+output of each command, see [Getting started](docs/GETTING-STARTED.md).
+
+### Rust
+
+```bash
 cargo run -p aikit-runtime --example quickstart
 ```
 
-Expected output:
+Expected output. With no tools registered, `mock-1` always returns this canned Turkish reply ("I
+received the tool result; I completed the task"); when tools are registered it first calls one, so
+the whole tool loop can be exercised offline:
 
 ```text
 Araç sonucunu aldım; görevi tamamladım.
 ```
+
+That example is [`crates/aikit/examples/quickstart.rs`](crates/aikit/examples/quickstart.rs):
+
+```rust
+use aikit::Agent;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let answer = Agent::new()
+        .generate_text("Say hello in Turkish", "mock-1", 128)
+        .await?;
+
+    println!("{}", answer.text);
+    Ok(())
+}
+```
+
+To use it from your own crate, depend on the checkout by path or by git. The package is
+`aikit-runtime`, the library import is `aikit`, and you also need an async runtime such as
+`tokio` (features `macros` and `rt-multi-thread`). Pin a `rev` for reproducible builds; CI does not
+exercise this external-consumer path, so report any resolution problem as an issue:
+
+```toml
+[dependencies]
+aikit-runtime = { git = "https://github.com/matakartal/aikit-runtime", rev = "<commit>" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+### Python
+
+Build the PyO3 binding into a local virtual environment once:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes -r requirements/maturin.txt
+.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
+```
+
+Save as `hello.py` and run it with `.venv/bin/python hello.py`:
+
+```python
+import asyncio
+import aikit
+
+async def main() -> None:
+    agent = aikit.Agent.from_env({})  # explicit empty env: keyless and deterministic
+    answer = await agent.generate_text("Say hello in Turkish")  # model defaults to "mock-1"
+    print(answer["text"])
+
+asyncio.run(main())
+```
+
+Results are typed dictionaries (see [`aikit.pyi`](crates/aikit-py/aikit.pyi)), so fields are read as
+`answer["text"]`. A fuller keyless tour: `.venv/bin/python examples/python/agent_governance.py`.
+
+### TypeScript / Node.js
+
+Build the napi addon (no npm install or network access needed):
+
+```bash
+./scripts/build-node.sh
+```
+
+Save as `hello.cjs` in the repository root and run it with `node hello.cjs`:
+
+```js
+const { Agent } = require("./crates/aikit-node");
+
+async function main() {
+  const agent = Agent.fromEnv({}); // explicit empty env: keyless and deterministic
+  const answer = await agent.generateText("Say hello in Turkish"); // model defaults to "mock-1"
+  console.log(answer.text);
+}
+
+main();
+```
+
+The `require` path is relative to the repository root; adjust it if your script lives elsewhere.
+Types are in [`index.d.ts`](crates/aikit-node/index.d.ts). A fuller keyless tour:
+`node examples/node/agent_governance.cjs`.
+
+### Going live with a real provider
+
+The quick starts pass an explicit empty environment so a key in your shell cannot change their
+output. To call a real model, provide its key and name a model explicitly:
+
+| Construction | Reads provider keys from |
+|---|---|
+| Rust `Agent::new()` | Nothing (keyless) |
+| Rust `Agent::from_process_env()` | The process environment |
+| Python `aikit.Agent()` / Node `new Agent()` | The process environment |
+| `Agent::from_env(pairs)` / `aikit.Agent.from_env({...})` / `Agent.fromEnv({...})` | Only the map you pass |
+
+Recognized variables are `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or
+`GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, and
+`XAI_API_KEY`. The model id selects the provider by prefix: `claude*` (Anthropic), `gpt*` / `o1*` /
+`o3*` / `o4*` (OpenAI), `gemini*` (Google), `deepseek*` (DeepSeek), `grok-*` or `xai:` (xAI), and
+`openrouter:` / `groq:` / `mistral:` for those endpoints. Choose a model id currently enabled for
+your account.
+
+```python
+# inside an async function, with e.g. ANTHROPIC_API_KEY exported in your shell
+agent = aikit.Agent()
+answer = await agent.generate_text("Hello", model="<a claude-... model id>")
+```
+
+Run `cargo run -p aikit-cli -- providers` to see which providers your environment activates
+(keys are never printed).
 
 ## Command-line interface
 
@@ -136,67 +263,29 @@ and preserves the previous version for rollback. See the
 [external-agent and update guide](docs/EXTERNAL-AGENTS.md) for trust setup, Gemini account terms,
 and scheduling behavior.
 
-### Rust
+### Troubleshooting first runs
 
-```rust
-use aikit::Agent;
+| Symptom | Fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'aikit'` | Run Python as `.venv/bin/python` (or activate `.venv`), and re-run `maturin develop` after pulling changes. |
+| `maturin` cannot find a virtual environment | Create `.venv` in the repository root first, or activate the environment you want to install into. |
+| Node cannot load `aikit_node.node` | Re-run `./scripts/build-node.sh` after pulling changes; the addon is a local build output. |
+| Unexpected network calls or provider errors | You probably passed a non-`mock` model or constructed the agent from the process environment; use `from_env({})` / `fromEnv({})` with the default model. |
+| Anything else | `cargo run -p aikit-cli -- doctor` reports provider discovery and containment diagnostics. |
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let answer = Agent::new()
-        .generate_text("Say hello in Turkish", "mock-1", 128)
-        .await?;
+## Where to go next
 
-    println!("{}", answer.text);
-    Ok(())
-}
-```
-
-Run it from this checkout:
-
-```bash
-cargo run -p aikit-runtime --example quickstart
-```
-
-### Python
-
-Build the native binding once, then use the same core from Python:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install --require-hashes -r requirements/maturin.txt
-.venv/bin/maturin develop --manifest-path crates/aikit-py/Cargo.toml
-```
-
-```python
-import asyncio
-import aikit
-
-async def main() -> None:
-    agent = aikit.Agent.from_env({})
-    answer = await agent.generate_text("Say hello in Turkish")
-    print(answer["text"])
-
-asyncio.run(main())
-```
-
-### TypeScript / Node.js
-
-```bash
-./scripts/build-node.sh
-```
-
-```js
-const { Agent } = require("./crates/aikit-node");
-
-async function main() {
-  const agent = Agent.fromEnv({});
-  const answer = await agent.generateText("Say hello in Turkish");
-  console.log(answer.text);
-}
-
-main();
-```
+| If you want to... | Read |
+|---|---|
+| Walk through every keyless path step by step | [Getting started](docs/GETTING-STARTED.md) |
+| Learn from runnable Python or Node examples | [Python examples](examples/python/README.md) · [Node examples](examples/node/README.md) |
+| Register tools and gate them with permissions | [Governed tool execution](#governed-tool-execution), then the [feature reference](docs/FEATURES.md#governance-and-hooks) |
+| Use the Python or Node API in depth | [Python binding](crates/aikit-py/README.md) · [Node binding](crates/aikit-node/README.md) |
+| Script runs, chats, or evals from a shell | [CLI guide](crates/aikit-cli/README.md) · [Evaluation guide](docs/EVALUATIONS.md) |
+| Understand the design and trust boundaries | [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT-MODEL.md) |
+| Know what is and is not proven yet | [Project status](docs/PROJECT-STATUS.md) · [Parity matrix](docs/PARITY-MATRIX.md) |
+| Upgrade from 0.2 | [0.3 migration guide](docs/MIGRATING-0.3.md) |
+| Contribute | [CONTRIBUTING.md](CONTRIBUTING.md#local-setup) |
 
 ## Built for agent workloads
 
@@ -434,10 +523,12 @@ release gate, not a claim about artifacts that exist today.
 | Node native binaries | `aikit-runtime-{platform}` | selected locally by the wrapper |
 
 The current `v0.3.0-alpha.1` tree is a **source-first implementation preview**. Keyless source, binding,
-and local package-layout checks run in CI. Use the checkout commands in [Quick start](#quick-start);
-no npm, PyPI, or crates.io publication is claimed for this candidate.
+and local package-layout checks run in CI. Use the checkout commands in [Quick start](#quick-start).
 
 ### Supported binary targets
+
+These are the targets the manual, non-publishing [artifact workflow](docs/RELEASE.md#manual-artifact-assembly)
+builds and load-checks; nothing is uploaded to a registry.
 
 | Platform | Python ABI3 wheel | Node native package |
 |---|---:|---:|
@@ -502,21 +593,22 @@ inheriting the GitHub runner's newer glibc requirement.
 | Guide | Purpose |
 |---|---|
 | [Documentation index](docs/README.md) | Full map of guides, policies, and historical notes. |
+| [Getting started](docs/GETTING-STARTED.md) | Step-by-step keyless walkthrough from clone to first real provider call. |
 | [Architecture](docs/ARCHITECTURE.md) | Ownership boundaries, run lifecycle, state model, and trust boundaries. |
 | [Feature reference](docs/FEATURES.md) | Runtime capabilities, governance depth, fidelity, routing, state, and limits. |
 | [Threat model](docs/THREAT-MODEL.md) | Security guarantees, containment boundaries, and exclusions. |
 | [A2A conformance](docs/A2A-CONFORMANCE.md) | Pinned official TCK procedure, raw result, verified false negatives, and proof boundary. |
-| [Project status](docs/PROJECT-STATUS.md) | Current local, remote-CI, live-provider, and publication evidence boundaries. |
+| [Project status](docs/PROJECT-STATUS.md) | What is complete, what is intentionally source-only, and the local, CI, live-provider, and publication evidence boundaries. |
 | [Distribution guide](docs/RELEASE.md) | Source-first distribution and manual artifact assembly. |
 | [Live-provider harness](docs/LIVE-SMOKE.md) | Optional real-provider acceptance test contract. |
 | [Competitor parity matrix](docs/PARITY-MATRIX.md) | Current upstream pins, implementation evidence, honest gaps, and the v1 gate. |
 | [0.3 migration guide](docs/MIGRATING-0.3.md) | Streaming, MCP naming, capability, durability, and release changes from 0.2. |
 | [Historical 0.2 migration guide](docs/MIGRATING-0.2.md) | Archived changes from the 0.1 source preview. |
-| [Current project status](docs/PROJECT-STATUS.md) | What is complete, shareable, and intentionally source-only. |
 | [Node binding](crates/aikit-node/README.md) | Local TypeScript / Node checkout usage. |
 | [Python binding](crates/aikit-py/README.md) | Local Python checkout usage. |
 | [CLI guide](crates/aikit-cli/README.md) | Commands, automation contracts, diagnostics, and completions. |
 | [Evaluation guide](docs/EVALUATIONS.md) | Keyless datasets, deterministic gates, reports, and CI exit codes. |
+| [External agents](docs/EXTERNAL-AGENTS.md) | Reusing vendor CLI sessions, signed runtime updates, and the credential boundary. |
 
 ## Contributing
 

@@ -2,6 +2,14 @@
 
 Every emitted payload deliberately excludes run IDs, timestamps, durations, and raw error text.
 The parity gate compares these compact JSON lines byte-for-byte with Rust and Node.
+
+Run from the repository root after building the binding (see examples/python/README.md):
+
+    .venv/bin/python examples/python/conformance.py   # one CONFORMANCE_<MODULE>_JSON line each
+    ./scripts/parity-check.sh                          # compare with Rust and Node
+
+This is a test fixture more than a tutorial: read quickstart.py first. Do not change what it
+prints; any edit to the emitted facts must land in the Rust and Node conformance examples too.
 """
 
 import asyncio

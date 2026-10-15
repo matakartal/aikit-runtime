@@ -1,8 +1,20 @@
-//! Content-safety guardrails — a tool that returns secrets/PII must not hand them to the model or
-//! the logs. Deterministic and keyless: no API key, no network. This is aikit's "secrets never
-//! leak" invariant made enforceable at the tool boundary.
+//! Content-safety guardrails at the tool boundary — a tool that returns secrets/PII must not hand
+//! them to the model or the logs. Deterministic and keyless: no API key, no network.
+//!
+//! What it demonstrates:
+//! 1. An *output* `GuardrailChain` (`SecretRedactor` + `PiiRedactor`) rewrites a tool result so
+//!    an API key, an email address and a card number reach the model as `[REDACTED:<kind>]`.
+//! 2. An *input* chain (`RegexBlocklist`) refuses a destructive command before the tool runs.
+//!
+//! `GuardedExecutor` wraps any `ToolExecutor`, so in a real agent you wrap your tool executor with
+//! it and hand the result to the run. The built-in redactors are pattern-based: they catch known
+//! formats, not every possible secret. For semantic detection, `McpGuardrail` can delegate to an
+//! external MCP safety server and fails closed if that server errors.
 //!
 //! Run: `cargo run -p aikit-runtime-core --example guardrails`
+//!
+//! Expected: step 1 prints the line with three `[REDACTED:...]` markers; step 2 prints
+//! `blocked: ... blocked by rule 'destructive'`.
 
 use aikit_core::governance::guardrail::{
     GuardedExecutor, GuardrailChain, PiiRedactor, RegexBlocklist, SecretRedactor,
@@ -58,13 +70,13 @@ async fn main() {
         .execute("Bash", json!({ "command": "rm -rf /" }))
         .await
     {
-        Ok(o) => println!("   -> {o}  (!! should have been blocked)"),
+        Ok(o) => panic!("the destructive input should have been blocked, got: {o}"),
         Err(e) => println!("   -> blocked: {e}"),
     }
 
     println!(
-        "\n✅ Guardrails enforce content safety at the tool boundary — deterministic, keyless, and\n\
-         composable with the permission engine + sandbox. For semantic injection/PII detection,\n\
-         plug an external safety server (Superagent / LlamaFirewall) via McpGuardrail — fail-closed."
+        "\nOK: guardrails redacted the tool output and blocked the destructive input — deterministic,\n\
+         keyless, and composable with the permission engine + sandbox. For semantic injection/PII\n\
+         detection, plug an external MCP safety server in via McpGuardrail (fails closed on error)."
     );
 }

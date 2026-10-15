@@ -5,6 +5,35 @@
 //! Honesty about ambiguity is a feature: OpenAI and DeepSeek both mint `sk-...` keys, so the
 //! key format alone cannot tell them apart. We say so ([`KeyGuess::AmbiguousSk`]) instead of
 //! guessing wrong — the caller disambiguates with an explicit provider or the env-var name.
+//!
+//! # Resolution order
+//!
+//! [`resolve_provider`] tries, in order:
+//!
+//! 1. an explicit provider name (`provider=` in the Python/Node `add_key`, `explicit` in Rust),
+//!    which must be one of [`KNOWN_PROVIDERS`];
+//! 2. the conventional environment-variable name the key came from (see
+//!    [`provider_from_env_var`] and [`env_vars_for_provider`]);
+//! 3. the key's format signature ([`provider_from_key`]).
+//!
+//! | Provider     | Environment variable(s)              | Detected from key format? |
+//! |--------------|--------------------------------------|---------------------------|
+//! | `anthropic`  | `ANTHROPIC_API_KEY`                  | yes (`sk-ant-`, not `sk-ant-admin`) |
+//! | `openai`     | `OPENAI_API_KEY`                     | no (`sk-` is shared)      |
+//! | `google`     | `GOOGLE_API_KEY`, `GEMINI_API_KEY`   | yes (`AIza`)              |
+//! | `deepseek`   | `DEEPSEEK_API_KEY`                   | no (`sk-` is shared)      |
+//! | `openrouter` | `OPENROUTER_API_KEY`                 | no                        |
+//! | `groq`       | `GROQ_API_KEY`                       | no                        |
+//! | `mistral`    | `MISTRAL_API_KEY`                    | no                        |
+//! | `xai`        | `XAI_API_KEY`                        | no                        |
+//!
+//! When both Google variables are set, [`crate::agent::Agent::from_env`] prefers
+//! `GOOGLE_API_KEY`.
+//!
+//! # Errors never echo the key
+//!
+//! [`ResolveError`] messages name the provider, the environment variables and the option to
+//! set, but never include the credential value itself, so they are safe to log or show.
 
 /// Canonical provider names aikit knows how to activate from a credential.
 pub const KNOWN_PROVIDERS: &[&str] = &[
@@ -54,7 +83,7 @@ pub fn provider_from_key(key: &str) -> KeyGuess {
     }
 }
 
-/// Map a conventional environment-variable name to its provider. This is the reliable
+/// Map a conventional environment-variable name to its provider (exact, case-sensitive match). This is the reliable
 /// disambiguator: `OPENAI_API_KEY` vs `DEEPSEEK_API_KEY` resolve cleanly where the key format
 /// cannot.
 pub fn provider_from_env_var(name: &str) -> Option<&'static str> {
@@ -71,9 +100,49 @@ pub fn provider_from_env_var(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The conventional environment variables aikit reads for `provider`, in the order they are
+/// documented (for Google, `GOOGLE_API_KEY` takes precedence when both are set). Returns an
+/// empty slice for a name outside [`KNOWN_PROVIDERS`]. This is the inverse of
+/// [`provider_from_env_var`] and is what error messages use to tell the user what to set.
+///
+/// ```
+/// use aikit_core::credentials::env_vars_for_provider;
+/// assert_eq!(env_vars_for_provider("deepseek"), ["DEEPSEEK_API_KEY"]);
+/// assert_eq!(env_vars_for_provider("google"), ["GOOGLE_API_KEY", "GEMINI_API_KEY"]);
+/// assert!(env_vars_for_provider("nope").is_empty());
+/// ```
+pub fn env_vars_for_provider(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "openai" => &["OPENAI_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "google" => &["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        _ => &[],
+    }
+}
+
 /// Resolve a credential to a provider using an optional explicit hint, then the env-var name,
 /// then the key format. Returns `Err` when the result is genuinely ambiguous or unknown so the
 /// agent can ask rather than mis-route the key.
+///
+/// * `key` — the raw credential; surrounding whitespace is ignored, an empty value is
+///   [`ResolveError::Empty`] even when a provider is given.
+/// * `explicit` — a provider name from [`KNOWN_PROVIDERS`] (exact, lowercase). When present it
+///   wins outright and the key format is not inspected.
+/// * `env_var` — the variable the key was read from, e.g. `Some("DEEPSEEK_API_KEY")`. An
+///   unrecognized name is ignored and resolution falls through to the key format.
+///
+/// ```
+/// use aikit_core::credentials::{resolve_provider, ResolveError};
+/// assert_eq!(resolve_provider("sk-ant-api03-example", None, None), Ok("anthropic"));
+/// assert_eq!(resolve_provider("sk-example", None, Some("DEEPSEEK_API_KEY")), Ok("deepseek"));
+/// assert_eq!(resolve_provider("sk-example", Some("openai"), None), Ok("openai"));
+/// assert_eq!(resolve_provider("sk-example", None, None), Err(ResolveError::Ambiguous));
+/// ```
 pub fn resolve_provider(
     key: &str,
     explicit: Option<&str>,
@@ -99,6 +168,11 @@ pub fn resolve_provider(
     }
 }
 
+/// Why a credential could not be routed to a provider.
+///
+/// The `Display` text is user-facing (Python raises it as `ValueError`, Node throws it): each
+/// message says what to set — a provider name or an environment variable — and how to check the
+/// result. No variant carries or prints the credential value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     /// An empty or whitespace-only value can never authenticate an inference request.
@@ -111,18 +185,67 @@ pub enum ResolveError {
     UnknownProvider(String),
 }
 
+/// How a user can confirm which providers are active after fixing a credential problem.
+const VERIFY_HINT: &str =
+    "run `aikit providers` (or call active_providers() in Python, activeProviders() in Node) to \
+     confirm which providers are active";
+
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolveError::Empty => write!(f, "credential cannot be empty"),
+            ResolveError::Empty => write!(
+                f,
+                "credential is empty or whitespace-only; pass the provider's API key value \
+                 (for example the contents of ANTHROPIC_API_KEY or OPENAI_API_KEY), then {VERIFY_HINT}"
+            ),
             ResolveError::Ambiguous => write!(
                 f,
-                "sk- key is ambiguous (OpenAI or DeepSeek); pass an explicit provider or use the env-var name"
+                "sk- key is ambiguous (OpenAI or DeepSeek both issue sk- keys); pass \
+                 provider=\"openai\" or provider=\"deepseek\", or export it as OPENAI_API_KEY or \
+                 DEEPSEEK_API_KEY, then {VERIFY_HINT}"
             ),
-            ResolveError::Unrecognized => write!(f, "unrecognized key format; pass an explicit provider"),
-            ResolveError::UnknownProvider(p) => write!(f, "unknown provider '{p}'"),
+            ResolveError::Unrecognized => write!(
+                f,
+                "unrecognized key format (only Anthropic sk-ant- and Google AIza keys are detected \
+                 from the key alone; Anthropic admin keys are not inference keys); pass \
+                 provider=\"<name>\" with one of: {providers}, or export the key under its \
+                 provider's variable ({vars}), then {VERIFY_HINT}",
+                providers = KNOWN_PROVIDERS.join(", "),
+                vars = all_env_vars().join(", "),
+            ),
+            ResolveError::UnknownProvider(p) if looks_like_credential(p) => write!(
+                f,
+                "unknown provider '<redacted>': the provider argument looks like an API key \
+                 (were the key and provider arguments swapped?); expected one of: {}",
+                KNOWN_PROVIDERS.join(", ")
+            ),
+            ResolveError::UnknownProvider(p) => write!(
+                f,
+                "unknown provider '{p}'; expected one of: {} (exact, lowercase)",
+                KNOWN_PROVIDERS.join(", ")
+            ),
         }
     }
+}
+
+/// A provider name is short and lowercase-ish; anything key-shaped is redacted from messages so a
+/// swapped `add_key(provider, key)` call cannot echo the secret.
+fn looks_like_credential(value: &str) -> bool {
+    let value = value.trim();
+    value.len() > 32
+        || provider_from_key(value) != KeyGuess::Unknown
+        || value.starts_with("sk-")
+        || value.starts_with("gsk_")
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn all_env_vars() -> Vec<&'static str> {
+    KNOWN_PROVIDERS
+        .iter()
+        .flat_map(|provider| env_vars_for_provider(provider).iter().copied())
+        .collect()
 }
 
 impl std::error::Error for ResolveError {}
@@ -204,6 +327,54 @@ mod tests {
     fn openrouter_key_is_unknown_not_ambiguous() {
         // Aggregator keys are neither OpenAI nor DeepSeek, so not `AmbiguousSk`.
         assert_eq!(provider_from_key("sk-or-v1-xxxx"), KeyGuess::Unknown);
+    }
+
+    #[test]
+    fn env_var_table_round_trips_for_every_known_provider() {
+        for &provider in KNOWN_PROVIDERS {
+            let vars = env_vars_for_provider(provider);
+            assert!(!vars.is_empty(), "{provider} has no documented env var");
+            for var in vars {
+                assert_eq!(provider_from_env_var(var), Some(provider), "{var}");
+            }
+        }
+        assert!(env_vars_for_provider("unknown").is_empty());
+    }
+
+    #[test]
+    fn error_messages_name_the_fix_and_never_echo_the_key() {
+        let secret = "sk-proj-SECRETVALUE123";
+        let ambiguous = resolve_provider(secret, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("provider=\"openai\""), "{ambiguous}");
+        assert!(ambiguous.contains("DEEPSEEK_API_KEY"), "{ambiguous}");
+        assert!(ambiguous.contains("aikit providers"), "{ambiguous}");
+        assert!(!ambiguous.contains("SECRETVALUE"), "{ambiguous}");
+
+        let unrecognized = resolve_provider("opaque-SECRETVALUE", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(unrecognized.contains("openrouter"), "{unrecognized}");
+        assert!(unrecognized.contains("GROQ_API_KEY"), "{unrecognized}");
+        assert!(!unrecognized.contains("SECRETVALUE"), "{unrecognized}");
+
+        let unknown = resolve_provider(secret, Some("OpenAI"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("'OpenAI'"), "{unknown}");
+        assert!(unknown.contains("openai"), "{unknown}");
+        assert!(!unknown.contains("SECRETVALUE"), "{unknown}");
+
+        assert!(ResolveError::Empty.to_string().contains("empty"));
+
+        // Swapped arguments: the "provider" is actually a key and must not be echoed.
+        let swapped = resolve_provider("openai", Some(secret), None)
+            .unwrap_err()
+            .to_string();
+        assert!(swapped.contains("<redacted>"), "{swapped}");
+        assert!(swapped.contains("swapped"), "{swapped}");
+        assert!(!swapped.contains("SECRETVALUE"), "{swapped}");
     }
 
     #[test]

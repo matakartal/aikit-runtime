@@ -3,6 +3,18 @@
 //! Cassettes are evidence, not mocks hidden inside adapter tests. The validator deliberately
 //! accepts only a small header allowlist, verifies complete scenario coverage, and checks the
 //! normalized stream lifecycle before any fixture can be used as parity proof.
+//!
+//! The checked-in evidence lives under `crates/aikit-core/cassettes/providers/v1/`, one
+//! `<provider>.json` per entry in [`SUPPORTED_PROVIDERS`], each covering every
+//! [`CassetteScenario::REQUIRED`] scenario exactly once. Verify the whole set offline with:
+//!
+//! ```text
+//! cargo test -p aikit-runtime-core --test provider_cassettes --locked
+//! ```
+//!
+//! Validation fails closed. Every [`CassetteValidationError::Invalid`] names the cassette and
+//! interaction (`provider:model/interaction-id`) and says what to change; messages never echo a
+//! suspected credential value, only the marker or field name that triggered the rejection.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +23,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// The only `schema_version` this validator accepts.
 pub const CASSETTE_SCHEMA_VERSION: u32 = 1;
+/// Providers that must each have exactly one cassette; mirrors
+/// [`crate::credentials::KNOWN_PROVIDERS`].
 pub const SUPPORTED_PROVIDERS: [&str; 8] = [
     "anthropic",
     "openai",
@@ -49,18 +64,26 @@ const SECRET_BODY_FIELDS: [&str; 8] = [
     "token",
 ];
 
+/// The behaviour an interaction proves. Serialized in `snake_case` (e.g. `"structured_output"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CassetteScenario {
+    /// A non-streaming text completion with a 2xx HTTP exchange.
     Text,
+    /// A 2xx streaming exchange plus its normalized `response_start` … `response_end` events.
     Streaming,
+    /// A 2xx exchange that exercises tool calling.
     Tool,
+    /// A 2xx exchange that exercises structured (JSON-schema) output.
     StructuredOutput,
+    /// An HTTP status >= 400 with a matching typed error classification.
     ProviderError,
+    /// A request rejected before any network call because of a named unsupported parameter.
     Unsupported,
 }
 
 impl CassetteScenario {
+    /// Every cassette must contain each of these scenarios exactly once.
     pub const REQUIRED: [Self; 6] = [
         Self::Text,
         Self::Streaming,
@@ -71,6 +94,7 @@ impl CassetteScenario {
     ];
 }
 
+/// One provider's sanitized evidence file. Unknown JSON fields are rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCassette {
@@ -83,6 +107,8 @@ pub struct ProviderCassette {
     pub interactions: Vec<CassetteInteraction>,
 }
 
+/// Where the recorded shape came from: the adapter contract name and the 40-character lowercase
+/// git SHA it was recorded against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CassetteSource {
@@ -90,6 +116,8 @@ pub struct CassetteSource {
     pub reference_commit: String,
 }
 
+/// A single scenario's evidence. `request`/`response` are required when `network_performed` is
+/// true and forbidden otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CassetteInteraction {
@@ -111,6 +139,9 @@ pub struct CassetteInteraction {
     pub assertions: Vec<String>,
 }
 
+/// A sanitized outbound request. Only allowlisted headers may be stored; the provider's auth
+/// header must instead be named in `redacted_headers` (`x-api-key` for Anthropic,
+/// `x-goog-api-key` for Google, `authorization` for the rest).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedHttpRequest {
@@ -123,6 +154,7 @@ pub struct RecordedHttpRequest {
     pub body: Value,
 }
 
+/// A sanitized provider response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedHttpResponse {
@@ -132,6 +164,7 @@ pub struct RecordedHttpResponse {
     pub body: Value,
 }
 
+/// One normalized stream event; `sequence` must be contiguous from zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedStreamEvent {
@@ -142,6 +175,7 @@ pub struct RecordedStreamEvent {
     pub block_id: Option<String>,
 }
 
+/// The typed error aikit is expected to surface for a failure scenario.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordedTypedError {
@@ -157,6 +191,7 @@ pub struct RecordedTypedError {
     pub message: String,
 }
 
+/// Summary returned by [`load_and_validate_directory`] when every cassette passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CassetteValidationReport {
     pub providers: Vec<String>,
@@ -164,20 +199,25 @@ pub struct CassetteValidationReport {
     pub interaction_count: usize,
 }
 
+/// Why a cassette (or cassette directory) was rejected.
 #[derive(Debug, Error)]
 pub enum CassetteValidationError {
+    /// The file or directory could not be read.
     #[error("cannot read provider cassette at {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// The file is not valid JSON for [`ProviderCassette`] (including unknown fields).
     #[error("invalid provider cassette JSON at {path}: {source}")]
     Json {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
+    /// The cassette parsed but broke a sanitization, coverage, or lifecycle rule. `context` is
+    /// `provider:model[/interaction-id]` or a path.
     #[error("invalid provider cassette ({context}): {message}")]
     Invalid { context: String, message: String },
 }
@@ -189,6 +229,7 @@ fn invalid(context: impl Into<String>, message: impl Into<String>) -> CassetteVa
     }
 }
 
+/// Read and parse one cassette file without validating it; pair with [`validate_cassette`].
 pub fn load_cassette(path: impl AsRef<Path>) -> Result<ProviderCassette, CassetteValidationError> {
     let path = path.as_ref();
     let bytes = fs::read(path).map_err(|source| CassetteValidationError::Io {
@@ -201,6 +242,8 @@ pub fn load_cassette(path: impl AsRef<Path>) -> Result<ProviderCassette, Cassett
     })
 }
 
+/// Validate one parsed cassette: identity, sanitization, scenario coverage, and per-scenario
+/// evidence. Returns the first violation found.
 pub fn validate_cassette(cassette: &ProviderCassette) -> Result<(), CassetteValidationError> {
     let context = format!("{}:{}", cassette.provider, cassette.model);
     if cassette.schema_version != CASSETTE_SCHEMA_VERSION {
@@ -213,23 +256,35 @@ pub fn validate_cassette(cassette: &ProviderCassette) -> Result<(), CassetteVali
         ));
     }
     if cassette.fixture_version.trim().is_empty() {
-        return Err(invalid(&context, "fixture_version must be pinned"));
+        return Err(invalid(
+            &context,
+            "fixture_version must be pinned to a non-empty value",
+        ));
     }
     if !SUPPORTED_PROVIDERS.contains(&cassette.provider.as_str()) {
-        return Err(invalid(&context, "provider is outside the supported set"));
+        return Err(invalid(
+            &context,
+            format!(
+                "provider is outside the supported set; expected one of: {}",
+                SUPPORTED_PROVIDERS.join(", ")
+            ),
+        ));
     }
     if cassette.model.trim().is_empty() {
         return Err(invalid(&context, "model identity must be present"));
     }
     if !cassette.sanitized {
-        return Err(invalid(&context, "cassette must be marked sanitized"));
+        return Err(invalid(
+            &context,
+            "cassette must be marked sanitized (set \"sanitized\": true only after removing credentials)",
+        ));
     }
     if cassette.source.adapter_contract.trim().is_empty()
         || cassette.source.reference_commit.trim().is_empty()
     {
         return Err(invalid(
             &context,
-            "source contract and commit must be pinned",
+            "source.adapter_contract and source.reference_commit must be pinned",
         ));
     }
     if cassette.source.reference_commit.len() != 40
@@ -285,6 +340,8 @@ pub fn validate_cassette(cassette: &ProviderCassette) -> Result<(), CassetteVali
     Ok(())
 }
 
+/// Recursively load and validate every `*.json` under `directory`, then require exactly one
+/// cassette per [`SUPPORTED_PROVIDERS`] entry. Symlinks are rejected.
 pub fn load_and_validate_directory(
     directory: impl AsRef<Path>,
 ) -> Result<CassetteValidationReport, CassetteValidationError> {
@@ -301,7 +358,10 @@ pub fn load_and_validate_directory(
         if !providers.insert(cassette.provider.clone()) {
             return Err(invalid(
                 path.display().to_string(),
-                format!("duplicate cassette for provider {}", cassette.provider),
+                format!(
+                    "duplicate cassette for provider {}; keep exactly one file per provider",
+                    cassette.provider
+                ),
             ));
         }
         interaction_count += cassette.interactions.len();
@@ -469,7 +529,10 @@ fn validate_request(
     if !redacted.contains(expected_auth_header) {
         return Err(invalid(
             context,
-            format!("redacted auth header {expected_auth_header} is not declared"),
+            format!(
+                "redacted auth header {expected_auth_header} is not declared; add \
+                 \"{expected_auth_header}\" to request.redacted_headers"
+            ),
         ));
     }
     if redacted
@@ -478,7 +541,10 @@ fn validate_request(
     {
         return Err(invalid(
             context,
-            "redacted_headers contains a non-secret header",
+            format!(
+                "redacted_headers contains a non-secret header; only these may be listed: {}",
+                SECRET_HEADERS.join(", ")
+            ),
         ));
     }
     Ok(())
@@ -555,7 +621,11 @@ fn validate_headers(
         if !ALLOWED_HEADERS.contains(&normalized.as_str()) {
             return Err(invalid(
                 context,
-                format!("header {name} is not allowlisted for cassette storage"),
+                format!(
+                    "header {name} is not allowlisted for cassette storage; remove it (auth \
+                     headers belong in redacted_headers) or keep only: {}",
+                    ALLOWED_HEADERS.join(", ")
+                ),
             ));
         }
         scan_string_for_secrets(value, context)?;
@@ -628,7 +698,11 @@ fn validate_provider_error(
     if (error.code.as_str(), error.kind.as_str(), error.retryable) != expected {
         return Err(invalid(
             context,
-            "typed error classification does not match HTTP status",
+            format!(
+                "typed error classification does not match HTTP status {}; expected \
+                 code={}, kind={}, retryable={}",
+                response.status, expected.0, expected.1, expected.2
+            ),
         ));
     }
     if !error.retryable && error.retry_after_ms.is_some() {
@@ -831,9 +905,13 @@ fn scan_value_for_secrets(value: &Value, context: &str) -> Result<(), CassetteVa
                 if SECRET_HEADERS.contains(&key.to_ascii_lowercase().as_str())
                     || SECRET_BODY_FIELDS.contains(&normalized_key.as_str())
                 {
+                    // The field name is safe to report; its value is not.
                     return Err(invalid(
                         context,
-                        "secret-shaped field is present in HTTP body",
+                        format!(
+                            "secret-shaped field {key:?} is present in HTTP body; remove it \
+                             from the recorded JSON"
+                        ),
                     ));
                 }
                 scan_value_for_secrets(value, context)?;
@@ -859,10 +937,18 @@ fn scan_string_for_secrets(value: &str, context: &str) -> Result<(), CassetteVal
         "token=",
         "-----begin private key-----",
     ];
-    if suspicious.iter().any(|needle| normalized.contains(needle)) {
+    if let Some(needle) = suspicious
+        .iter()
+        .find(|needle| normalized.contains(*needle))
+    {
+        // Report the marker that matched, never the surrounding value.
         return Err(invalid(
             context,
-            "possible credential material found in cassette",
+            format!(
+                "possible credential material found in cassette (matched marker {:?}); \
+                 replace the value with a sanitized placeholder",
+                needle.trim_end()
+            ),
         ));
     }
     Ok(())
@@ -984,7 +1070,9 @@ mod tests {
             .unwrap()
             .headers
             .insert("authorization".into(), "Bearer fixture-secret".into());
-        assert!(validate_cassette(&cassette).is_err());
+        let message = validate_cassette(&cassette).unwrap_err().to_string();
+        assert!(message.contains("redacted_headers"), "{message}");
+        assert!(!message.contains("fixture-secret"), "{message}");
 
         let mut cassette = fixture();
         let stream = cassette
@@ -994,5 +1082,30 @@ mod tests {
             .unwrap();
         stream.normalized_events.swap(1, 2);
         assert!(validate_cassette(&cassette).is_err());
+    }
+
+    #[test]
+    fn credential_rejections_name_the_marker_or_field_not_the_value() {
+        let mut cassette = fixture();
+        cassette.interactions[0].request.as_mut().unwrap().body =
+            serde_json::json!({"model": "gpt-fixture", "note": "sk-live-VALUE123"});
+        let message = validate_cassette(&cassette).unwrap_err().to_string();
+        assert!(message.contains("\"sk-\""), "{message}");
+        assert!(!message.contains("VALUE123"), "{message}");
+
+        let mut cassette = fixture();
+        cassette.interactions[0].request.as_mut().unwrap().body =
+            serde_json::json!({"model": "gpt-fixture", "api_key": "placeholder-VALUE"});
+        let message = validate_cassette(&cassette).unwrap_err().to_string();
+        assert!(message.contains("\"api_key\""), "{message}");
+        assert!(!message.contains("placeholder-VALUE"), "{message}");
+    }
+
+    #[test]
+    fn unsupported_provider_lists_the_supported_set() {
+        let mut cassette = fixture();
+        cassette.provider = "acme".into();
+        let message = validate_cassette(&cassette).unwrap_err().to_string();
+        assert!(message.contains("anthropic, openai"), "{message}");
     }
 }

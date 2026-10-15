@@ -1,7 +1,20 @@
-//! Defense in depth — aikit's governance layers, composed. Each layer is independent; stacked they
-//! form the bundle no single multi-provider SDK ships. Deterministic and keyless (no API key).
+//! Defense in depth — aikit's governance layers, composed. Each layer is independent and can be
+//! used alone; this example stacks them. Deterministic, keyless and offline (no model is called).
 //!
-//! Run: cargo run -p aikit-runtime-core --example defense_in_depth
+//! 1. Decision layer: three independent judgments on one proposed `Bash(rm -rf /)` call —
+//!    `PolicySpec` -> `PermissionEngine` (allow/ask/deny), `HeuristicRiskScorer` (low/medium/high)
+//!    and `ReliabilityPolicy` (ordering prerequisites such as "deploy only after test").
+//! 2. Execution layer: a leaky, oversized tool result passes through `GuardedExecutor`
+//!    (`SecretRedactor`) and then `OffPromptExecutor`, which stores the bulk outside the prompt and
+//!    hands the model a short reference it can expand with the `retrieve_output` tool.
+//!
+//! Human-in-the-loop layers (plan review, capability requests, approvals) are shown in the
+//! `plan_mode`, `capability_request` and `smart_approval` examples.
+//!
+//! Run: `cargo run -p aikit-runtime-core --example defense_in_depth`
+//!
+//! Expected: permission `Deny`, risk `High`, reliability `Forbid`, then an `[off-prompt: id=...]`
+//! reference and `secret redacted before it was stored off-prompt: true`.
 
 use aikit_core::{
     GuardedExecutor, GuardrailChain, HeuristicRiskScorer, OffPromptExecutor, OffPromptStore,
@@ -66,14 +79,16 @@ async fn main() {
     let stored = store
         .retrieve(id)
         .expect("the returned off-prompt reference must resolve");
-    println!(
-        "     secret redacted before it was stored off-prompt: {}",
-        !stored.contains("sk-ant-")
+    let redacted = !stored.contains("sk-ant-");
+    println!("     secret redacted before it was stored off-prompt: {redacted}");
+    assert!(
+        redacted,
+        "the secret reached the off-prompt store unredacted!"
     );
 
     println!(
-        "\n✅ Defense in depth: permission + risk + reliability DECIDE; guardrail + off-prompt \
-         SANITIZE; capability requests + plan mode keep a human in the loop. Each layer is \
-         independent, all provider-neutral, from one Rust core."
+        "\nOK: defense in depth — permission + risk + reliability DECIDE; guardrail + off-prompt \
+         SANITIZE. Each layer is independent and provider-neutral. For the human-in-the-loop \
+         layers, run the plan_mode, capability_request and smart_approval examples."
     );
 }
