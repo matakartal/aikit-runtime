@@ -22,11 +22,21 @@ pub type DeltaStream = Pin<Box<dyn Stream<Item = StreamDelta> + Send + 'static>>
 /// A high-level cancellable stream. A small owned driver drains the core stream so dropping this
 /// handle still lets the runtime run its Stop hook, `RunStopped` audit, and recorder finalizer.
 /// The driver is cancellation-bounded and never survives a completed/cancelled run.
+///
+/// The run is lazy: the driver does not start the agent loop until the first poll, [`cancel`],
+/// [`finish`], or drop. A cancellation requested before that point (through this handle or a
+/// cloned [`CancellationHandle`]) therefore deterministically finalizes as `Cancelled` without a
+/// provider call, instead of racing a fast provider to completion.
+///
+/// [`cancel`]: CancellableRun::cancel
+/// [`finish`]: CancellableRun::finish
 pub struct CancellableRun {
     receiver: tokio::sync::mpsc::Receiver<StreamDelta>,
     cancellation: CancellationHandle,
     recorder: crate::session::RunRecorder,
     driver: Option<tokio::task::JoinHandle<()>>,
+    /// Releases the lazily-started driver. Sending or dropping it both start the run.
+    start: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CancellableRun {
@@ -46,14 +56,22 @@ impl CancellableRun {
     /// Request cancellation and wait for all deterministic runtime finalizers.
     pub async fn cancel(mut self) -> crate::session::RunOutcome {
         self.cancellation.cancel();
+        self.start();
         self.wait_for_driver().await;
         self.recorder.outcome()
     }
 
     /// Wait for normal completion and return the canonical recorded outcome.
     pub async fn finish(mut self) -> crate::session::RunOutcome {
+        self.start();
         self.wait_for_driver().await;
         self.recorder.outcome()
+    }
+
+    fn start(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
     }
 
     async fn wait_for_driver(&mut self) {
@@ -68,6 +86,7 @@ impl Stream for CancellableRun {
     type Item = StreamDelta;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.start();
         Pin::new(&mut self.receiver).poll_recv(cx)
     }
 }
@@ -77,8 +96,9 @@ impl Drop for CancellableRun {
         if self.recorder.outcome().terminal_status == crate::session::RunTerminalStatus::Running {
             self.cancellation.cancel();
         }
-        // Dropping the receiver wakes a driver blocked on backpressure. The driver deliberately
-        // remains attached to the runtime stream long enough to execute its bounded finalizers.
+        // Dropping the receiver wakes a driver blocked on backpressure, and dropping `start` releases
+        // a driver that was never polled. The driver deliberately remains attached to the runtime
+        // stream long enough to execute its bounded finalizers.
     }
 }
 
@@ -278,7 +298,10 @@ impl Client {
                 "query_cancellable requires an active Tokio runtime".into(),
             ))
         })?;
+        let (start, started) = tokio::sync::oneshot::channel::<()>();
         let driver = runtime.spawn(async move {
+            // Lazy start: `Err` means the handle was dropped unpolled, which must still finalize.
+            let _ = started.await;
             while let Some(delta) = stream.next().await {
                 if sender.send(delta).await.is_err() {
                     // The public handle was dropped. Keep draining: cancellation makes every
@@ -293,6 +316,7 @@ impl Client {
             cancellation,
             recorder,
             driver: Some(driver),
+            start: Some(start),
         })
     }
 
@@ -609,6 +633,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_through_cloned_handle_before_first_poll_is_deterministic() {
+        // MockProvider completes instantly; an eagerly-started driver used to win this race.
+        for _ in 0..200 {
+            let mut run = Client::default()
+                .query_cancellable("hello", AgentOptions::default())
+                .unwrap();
+            tokio::task::yield_now().await;
+            run.cancellation_handle().cancel();
+            let mut codes = Vec::new();
+            while let Some(delta) = run.next().await {
+                if let StreamDelta::Error { info, .. } = delta {
+                    codes.push(info.code);
+                }
+            }
+            assert_eq!(
+                run.outcome().terminal_status,
+                crate::session::RunTerminalStatus::Cancelled
+            );
+            assert_eq!(codes, vec![crate::error::ErrorCode::Cancelled]);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_cancellable_query_still_finalizes() {
+        let run = Client::default()
+            .query_cancellable("hello", AgentOptions::default())
+            .unwrap();
+        let recorder = run.recorder();
+        drop(run);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while recorder.outcome().terminal_status == crate::session::RunTerminalStatus::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unpolled dropped run must still run its finalizers");
+        assert_eq!(
+            recorder.outcome().terminal_status,
+            crate::session::RunTerminalStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
     async fn high_level_client_stream_exposes_typed_cancellation() {
         let token = CancellationToken::new();
         token.cancel();
@@ -654,7 +721,10 @@ mod tests {
         let run = Client::default()
             .query_cancellable("hello", options)
             .unwrap();
+        let mut run = run;
         let recorder = run.recorder();
+        // The run starts on first poll; this poll stays pending inside the blocked prompt hook.
+        assert!(futures::poll!(run.next()).is_pending());
         prompt_entered.notified().await;
         drop(run);
 
